@@ -806,8 +806,14 @@ async function requestWithRetry(req, opts, { streaming = false } = {}) {
     }
 
     if (res.ok) {
+      // Headers are not a response — the body still has to arrive, and a 200
+      // whose body trickles forever would otherwise hang with no timeout and no
+      // way to cancel, because dropping the controller here severs both. So the
+      // timeout and the caller's signal stay wired until release(), which every
+      // caller invokes once the body is fully read. Streaming relaxes only the
+      // timer: a live token stream is allowed to outlast the request timeout,
+      // but a non-streaming body read is not.
       if (streaming) control.settle();
-      else control.dispose();
       return { res, release: () => control.dispose() };
     }
 
@@ -860,7 +866,25 @@ async function readJson(res, address) {
  * ------------------------------------------------------------------ */
 
 /**
- * One round trip. -> {text, usage:{input,output}, model, raw}
+ * Why generation ended, folded into one vocabulary: 'length' when the reply hit
+ * the token ceiling, 'stop' when the model finished of its own accord, the
+ * provider's raw word for anything rarer, and null when the response did not
+ * say. The distinction callers care about is 'length' — a reply cut off
+ * mid-JSON will not parse, and the honest advice is "raise maxTokens", not
+ * "get a better model".
+ */
+function normalizeStopReason(protocol, raw) {
+  if (typeof raw !== 'string' || !raw) return null;
+  if (protocol === 'anthropic') {
+    if (raw === 'max_tokens') return 'length';
+    if (raw === 'end_turn' || raw === 'stop_sequence') return 'stop';
+    return raw;
+  }
+  return raw; // openai already says 'length' and 'stop'
+}
+
+/**
+ * One round trip. -> {text, usage:{input,output}, model, stopReason, raw}
  */
 export async function complete(opts = {}) {
   const req = buildChatRequest(opts, { stream: false });
@@ -883,6 +907,7 @@ export async function complete(opts = {}) {
       text,
       usage: { input: num(raw?.usage?.input_tokens), output: num(raw?.usage?.output_tokens) },
       model: typeof raw?.model === 'string' ? raw.model : req.model,
+      stopReason: normalizeStopReason('anthropic', raw?.stop_reason),
       raw,
     };
   }
@@ -892,6 +917,7 @@ export async function complete(opts = {}) {
     text: textOf(choice?.message?.content),
     usage: { input: num(raw?.usage?.prompt_tokens), output: num(raw?.usage?.completion_tokens) },
     model: typeof raw?.model === 'string' ? raw.model : req.model,
+    stopReason: normalizeStopReason('openai', choice?.finish_reason),
     raw,
   };
 }

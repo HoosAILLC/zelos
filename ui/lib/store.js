@@ -71,8 +71,29 @@ export function emit() {
   }
 }
 
-export function notify(message, { tone = 'info' } = {}) {
-  state.toast = message ? { message, tone, at: Date.now() } : null;
+/**
+ * A toast should not need to be dismissed to go away: it auto-dismisses after a
+ * few seconds, and a NEW toast restarts the clock by replacing the old timer
+ * along with the old message. A toast carrying an action (Undo, mostly) gets
+ * longer — vanishing under a cursor that is on its way to the button is worse
+ * than lingering — but it still goes eventually; a permanent toast is a banner
+ * that chose the wrong container.
+ */
+const TOAST_MS = 6_000;
+const TOAST_ACTION_MS = 8_000;
+let toastTimer = null;
+
+export function notify(message, { tone = 'info', action = null } = {}) {
+  clearTimeout(toastTimer);
+  toastTimer = null;
+  state.toast = message ? { message, tone, action, at: Date.now() } : null;
+  if (state.toast) {
+    toastTimer = setTimeout(() => {
+      toastTimer = null;
+      state.toast = null;
+      emit();
+    }, action ? TOAST_ACTION_MS : TOAST_MS);
+  }
   emit();
 }
 
@@ -318,8 +339,20 @@ export function nowMark() {
   return { key: dayKey(iso), minutes };
 }
 
+/**
+ * What a pane shows for a bucket. Snoozed rows are excluded on purpose: the
+ * whole point of a snooze is that the thing leaves the board until its time,
+ * and a pane that still lists it — while the count above says otherwise — is
+ * two answers to one question. The snoozed live in their own folded section on
+ * Now, via snoozedItems().
+ */
 export function itemsInBucket(bucket) {
-  return state.board.items.filter((i) => i.bucket === bucket && i.state !== 'done' && i.state !== 'dismissed');
+  return state.board.items.filter((i) =>
+    i.bucket === bucket && i.state !== 'done' && i.state !== 'dismissed' && i.state !== 'snoozed');
+}
+
+export function snoozedItems() {
+  return state.board.items.filter((i) => i.state === 'snoozed');
 }
 
 export function openDrafts() {
@@ -344,19 +377,46 @@ export function eventsToday() {
 
 /* -------------------------------------------------------------- item actions */
 
-export async function setItemState(id, next) {
+/** What the Undo toast calls the thing it can undo. */
+const STATE_VERB = { done: 'Marked done', dismissed: 'Dismissed', snoozed: 'Snoozed' };
+
+export async function setItemState(id, next, { until = undefined, silent = false } = {}) {
   const before = state.board.items;
+  const prior = before.find((i) => i.id === id) || null;
   // Optimistic: the board is the user's own decision surface, and a round-trip
   // of latency on "done" makes it feel broken. A failure puts the row back.
+  // `snoozed_until` follows the server's rule locally too: it exists only while
+  // the state is `snoozed`, and any other state clears it.
   state.board = {
     ...state.board,
-    items: before.map((i) => (i.id === id ? { ...i, state: next } : i)),
+    items: before.map((i) => (i.id === id
+      ? { ...i, state: next, snoozed_until: next === 'snoozed' ? (until ?? null) : null }
+      : i)),
   };
   state.rev += 1;
   emit();
   try {
-    await api.setItemState(id, next);
+    await api.setItemState(id, next, until === undefined ? {} : { until });
     await loadBoard();
+    // "Done", "dismissed" and "snoozed" all take a row off the board, and all
+    // three are one slipped click away from losing something real — so each
+    // offers its undo in the toast, restoring the exact prior state, snooze
+    // deadline included. The undo itself is silent: a toast offering to undo
+    // an undo is a hall of mirrors.
+    if (!silent && prior && STATE_VERB[next]) {
+      // Restoring to `snoozed` states the deadline explicitly — including an
+      // explicit null for the legacy manual snooze, which the server reads as
+      // "no deadline" rather than as a request for its morning default. Any
+      // other prior state carries no deadline to restore.
+      notify(`${STATE_VERB[next]}: ${prior.headline || 'that item'}`, {
+        action: {
+          label: 'Undo',
+          run: () => setItemState(id, prior.state, prior.state === 'snoozed'
+            ? { until: prior.snoozed_until ?? null, silent: true }
+            : { silent: true }),
+        },
+      });
+    }
   } catch (err) {
     state.board = { ...state.board, items: before };
     notify(`Could not update that item: ${err.message}`, { tone: 'warn' });

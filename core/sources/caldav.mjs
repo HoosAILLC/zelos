@@ -272,82 +272,101 @@ async function request(method, url, { user, pass, body = null, depth = null, tim
     controller.abort(new Error('timeout'));
   }, timeoutMs);
 
+  // The deadline and the caller's abort wiring must outlive the header
+  // exchange: fetch() resolves the moment the status line and headers are in,
+  // and the body — which a stalling or trickling server controls — is read
+  // after that. Tearing the timer down when fetch() resolves would leave the
+  // body read unbounded and un-abortable, so everything through the last body
+  // byte runs inside this try and the teardown happens once, in the finally.
   let response;
+  let text;
   try {
-    response = await fetch(url, { method, headers, body, redirect: 'manual', signal: controller.signal });
-  } catch (err) {
-    const reason = timedOut
-      ? `no response within ${timeoutMs}ms`
-      : signal?.aborted
-        ? 'cancelled'
-        : err?.message || String(err);
-    throw new CalDavError(`CalDAV ${method} could not reach ${hostOf(url)}: ${reason}`, { host: hostOf(url) });
-  } finally {
-    clearTimeout(timer);
-    signal?.removeEventListener('abort', onAbort);
-  }
-
-  if ([301, 302, 303, 307, 308].includes(response.status)) {
-    const location = response.headers.get('location');
-    if (redirectsLeft > 0 && location) {
-      let next;
-      try {
-        next = new URL(location, url);
-      } catch {
-        throw new CalDavError(`CalDAV ${method} at ${hostOf(url)} redirected to an unusable location`, {
-          status: response.status,
-          host: hostOf(url),
-        });
-      }
-      if (next.protocol !== 'http:' && next.protocol !== 'https:') {
-        throw new CalDavError(`CalDAV ${method} at ${hostOf(url)} redirected to a non-HTTP location`, {
-          status: response.status,
-          host: hostOf(url),
-        });
-      }
-      dav.debug(`${method} ${response.status} -> ${next.origin}${next.pathname}`);
-      return request(method, next.toString(), { user, pass, body, depth, timeoutMs, signal, redirectsLeft: redirectsLeft - 1, authOrigin: scope });
+    try {
+      response = await fetch(url, { method, headers, body, redirect: 'manual', signal: controller.signal });
+    } catch (err) {
+      const reason = timedOut
+        ? `no response within ${timeoutMs}ms`
+        : signal?.aborted
+          ? 'cancelled'
+          : err?.message || String(err);
+      throw new CalDavError(`CalDAV ${method} could not reach ${hostOf(url)}: ${reason}`, { host: hostOf(url) });
     }
-    throw new CalDavError(`CalDAV ${method} at ${hostOf(url)} redirected more than once`, {
-      status: response.status,
-      host: hostOf(url),
-    });
-  }
 
-  if (response.status === 401 || response.status === 403) {
-    // Told apart on purpose: "your password is wrong" and "we declined to send
-    // your password to a host you did not choose" are different problems, and a
-    // user given the first message for the second one will keep retyping a
-    // password that was never the issue.
-    if (!auth && basicAuth(user, pass)) {
+    if ([301, 302, 303, 307, 308].includes(response.status)) {
+      const location = response.headers.get('location');
+      if (redirectsLeft > 0 && location) {
+        let next;
+        try {
+          next = new URL(location, url);
+        } catch {
+          throw new CalDavError(`CalDAV ${method} at ${hostOf(url)} redirected to an unusable location`, {
+            status: response.status,
+            host: hostOf(url),
+          });
+        }
+        if (next.protocol !== 'http:' && next.protocol !== 'https:') {
+          throw new CalDavError(`CalDAV ${method} at ${hostOf(url)} redirected to a non-HTTP location`, {
+            status: response.status,
+            host: hostOf(url),
+          });
+        }
+        dav.debug(`${method} ${response.status} -> ${next.origin}${next.pathname}`);
+        return await request(method, next.toString(), { user, pass, body, depth, timeoutMs, signal, redirectsLeft: redirectsLeft - 1, authOrigin: scope });
+      }
+      throw new CalDavError(`CalDAV ${method} at ${hostOf(url)} redirected more than once`, {
+        status: response.status,
+        host: hostOf(url),
+      });
+    }
+
+    if (response.status === 401 || response.status === 403) {
+      // Told apart on purpose: "your password is wrong" and "we declined to send
+      // your password to a host you did not choose" are different problems, and a
+      // user given the first message for the second one will keep retyping a
+      // password that was never the issue.
+      if (!auth && basicAuth(user, pass)) {
+        throw new CalDavError(
+          `${hostOf(url)} asked for a password, but it is not the calendar host you configured — ` +
+            'Zelos will not send your calendar password to a host a server redirected it to. ' +
+            `If ${hostOf(url)} really is your calendar, put its address in the calendar URL directly.`,
+          { status: response.status, host: hostOf(url) },
+        );
+      }
       throw new CalDavError(
-        `${hostOf(url)} asked for a password, but it is not the calendar host you configured — ` +
-          'Zelos will not send your calendar password to a host a server redirected it to. ' +
-          `If ${hostOf(url)} really is your calendar, put its address in the calendar URL directly.`,
+        `CalDAV rejected the credentials for ${hostOf(url)} (HTTP ${response.status}). ` +
+          'iCloud and Fastmail need an app-specific password, not the account password.',
         { status: response.status, host: hostOf(url) },
       );
     }
-    throw new CalDavError(
-      `CalDAV rejected the credentials for ${hostOf(url)} (HTTP ${response.status}). ` +
-        'iCloud and Fastmail need an app-specific password, not the account password.',
-      { status: response.status, host: hostOf(url) },
-    );
-  }
 
-  const declared = Number(response.headers.get('content-length') || 0);
-  if (declared > MAX_RESPONSE_BYTES) {
-    throw new CalDavError(`CalDAV response from ${hostOf(url)} is too large (${declared} bytes)`, {
-      status: response.status,
-      host: hostOf(url),
-    });
-  }
+    const declared = Number(response.headers.get('content-length') || 0);
+    if (declared > MAX_RESPONSE_BYTES) {
+      // Cancel explicitly: a refused body left unconsumed keeps its pooled
+      // connection busy and the next request to the same host queues behind it.
+      response.body?.cancel()?.catch?.(() => {});
+      throw new CalDavError(`CalDAV response from ${hostOf(url)} is too large (${declared} bytes)`, {
+        status: response.status,
+        host: hostOf(url),
+      });
+    }
 
-  const text = await response.text();
-  if (text.length > MAX_RESPONSE_BYTES) {
-    throw new CalDavError(`CalDAV response from ${hostOf(url)} is too large`, {
-      status: response.status,
-      host: hostOf(url),
-    });
+    try {
+      text = await readBodyCapped(response, url);
+    } catch (err) {
+      if (err instanceof CalDavError) throw err;
+      const reason = timedOut
+        ? `no response within ${timeoutMs}ms`
+        : signal?.aborted
+          ? 'cancelled'
+          : err?.message || String(err);
+      throw new CalDavError(`CalDAV ${method} response from ${hostOf(url)} could not be read: ${reason}`, {
+        status: response.status,
+        host: hostOf(url),
+      });
+    }
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', onAbort);
   }
 
   if (response.status >= 400) {
@@ -358,6 +377,34 @@ async function request(method, url, { user, pass, body = null, depth = null, tim
   }
 
   return { status: response.status, text, url };
+}
+
+/**
+ * Read a response body while counting bytes, not after buffering them.
+ * A content-length check upstream catches the honest oversized response; this
+ * catches the chunked one that never declares a length — the read stops and
+ * the connection is cancelled the moment the cap is crossed, so a server
+ * trickling gigabytes costs at most MAX_RESPONSE_BYTES of memory.
+ */
+async function readBodyCapped(response, url) {
+  if (!response.body) return '';
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_RESPONSE_BYTES) {
+      await reader.cancel().catch(() => {});
+      throw new CalDavError(`CalDAV response from ${hostOf(url)} is too large`, {
+        status: response.status,
+        host: hostOf(url),
+      });
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks, total).toString('utf8');
 }
 
 /* ------------------------------------------------------------------ *

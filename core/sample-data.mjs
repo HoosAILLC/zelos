@@ -16,7 +16,9 @@
  *  2. **Exactly reversible.** Seeding writes a manifest into `kv` listing the row
  *     ids it actually inserted — and it only records the ones where the insert was
  *     genuinely new, skipping anything that already existed. Clearing deletes that
- *     list and nothing else, which is why `rowCounts()` before and after is
+ *     list, plus any item a later sweep minted whose source refs point at nothing
+ *     but manifest rows — the model's echoes of the fiction — and nothing else,
+ *     which is why `rowCounts()` before and after a plain seed-and-clear is
  *     identical rather than approximately identical. `test/sample-data.test.mjs`
  *     asserts precisely that.
  *
@@ -603,6 +605,14 @@ const DELETE_BY_ID = Object.freeze({
  * Remove exactly the rows the manifest names, then the manifest. Anything the
  * user did in the meantime — a real message, an item they marked done — is
  * untouched, because this never deletes by pattern, only by recorded id.
+ *
+ * With one earned exception: a sweep that ran while the demo was installed may
+ * have minted its own items about the fictional cast. Those are model output,
+ * so their ids are not in the manifest — but they are still recognisable,
+ * because their source refs resolve to nothing except rows the manifest does
+ * name. An item citing only sample rows is about people who do not exist and
+ * goes with them; an item holding even one real ref is evidence of real work
+ * and stays, whatever else it cites.
  */
 export function clearSampleData(db) {
   if (!db) throw new TypeError('sample-data: clearSampleData needs an open database');
@@ -612,6 +622,12 @@ export function clearSampleData(db) {
   }
 
   const removed = { messages: 0, events: 0, items: 0, drafts: 0, captures: 0, runs: 0, refs: 0 };
+
+  const sampleRefs = new Set([
+    ...manifest.ids.messages.map((id) => `msg:${id}`),
+    ...manifest.ids.events.map((id) => `evt:${id}`),
+    ...manifest.ids.captures.map((id) => `cap:${id}`),
+  ]);
 
   withTransaction(db, () => {
     for (const [table, sql] of Object.entries(DELETE_BY_ID)) {
@@ -623,6 +639,26 @@ export function clearSampleData(db) {
     for (const ref of manifest.ids.refs || []) {
       if (removeDoc(db, ref)) removed.refs += 1;
     }
+
+    // The echo pass. The manifest's own items are already gone, so what is
+    // left is either the user's or a sweep's; only an item whose every ref
+    // names a sample row — and that has refs at all, because an unreferenced
+    // item proves nothing about its origin — is removed, along with its drafts
+    // and its search entry.
+    for (const row of db.prepare('SELECT id, source_refs_json FROM items').all()) {
+      let refs;
+      try {
+        refs = JSON.parse(row.source_refs_json);
+      } catch {
+        refs = null;
+      }
+      if (!Array.isArray(refs) || refs.length === 0) continue;
+      if (!refs.every((ref) => sampleRefs.has(ref))) continue;
+      removed.items += db.prepare('DELETE FROM items WHERE id = ?').run(row.id).changes;
+      removed.drafts += db.prepare('DELETE FROM drafts WHERE item_id = ?').run(row.id).changes;
+      if (removeDoc(db, `item:${row.id}`)) removed.refs += 1;
+    }
+
     deleteKV(db, MANIFEST_KEY);
   });
 

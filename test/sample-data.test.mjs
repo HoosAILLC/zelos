@@ -32,9 +32,9 @@ const {
 const dbm = await import('../core/db.mjs');
 const {
   open, close, migrate, BUCKETS, ITEM_STATES,
-  messageRowId, itemRowId,
+  messageRowId, eventRowId, itemRowId,
   listBoard, bucketCounts, listDrafts, listEvents, listMessages, listCaptures,
-  getMessage, getItemByKey, getKV, search, upsertMessage, upsertItem,
+  getMessage, getItemByKey, getKV, search, upsertMessage, upsertItem, upsertDraft,
 } = dbm;
 
 const time = await import('../core/time.mjs');
@@ -368,6 +368,90 @@ test('a pre-existing row that collides with a sample id is never adopted, and ne
   clearSampleData(db);
   assert.deepEqual(rowCounts(db), before);
   assert.equal(getMessage(db, collidingId).subject, 'This was here first');
+});
+
+/**
+ * A sweep that ran while the demo was installed can mint items *about* the
+ * fictional cast — model output, so the manifest never heard of them and they
+ * carry no SAMPLE_MARK. The tell is their source refs: an item citing nothing
+ * but sample rows is about nobody real and must go with the fiction; an item
+ * holding even one real ref is evidence of real work and must stay.
+ */
+test('clearing removes model echoes of the fiction and keeps anything with a real ref', () => {
+  const db = fresh();
+  seedSampleData(db);
+
+  const sampleMsgId = messageRowId(SAMPLE_SOURCE_ID, 9001, '<sample-9001@quillonrow.example>');
+  const sampleEvtId = eventRowId(SAMPLE_CALENDAR_ID, 'sample-evt-5001', '');
+
+  upsertMessage(db, {
+    sourceId: 'm_real',
+    uid: 4242,
+    messageId: '<real@somewhere.example>',
+    folder: 'INBOX',
+    direction: 'in',
+    from: { name: 'A Real Person', email: 'real@somewhere.example' },
+    to: [],
+    subject: 'A real message',
+    date: '2026-08-07T09:00:00-04:00',
+    snippet: 'genuinely mine',
+    text: 'genuinely mine',
+  });
+  const realMsgId = messageRowId('m_real', 4242, '<real@somewhere.example>');
+
+  // The echo: unmarked, unmanifested, and citing only fiction.
+  const echo = upsertItem(db, {
+    key: 'echo-rafe-drawings',
+    kind: 'mixed',
+    bucket: 'today',
+    headline: 'Send Rafe Ondrik the marked-up drawings echoword',
+    why: 'Minted by a sweep from sample mail.',
+    severity: 2,
+    sourceRefs: [`msg:${sampleMsgId}`, `evt:${sampleEvtId}`],
+  });
+  dbm.indexDoc(db, { ref: `item:${echo.id}`, kind: 'item', title: 'drawings echoword', body: '' });
+  upsertDraft(db, {
+    itemId: echo.id,
+    to: 'rafe@thistlebank.example',
+    subject: 'Re: drawings',
+    body: 'Rafe — the set goes over tonight, no placeholders in here at all.',
+    state: 'pending',
+  });
+
+  // One sample ref plus one real ref: real work happened, so it stays.
+  upsertItem(db, {
+    key: 'mixed-refs',
+    kind: 'mail',
+    bucket: 'today',
+    headline: 'Chase the thing both threads mention',
+    why: 'One of its sources is genuinely mine.',
+    severity: 2,
+    sourceRefs: [`msg:${sampleMsgId}`, `msg:${realMsgId}`],
+  });
+
+  // No refs at all proves nothing about origin, so it also stays.
+  upsertItem(db, {
+    key: 'no-refs',
+    kind: 'note',
+    bucket: 'note',
+    headline: 'A thought with no sources',
+    why: 'Typed, not derived.',
+    severity: 0,
+    sourceRefs: [],
+  });
+
+  const result = clearSampleData(db);
+  assert.equal(result.cleared, true);
+
+  assert.equal(getItemByKey(db, 'echo-rafe-drawings'), null, 'the echo item must go with the fiction');
+  assert.equal(listDrafts(db, { itemId: echo.id }).length, 0, 'and its draft with it');
+  assert.equal(search(db, 'echoword').length, 0, 'and its search entry');
+
+  const mixed = getItemByKey(db, 'mixed-refs');
+  assert.ok(mixed, 'an item with a real ref survives the clear');
+  assert.deepEqual(mixed.sourceRefs, [`msg:${sampleMsgId}`, `msg:${realMsgId}`]);
+  assert.ok(getItemByKey(db, 'no-refs'), 'an unreferenced item is never guessed at');
+  assert.ok(getMessage(db, realMsgId), 'the real message is untouched');
 });
 
 test('a corrupt manifest disables the automatic clear rather than deleting at random', () => {

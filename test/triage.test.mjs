@@ -500,6 +500,23 @@ test('a `first` that names no surviving item is cleared rather than dangling', (
   assert.ok(result.errors.some((e) => e.path === 'first'));
 });
 
+test('a failed validation cannot blank the last good board pointers', () => {
+  const db = fresh();
+  // A good sweep put a hero and a note where the board reads them.
+  mergeSweep(db, sweepResult(), { runId: 'run_kv1', now: NOW });
+  const goodFirst = getKV(db, SWEEP_KV.first);
+  const goodNotes = getKV(db, SWEEP_KV.notes);
+  assert.ok(goodFirst, 'the precondition: a first pointer exists');
+
+  // Then the model produced something shaped like nothing. The merge reports
+  // the failure — and the pointers from the last good sweep must survive it,
+  // or a single garbage reply blanks the hero and the notes.
+  const bad = mergeSweep(db, { answer: 'here is your board, in prose' }, { runId: 'run_kv2', now: NOW });
+  assert.equal(bad.ok, false);
+  assert.equal(getKV(db, SWEEP_KV.first), goodFirst, 'first survives a failed merge');
+  assert.equal(getKV(db, SWEEP_KV.notes), goodNotes, 'notes survive a failed merge');
+});
+
 test('a model result that is not usable still leaves the database consistent', () => {
   const db = fresh();
   const result = mergeSweep(db, 'not an object at all', { runId: 'run_l', now: NOW });

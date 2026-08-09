@@ -712,6 +712,15 @@ describe('parseShellArgs', () => {
     });
   });
 
+  it('ignores a --home that is interpolation garbage, not a directory', () => {
+    // `--home=${dir}` with `dir` unset hands us the literal string
+    // "undefined"; honouring it once created a live data directory named
+    // undefined/ in the working directory.
+    for (const bad of [['--home=undefined'], ['--home', 'undefined'], ['--home=null'], ['--home', 'NULL']]) {
+      assert.equal(parseShellArgs(bad).home, null, bad.join(' '));
+    }
+  });
+
   it('ignores a port that is not one', () => {
     for (const bad of [['--port=nope'], ['--port=70000'], ['--port=-1'], ['--port']]) {
       assert.equal(parseShellArgs(bad).port, null, bad.join(' '));

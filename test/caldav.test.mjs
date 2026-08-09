@@ -692,3 +692,104 @@ test('an oversized response is refused before it is buffered', async (t) => {
   assert.equal(result.ok, false);
   assert.match(result.error, /too large/);
 });
+
+test('a 207 whose body never finishes is abandoned at the deadline', async (t) => {
+  // The trap this guards: fetch() resolves as soon as the headers arrive, so a
+  // deadline torn down at that moment leaves the body read unbounded — a
+  // server that sends "207, <?xml" and then goes silent used to hang the
+  // whole sweep forever.
+  const sockets = new Set();
+  const server = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      res.writeHead(207, { 'content-type': 'application/xml; charset=utf-8' });
+      res.write('<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">');
+      // ...and nothing more, ever.
+    });
+  });
+  server.on('connection', (socket) => {
+    sockets.add(socket);
+    socket.on('close', () => sockets.delete(socket));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => {
+    for (const socket of sockets) socket.destroy();
+    return new Promise((resolve) => server.close(resolve));
+  });
+
+  // The race is the assertion: with the old behaviour testConnection never
+  // settles, and only the sentinel comes back.
+  let sentinel;
+  const result = await Promise.race([
+    testConnection({ url: `http://127.0.0.1:${server.address().port}`, user: USER, pass: PASS, timeoutMs: 300 }),
+    new Promise((resolve) => {
+      sentinel = setTimeout(() => resolve('hung'), 5000);
+    }),
+  ]);
+  clearTimeout(sentinel);
+
+  assert.notEqual(result, 'hung', 'the stalled body must be abandoned, not awaited forever');
+  assert.equal(result.ok, false);
+  assert.match(result.error, /within 300ms/);
+});
+
+test('a chunked body past the size cap is cut off with "too large"', async (t) => {
+  // No content-length header, so the pre-flight check cannot catch it: the cap
+  // has to be enforced while the body streams. The server sends well past the
+  // cap and then goes quiet without ever finishing — a client that only checks
+  // size after buffering the whole body never gets a whole body to check, so
+  // the streaming check is the only thing that can end this request.
+  const chunk = Buffer.alloc(4 * 1024 * 1024, 0x61);
+  const sockets = new Set();
+  const server = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      if (req.url === '/.well-known/caldav') {
+        res.writeHead(404, { 'content-type': 'text/plain' });
+        res.end('Not Found');
+        return;
+      }
+      res.writeHead(207, { 'content-type': 'application/xml; charset=utf-8' });
+      res.on('error', () => {}); // the client is expected to hang up on us
+      let sent = 0;
+      const pump = () => {
+        while (sent < 48 * 1024 * 1024 && res.writable) {
+          sent += chunk.length;
+          if (!res.write(chunk)) {
+            res.once('drain', pump);
+            return;
+          }
+        }
+        // ...and then silence: the response is never ended.
+      };
+      pump();
+    });
+  });
+  server.on('connection', (socket) => {
+    sockets.add(socket);
+    socket.on('close', () => sockets.delete(socket));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => {
+    for (const socket of sockets) socket.destroy();
+    return new Promise((resolve) => server.close(resolve));
+  });
+
+  let sentinel;
+  const result = await Promise.race([
+    testConnection({
+      url: `http://127.0.0.1:${server.address().port}`,
+      user: USER,
+      pass: PASS,
+      timeoutMs: 15000,
+    }),
+    new Promise((resolve) => {
+      sentinel = setTimeout(() => resolve('hung'), 10000);
+    }),
+  ]);
+  clearTimeout(sentinel);
+
+  assert.notEqual(result, 'hung', 'the cap must trip mid-stream, not after a body that never completes');
+  assert.equal(result.ok, false);
+  assert.match(result.error, /too large/);
+});

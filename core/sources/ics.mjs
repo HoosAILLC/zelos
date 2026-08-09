@@ -616,8 +616,13 @@ function parseUtcOffset(raw) {
  * DTSTART is always yielded first, even when it does not itself satisfy the
  * BY* parts — real-world files break that rule constantly and dropping the
  * first instance is the more visible bug.
+ *
+ * `minNominal` is a fast-forward hint, not a filter: when the caller only
+ * cares about instances at or after it, periods that end before it may be
+ * skipped without being enumerated. Instances before `minNominal` may still
+ * be yielded (DTSTART always is); the caller keeps its own window check.
  */
-function* recurrenceNominals(start, rule, { maxNominal = Infinity, maxCount = 1500 } = {}) {
+function* recurrenceNominals(start, rule, { maxNominal = Infinity, minNominal = -Infinity, maxCount = 1500 } = {}) {
   yield start;
   let emitted = 1;
   if (emitted >= maxCount) return;
@@ -643,6 +648,46 @@ function* recurrenceNominals(start, rule, { maxNominal = Infinity, maxCount = 15
   } else if (rule.freq === 'YEARLY') {
     periodMo = 1;
     periodD = 1;
+  }
+
+  // A rule with no COUNT can be entered anywhere in its series: every period
+  // boundary is DTSTART's boundary plus a whole number of interval steps, and
+  // no period's expansion depends on the ones before it. So when the caller
+  // only wants a distant window, jump the anchor to just before it instead of
+  // walking — and counting against maxCount — years of instances nobody asked
+  // for; without this jump a daily rule anchored a few years back exhausts the
+  // instance budget before it ever reaches the window and the standing meeting
+  // silently vanishes. The jump lands one full period early on purpose, cheap
+  // insurance that the period straddling `minNominal` is generated whole.
+  // COUNT rules cannot take the shortcut: which instances exist depends on how
+  // many came before, so those still enumerate from DTSTART.
+  if (rule.count === null && Number.isFinite(minNominal)) {
+    const anchorMs = mk(periodY, periodMo, periodD);
+    if (minNominal > anchorMs) {
+      if (rule.freq === 'DAILY' || rule.freq === 'WEEKLY') {
+        const stepMs = rule.interval * (rule.freq === 'WEEKLY' ? 7 : 1) * DAY_MS;
+        const whole = Math.floor((minNominal - anchorMs) / stepMs) - 1;
+        if (whole > 0) {
+          const landed = fields(anchorMs + whole * stepMs);
+          periodY = landed.y;
+          periodMo = landed.mo;
+          periodD = landed.d;
+        }
+      } else if (rule.freq === 'MONTHLY') {
+        const target = fields(minNominal);
+        const months = target.y * 12 + (target.mo - 1) - (periodY * 12 + (periodMo - 1));
+        const whole = Math.floor(months / rule.interval) - 1;
+        if (whole > 0) {
+          const total = periodY * 12 + (periodMo - 1) + whole * rule.interval;
+          periodY = Math.floor(total / 12);
+          periodMo = (total % 12) + 1;
+          periodD = 1;
+        }
+      } else {
+        const whole = Math.floor((fields(minNominal).y - periodY) / rule.interval) - 1;
+        if (whole > 0) periodY += whole * rule.interval;
+      }
+    }
   }
 
   let emptyRun = 0;
@@ -946,9 +991,23 @@ function expandOne(master, ctx, cap, overrideByInstant, overrideByDay, usedOverr
 
   const nominals = [];
   if (master.rrule) {
+    // The generator may skip whole periods before this point, so it must sit
+    // far enough below the window that nothing overlapping it is lost: an
+    // instance still counts when it *ends* after `fromMs`, and its nominal can
+    // read up to ~14h away from the instant it names, so back off by the
+    // event's own length plus the same day of slack the upper bound uses.
+    // For a COUNT rule the budget must reach the full count — the series is
+    // enumerated from DTSTART, and a cap below COUNT would drop the tail of a
+    // series whose window sits exactly there. A hostile COUNT still cannot
+    // buy unbounded work: the budget tops out at a figure no human rule
+    // reaches (100k instances is centuries of anything), and MAX_PERIODS
+    // holds underneath it regardless.
+    const minNominal = ctx.fromMs === -Infinity ? -Infinity : ctx.fromMs - Math.max(0, durationMs) - 26 * HOUR_MS;
+    const budget = master.rrule.count !== null ? Math.max(cap, Math.min(master.rrule.count, 100_000)) : cap;
     for (const t of recurrenceNominals(master.dtstart.nominal, master.rrule, {
       maxNominal: generationBound,
-      maxCount: cap,
+      minNominal,
+      maxCount: budget,
     })) {
       nominals.push(t);
     }

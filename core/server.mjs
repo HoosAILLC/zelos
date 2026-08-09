@@ -66,7 +66,7 @@ import { safeUrl, screenContent, cap, wrapUntrusted, scrubForPrompt, SafetyError
 import { testConnection as testMailConnection } from './sources/imap.mjs';
 import { testConnection as testCalDavConnection } from './sources/caldav.mjs';
 import { parseICS } from './sources/ics.mjs';
-import { nowISO, toZonedISO, localTimezone } from './time.mjs';
+import { nowISO, toZonedISO, localTimezone, instant, offsetFor, addDaysToKey, todayKey } from './time.mjs';
 import { log } from './log.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -714,17 +714,22 @@ function handleState(ctx) {
   // A window wide enough for "last week" and the month view, and no wider.
   const from = toZonedISO(new Date(now - 7 * 86_400_000), tz);
   const to = toZonedISO(new Date(now + 60 * 86_400_000), tz);
+  const nowZoned = nowISO(tz);
   const narrative = boardNarrative(db);
 
   sendJSON(ctx.res, 200, {
-    items: listBoard(db, { states: ['open', 'snoozed'], limit: 500 }),
+    // listBoard before bucketCounts, deliberately: reading the board is what
+    // wakes due snoozes, and the counts must describe the board as returned.
+    // `now` in the configured zone so the wake comparison is offset-exact
+    // against the snoozed_until values this server wrote.
+    items: listBoard(db, { states: ['open', 'snoozed'], limit: 500, now: nowZoned }),
     counts: bucketCounts(db, { states: ['open'] }),
     events: listEvents(db, { from, to, limit: 1000 }),
     drafts: listDrafts(db, { states: ['pending', 'edited'], limit: 200 }),
     runs: { last: lastRun(db) },
     notes: narrative.notes,
     first: narrative.first,
-    now: nowISO(tz),
+    now: nowZoned,
   });
 }
 
@@ -748,12 +753,46 @@ function handleSweepStream(ctx) {
   sse.signal.addEventListener('abort', unsubscribe, { once: true });
 }
 
+/**
+ * Where a snooze ends. `until` carries three meanings, told apart with care:
+ * ABSENT (or '') means 09:00 tomorrow in the configured timezone, which is
+ * what "snooze" means to a person who did not say otherwise — out of sight
+ * tonight, back on the board with the morning coffee. An EXPLICIT NULL means
+ * no deadline at all: the manual snooze that only a hand on the Wake button
+ * ends — it exists so Undo can put back a legacy snoozed item exactly as it
+ * was, instead of quietly promising it a morning it was never given. A
+ * SUPPLIED STRING must parse and must be in the future; a snooze that ends in
+ * the past would wake on the very next read of the board, which is never what
+ * anyone meant, so it is refused rather than guessed at.
+ */
+function resolveSnoozeUntil(until, tz) {
+  if (until === null) return null;
+  if (until === undefined || until === '') {
+    const key = addDaysToKey(todayKey(tz), 1);
+    // Two passes so DST cannot mislabel the morning: the offset is looked up
+    // near the target instant, then confirmed at the instant it implies.
+    let offset = offsetFor(tz, new Date(`${key}T09:00:00Z`));
+    offset = offsetFor(tz, new Date(`${key}T09:00:00${offset}`));
+    return `${key}T09:00:00${offset}`;
+  }
+  if (typeof until !== 'string' || until.length > 64) {
+    throw new HttpError(400, 'until must be an ISO date-time string');
+  }
+  const t = instant(until);
+  if (t === null) throw new HttpError(400, 'until is not a date-time Zelos can read');
+  if (t <= Date.now()) throw new HttpError(400, 'until must be in the future');
+  return toZonedISO(new Date(t), tz);
+}
+
 async function handleItemState(ctx, [id]) {
   const body = await readJSON(ctx.req);
   const state = requireString(body, 'state', { max: 20 });
+  const tz = ctx.config().identity.timezone || localTimezone();
+  const opts = { now: nowISO(tz) };
+  if (state === 'snoozed') opts.snoozedUntil = resolveSnoozeUntil(body.until, tz);
   let item;
   try {
-    item = setItemState(ctx.db, id, state);
+    item = setItemState(ctx.db, id, state, opts);
   } catch (err) {
     throw new HttpError(400, err.message);
   }

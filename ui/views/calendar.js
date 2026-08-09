@@ -375,7 +375,14 @@ export function renderCalendar(ctx) {
   const keys = keysForRange();
   const body = el('div', { class: 'view view-calendar' }, [toolbar(keys, rerender), meander()]);
 
-  if (!state.board.events.length) {
+  // "No calendar connected" is a claim about the CONFIG, so it branches on the
+  // config. Branching on the events list alone told a connected calendar with a
+  // quiet fortnight that it did not exist — and hid the grid, which was the
+  // only way to scroll to a week that has something in it. The events check
+  // that remains covers the one case config can't: the demo seeds events into
+  // the database without adding a config entry, and a demo board with a week
+  // of meetings deserves its grid, not a setup card.
+  if ((state.config?.calendars?.length || 0) === 0 && !state.board.events.length) {
     body.appendChild(emptyState({
       title: 'No calendar connected',
       detail: 'Add an .ics subscription, a CalDAV account or a local file in Settings, and your week appears here. The grid is drawn from the times in your calendar, in your calendar’s own zone.',

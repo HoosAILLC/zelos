@@ -82,8 +82,13 @@ export function parseShellArgs(argv = []) {
 
     switch (name) {
       case '--home': {
+        // Reject the literal strings "undefined" and "null" alongside the
+        // empty value: they are what a wrapper script produces when it
+        // interpolates an unset variable into `--home=${dir}`, and passing
+        // them through once created a real data directory named `undefined/`.
         const dir = value();
-        if (dir) flags.home = dir;
+        const junk = dir.trim().toLowerCase();
+        if (dir && junk !== 'undefined' && junk !== 'null') flags.home = dir;
         break;
       }
       case '--port': {

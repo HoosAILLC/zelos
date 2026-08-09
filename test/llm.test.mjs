@@ -169,6 +169,16 @@ async function startMock() {
           res.on('close', () => state.hung.delete(res));
           return;
         }
+        if (canned.hangBody) {
+          // The nastier hang: a healthy 200 with headers and a first chunk,
+          // then a body that never completes. This is what a proxy mid-restart
+          // or a wedged local runtime actually looks like on the wire.
+          state.hung.add(res);
+          res.on('close', () => state.hung.delete(res));
+          res.writeHead(canned.status ?? 200, { 'content-type': 'application/json' });
+          res.write(typeof canned.body === 'string' ? canned.body : '{"choices":[');
+          return;
+        }
         if (canned.chunks) return sendChunks(res, canned);
         const payload = typeof canned.body === 'string' ? canned.body : JSON.stringify(canned.body ?? {});
         res.writeHead(canned.status ?? 200, {
@@ -962,6 +972,95 @@ test('a request timeout names the address and is marked retriable', async () => 
       return true;
     },
   );
+});
+
+test('complete() reports why generation stopped, in one vocabulary across protocols', async () => {
+  // openai already speaks the vocabulary: finish_reason passes through.
+  const stopped = await complete({
+    protocol: 'openai', baseUrl: mock.origin, model: 'llama3.2',
+    messages: [{ role: 'user', content: 'hi' }], retries: 0,
+  });
+  assert.equal(stopped.stopReason, 'stop');
+
+  mock.plan.push({
+    body: {
+      ...OPENAI_COMPLETION,
+      choices: [{ index: 0, message: { role: 'assistant', content: '{"items":[' }, finish_reason: 'length' }],
+    },
+  });
+  const cutOff = await complete({
+    protocol: 'openai', baseUrl: mock.origin, model: 'llama3.2',
+    messages: [{ role: 'user', content: 'hi' }], retries: 0,
+  });
+  assert.equal(cutOff.stopReason, 'length');
+
+  // anthropic spells the same facts differently; the caller must not care.
+  mock.plan.push({ body: { ...ANTHROPIC_MESSAGE, stop_reason: 'max_tokens' } });
+  const antCutOff = await complete({
+    protocol: 'anthropic', baseUrl: mock.origin, model: 'claude-opus-5', apiKey: 'k',
+    messages: [{ role: 'user', content: 'hi' }], retries: 0,
+  });
+  assert.equal(antCutOff.stopReason, 'length');
+
+  mock.plan.push({ body: { ...ANTHROPIC_MESSAGE, stop_reason: 'end_turn' } });
+  const antStopped = await complete({
+    protocol: 'anthropic', baseUrl: mock.origin, model: 'claude-opus-5', apiKey: 'k',
+    messages: [{ role: 'user', content: 'hi' }], retries: 0,
+  });
+  assert.equal(antStopped.stopReason, 'stop');
+
+  // A response that does not say is null, never a guess.
+  const silent = await complete({
+    protocol: 'anthropic', baseUrl: mock.origin, model: 'claude-opus-5', apiKey: 'k',
+    messages: [{ role: 'user', content: 'hi' }], retries: 0,
+  });
+  assert.equal(silent.stopReason, null);
+});
+
+test('a 200 whose body never finishes is timed out, not waited on forever', async () => {
+  mock.plan.push({ hangBody: true });
+  const started = Date.now();
+  await assert.rejects(
+    () =>
+      complete({
+        protocol: 'openai',
+        baseUrl: mock.origin,
+        model: 'llama3.2',
+        messages: [{ role: 'user', content: 'hi' }],
+        timeoutMs: 200,
+        retries: 0,
+      }),
+    (err) => {
+      assert.ok(err instanceof LLMError);
+      assert.match(err.message, /127\.0\.0\.1/, 'the error must name the address');
+      return true;
+    },
+  );
+  assert.ok(Date.now() - started < 2000, 'the timeout must cover the body read, not just the headers');
+});
+
+test('the caller can still cancel while a 200 body is trickling in', async () => {
+  mock.plan.push({ hangBody: true });
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), 80);
+  const started = Date.now();
+  await assert.rejects(
+    () =>
+      complete({
+        protocol: 'openai',
+        baseUrl: mock.origin,
+        model: 'llama3.2',
+        messages: [{ role: 'user', content: 'hi' }],
+        timeoutMs: 30_000,
+        retries: 0,
+        signal: controller.signal,
+      }),
+    (err) => {
+      assert.ok(err instanceof LLMError);
+      return true;
+    },
+  );
+  assert.ok(Date.now() - started < 2000, 'abort must reach the body read, not just the request');
 });
 
 test('a refused connection reads as "is it running?", naming the address', async () => {

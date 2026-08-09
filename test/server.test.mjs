@@ -31,6 +31,7 @@ const { createServer, listen } = await import('../core/server.mjs');
 const db = await import('../core/db.mjs');
 const { loadConfig } = await import('../core/config.mjs');
 const { setSecret, deleteSecret } = await import('../core/secrets.mjs');
+const { todayKey, addDaysToKey, instant } = await import('../core/time.mjs');
 
 const SECRET_VALUE = 'zelos-test-secret-4d1f9c7b2e6a';
 
@@ -946,6 +947,85 @@ test('an item state change is recorded, and an illegal one is refused', async (t
 
   const missing = await call(ctx, 'POST', '/api/items/nosuchitem/state', { body: { state: 'done' } });
   assert.equal(missing.status, 404);
+});
+
+test('a snoozed item leaves the counts and /api/state wakes it once the time has passed', async (t) => {
+  const ctx = await startServer(t);
+  const { id } = db.upsertItem(ctx.db, { key: 'chase-invoice', bucket: 'now', headline: 'Chase the invoice' });
+
+  // Whole seconds, because the stored zoned ISO carries none finer — the
+  // round-trip assertion below compares instants, and truncation would skew it.
+  const untilMs = Math.ceil((Date.now() + 1_200) / 1000) * 1000;
+  const until = new Date(untilMs).toISOString();
+
+  const snoozed = await call(ctx, 'POST', `/api/items/${id}/state`, { body: { state: 'snoozed', until } });
+  assert.equal(snoozed.status, 200);
+  assert.equal(snoozed.json.state, 'snoozed');
+  assert.equal(instant(snoozed.json.snoozed_until), untilMs, 'the stored wake time is the same instant, re-zoned');
+
+  // Asleep: still in the items payload (the rail shows snoozed rows dimmed),
+  // carrying snoozed_until, but out of the open counts.
+  const before = await call(ctx, 'GET', '/api/state');
+  const sleeping = before.json.items.find((i) => i.id === id);
+  assert.equal(sleeping.state, 'snoozed');
+  assert.equal(instant(sleeping.snoozed_until), untilMs);
+  assert.equal(before.json.counts.now, 0);
+
+  await delay(untilMs - Date.now() + 250);
+
+  // Reading the state is what wakes it — no timer, no sweep required.
+  const after = await call(ctx, 'GET', '/api/state');
+  const woken = after.json.items.find((i) => i.id === id);
+  assert.equal(woken.state, 'open');
+  assert.equal(woken.snoozed_until, null);
+  assert.equal(after.json.counts.now, 1, 'the counts describe the board as returned, wake included');
+});
+
+test('snoozing without an until defaults to 09:00 tomorrow in the configured timezone', async (t) => {
+  // A fixed-offset zone (UTC+14, no DST) that no test machine runs in, so a
+  // pass cannot be the server's own local zone answering by coincidence.
+  const tz = 'Pacific/Kiritimati';
+  const cfg = baseConfig();
+  const ctx = await startServer(t, { config: { ...cfg, identity: { ...cfg.identity, timezone: tz } } });
+  const { id } = db.upsertItem(ctx.db, { key: 'later-thing', bucket: 'soon', headline: 'Later' });
+
+  const res = await call(ctx, 'POST', `/api/items/${id}/state`, { body: { state: 'snoozed' } });
+  assert.equal(res.status, 200);
+  assert.equal(res.json.state, 'snoozed');
+  assert.equal(res.json.snoozed_until, `${addDaysToKey(todayKey(tz), 1)}T09:00:00+14:00`);
+});
+
+test('an explicit null until is the manual snooze: no deadline, wake by hand', async (t) => {
+  const ctx = await startServer(t);
+  const { id } = db.upsertItem(ctx.db, { key: 'manual-snooze', bucket: 'now', headline: 'Set aside' });
+
+  // null is not "use the default" — that is what ABSENCE means. null is the
+  // legacy manual snooze, and Undo depends on the difference: restoring a
+  // snoozed item that never had a deadline must not gift it one.
+  const res = await call(ctx, 'POST', `/api/items/${id}/state`, { body: { state: 'snoozed', until: null } });
+  assert.equal(res.status, 200);
+  assert.equal(res.json.state, 'snoozed');
+  assert.equal(res.json.snoozed_until, null);
+
+  // And with no deadline, no amount of reading the board wakes it.
+  const later = await call(ctx, 'GET', '/api/state');
+  assert.equal(later.status, 200);
+  const row = later.json.items.find((i) => i.id === id);
+  assert.equal(row.state, 'snoozed');
+  assert.equal(row.snoozed_until, null);
+});
+
+test('a snooze with an unusable until is refused and changes nothing', async (t) => {
+  const ctx = await startServer(t);
+  const { id } = db.upsertItem(ctx.db, { key: 'nope-snooze', bucket: 'now', headline: 'Nope' });
+
+  for (const until of ['not-a-date', '2026-13-45T99:00:00Z', '2020-01-01T09:00:00Z', 12345, {}]) {
+    const res = await call(ctx, 'POST', `/api/items/${id}/state`, { body: { state: 'snoozed', until } });
+    assert.equal(res.status, 400, `until ${JSON.stringify(until)} should have been refused`);
+    assert.equal(typeof res.json.error, 'string');
+  }
+  assert.equal(db.getItem(ctx.db, id).state, 'open', 'a refused snooze leaves the item untouched');
+  assert.equal(db.getItem(ctx.db, id).snoozed_until, null);
 });
 
 test('a capture is stored and immediately searchable', async (t) => {

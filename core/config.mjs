@@ -88,9 +88,19 @@ export const DEFAULTS = deepFreeze({
 
 /* ------------------------------------------------------------------ paths */
 
+/**
+ * The literal strings "undefined" and "null" are treated as no override at
+ * all. They are what an undefined JavaScript value becomes when a launcher
+ * interpolates it into an environment variable (`ZELOS_HOME=${home}` with
+ * `home` unset), and honouring them once put a live data directory named
+ * `undefined/` in the current working directory. Garbage that specific is
+ * worth naming rather than resolving.
+ */
 function homeDir() {
   const override = process.env.ZELOS_HOME;
-  return override && override.trim() ? path.resolve(override) : path.join(os.homedir(), '.zelos');
+  const trimmed = override ? override.trim() : '';
+  const garbage = trimmed.toLowerCase() === 'undefined' || trimmed.toLowerCase() === 'null';
+  return trimmed && !garbage ? path.resolve(override) : path.join(os.homedir(), '.zelos');
 }
 
 /**

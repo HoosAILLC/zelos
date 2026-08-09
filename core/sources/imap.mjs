@@ -109,7 +109,16 @@ class ResponseAssembler {
         const head = line.slice(0, marker.index);
         this.#segments.push(head);
         this.#length += head.length;
-        this.#pendingLiteral = size;
+        if (size === 0) {
+          // "{0}" is a real value — the empty string — not a formality. The
+          // payload branch above never runs for it (there are no bytes to
+          // wait for), so the empty range is recorded here; dropping it
+          // instead would delete a value from a FETCH response and shift
+          // every item after it onto the wrong key.
+          this.#literals.push({ start: this.#length, end: this.#length });
+        } else {
+          this.#pendingLiteral = size;
+        }
         this.#buf = this.#buf.subarray(idx + 2);
         this.#scan = 0;
         continue;
@@ -210,6 +219,10 @@ function parseResponse({ text, literals }) {
     if (pos >= end) return null;
     const range = literalAt.get(pos);
     if (range) {
+      // Consumed ranges are forgotten so a zero-length literal — whose end is
+      // its start, leaving `pos` where it stood — reads as one empty value
+      // instead of an endless stream of them.
+      literalAt.delete(range.start);
       const buf = Buffer.from(text.slice(range.start, range.end), 'latin1');
       pos = range.end;
       return { type: 'string', value: buf };

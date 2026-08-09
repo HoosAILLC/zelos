@@ -1084,8 +1084,14 @@ export function mergeSweep(db, parsed, { runId = null, now = nowISO() } = {}) {
       });
     }
 
-    setKV(db, SWEEP_KV.first, firstId || '');
-    setKV(db, SWEEP_KV.notes, JSON.stringify(value.notes));
+    // A reply that failed validation carries no board worth pointing at. The
+    // transaction still commits — the per-item loop above saw nothing to do —
+    // but the first/notes pointers must survive it, or a garbage reply would
+    // blank the hero and the notes the LAST good sweep put there.
+    if (validated.ok) {
+      setKV(db, SWEEP_KV.first, firstId || '');
+      setKV(db, SWEEP_KV.notes, JSON.stringify(value.notes));
+    }
   });
 
   if (errors.length) {

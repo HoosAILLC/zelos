@@ -11,9 +11,11 @@
  * other.
  */
 
-import { el, button, meander } from './dom.js';
-import { setItemState } from './store.js';
-import { todayKey } from './time.js';
+import { el, button, meander, replace } from './dom.js';
+import { setItemState, timezone } from './store.js';
+import {
+  todayKey, addDaysToKey, weekdayOfKey, dayKey, offsetFor, toZonedISO, formatTime, formatDay,
+} from './time.js';
 import {
   BUCKET_TAG, severityOf, carriedFor, dueLabel, isOverdue, personLabel,
 } from './format.js';
@@ -45,6 +47,15 @@ function tick(item, { label = 'Mark done' } = {}) {
   return node;
 }
 
+/** "until 2 PM" today, "until Tue, Aug 11 9 AM" any other day. */
+function untilLabel(iso, tz) {
+  const time = formatTime(iso);
+  if (dayKey(iso) === todayKey(tz)) return time ? `until ${time}` : null;
+  const day = formatDay(iso);
+  if (!day) return null;
+  return `until ${day}${time ? ` ${time}` : ''}`;
+}
+
 function metaLine(item, { tz }) {
   const bits = [];
   const due = dueLabel(item);
@@ -53,6 +64,10 @@ function metaLine(item, { tz }) {
   if (who) bits.push({ text: who, class: '' });
   const carried = carriedFor(item, todayKey(tz));
   if (carried) bits.push({ text: carried, class: 'meta-carried' });
+  if (item.state === 'snoozed' && item.snoozed_until) {
+    const until = untilLabel(item.snoozed_until, tz);
+    if (until) bits.push({ text: until, class: 'meta-carried' });
+  }
   if (!bits.length) return null;
   return el('p', { class: 'meta mono' }, bits.map((b, i) => el('span', {
     class: `meta-bit ${b.class}`.trim(),
@@ -61,12 +76,74 @@ function metaLine(item, { tz }) {
 }
 
 /**
+ * 09:00 on the morning of `key`, as an ISO string carrying `tz`'s offset.
+ *
+ * Two passes over the offset on purpose: the first guess reads the zone's
+ * offset at roughly the right instant, and the second re-reads it at the exact
+ * instant the guess names, which is the only way a DST changeover sitting
+ * between "now" and "tomorrow morning" gets the right side of the fold.
+ */
+function morningISO(key, tz) {
+  const guess = offsetFor(tz, new Date(Date.parse(`${key}T09:00:00Z`)));
+  const offset = offsetFor(tz, new Date(Date.parse(`${key}T09:00:00${guess}`)));
+  return `${key}T09:00:00${offset}`;
+}
+
+/**
+ * The three snooze deadlines on offer, computed in the user's configured zone
+ * at the moment the chooser opens — "later today" from a chooser opened at
+ * lunch and one opened at dinner are different instants, and both mean four
+ * hours from now.
+ */
+export function snoozeChoices(tz, now = Date.now()) {
+  const today = dayKey(toZonedISO(new Date(now), tz));
+  const wd = weekdayOfKey(today);
+  // "Next week" is Monday morning, and from a Monday it means the NEXT one.
+  const monday = addDaysToKey(today, ((1 - wd + 7) % 7) || 7);
+  return [
+    { label: 'Later today', until: toZonedISO(new Date(now + 4 * 3_600_000), tz) },
+    { label: 'Tomorrow morning', until: morningISO(addDaysToKey(today, 1), tz) },
+    { label: 'Next week', until: morningISO(monday, tz) },
+  ];
+}
+
+/**
+ * The snooze control: a quiet button that unfolds three concrete deadlines
+ * rather than acting on the click itself. "Snooze" with no time attached was
+ * the old behaviour, and it produced rows that slept until someone remembered
+ * they existed.
+ */
+function snoozeControl(item) {
+  const panel = el('div', { class: 'snooze-menu', hidden: true });
+  const toggle = el('button', {
+    type: 'button',
+    class: 'btn quiet',
+    'aria-expanded': 'false',
+    'aria-label': `Snooze ${item.headline || 'this item'}`,
+    onclick() {
+      const open = this.getAttribute('aria-expanded') === 'true';
+      this.setAttribute('aria-expanded', open ? 'false' : 'true');
+      if (!open) {
+        replace(panel, snoozeChoices(timezone()).map(({ label, until }) =>
+          button(label, {
+            class: 'btn quiet',
+            onClick: () => setItemState(item.id, 'snoozed', { until }),
+          })));
+      }
+      panel.hidden = open;
+    },
+  }, 'Snooze');
+  return { toggle, panel };
+}
+
+/**
  * The extra controls. Behind a disclosure because "done" is the answer 90% of
  * the time and three equal buttons make you read all three.
  */
 function moreControls(item) {
+  const snooze = snoozeControl(item);
   const panel = el('div', { class: 'row-more', hidden: true }, [
-    button('Snooze', { class: 'btn quiet', onClick: () => setItemState(item.id, 'snoozed') }),
+    snooze.toggle,
     button('Not a thing', {
       class: 'btn quiet',
       onClick: () => setItemState(item.id, 'dismissed'),
@@ -75,6 +152,7 @@ function moreControls(item) {
     item.state === 'snoozed'
       ? button('Wake', { class: 'btn quiet', onClick: () => setItemState(item.id, 'open') })
       : null,
+    snooze.panel,
   ]);
 
   const toggle = el('button', {
@@ -129,12 +207,13 @@ export function itemRow(item, { tz, showBucket = true } = {}) {
 
 /**
  * The hero. One item, the one the model ranked first — given the size that says
- * "if you do one thing". Terracotta appears here and almost nowhere else.
+ * "if you do one thing".
  */
 export function itemHero(item, { tz } = {}) {
   const link = linkFor(item);
   const carried = carriedFor(item, todayKey(tz));
   const due = dueLabel(item);
+  const snooze = snoozeControl(item);
 
   return el('article', { class: `hero sev-${severityOf(item)}` }, [
     el('p', { class: 'hero-eyebrow', text: 'Do this first' }),
@@ -148,7 +227,7 @@ export function itemHero(item, { tz } = {}) {
     ]),
     el('div', { class: 'hero-actions' }, [
       button('Done', { class: 'btn solid', onClick: () => setItemState(item.id, 'done') }),
-      button('Snooze', { class: 'btn quiet', onClick: () => setItemState(item.id, 'snoozed') }),
+      snooze.toggle,
       link ? el('a', {
         class: 'btn quiet',
         href: link,
@@ -157,6 +236,7 @@ export function itemHero(item, { tz } = {}) {
         text: 'Open',
       }) : null,
     ]),
+    snooze.panel,
   ]);
 }
 

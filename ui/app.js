@@ -6,8 +6,11 @@
  * 1. **The main view re-renders on `state.rev`, not on every store event.** A
  *    sweep emits progress several times a second; rebuilding the view on each
  *    one would wipe out a draft someone is halfway through typing. The chrome
- *    (counts, sweep line) is cheap and holds no input, so it repaints on every
- *    event; the view waits for the data underneath it to actually change.
+ *    (counts, sweep line) is cheap and repaints on every event — but the quick
+ *    capture panel inside it DOES hold input, so the chrome is updated in
+ *    place around a panel that is built exactly once and never rebuilt. And
+ *    because "the data changed" can arrive while a cursor is inside a form in
+ *    the view too, a board-driven re-render is deferred until that field blurs.
  *
  * 2. **Nothing is ever assembled from a string.** Every node below comes from
  *    ui/lib/dom.js, which has no innerHTML path at all — a subject line is text,
@@ -142,32 +145,54 @@ function capturePanel() {
     },
   });
 
-  return { toggle, panel };
+  return { toggle, panel, box };
 }
 
-function topbar() {
-  const { toggle, panel } = capturePanel();
-  const nm = nowMark();
+/**
+ * The chrome, built ONCE and updated in place ever after.
+ *
+ * The old shape — rebuild the whole topbar on every store emit — destroyed the
+ * capture panel each time a sweep ticked or the minute clock fired, taking a
+ * half-typed note (and the "Kept." status, and keyboard focus) with it. So the
+ * nodes that hold or frame user input are created here exactly once and kept;
+ * everything around them (date, sweep line, rail counts, tab bar, toast) is
+ * either a plain text update or an input-free node that is swapped wholesale.
+ */
+let chrome = null;
 
-  return el('header', { class: 'topbar' }, [
+function buildChrome() {
+  const capture = capturePanel();
+  const dateNode = el('p', { class: 'topbar-date mono' });
+  const sweepBtn = button('Sweep now', {
+    class: 'btn solid',
+    onClick: () => startSweep('auto'),
+  });
+  const sweepSlot = sweepLine();
+  const topbarNode = el('header', { class: 'topbar' }, [
     el('div', { class: 'topbar-row' }, [
       el('a', { class: 'wordmark', href: '#/now' }, [
         el('span', { class: 'wordmark-name', text: 'Zelos' }),
         el('span', { class: 'wordmark-greek', 'aria-hidden': 'true', text: 'ΖΗΛΟΣ' }),
       ]),
-      el('p', { class: 'topbar-date mono', text: nm.key ? formatDay(state.board.now) : '' }),
-      el('div', { class: 'topbar-actions' }, [
-        toggle,
-        button(state.sweep.running ? 'Sweeping…' : 'Sweep now', {
-          class: 'btn solid',
-          disabled: state.sweep.running,
-          onClick: () => startSweep('auto'),
-        }),
-      ]),
+      dateNode,
+      el('div', { class: 'topbar-actions' }, [capture.toggle, sweepBtn]),
     ]),
-    panel,
-    sweepLine(),
+    capture.panel,
+    sweepSlot,
   ]);
+  return {
+    topbarNode,
+    dateNode,
+    sweepBtn,
+    sweepSlot,
+    capture,
+    railNode: rail(route.view),
+    tabbarNode: tabbar(route.view),
+    // The toast lives in a slot so showing and clearing it never moves its
+    // siblings. The slot is display:contents, so it is not a grid item and the
+    // shell's named areas are undisturbed.
+    toastSlot: el('div', { class: 'toast-slot' }),
+  };
 }
 
 function railLink(view, counts, current) {
@@ -217,7 +242,7 @@ function tabbar(current) {
       el('span', { class: 'tab-label', text: v.label }),
       // Always present, even when empty: an absent count row makes that tab's
       // label sit a line lower than its neighbours'.
-      el('span', { class: 'tab-count mono', text: v.countKey && count ? String(count) : ' ' }),
+      el('span', { class: 'tab-count mono', text: v.countKey && count ? String(count) : ' ' }),
       el('span', { class: 'tab-marker', 'aria-hidden': 'true' }),
     ]);
   }));
@@ -225,8 +250,19 @@ function tabbar(current) {
 
 function toastBar() {
   if (!state.toast) return null;
+  const action = state.toast.action;
   return el('div', { class: `toast toast-${state.toast.tone}`, role: 'status' }, [
     el('p', { text: state.toast.message }),
+    action ? button(action.label, {
+      class: 'link',
+      onClick: () => {
+        // Clear first: the action usually re-renders, and a toast describing an
+        // undone thing must not outlive the undo it offered.
+        const run = action.run;
+        notify(null);
+        run();
+      },
+    }) : null,
     button('Dismiss', { class: 'link', onClick: () => notify(null) }),
   ]);
 }
@@ -293,6 +329,63 @@ function currentView() {
 
 let main = null;
 let chromeWrap = null;
+/** 'chrome' | 'bare' | null — which skeleton is currently in the root. */
+let layout = null;
+/** The toast object last painted into its slot. Reference identity is the
+ *  change signal, because notify() always mints a fresh object. */
+let paintedToast = null;
+
+/**
+ * A board refresh that lands while the cursor is inside a form field would
+ * rebuild the view under the user's hands: the Owed draft they are typing, a
+ * settings field half-filled, every open disclosure snapped shut. So a render
+ * caused by data (a background sweep finishing, mostly) is QUEUED while a text
+ * field inside <main> has focus, and runs when that field blurs. A forced
+ * render — the user's own navigation — is never deferred: they asked for it.
+ */
+let renderQueued = false;
+
+function editingInMain() {
+  const active = document.activeElement;
+  if (!active || !main || !main.contains(active)) return false;
+  return active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.tagName === 'SELECT';
+}
+
+/**
+ * When the queued render is allowed to run. Two things must both be over: the
+ * editing (no text field in <main> holds focus) and the CLICK THAT ENDED IT.
+ * A click on a button blurs the field at pointerdown, and flushing right then
+ * would replace that button before pointerup — the click the user is mid-way
+ * through would land on nothing. So while the pointer is down the flush waits,
+ * and the pointerup handler re-schedules it for after the click has dispatched.
+ */
+let pointerHeld = false;
+
+function flushQueuedRender() {
+  if (renderQueued && !pointerHeld && !editingInMain()) {
+    renderQueued = false;
+    render({ force: true });
+  }
+}
+
+document.addEventListener('pointerdown', () => { pointerHeld = true; });
+document.addEventListener('pointerup', () => {
+  pointerHeld = false;
+  // setTimeout from inside pointerup runs after the click event dispatches,
+  // so the button the user pressed is still the button they release on.
+  if (renderQueued) setTimeout(flushQueuedRender, 0);
+});
+document.addEventListener('pointercancel', () => {
+  pointerHeld = false;
+  if (renderQueued) setTimeout(flushQueuedRender, 0);
+});
+
+document.addEventListener('focusout', () => {
+  if (!renderQueued) return;
+  // Focus may be mid-flight to the next field of the same form; let it land
+  // before deciding, or tabbing between draft fields would flush the render.
+  setTimeout(flushQueuedRender, 0);
+});
 
 function render({ force = false } = {}) {
   const key = renderKey();
@@ -300,49 +393,126 @@ function render({ force = false } = {}) {
     paintChrome();
     return;
   }
+  if (!force && layout === 'chrome' && state.phase === 'ready' && editingInMain()) {
+    renderQueued = true;
+    paintChrome();
+    return;
+  }
+  renderQueued = false;
   lastRenderKey = key;
 
   if (!hasToken()) {
     replace(root, noTokenScreen());
     main = null;
+    chromeWrap = null;
+    layout = null;
     return;
   }
   if (state.phase === 'boot') {
     replace(root, bootScreen());
     main = null;
+    chromeWrap = null;
+    layout = null;
     return;
   }
   if (state.phase === 'down' && state.fatal) {
     replace(root, fatalScreen());
     main = null;
+    chromeWrap = null;
+    layout = null;
     return;
   }
 
   const onboarding = route.view === 'welcome' || needsOnboarding();
-  main = el('main', { class: 'main', id: 'main', tabindex: '-1' }, currentView());
-
   if (onboarding) {
     // The flow gets the whole window: no rail, no tab bar, nothing to click past.
+    main = el('main', { class: 'main', id: 'main', tabindex: '-1' }, currentView());
     chromeWrap = null;
+    layout = 'bare';
     replace(root, el('div', { class: 'shell shell-bare' }, main));
     return;
   }
 
-  chromeWrap = el('div', { class: 'chrome' });
-  replace(root, el('div', { class: 'shell' }, [
-    el('a', { class: 'skip-link', href: '#main', text: 'Skip to content' }),
-    chromeWrap,
-    main,
-  ]));
+  // The skeleton survives re-renders. Rebuilding it would re-parent the topbar
+  // — and re-parenting a focused textarea blurs it, which is the note-wipe bug
+  // in a different coat. Only the view's own content is replaced.
+  if (layout !== 'chrome') {
+    main = el('main', { class: 'main', id: 'main', tabindex: '-1' });
+    chromeWrap = el('div', { class: 'chrome' });
+    layout = 'chrome';
+    replace(root, el('div', { class: 'shell' }, [
+      el('a', { class: 'skip-link', href: '#main', text: 'Skip to content' }),
+      chromeWrap,
+      main,
+    ]));
+    // Arriving at the board from a different skeleton — onboarding, mostly —
+    // is a navigation in everything but the hash, and it inherits whatever
+    // scroll depth the last screen was read at. onRoute() cannot see this
+    // transition (the view name is 'now' on both sides), so the top-of-page
+    // rule is applied here, where the skeleton itself changes hands.
+    window.scrollTo(0, 0);
+  }
+  replace(main, currentView());
   paintChrome();
 }
 
-/** Chrome repaints on every store event; it holds no user input. */
+/**
+ * Chrome repaints on every store event — but only around the capture panel,
+ * never through it. The panel and its toggle are the same nodes for the life
+ * of the page; the date and sweep button are text/attribute updates on nodes
+ * that also persist; the sweep line, rail, tab bar and toast hold no input, so
+ * they are rebuilt and swapped in place with replaceWith, which cannot touch
+ * anything a person is typing into.
+ */
 function paintChrome() {
   if (!chromeWrap) return;
-  replace(chromeWrap, [topbar(), rail(route.view), tabbar(route.view), toastBar()]);
+  if (!chrome) chrome = buildChrome();
+  if (chrome.topbarNode.parentNode !== chromeWrap) {
+    replace(chromeWrap, [chrome.topbarNode, chrome.railNode, chrome.tabbarNode, chrome.toastSlot]);
+  }
+
+  const nm = nowMark();
+  chrome.dateNode.textContent = nm.key ? formatDay(state.board.now) : '';
+  chrome.sweepBtn.textContent = state.sweep.running ? 'Sweeping…' : 'Sweep now';
+  chrome.sweepBtn.disabled = state.sweep.running;
+
+  const freshSweep = sweepLine();
+  chrome.sweepSlot.replaceWith(freshSweep);
+  chrome.sweepSlot = freshSweep;
+
+  const freshRail = rail(route.view);
+  chrome.railNode.replaceWith(freshRail);
+  chrome.railNode = freshRail;
+
+  const freshTabs = tabbar(route.view);
+  chrome.tabbarNode.replaceWith(freshTabs);
+  chrome.tabbarNode = freshTabs;
+
+  // The toast is rebuilt only when the toast itself changed. paintChrome runs
+  // on every emit — sweep progress arrives several times a second — and
+  // rebuilding an action toast that often would replace its Undo button under
+  // a hovering cursor, mid-press.
+  if (paintedToast !== state.toast) {
+    paintedToast = state.toast;
+    replace(chrome.toastSlot, toastBar());
+  }
   measureTopbar();
 }
+
+/**
+ * The one document-level keyboard shortcut: Escape closes the capture panel
+ * and hands focus back to the button that opened it, so the keyboard user is
+ * exactly where they were. It lives on the document because the key should
+ * work from inside the textarea and from anywhere else alike; there are no
+ * other shortcuts, and this listener must stay the only one.
+ */
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  if (!chrome || chrome.capture.panel.hidden || !chrome.capture.panel.isConnected) return;
+  chrome.capture.panel.hidden = true;
+  chrome.capture.toggle.setAttribute('aria-expanded', 'false');
+  focusQuietly(chrome.capture.toggle);
+});
 
 /**
  * The rail sticks below the header, and the header's height is not a constant:
@@ -365,7 +535,8 @@ function measureTopbar() {
   const bar = chromeWrap?.querySelector('.topbar');
   if (!bar) return;
   document.documentElement.style.setProperty('--topbar-h', `${Math.round(bar.getBoundingClientRect().height)}px`);
-  // paintChrome builds a new topbar node each time, so the observer follows it.
+  // The topbar node persists now, but re-observing is cheap and keeps this
+  // correct if the shell was ever rebuilt around it.
   topbarWatcher?.disconnect();
   topbarWatcher?.observe(bar);
 }
@@ -374,7 +545,13 @@ function onRoute() {
   const before = route.view;
   route = parseHash();
   render({ force: true });
-  if (before !== route.view && main) focusQuietly(main);
+  if (before !== route.view) {
+    // A new view starts at its top. Same-view re-renders (a deferred board
+    // refresh, a settings save) deliberately do NOT pass through here, so they
+    // never yank the scroll position out from under the reader.
+    window.scrollTo(0, 0);
+    if (main) focusQuietly(main);
+  }
 }
 
 /* --------------------------------------------------------------------- boot */
@@ -389,9 +566,10 @@ subscribe(() => {
   render();
 });
 
-// Keep "3h ago" and the calendar's now-line honest without a data refetch —
-// and without re-rendering the calendar, which would throw the user's scroll
-// position back to the top every sixty seconds.
+// Keep "3h ago", the header date and the calendar's now-line honest without a
+// data refetch. paintChrome is safe on a timer now: it updates text around the
+// capture panel instead of rebuilding the topbar, so a half-typed note never
+// notices the minute passing.
 setInterval(() => {
   paintChrome();
   tickNowLine();

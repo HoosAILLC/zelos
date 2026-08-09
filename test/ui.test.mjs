@@ -453,6 +453,231 @@ test('anything filled with the raw accent states its own label colour', () => {
   assert.deepEqual(offenders, [], 'text on a filled accent must take --on-accent (or --ground)');
 });
 
+/* ------------------------------------------------- 4. store and item state */
+
+/**
+ * The store and the API client are plain modules with one browser assumption
+ * each: api.js reads the session token off `window.location` when it loads.
+ * These stubs satisfy exactly that — no DOM is faked, and anything that tries
+ * to build one in here fails loudly, because a unit test quietly exercising a
+ * pretend layout engine proves nothing about the real one.
+ */
+function stubBrowserGlobals() {
+  if (!globalThis.window) {
+    globalThis.window = {
+      location: { href: 'http://127.0.0.1:7777/' },
+      history: { replaceState() {} },
+      addEventListener() {},
+    };
+  }
+  if (!globalThis.sessionStorage) {
+    globalThis.sessionStorage = { getItem: () => '', setItem() {}, removeItem() {} };
+  }
+  if (!globalThis.localStorage) {
+    globalThis.localStorage = { getItem: () => null, setItem() {}, removeItem() {} };
+  }
+  if (!globalThis.document) {
+    globalThis.document = {
+      documentElement: { style: { setProperty() {} } },
+      addEventListener() {},
+      createElement() { throw new Error('these tests must not build DOM'); },
+    };
+  }
+}
+
+test('itemsInBucket keeps snoozed rows off the panes; snoozedItems carries them', async () => {
+  stubBrowserGlobals();
+  const store = await import(path.join(UI, 'lib/store.js'));
+  store.state.board = {
+    ...store.state.board,
+    items: [
+      { id: 'a', bucket: 'now', state: 'open' },
+      { id: 'b', bucket: 'now', state: 'snoozed', snoozed_until: '2026-08-12T09:00:00-04:00' },
+      { id: 'c', bucket: 'now', state: 'done' },
+      { id: 'd', bucket: 'now', state: 'snoozed', snoozed_until: null },
+      { id: 'e', bucket: 'today', state: 'dismissed' },
+    ],
+  };
+  // The regression this pins: a snoozed row used to stay in its bucket, so the
+  // pane showed a sleeping item while the count claimed the board was clear.
+  assert.deepEqual(store.itemsInBucket('now').map((i) => i.id), ['a']);
+  assert.deepEqual(store.itemsInBucket('today').map((i) => i.id), []);
+  assert.deepEqual(store.snoozedItems().map((i) => i.id), ['b', 'd']);
+});
+
+test('setItemState carries the snooze deadline, and only when one was chosen', async (t) => {
+  stubBrowserGlobals();
+  const { api } = await import(path.join(UI, 'lib/api.js'));
+  let captured = null;
+  globalThis.fetch = async (reqPath, init = {}) => {
+    captured = { path: reqPath, body: init.body ? JSON.parse(init.body) : null };
+    return { ok: true, status: 200, text: async () => '{}' };
+  };
+  t.after(() => { delete globalThis.fetch; });
+
+  await api.setItemState('abc', 'snoozed', { until: '2026-08-12T09:00:00-04:00' });
+  assert.equal(captured.path, '/api/items/abc/state');
+  assert.deepEqual(captured.body, { state: 'snoozed', until: '2026-08-12T09:00:00-04:00' });
+
+  // No deadline chosen: the field is ABSENT, so the server applies its own
+  // default rather than being handed a null to interpret.
+  await api.setItemState('abc', 'open');
+  assert.deepEqual(captured.body, { state: 'open' });
+
+  // An EXPLICIT null is different from absence and must survive the wire: it
+  // is how Undo restores a legacy manual snooze — no deadline, wake by hand —
+  // without the server upgrading it to tomorrow morning.
+  await api.setItemState('abc', 'snoozed', { until: null });
+  assert.deepEqual(captured.body, { state: 'snoozed', until: null });
+});
+
+test('the snooze chooser offers three future deadlines in the configured zone', async () => {
+  stubBrowserGlobals();
+  const items = await import(path.join(UI, 'lib/items.js'));
+  const tz = 'America/New_York';
+  const noon = Date.parse('2026-08-11T16:00:00Z'); // Tuesday, noon in New York
+
+  const [later, tomorrow, nextWeek] = items.snoozeChoices(tz, noon);
+  assert.equal(later.label, 'Later today');
+  assert.equal(later.until, ui.toZonedISO(new Date(noon + 4 * 3_600_000), tz));
+  assert.equal(tomorrow.until, '2026-08-12T09:00:00-04:00');
+  assert.equal(nextWeek.until, '2026-08-17T09:00:00-04:00');
+  assert.equal(ui.weekdayOfKey(ui.dayKey(nextWeek.until)), 1, 'next week means a Monday');
+
+  // From a Monday, "next week" is the FOLLOWING Monday, not later today.
+  const monday = Date.parse('2026-08-10T16:00:00Z');
+  const [, , fromMonday] = items.snoozeChoices(tz, monday);
+  assert.equal(fromMonday.until, '2026-08-17T09:00:00-04:00');
+});
+
+test('a toast dismisses itself, and an action toast is given longer', async (t) => {
+  stubBrowserGlobals();
+  const store = await import(path.join(UI, 'lib/store.js'));
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+
+  store.notify('saved');
+  t.mock.timers.tick(5_900);
+  assert.ok(store.state.toast, 'a plain toast must live its whole window');
+  t.mock.timers.tick(200);
+  assert.equal(store.state.toast, null, 'a plain toast must dismiss itself');
+
+  // A toast with an action must not vanish mid-reach for the button.
+  store.notify('Marked done: the invoice', { action: { label: 'Undo', run: () => {} } });
+  t.mock.timers.tick(6_500);
+  assert.ok(store.state.toast, 'an action toast outlives the plain window');
+  t.mock.timers.tick(2_000);
+  assert.equal(store.state.toast, null);
+
+  // A replacement restarts the clock along with the message.
+  store.notify('one');
+  t.mock.timers.tick(4_000);
+  store.notify('two');
+  t.mock.timers.tick(4_000);
+  assert.equal(store.state.toast?.message, 'two', 'the replacement restarted the clock');
+  t.mock.timers.tick(2_100);
+  assert.equal(store.state.toast, null);
+});
+
+test('done raises an Undo that restores the exact prior state, deadline included', async (t) => {
+  stubBrowserGlobals();
+  const store = await import(path.join(UI, 'lib/store.js'));
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+
+  const board = {
+    items: [{ id: 'x', bucket: 'now', state: 'snoozed', snoozed_until: '2026-08-12T09:00:00-04:00', headline: 'chase the survey invoice' }],
+    counts: {}, events: [], drafts: [], runs: { last: null }, notes: [], first: null, now: null,
+  };
+  const posts = [];
+  globalThis.fetch = async (reqPath, init = {}) => {
+    if (init.method === 'POST') posts.push({ path: reqPath, body: JSON.parse(init.body) });
+    return { ok: true, status: 200, text: async () => (reqPath === '/api/state' ? JSON.stringify(board) : '{}') };
+  };
+  t.after(() => { delete globalThis.fetch; });
+  store.state.board = { ...store.state.board, ...board };
+
+  await store.setItemState('x', 'done');
+  assert.deepEqual(posts[0].body, { state: 'done' });
+  assert.equal(store.state.toast?.action?.label, 'Undo');
+
+  await store.state.toast.action.run();
+  // The undo does not merely reopen the item — it re-snoozes it to the same
+  // deadline it had, because that deadline was a decision the user made.
+  assert.deepEqual(posts[1].body, { state: 'snoozed', until: '2026-08-12T09:00:00-04:00' });
+  store.notify(null);
+});
+
+/* ------------------------------------------ 5. shell behaviour, from source */
+
+/**
+ * The behaviours below need a layout engine to observe directly, so — like the
+ * chip-clamp and sticky-rail guards above — they are pinned at the source: the
+ * mechanism that made the bug impossible must still be present.
+ */
+test('the capture panel is built once, and no repaint path rebuilds it', () => {
+  const app = fs.readFileSync(path.join(UI, 'app.js'), 'utf8');
+  // Exactly one call site (the one-time chrome build) plus the definition. A
+  // second call site means some repaint mints a fresh panel — which is the
+  // note-wipe bug: every sweep tick destroyed a half-typed note.
+  assert.equal(app.split('capturePanel(').length - 1, 2,
+    'capturePanel must have exactly one call site besides its definition');
+  const paint = /function paintChrome\(\)[\s\S]*?\n\}/m.exec(app);
+  assert.ok(paint, 'paintChrome is missing');
+  assert.ok(!paint[0].includes('capturePanel('), 'paintChrome rebuilds the capture panel');
+  assert.match(paint[0], /if \(!chrome\) chrome = buildChrome\(\)/,
+    'the chrome must be built once and reused');
+});
+
+test('a board-driven re-render defers while a text field in main has focus', () => {
+  const app = fs.readFileSync(path.join(UI, 'app.js'), 'utf8');
+  const render = /function render\(\{ force = false \}[\s\S]*?\n\}/m.exec(app);
+  assert.ok(render, 'render is missing');
+  assert.match(render[0], /editingInMain\(\)/, 'render must check for a focused field');
+  assert.match(render[0], /renderQueued = true/, 'a mid-edit render must queue, not run');
+  assert.match(app, /document\.addEventListener\('focusout'/, 'the queued render must flush on blur');
+});
+
+test('view navigation resets the scroll; same-view re-renders leave it alone', () => {
+  const app = fs.readFileSync(path.join(UI, 'app.js'), 'utf8');
+  const onRoute = /function onRoute\(\)[\s\S]*?\n\}/m.exec(app);
+  assert.ok(onRoute, 'onRoute is missing');
+  assert.match(onRoute[0], /window\.scrollTo\(0, 0\)/);
+  assert.match(onRoute[0], /before !== route\.view/,
+    'the reset must be gated on the view actually changing');
+  // The navigation handler is the only place allowed to move the scroll: a
+  // deferred board refresh yanking the page to the top is its own bug.
+  assert.equal(app.split('scrollTo').length - 1, 1);
+});
+
+test('exactly one document-level keydown listener, and it closes the note panel', () => {
+  const app = fs.readFileSync(path.join(UI, 'app.js'), 'utf8');
+  assert.equal(app.split("document.addEventListener('keydown'").length - 1, 1);
+  assert.match(app, /e\.key !== 'Escape'/);
+});
+
+test('the calendar empty state is a claim about the config AND an empty board', () => {
+  const cal = fs.readFileSync(path.join(UI, 'views/calendar.js'), 'utf8');
+  // "No calendar connected" while a calendar is connected was the lie; a
+  // connected calendar with a quiet fortnight must still get its grid. But the
+  // config cannot be the whole story: the demo seeds a week of events without
+  // writing any config entry, and a demo board deserves its grid too. So the
+  // setup card appears only when BOTH are empty.
+  assert.match(cal, /\(state\.config\?\.calendars\?\.length \|\| 0\) === 0 && !state\.board\.events\.length/);
+});
+
+test('the clash flag cannot escape its month cell', () => {
+  const css = fs.readFileSync(path.join(UI, 'app.css'), 'utf8');
+  const flag = /^\.month-flag \{([^}]*)\}/m.exec(css);
+  assert.ok(flag, '.month-flag rule is missing');
+  assert.match(flag[1], /max-width:\s*100%/);
+  assert.match(flag[1], /overflow:\s*hidden/);
+  assert.match(flag[1], /text-overflow:\s*ellipsis/);
+  // The flex row above it must be allowed to shrink, or max-width: 100% is
+  // measured against a row that already blew the cell open.
+  const row = /^\.month-num-row \{([^}]*)\}/m.exec(css);
+  assert.ok(row, '.month-num-row rule is missing');
+  assert.match(row[1], /min-width:\s*0/);
+});
+
 test('no rule still branches on a theme attribute that is never set', () => {
   const css = fs.readFileSync(path.join(UI, 'app.css'), 'utf8');
   const html = fs.readFileSync(path.join(UI, 'index.html'), 'utf8');

@@ -9,8 +9,8 @@
 import { el, button, meander, section } from '../lib/dom.js';
 import { itemHero, itemRow, emptyState } from '../lib/items.js';
 import { byUrgency, sweepSummary, plural } from '../lib/format.js';
-import { state, startSweep, itemsInBucket } from '../lib/store.js';
-import { humanDelta } from '../lib/time.js';
+import { state, startSweep, itemsInBucket, snoozedItems } from '../lib/store.js';
+import { humanDelta, instant } from '../lib/time.js';
 
 const MAX_NOW_ROWS = 4;
 
@@ -96,7 +96,16 @@ export function renderNow(ctx) {
   if (banner) body.appendChild(banner);
 
   if (!hero) {
-    body.appendChild(emptyForContext(navigate));
+    // When the banner is up it has already said what failed and offered the
+    // retry. Repeating both in the empty state — same fact, two boxes, two
+    // buttons — reads like the app panicking, so under a banner the empty
+    // state is just the plain shell.
+    body.appendChild(banner
+      ? emptyState({
+        title: 'Nothing on the board yet.',
+        detail: 'The board fills in when a sweep finishes.',
+      })
+      : emptyForContext(navigate));
   } else {
     body.appendChild(itemHero(hero, { tz }));
     if (rest.length) {
@@ -138,6 +147,30 @@ export function renderNow(ctx) {
       el('span', { text: `${plural(todayCount, 'other thing')} for today. ` }),
       button('Open Today', { class: 'link', onClick: () => navigate('#/today') }),
     ]));
+  }
+
+  // The snoozed, folded and dimmed at the very bottom: off the board but never
+  // off the record. Each row says when it comes back, and Wake lives in the
+  // row's own disclosure. Soonest return first.
+  const snoozed = snoozedItems().sort((a, b) =>
+    (instant(a.snoozed_until) ?? Infinity) - (instant(b.snoozed_until) ?? Infinity));
+  if (snoozed.length) {
+    const panel = el('div', { class: 'worth-body', hidden: true },
+      el('div', { class: 'stack' }, snoozed.map((item) => itemRow(item, { tz, showBucket: false }))));
+    const toggle = el('button', {
+      type: 'button',
+      class: 'worth-toggle',
+      'aria-expanded': 'false',
+      onclick() {
+        const open = this.getAttribute('aria-expanded') === 'true';
+        this.setAttribute('aria-expanded', open ? 'false' : 'true');
+        panel.hidden = open;
+      },
+    }, [
+      el('span', { text: 'Snoozed' }),
+      el('span', { class: 'mono worth-count', text: String(snoozed.length) }),
+    ]);
+    body.appendChild(el('section', { class: 'section worth' }, [toggle, meander(), panel]));
   }
 
   return body;

@@ -45,6 +45,7 @@ import {
   getItem,
 } from './db.mjs';
 import { buildSweepPrompt, mergeSweep, SWEEP_KV } from './triage.mjs';
+import { SAMPLE_SOURCE_ID, SAMPLE_CALENDAR_ID, SAMPLE_MARK } from './sample-data.mjs';
 import {
   nowISO,
   instant,
@@ -593,11 +594,31 @@ export async function runSweep({
   stats.tokensOut = Number(answer?.usage?.output) || 0;
 
   const parsed = extractJSON(answer?.text ?? '');
-  if (!parsed) {
+  // extractJSON is deliberately forgiving, and one thing it forgives is a reply
+  // that was cut off mid-board: the first *balanced* object inside a truncated
+  // answer is usually some inner fragment — a single item, a stray
+  // {"answer": …} — not the board. An object carrying none of the sweep's own
+  // top-level keys is that fragment, and letting it through to the merge would
+  // record a successful run that produced nothing. It is a failed parse, and is
+  // reported as one.
+  const looksLikeBoard =
+    parsed && typeof parsed === 'object' && !Array.isArray(parsed) &&
+    ('items' in parsed || 'first' in parsed || 'notes' in parsed);
+  if (!looksLikeBoard) {
     const sample = String(answer?.text ?? '').slice(0, 200).replace(/\s+/g, ' ');
+    if (answer?.stopReason === 'length') {
+      // The reply was cut off at the token ceiling, so no model swap will fix
+      // it — the same model with more room will.
+      return finish(
+        false,
+        `The model's reply was cut off at its token limit before the board was complete${sample ? ` — it began "${sample}"` : ''}. Raise model.maxTokens in Settings and sweep again.`,
+      );
+    }
     return finish(
       false,
-      `The model replied but not with JSON${sample ? ` — it began "${sample}"` : ''}. Try a larger model, or one that follows a format instruction.`,
+      parsed
+        ? 'The model replied with JSON, but not with a board — none of items, first or notes were in it. Try a larger model, or one that follows a format instruction.'
+        : `The model replied but not with JSON${sample ? ` — it began "${sample}"` : ''}. Try a larger model, or one that follows a format instruction.`,
     );
   }
 
@@ -610,6 +631,32 @@ export async function runSweep({
   } catch (err) {
     slog.error('could not merge the sweep', { error: errorText(err) });
     return finish(false, `Could not store the board: ${errorText(err)}`);
+  }
+
+  // ok:false from the merge means the reply was not usable as a sweep result at
+  // all — repairs are normal and keep ok:true, this is the reply that had no
+  // usable items in it. Recording that as success would be worse than the
+  // failure itself: the captures below would be consumed untriaged and
+  // pendingNew zeroed, so the mail that prompted this run would never be
+  // re-thought. The run fails, nothing is consumed, and the next run tries again.
+  if (!merged.ok) {
+    slog.error('model reply was not a usable board', {
+      runId,
+      first: merged.errors.slice(0, 3).map((e) => `${e.path}: ${e.message}`),
+    });
+    const why = merged.errors.slice(0, 2)
+      .map((e) => (e.path ? `${e.path}: ${e.message}` : e.message))
+      .join('; ') || 'the reply was not a usable board';
+    if (answer?.stopReason === 'length') {
+      return finish(
+        false,
+        `The model's reply was cut off at its token limit before the board was usable (${why}). Raise model.maxTokens in Settings and sweep again.`,
+      );
+    }
+    return finish(
+      false,
+      `The model's reply was not a usable board (${why}). Try a larger model, or one that follows a format instruction.`,
+    );
   }
 
   // Only the captures that actually reached the model are marked processed —
@@ -658,14 +705,27 @@ function gatherPromptInput(db, config, now) {
   // their own offsets and all-day events are bare dates, so a plain YYYY-MM-DD
   // compares sanely against both shapes where a `...Z` timestamp does not.
   const today = dayKey(now);
+  // The demo week lives in the same tables as real mail — that is the point of
+  // it — but it must never reach the model: a sweep that reasons over Quillon
+  // Row spends real tokens on fiction and can mint board items about people who
+  // do not exist. Sample rows are recognisable by the source ids the seed wrote
+  // them under, so they are dropped here rather than at the query, which keeps
+  // the demo visible in every view while making it invisible to the prompt.
+  const messages = listMessages(db, { sinceISO, limit: PROMPT_MESSAGE_LIMIT })
+    .filter((m) => m.source_id !== SAMPLE_SOURCE_ID);
+  const events = listEvents(db, {
+    from: addDaysToKey(today, -2),
+    to: addDaysToKey(today, CALENDAR_FORWARD_DAYS + 1),
+    limit: 400,
+  }).filter((e) => e.calendar_id !== SAMPLE_CALENDAR_ID);
   return {
-    messages: listMessages(db, { sinceISO, limit: PROMPT_MESSAGE_LIMIT }),
-    events: listEvents(db, {
-      from: addDaysToKey(today, -2),
-      to: addDaysToKey(today, CALENDAR_FORWARD_DAYS + 1),
-      limit: 400,
-    }),
-    captures: listCaptures(db, { includeProcessed: false, limit: 50 }),
+    messages,
+    events,
+    // Captures get the same treatment as mail and events: the seed writes one
+    // demo capture, marked the way every sample row is marked, and a real
+    // sweep must not spend the model's attention triaging it.
+    captures: listCaptures(db, { includeProcessed: false, limit: 50 })
+      .filter((c) => !String(c.text || '').startsWith(SAMPLE_MARK)),
     priorItems: listBoard(db, { states: ['open', 'snoozed'], limit: 120 }),
   };
 }

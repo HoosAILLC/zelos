@@ -451,6 +451,144 @@ test('DTSTART is emitted even when it does not satisfy its own rule', () => {
 });
 
 /* ------------------------------------------------------------------ *
+ * Old series reaching a distant window
+ *
+ * The regression these guard: nominal generation used to spend its whole
+ * instance budget counting forward from DTSTART, so a rule anchored a few
+ * years back ran out before it ever reached the requested window and a real
+ * standing meeting silently vanished from the calendar.
+ * ------------------------------------------------------------------ */
+
+test('a daily rule anchored years back still fills a distant window', () => {
+  const window = { from: '2026-08-01T00:00:00Z', to: '2026-08-31T00:00:00Z' };
+  const rule = (uid, dtstart) =>
+    vevent(uid, `DTSTART;TZID=America/New_York:${dtstart}`, 'RRULE:FREQ=DAILY', 'SUMMARY:Standing');
+
+  const old = expandFixture(rule('UID:ff-daily-old', '20210105T090000'), window);
+  const recent = expandFixture(rule('UID:ff-daily-new', '20260701T090000'), window);
+
+  // The sweep: one instance per day across the whole window, at the anchored
+  // wall clock, regardless of how long ago the series began.
+  assert.equal(recent.length, 30, 'the recently anchored control covers the window');
+  assert.deepEqual(
+    starts(old),
+    Array.from({ length: 30 }, (_, i) => `2026-08-${String(i + 1).padStart(2, '0')}T09:00:00-04:00`),
+    'the 2021 anchor produces the same 30 August days, not zero',
+  );
+});
+
+test('a weekly BYDAY rule anchored in 2019 lands on the right weekdays in 2026', () => {
+  // `max` deliberately smaller than the instances between the anchor and the
+  // window: enumerating from DTSTART would exhaust it long before 2026.
+  const events = expandFixture(
+    vevent(
+      'UID:ff-weekly-byday',
+      'DTSTART;TZID=America/New_York:20190107T093000', // a Monday
+      'RRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR',
+      'SUMMARY:Standup',
+    ),
+    { from: '2026-08-01T00:00:00Z', to: '2026-09-01T00:00:00Z', max: 100 },
+  );
+  assert.deepEqual(
+    starts(events).map((s) => s.slice(0, 10)),
+    [
+      '2026-08-03', '2026-08-05', '2026-08-07',
+      '2026-08-10', '2026-08-12', '2026-08-14',
+      '2026-08-17', '2026-08-19', '2026-08-21',
+      '2026-08-24', '2026-08-26', '2026-08-28',
+      '2026-08-31',
+    ],
+    'every Monday, Wednesday and Friday of August 2026, nothing else',
+  );
+  for (const ev of events) {
+    const wd = new Date(`${ev.startsAt.slice(0, 10)}T12:00:00Z`).getUTCDay();
+    assert.ok([1, 3, 5].includes(wd), `${ev.startsAt} must be Mo/We/Fr`);
+  }
+});
+
+test('INTERVAL=2 weekly keeps its week parity after the jump to the window', () => {
+  // Bi-weekly Mondays from 2019-01-07. 2026-08-03 is 2765 days = 197 weeks and
+  // 4 days on, an odd week — so August 2026 holds exactly the 10th and 24th,
+  // and landing on the wrong parity would surface the 3rd, 17th and 31st.
+  const events = expandFixture(
+    vevent(
+      'UID:ff-parity',
+      'DTSTART;TZID=America/New_York:20190107T090000',
+      'RRULE:FREQ=WEEKLY;INTERVAL=2',
+      'SUMMARY:Biweekly',
+    ),
+    { from: '2026-08-01T00:00:00Z', to: '2026-09-01T00:00:00Z', max: 50 },
+  );
+  assert.deepEqual(
+    starts(events).map((s) => s.slice(0, 10)),
+    ['2026-08-10', '2026-08-24'],
+  );
+});
+
+test('an EXDATE inside the window of an old series still excludes its instance', () => {
+  const events = expandFixture(
+    vevent(
+      'UID:ff-exdate',
+      'DTSTART;TZID=America/New_York:20210105T090000',
+      'RRULE:FREQ=DAILY',
+      'EXDATE;TZID=America/New_York:20260812T090000',
+      'SUMMARY:Standing minus one',
+    ),
+    { from: '2026-08-01T00:00:00Z', to: '2026-08-31T00:00:00Z' },
+  );
+  assert.equal(events.length, 29, 'thirty August days minus the excluded one');
+  assert.ok(!starts(events).some((s) => s.startsWith('2026-08-12')), 'the 12th is excluded');
+  assert.ok(starts(events).some((s) => s.startsWith('2026-08-11')), 'its neighbours are not');
+  assert.ok(starts(events).some((s) => s.startsWith('2026-08-13')));
+});
+
+test('COUNT rules enumerate from DTSTART: exactly the count, never more', () => {
+  // COUNT semantics forbid the jump — which instances exist depends on how
+  // many came before — so the finite series is walked from its anchor.
+  const events = expandFixture(
+    vevent(
+      'UID:ff-count',
+      'DTSTART;TZID=America/New_York:20210105T090000',
+      'RRULE:FREQ=DAILY;COUNT=10',
+      'SUMMARY:Short series',
+    ),
+    { from: '2020-01-01T00:00:00Z', to: '2035-01-01T00:00:00Z' },
+  );
+  assert.equal(events.length, 10);
+  assert.equal(starts(events)[0], '2021-01-05T09:00:00-05:00');
+  assert.equal(starts(events)[9], '2021-01-14T09:00:00-05:00');
+
+  const afterTheEnd = expandFixture(
+    vevent(
+      'UID:ff-count-after',
+      'DTSTART;TZID=America/New_York:20210105T090000',
+      'RRULE:FREQ=DAILY;COUNT=10',
+      'SUMMARY:Short series',
+    ),
+    { from: '2026-08-01T00:00:00Z', to: '2026-08-31T00:00:00Z' },
+  );
+  assert.deepEqual(afterTheEnd, [], 'a series that ended in 2021 has nothing in 2026');
+});
+
+test('the instance budget cannot truncate a COUNT series below its count', () => {
+  // 2000 daily instances from 2021-01-05 run to 2026-06-27. A budget pinned at
+  // the default cap of 1500 would end the series in early 2025 and leave this
+  // June 2026 window empty.
+  const events = expandFixture(
+    vevent(
+      'UID:ff-count-tail',
+      'DTSTART;TZID=America/New_York:20210105T090000',
+      'RRULE:FREQ=DAILY;COUNT=2000',
+      'SUMMARY:Long finite series',
+    ),
+    { from: '2026-06-01T00:00:00Z', to: '2026-07-01T00:00:00Z' },
+  );
+  assert.equal(events.length, 27, 'June 1st through the 27th, where instance #2000 falls');
+  assert.equal(starts(events)[0], '2026-06-01T09:00:00-04:00');
+  assert.equal(starts(events)[26], '2026-06-27T09:00:00-04:00');
+});
+
+/* ------------------------------------------------------------------ *
  * EXDATE, RDATE, RECURRENCE-ID
  * ------------------------------------------------------------------ */
 

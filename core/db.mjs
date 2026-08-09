@@ -33,7 +33,7 @@ import { paths } from './config.mjs';
 import { nowISO } from './time.mjs';
 import { log } from './log.mjs';
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 /** Closed set, in board order: the rail reads top to bottom. */
 export const BUCKETS = Object.freeze(['now', 'today', 'soon', 'waiting', 'promised', 'note', 'money']);
@@ -152,6 +152,19 @@ const MIGRATIONS = [
           title, body, ref UNINDEXED, kind UNINDEXED, tokenize='porter unicode61'
         );
       `);
+    },
+  },
+  {
+    /**
+     * Snooze-until. NULL means what every snoozed row meant before this column
+     * existed — snoozed until the user wakes it by hand — so a database written
+     * by version 1 upgrades without any row changing its behaviour. A zoned ISO
+     * timestamp means "wake it for me": `listBoard()` clears it and reopens the
+     * item once the moment has passed.
+     */
+    version: 2,
+    up(db) {
+      db.exec('ALTER TABLE items ADD COLUMN snoozed_until TEXT');
     },
   },
 ];
@@ -570,25 +583,53 @@ export function getItemByKey(db, key) {
   return getItem(db, itemRowId(str(key)));
 }
 
-/** The user's decision. Returns the updated row, or null if there is no such item. */
-export function setItemState(db, id, state, { now = nowISO() } = {}) {
+/**
+ * The user's decision. Returns the updated row, or null if there is no such item.
+ *
+ * `snoozedUntil` only means anything when the state being set is `snoozed`: a
+ * zoned ISO timestamp arms the auto-wake in `listBoard()`, and null (the
+ * default) is the old manual snooze that only a human wakes. Every *other*
+ * state clears the column unconditionally — a wake-up call for an item that is
+ * already done, dismissed or reopened would reopen it behind the user's back.
+ */
+export function setItemState(db, id, state, { now = nowISO(), snoozedUntil = null } = {}) {
   if (!ITEM_STATES.includes(state)) {
     throw new TypeError(`db: state must be one of ${ITEM_STATES.join('|')}, got ${JSON.stringify(state)}`);
   }
-  const res = prep(db, 'UPDATE items SET state = ?, state_at = ?, updated_at = ? WHERE id = ?')
-    .run(state, now, now, str(id));
+  const until = state === 'snoozed' ? strOrNull(snoozedUntil) : null;
+  const res = prep(db, 'UPDATE items SET state = ?, state_at = ?, updated_at = ?, snoozed_until = ? WHERE id = ?')
+    .run(state, now, now, until, str(id));
   if (!res.changes) return null;
   return getItem(db, id);
 }
 
 const BUCKET_RANK_SQL = `CASE bucket ${BUCKETS.map((b, i) => `WHEN '${b}' THEN ${i}`).join(' ')} ELSE ${BUCKETS.length} END`;
 
+const WAKE_DUE_SNOOZES = `
+UPDATE items SET state = 'open', snoozed_until = NULL, state_at = :now, updated_at = :now
+WHERE state = 'snoozed' AND snoozed_until IS NOT NULL
+  AND datetime(snoozed_until) <= datetime(:now)`;
+
 /**
  * The board, in reading order: bucket, then severity, then what is due soonest,
  * then oldest-carried first. Nothing is dropped — `limit` is a safety rail, and
  * the UI folds the tail rather than hiding it.
+ *
+ * Reading the board is also what wakes snoozes that have come due. Putting the
+ * wake here rather than on a timer means every reader — the server's
+ * /api/state, the sweep's prior-items pass, the MCP tools — sees woken items
+ * without any of them having to know snoozing exists. The UPDATE is cheap: the
+ * `state = 'snoozed'` guard rides the items_state_bucket index, so on the usual
+ * board it touches a handful of rows or none. A NULL snoozed_until is exempt on
+ * purpose — that is the legacy manual snooze, and only the user wakes it. Both
+ * sides of the `<=` go through datetime(), which normalises a zoned ISO string
+ * to UTC — the server writes snoozed_until in the configured zone while the
+ * sweep and MCP pass a machine-zone `now`, and comparing those lexically would
+ * be off by the offset difference. A string datetime() cannot read becomes
+ * NULL, and NULL never satisfies the comparison: garbage sleeps, safely.
  */
-export function listBoard(db, { states = ['open'], buckets = null, limit = 500 } = {}) {
+export function listBoard(db, { states = ['open'], buckets = null, limit = 500, now = nowISO() } = {}) {
+  prep(db, WAKE_DUE_SNOOZES).run({ now });
   const args = [];
   const where = [];
   const stateList = (states || []).filter((s) => ITEM_STATES.includes(s));

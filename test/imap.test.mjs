@@ -268,6 +268,62 @@ test('a literal that opens with a space and closes with one keeps every byte', a
   );
 });
 
+test('a zero-length literal is kept as an empty value so FETCH pairing holds', async () => {
+  // "{0}" is a legal literal — an empty body part, say — and it is still a
+  // value. Dropping it shifts every FETCH item after it onto the wrong key,
+  // which is how this exact wire once parsed UID 9 into uid null.
+  await withServer(
+    {
+      onCommand: session({
+        extra: ({ tag, verb, send }) => {
+          if (verb !== 'UID FETCH') return false;
+          send(`* 1 FETCH (BODY[1] {0}\r\n UID 9)\r\n${tag} OK UID FETCH completed\r\n`);
+          return true;
+        },
+      }),
+    },
+    async ({ port }) => {
+      const client = new ImapClient({ host: '127.0.0.1', port, secure: false, user: 'u', pass: 'p', timeoutMs: 5000 });
+      await client.connect();
+      await client.login();
+      const [row] = await client.fetch([9], 'UID BODY.PEEK[1]');
+      assert.equal(row.uid, 9, 'the UID that follows the empty literal must not shift into its slot');
+      const section = row.sections.get('1');
+      assert.ok(Buffer.isBuffer(section), 'the empty literal is a value, not a hole');
+      assert.equal(section.length, 0);
+      await client.close();
+    },
+  );
+});
+
+test('HEADER.FIELDS matching nothing comes back as {0} and pairs cleanly', async () => {
+  // A message with none of the requested headers is served as a zero-length
+  // literal; the items after it must still land on their own keys.
+  await withServer(
+    {
+      onCommand: session({
+        extra: ({ tag, verb, send }) => {
+          if (verb !== 'UID FETCH') return false;
+          send(`* 1 FETCH (BODY[HEADER.FIELDS (X-NOPE)] {0}\r\n UID 12 FLAGS (\\Seen))\r\n${tag} OK UID FETCH completed\r\n`);
+          return true;
+        },
+      }),
+    },
+    async ({ port }) => {
+      const client = new ImapClient({ host: '127.0.0.1', port, secure: false, user: 'u', pass: 'p', timeoutMs: 5000 });
+      await client.connect();
+      await client.login();
+      const [row] = await client.fetch([12], 'UID FLAGS BODY.PEEK[HEADER.FIELDS (X-NOPE)]');
+      assert.equal(row.uid, 12);
+      assert.deepEqual(row.flags, ['\\Seen'], 'FLAGS pairs with its own list, not a shifted neighbour');
+      const section = row.sections.get('HEADER.FIELDS (X-NOPE)');
+      assert.ok(Buffer.isBuffer(section));
+      assert.equal(section.length, 0);
+      await client.close();
+    },
+  );
+});
+
 test('an empty search result short-circuits without fetching anything', async () => {
   await withServer(
     {

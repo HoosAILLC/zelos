@@ -41,6 +41,28 @@ test('paths() creates the home at 0700 and never touches the real one', () => {
   assert.ok(!p.home.includes(os.homedir() + path.sep + '.zelos'));
 });
 
+test('paths() treats ZELOS_HOME=undefined as no override, not a directory name', () => {
+  // A launcher that interpolates an unset variable produces the literal
+  // string "undefined" — the old code resolved it to <cwd>/undefined and put
+  // a real data directory there. Point $HOME at a sandbox so the fallback
+  // lands inside HOME_ROOT instead of the user's real ~/.zelos.
+  const realHome = process.env.HOME;
+  const fakeHome = path.join(HOME_ROOT, 'fake-user');
+  fs.mkdirSync(fakeHome, { recursive: true });
+  process.env.HOME = fakeHome;
+  try {
+    for (const junk of ['undefined', 'null', ' Undefined ', 'NULL']) {
+      process.env.ZELOS_HOME = junk;
+      const p = paths();
+      assert.equal(p.home, path.join(fakeHome, '.zelos'), JSON.stringify(junk));
+      assert.ok(!fs.existsSync(path.resolve(process.cwd(), junk.trim())), JSON.stringify(junk));
+    }
+  } finally {
+    process.env.HOME = realHome;
+    freshHome('after-junk');
+  }
+});
+
 test('paths() tightens a home somebody left world-readable', () => {
   const home = freshHome('loose');
   fs.mkdirSync(home, { recursive: true, mode: 0o755 });

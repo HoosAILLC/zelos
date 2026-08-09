@@ -113,8 +113,21 @@ export const api = {
   config: () => request('/api/config'),
   saveConfig: (patch) => request('/api/config', { method: 'PUT', body: patch }),
   sweep: (mode = 'auto') => request('/api/sweep', { method: 'POST', body: { mode } }),
-  setItemState: (id, state) =>
-    request(`/api/items/${encodeURIComponent(id)}/state`, { method: 'POST', body: { state } }),
+  // `until` rides along only when the caller set one: the server treats an
+  // absent field as "default to tomorrow morning", and sending null would ask
+  // it to decide what null means instead.
+  // `until` is three-valued on the wire and the distinction is load-bearing:
+  // absent asks the server for its default (09:00 tomorrow), an explicit null
+  // asks for a manual snooze with no deadline (how Undo restores a legacy
+  // snooze exactly), and a string names the wake time. So the field is sent
+  // whenever the caller stated one, even when what they stated is null.
+  setItemState: (id, state, opts = {}) =>
+    request(`/api/items/${encodeURIComponent(id)}/state`, {
+      method: 'POST',
+      body: 'until' in opts && opts.until !== undefined
+        ? { state, until: opts.until }
+        : { state },
+    }),
   capture: (text) => request('/api/capture', { method: 'POST', body: { text } }),
   setSecret: (ref, value) => request('/api/secrets', { method: 'POST', body: { ref, value } }),
   deleteSecret: (ref) => request(`/api/secrets/${encodeURIComponent(ref)}`, { method: 'DELETE' }),

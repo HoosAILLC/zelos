@@ -113,7 +113,7 @@ test('migrate() is idempotent and versioned by PRAGMA user_version', () => {
   dbs.push(db);
 
   assert.equal(db.prepare('PRAGMA user_version').get().user_version, 0);
-  assert.deepEqual(migrate(db), { version: SCHEMA_VERSION, applied: 1 });
+  assert.deepEqual(migrate(db), { version: SCHEMA_VERSION, applied: 2 });
 
   upsertItem(db, ITEM, { runId: 'run_1' });
 
@@ -132,6 +132,36 @@ test('migrate() is idempotent and versioned by PRAGMA user_version', () => {
   for (const t of ['messages', 'events', 'items', 'drafts', 'captures', 'runs', 'kv', 'search']) {
     assert.ok(tables.includes(t), `missing table ${t}`);
   }
+});
+
+test('migration 2 upgrades a version-1 database without touching its rows', () => {
+  // A file exactly as version 1 left it: the v1 items table, one row the user
+  // had snoozed, and user_version = 1. Migration 2 must add snoozed_until as
+  // NULL — the legacy manual snooze — and change nothing else.
+  const file = path.join(HOME_ROOT, 'upgrade-v1.db');
+  const db = open(file);
+  dbs.push(db);
+  db.exec(`
+    CREATE TABLE items (
+      id TEXT PRIMARY KEY, kind TEXT, bucket TEXT, headline TEXT, why TEXT,
+      person TEXT, person_email TEXT, due_at TEXT, severity INTEGER, link TEXT,
+      source_refs_json TEXT, payload_json TEXT,
+      first_seen TEXT, seen_runs INTEGER, last_seen_run TEXT,
+      state TEXT, state_at TEXT, updated_at TEXT
+    );
+  `);
+  db.prepare(`INSERT INTO items (id, bucket, headline, state, state_at, updated_at)
+              VALUES ('legacy1', 'now', 'Carried over from v1', 'snoozed', '2026-08-01T10:00:00-04:00', '2026-08-01T10:00:00-04:00')`).run();
+  db.exec('PRAGMA user_version = 1');
+
+  assert.deepEqual(migrate(db), { version: 2, applied: 1 });
+  const columns = db.prepare('PRAGMA table_info(items)').all().map((c) => c.name);
+  assert.ok(columns.includes('snoozed_until'), 'v2 adds the snoozed_until column');
+
+  const row = db.prepare('SELECT * FROM items WHERE id = ?').get('legacy1');
+  assert.equal(row.headline, 'Carried over from v1');
+  assert.equal(row.state, 'snoozed');
+  assert.equal(row.snoozed_until, null, 'an upgraded row behaves like the manual snooze it was');
 });
 
 test('withTransaction() rolls back on failure', () => {
@@ -345,6 +375,89 @@ test('listBoard() orders by bucket, then severity, then what is due soonest', ()
   assert.equal(Object.keys(counts).length, BUCKETS.length);
   assert.deepEqual(counts, { now: 2, today: 1, soon: 0, waiting: 1, promised: 0, note: 1, money: 0 });
   assert.equal(bucketCounts(db, { states: ['done'] }).now, 1);
+});
+
+/* ------------------------------------------------------------------ snooze */
+
+test('the wake compares instants, not strings — mixed offsets cannot mislead it', () => {
+  const db = fresh();
+  // The server writes snoozed_until in the configured zone; the sweep and the
+  // MCP tools read the board with a machine-zone `now`. The two offsets need
+  // not match, and a lexical <= would be off by their difference in both
+  // directions. Both cases here are chosen so the string order and the
+  // instant order DISAGREE — the assertion is that the instant wins.
+
+  // Due by instant (08:00Z <= 09:00Z) but lexically later ('08' > '05'): wakes.
+  const a = upsertItem(db, { key: 'k-due', bucket: 'now', headline: 'Due across zones' }, { runId: 'r', now: '2026-08-09T00:00:00+00:00' });
+  setItemState(db, a.id, 'snoozed', { now: '2026-08-09T01:00:00+00:00', snoozedUntil: '2026-08-10T08:00:00+00:00' });
+  const woken = listBoard(db, { now: '2026-08-10T05:00:00-04:00' });
+  assert.equal(woken.length, 1, 'an elapsed snooze wakes whatever offset now arrives in');
+  assert.equal(woken[0].state, 'open');
+
+  // Not yet due by instant (10:00Z > 09:30Z) but lexically earlier ('06' < '09'): sleeps on.
+  const b = upsertItem(db, { key: 'k-early', bucket: 'now', headline: 'Not due yet' }, { runId: 'r', now: '2026-08-09T00:00:00+00:00' });
+  setItemState(db, b.id, 'snoozed', { now: '2026-08-09T01:00:00+00:00', snoozedUntil: '2026-08-10T06:00:00-04:00' });
+  const board = listBoard(db, { now: '2026-08-10T09:30:00+00:00' });
+  assert.ok(!board.some((i) => i.id === b.id),
+    'a snooze must not wake early because its zone writes smaller digits');
+  assert.equal(getItem(db, b.id).state, 'snoozed');
+});
+
+test('a snooze with a wake time hides the item until listBoard() finds it due', () => {
+  const db = fresh();
+  const { id } = upsertItem(db, ITEM, { runId: 'r', now: '2026-08-05T10:00:00-04:00' });
+  setItemState(db, id, 'snoozed', { now: '2026-08-05T11:00:00-04:00', snoozedUntil: '2026-08-06T09:00:00-04:00' });
+
+  let row = getItem(db, id);
+  assert.equal(row.state, 'snoozed');
+  assert.equal(row.snoozed_until, '2026-08-06T09:00:00-04:00');
+  assert.equal(row.state_at, '2026-08-05T11:00:00-04:00', 'snoozing bumps state_at');
+  assert.equal(row.updated_at, '2026-08-05T11:00:00-04:00', 'snoozing bumps updated_at');
+
+  // While it sleeps: off the open board, out of the open counts.
+  assert.equal(listBoard(db, { now: '2026-08-05T12:00:00-04:00' }).length, 0);
+  assert.equal(bucketCounts(db).now, 0);
+
+  // Still asleep a minute before the wake time; reading the board did not wake it.
+  assert.equal(listBoard(db, { now: '2026-08-06T08:59:00-04:00' }).length, 0);
+  assert.equal(getItem(db, id).state, 'snoozed');
+
+  // The wake moment itself is due, and waking clears the alarm and stamps both times.
+  const board = listBoard(db, { now: '2026-08-06T09:00:00-04:00' });
+  assert.equal(board.length, 1);
+  assert.equal(board[0].state, 'open');
+  assert.equal(board[0].snoozed_until, null);
+  assert.equal(board[0].state_at, '2026-08-06T09:00:00-04:00');
+  assert.equal(board[0].updated_at, '2026-08-06T09:00:00-04:00');
+  assert.equal(bucketCounts(db).now, 1, 'the woken item is back in the open counts');
+});
+
+test('a snoozed row with no wake time never auto-wakes', () => {
+  const db = fresh();
+  const { id } = upsertItem(db, ITEM, { runId: 'r' });
+  setItemState(db, id, 'snoozed', { now: '2026-08-05T11:00:00-04:00' });
+  assert.equal(getItem(db, id).snoozed_until, null);
+
+  assert.equal(listBoard(db, { now: '2126-01-01T00:00:00-04:00' }).length, 0);
+  assert.equal(getItem(db, id).state, 'snoozed', 'a manual snooze outlasts any clock');
+
+  // The user waking it by hand is the only path back to the board.
+  assert.equal(setItemState(db, id, 'open').state, 'open');
+  assert.equal(listBoard(db).length, 1);
+});
+
+test('setting any non-snoozed state clears snoozed_until', () => {
+  const db = fresh();
+  const { id } = upsertItem(db, ITEM, { runId: 'r' });
+  setItemState(db, id, 'snoozed', { snoozedUntil: '2126-01-01T09:00:00-04:00' });
+  assert.equal(getItem(db, id).snoozed_until, '2126-01-01T09:00:00-04:00');
+
+  setItemState(db, id, 'done', { now: '2026-08-05T12:00:00-04:00' });
+  const row = getItem(db, id);
+  assert.equal(row.state, 'done');
+  assert.equal(row.snoozed_until, null, 'a finished item must not carry a wake-up call');
+  assert.equal(row.state_at, '2026-08-05T12:00:00-04:00');
+  assert.equal(row.updated_at, '2026-08-05T12:00:00-04:00');
 });
 
 /* ------------------------------------------------------------------ drafts */

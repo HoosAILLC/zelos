@@ -17,6 +17,7 @@ const {
   getRun, getKV, startRun, finishRun,
 } = await import('../core/db.mjs');
 const { SWEEP_KV } = await import('../core/triage.mjs');
+const { seedSampleData } = await import('../core/sample-data.mjs');
 const {
   runSweep, shouldRunFull, nextRunAt, isActiveHour, Scheduler, FULL_RUN_MAX_AGE_MS,
 } = await import('../core/sweep.mjs');
@@ -443,6 +444,102 @@ test('a model that answers with something other than JSON fails the run honestly
   assert.match(result.error, /I am terribly sorry/);
   assert.equal(listMessages(db).length, 1, 'what was fetched is still stored');
   assert.equal(getRun(db, result.runId).ok, false);
+});
+
+test('a parseable but wrong-shape reply fails the run and consumes nothing', async () => {
+  const db = fresh();
+  insertCapture(db, 'Call the bank about the retainage line');
+  // Parses fine, is an object, and is not a board. Before the shape check this
+  // recorded a successful empty run, marked the capture processed, and zeroed
+  // pendingNew — three silent losses from one bad reply.
+  const model = fakeModel({ answer: 'Here is a summary of your mail.' });
+  const result = await runSweep({
+    db,
+    config: baseConfig({ mail: [mailAccount()] }),
+    mode: 'full',
+    deps: { getSecret: SECRETS, complete: model, fetchMail: async () => [fetched()] },
+  });
+
+  assert.equal(result.ok, false);
+  assert.match(result.error, /not with a board|not a usable board/);
+  assert.equal(getRun(db, result.runId).ok, false);
+  assert.equal(listCaptures(db, { includeProcessed: false }).length, 1,
+    'the untriaged capture must come back next run');
+  assert.equal(getKV(db, SWEEP_KV.pendingNew), '1',
+    'the new mail still counts as unthought-about');
+  assert.equal(shouldRunFull(db, baseConfig()), true, 'the next auto run must think again');
+});
+
+test('a board whose items are unusable fails the run instead of quietly emptying it', async () => {
+  const db = fresh();
+  insertCapture(db, 'Call the bank about the retainage line');
+  // `items` is present but not an array, so validateSweep says ok:false; the
+  // shape guard lets it through to the merge, and the merge's verdict must fail
+  // the run rather than be dropped on the floor.
+  const model = fakeModel({ first: null, items: 'no items today', notes: [] });
+  const result = await runSweep({
+    db,
+    config: baseConfig({ mail: [mailAccount()] }),
+    mode: 'full',
+    deps: { getSecret: SECRETS, complete: model, fetchMail: async () => [fetched()] },
+  });
+
+  assert.equal(result.ok, false);
+  assert.match(result.error, /items/);
+  assert.equal(getRun(db, result.runId).ok, false);
+  assert.equal(listCaptures(db, { includeProcessed: false }).length, 1);
+  assert.equal(getKV(db, SWEEP_KV.pendingNew), '1');
+});
+
+test('a reply cut off at the token limit says so, and says what to raise', async () => {
+  const db = fresh();
+  // Truncated mid-board: extractJSON salvages the first balanced inner object
+  // — a single item, not the board — which is exactly the wrong-shape input the
+  // shape guard exists for. The provider said why: finish_reason 'length'.
+  const model = async () => ({
+    text: '{"first": null, "items": [{"key":"k1","bucket":"now","headline":"Do the thing","why":"because"}',
+    usage: { input: 1000, output: 2048 },
+    model: 'test-model',
+    stopReason: 'length',
+    raw: {},
+  });
+  const result = await runSweep({
+    db,
+    config: baseConfig({ mail: [mailAccount()] }),
+    mode: 'full',
+    deps: { getSecret: SECRETS, complete: model, fetchMail: async () => [fetched()] },
+  });
+
+  assert.equal(result.ok, false);
+  assert.match(result.error, /cut off/i, 'the error must say the reply was truncated');
+  assert.match(result.error, /maxTokens/, 'and point at the setting that fixes it');
+  assert.ok(!/larger model/.test(result.error), 'a bigger model would be the wrong advice');
+});
+
+test('the demo week never reaches the model once real sources exist', async () => {
+  const db = fresh();
+  seedSampleData(db);
+  const model = fakeModel(board([item()]));
+  await runSweep({
+    db,
+    config: baseConfig({ mail: [mailAccount()] }),
+    mode: 'full',
+    deps: { getSecret: SECRETS, complete: model, fetchMail: async () => [fetched()] },
+  });
+
+  assert.equal(model.calls.length, 1);
+  const sent = `${model.calls[0].system}\n${model.calls[0].messages.map((m) => m.content).join('\n')}`;
+  assert.ok(sent.includes('Dates for the walkthrough'), 'the real message still goes');
+  assert.ok(!sent.includes('quillonrow.example'),
+    'no sample message or attendee may appear in the prompt');
+  assert.ok(!sent.includes('Timber delivery window'),
+    'no sample calendar entry may appear in the prompt');
+  assert.ok(!sent.includes('are we still good for the 12th'),
+    'no sample subject line may appear in the prompt');
+  // The seed also writes one capture, marked like every sample row. It is a
+  // third door into the prompt, and it must be as closed as the other two.
+  assert.ok(!sent.includes('Ask Thistlebank about 2214'),
+    'no sample capture may appear in the prompt');
 });
 
 test('a model that cannot be reached fails the run without losing the fetch', async () => {

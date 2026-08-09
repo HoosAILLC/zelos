@@ -525,6 +525,11 @@ textarea.input, .draft-body, .ask-field, .capture-field {
   overflow-wrap: anywhere;
 }
 
+/* The slot exists so the toast can appear and vanish without its siblings
+   moving. display:contents keeps it out of the shell grid — an auto-placed
+   empty div would otherwise mint its own implicit row. */
+.toast-slot { display: contents; }
+
 .toast {
   position: fixed;
   left: 50%;
@@ -670,6 +675,17 @@ textarea.input, .draft-body, .ask-field, .capture-field {
   padding: 0 0.6rem 0.6rem calc(var(--tap) + 0.6rem);
 }
 .row-more .btn { min-height: 2.25rem; padding: 0.3rem 0.7rem; font-size: 0.8125rem; }
+
+/* The three snooze deadlines. flex-basis: 100% drops the unfolded menu onto
+   its own line inside the flex row-more, so it reads as a follow-up question
+   rather than three more siblings of "Not a thing". */
+.snooze-menu {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  flex-basis: 100%;
+}
+.hero .snooze-menu { margin-top: 0.6rem; }
 
 .chip {
   padding: 0.1rem 0.45rem;
@@ -1040,14 +1056,21 @@ textarea.input, .draft-body, .ask-field, .capture-field {
   border-radius: 999px;
   padding: 0 0.35rem;
 }
-.month-num-row { display: flex; align-items: baseline; justify-content: space-between; gap: 0.3rem; }
-.month-num { font-size: 0.8125rem; }
+/* min-width: 0 on the row, or the flag's min-content width blows the cell
+   open on a phone and "clash" lands on top of the neighbouring date. */
+.month-num-row { display: flex; align-items: baseline; justify-content: space-between; gap: 0.3rem; min-width: 0; }
+.month-num { font-size: 0.8125rem; flex: none; }
 .month-flag {
   font-family: var(--mono);
   font-size: 0.5625rem;
   letter-spacing: 0.1em;
   text-transform: uppercase;
   color: var(--accent-text);
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .month-list { display: grid; gap: 0.1rem; min-width: 0; }
 .month-ev {
