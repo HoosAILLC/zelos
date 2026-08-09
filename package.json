@@ -1,0 +1,28 @@
+{
+  "name": "zelos-app",
+  "version": "1.0.0",
+  "description": "A local-first second brain. Reads your mail and calendar, thinks with a model you choose, and gives you one page worth looking at.",
+  "type": "module",
+  "bin": { "zelos": "./zelos.mjs" },
+  "main": "./core/server.mjs",
+  "files": [
+    "core/",
+    "ui/",
+    "assets/",
+    "docs/*.md",
+    "zelos.mjs",
+    "LICENSE"
+  ],
+  "engines": { "node": ">=22.5.0" },
+  "homepage": "https://zelos-app.netlify.app",
+  "repository": { "type": "git", "url": "https://zelos-app.netlify.app" },
+  "bugs": { "url": "https://zelos-app.netlify.app" },
+  "scripts": {
+    "start": "node zelos.mjs",
+    "test": "node --test \"test/*.test.mjs\"",
+    "test:watch": "node --test --watch \"test/*.test.mjs\""
+  },
+  "keywords": ["second-brain", "local-first", "imap", "calendar", "llm", "ollama", "privacy", "mcp"],
+  "license": "MIT",
+  "private": false
+}

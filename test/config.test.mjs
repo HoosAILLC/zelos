@@ -1,0 +1,248 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+// Quiet the shared logger before core/log.mjs is evaluated, and make absolutely
+// sure nothing in this file can reach the real ~/.zelos.
+process.env.ZELOS_LOG_LEVEL = 'silent';
+const HOME_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'zelos-config-'));
+process.env.ZELOS_HOME = path.join(HOME_ROOT, 'home');
+
+const { DEFAULTS, MAIL_ACCOUNT_DEFAULTS, paths, loadConfig, saveConfig, validateConfig, newId, isValidRef } =
+  await import('../core/config.mjs');
+
+const mode = (p) => fs.statSync(p).mode & 0o777;
+
+function freshHome(name) {
+  const home = path.join(HOME_ROOT, name);
+  process.env.ZELOS_HOME = home;
+  return home;
+}
+
+test.after(() => {
+  fs.rmSync(HOME_ROOT, { recursive: true, force: true });
+});
+
+test('paths() creates the home at 0700 and never touches the real one', () => {
+  const home = freshHome('paths');
+  const p = paths();
+
+  assert.equal(p.home, home);
+  assert.equal(p.configFile, path.join(home, 'config.json'));
+  assert.equal(p.db, path.join(home, 'zelos.db'));
+  assert.equal(p.logsDir, path.join(home, 'logs'));
+  assert.equal(p.cacheDir, path.join(home, 'cache'));
+
+  assert.equal(mode(p.home), 0o700);
+  assert.equal(mode(p.logsDir), 0o700);
+  assert.equal(mode(p.cacheDir), 0o700);
+  assert.ok(!p.home.includes(os.homedir() + path.sep + '.zelos'));
+});
+
+test('paths() tightens a home somebody left world-readable', () => {
+  const home = freshHome('loose');
+  fs.mkdirSync(home, { recursive: true, mode: 0o755 });
+  fs.chmodSync(home, 0o755);
+  assert.equal(mode(home), 0o755);
+
+  paths();
+  assert.equal(mode(home), 0o700);
+});
+
+test('loadConfig() returns the full default shape with a resolved timezone', () => {
+  freshHome('load-defaults');
+  const cfg = loadConfig();
+
+  assert.equal(cfg.version, 1);
+  assert.equal(cfg.model.protocol, 'anthropic');
+  assert.equal(cfg.model.keyRef, 'model.default');
+  assert.deepEqual(cfg.mail, []);
+  assert.deepEqual(cfg.calendars, []);
+  assert.deepEqual(cfg.sweep, { intervalMinutes: 30, activeHours: [6, 23], auto: true });
+  assert.equal(cfg.privacy.sendBodies, true);
+  assert.ok(cfg.identity.timezone.length > 0, 'timezone is filled from Intl when blank');
+
+  // Mutating the result must not poison the next caller.
+  cfg.model.maxTokens = 1;
+  assert.equal(loadConfig().model.maxTokens, 8192);
+  assert.equal(DEFAULTS.model.maxTokens, 8192);
+  assert.ok(Object.isFrozen(DEFAULTS));
+});
+
+test('saveConfig() deep-merges, writes 0600, and leaves untouched keys alone', () => {
+  const home = freshHome('save');
+  saveConfig({ identity: { name: 'Nemo' }, model: { model: 'claude-x', maxTokens: 4096 } });
+  const after = saveConfig({ model: { temperature: 0.4 } });
+
+  assert.equal(after.identity.name, 'Nemo');
+  assert.equal(after.model.model, 'claude-x');
+  assert.equal(after.model.maxTokens, 4096, 'second save must not reset the first');
+  assert.equal(after.model.temperature, 0.4);
+
+  const file = path.join(home, 'config.json');
+  assert.equal(mode(file), 0o600);
+  const onDisk = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(onDisk.model.model, 'claude-x');
+  assert.equal(onDisk.identity.timezone, '', 'a timezone resolved at runtime is not frozen into the file');
+});
+
+test('saveConfig() replaces arrays wholesale so an account can be removed', () => {
+  freshHome('arrays');
+  const two = saveConfig({
+    mail: [
+      { id: 'm_aaa', host: 'a.example', user: 'a@example.com' },
+      { id: 'm_bbb', host: 'b.example', user: 'b@example.com' },
+    ],
+  });
+  assert.equal(two.mail.length, 2);
+  assert.equal(two.mail[0].port, 993, 'account defaults are filled in');
+  assert.equal(two.mail[0].keyRef, 'mail.m_aaa', 'keyRef derives from the account id');
+  assert.deepEqual(two.mail[0].mailboxes, ['INBOX']);
+
+  const one = saveConfig({ mail: [{ id: 'm_bbb', host: 'b.example', user: 'b@example.com' }] });
+  assert.equal(one.mail.length, 1);
+  assert.equal(one.mail[0].id, 'm_bbb');
+});
+
+test('accounts without an id get one, and it is stable across loads', () => {
+  freshHome('ids');
+  const saved = saveConfig({ mail: [{ host: 'imap.example', user: 'x@example.com' }] });
+  const id = saved.mail[0].id;
+  assert.match(id, /^m_[0-9a-f]{6}$/);
+  assert.equal(loadConfig().mail[0].id, id);
+});
+
+test('a secret handed to saveConfig() never reaches the disk', () => {
+  const home = freshHome('secrets');
+  const cfg = saveConfig({
+    model: { apiKey: 'sk-ant-should-never-persist', keyRef: 'model.default' },
+    mail: [{ id: 'm_ccc', host: 'imap.example', user: 'u@example.com', pass: 'hunter2', keyRef: 'mail.m_ccc' }],
+  });
+
+  assert.equal(cfg.model.apiKey, undefined);
+  assert.equal(cfg.mail[0].pass, undefined);
+  assert.equal(cfg.mail[0].keyRef, 'mail.m_ccc');
+
+  const text = fs.readFileSync(path.join(home, 'config.json'), 'utf8');
+  assert.ok(!text.includes('hunter2'));
+  assert.ok(!text.includes('sk-ant-should-never-persist'));
+  assert.ok(!/"pass"|"apiKey"/.test(text));
+});
+
+test('a write that dies before the rename leaves the old config intact', () => {
+  const home = freshHome('atomic');
+  const file = path.join(home, 'config.json');
+  saveConfig({ identity: { name: 'Original' }, model: { model: 'first' } });
+  const before = fs.readFileSync(file, 'utf8');
+
+  const realRename = fs.renameSync;
+  fs.renameSync = () => { throw new Error('simulated crash between write and rename'); };
+  try {
+    assert.throws(() => saveConfig({ identity: { name: 'Replacement' } }), /simulated crash/);
+  } finally {
+    fs.renameSync = realRename;
+  }
+
+  // Old contents byte-for-byte, still parseable, and no debris left behind.
+  assert.equal(fs.readFileSync(file, 'utf8'), before);
+  assert.equal(JSON.parse(before).identity.name, 'Original');
+  assert.equal(loadConfig().identity.name, 'Original');
+  assert.deepEqual(fs.readdirSync(home).filter((f) => f.endsWith('.tmp')), []);
+
+  // And the next save still works.
+  assert.equal(saveConfig({ identity: { name: 'Replacement' } }).identity.name, 'Replacement');
+});
+
+test('a truncated temp file from an earlier crash is ignored', () => {
+  const home = freshHome('debris');
+  saveConfig({ identity: { name: 'Survivor' } });
+  fs.writeFileSync(path.join(home, '.config.json.4242.deadbeef.tmp'), '{"identity":{"name":"Half-writ');
+
+  assert.equal(loadConfig().identity.name, 'Survivor');
+  assert.equal(saveConfig({ model: { model: 'still-fine' } }).identity.name, 'Survivor');
+});
+
+test('an unparseable config is moved aside rather than silently obeyed', () => {
+  const home = freshHome('corrupt');
+  const file = path.join(home, 'config.json');
+  saveConfig({ identity: { name: 'Before' } });
+  fs.writeFileSync(file, '{"identity": {"name": "trunc');
+
+  const cfg = loadConfig();
+  assert.equal(cfg.identity.name, '', 'falls back to defaults');
+  const aside = fs.readdirSync(home).filter((f) => f.startsWith('config.json.corrupt-'));
+  assert.equal(aside.length, 1);
+  assert.match(fs.readFileSync(path.join(home, aside[0]), 'utf8'), /trunc/);
+});
+
+test('validateConfig() passes a real config and names every bad field', () => {
+  freshHome('validate');
+  const good = saveConfig({
+    identity: { name: 'Nemo', email: 'nemo@example.com', timezone: 'America/Indianapolis' },
+    model: { protocol: 'openai', baseUrl: 'http://127.0.0.1:11434/v1', model: 'llama3', keyRef: 'model.default' },
+    mail: [{ id: 'm_ddd', host: 'imap.example.com', user: 'nemo@example.com', keyRef: 'mail.m_ddd' }],
+    calendars: [{ id: 'c_eee', kind: 'ics', url: 'https://cal.example.com/x.ics' }],
+  });
+  assert.deepEqual(validateConfig(good), { ok: true, errors: [] });
+
+  const bad = validateConfig({
+    ...good,
+    version: 0,
+    identity: { name: 'Nemo', email: 'not-an-email', timezone: 'Mars/Olympus_Mons' },
+    model: { ...good.model, protocol: 'telepathy', baseUrl: 'ftp://nope', maxTokens: 0, temperature: 9, keyRef: 'bad ref!' },
+    mail: [{ ...good.mail[0], port: 99999, lookbackDays: 0, mailboxes: [] }],
+    calendars: [{ ...good.calendars[0], kind: 'runes', url: 'javascript:alert(1)' }],
+    sweep: { intervalMinutes: 1, activeHours: [23, 6], auto: 'yes' },
+    ui: { accent: 'neon' },
+    privacy: { maxItemsPerSweep: 0, sendBodies: 1, bodyChars: 5 },
+  });
+
+  assert.equal(bad.ok, false);
+  const at = bad.errors.map((e) => e.path);
+  for (const p of [
+    'version', 'identity.email', 'identity.timezone',
+    'model.protocol', 'model.baseUrl', 'model.maxTokens', 'model.temperature', 'model.keyRef',
+    'mail[0].port', 'mail[0].lookbackDays', 'mail[0].mailboxes',
+    'calendars[0].kind', 'sweep.intervalMinutes', 'sweep.activeHours', 'sweep.auto',
+    'ui.accent', 'privacy.maxItemsPerSweep', 'privacy.sendBodies', 'privacy.bodyChars',
+  ]) {
+    assert.ok(at.includes(p), `expected an error at ${p}, got ${at.join(', ')}`);
+  }
+  for (const e of bad.errors) assert.equal(typeof e.message, 'string');
+});
+
+test('validateConfig() rejects a config carrying a credential', () => {
+  freshHome('validate-secret');
+  const cfg = loadConfig();
+  cfg.mail = [{ ...MAIL_ACCOUNT_DEFAULTS, id: 'm_fff', host: 'h', user: 'u', keyRef: 'mail.m_fff', password: 'hunter2' }];
+  const res = validateConfig(cfg);
+  assert.equal(res.ok, false);
+  assert.ok(res.errors.some((e) => e.path === 'mail[0].password' && /secret store/.test(e.message)));
+});
+
+test('validateConfig() rejects non-objects and duplicate ids', () => {
+  freshHome('validate-shape');
+  assert.equal(validateConfig(null).ok, false);
+  assert.equal(validateConfig('nope').errors[0].path, '');
+
+  const cfg = saveConfig({ mail: [{ id: 'm_dup', host: 'a', user: 'a' }] });
+  cfg.mail.push({ ...cfg.mail[0] });
+  assert.ok(validateConfig(cfg).errors.some((e) => /duplicate account id/.test(e.message)));
+});
+
+test('newId() and isValidRef()', () => {
+  assert.match(newId('m'), /^m_[0-9a-f]{6}$/);
+  assert.notEqual(newId('c'), newId('c'));
+  assert.throws(() => newId('M'), TypeError);
+  assert.throws(() => newId('mail account'), TypeError);
+  assert.throws(() => newId(''), TypeError);
+
+  assert.ok(isValidRef('model.default'));
+  assert.ok(isValidRef('mail.m_9f3a1c'));
+  assert.ok(!isValidRef('../escape'));
+  assert.ok(!isValidRef('has space'));
+  assert.ok(!isValidRef(''));
+  assert.ok(!isValidRef('a'.repeat(65)));
+});

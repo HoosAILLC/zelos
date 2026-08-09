@@ -1,0 +1,13 @@
+# Data homes — never commit a live database or config
+undefined/
+*.db
+*.db-wal
+*.db-shm
+
+# Editor/backup junk
+*.bak
+.DS_Store
+
+# Build output and dependencies (desktop shell only; the app itself has none)
+node_modules/
+desktop/dist/

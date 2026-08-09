@@ -1,0 +1,7 @@
+# Electron and electron-builder live here and nowhere else in Zealous.
+# Neither the download nor the output belongs in the repository.
+node_modules/
+dist/
+
+# package-lock.json is deliberately NOT ignored: an app that asks people to
+# trust an unsigned build should at least pin exactly what went into it.

@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Zelos</title>
+  <meta name="description" content="A local-first second brain. What needs you now, what you owe, what owes you, what is coming.">
+  <meta name="color-scheme" content="light dark">
+  <link rel="icon" href="/assets/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/app.css">
+  <script src="/boot.js"></script>
+</head>
+<body>
+  <div id="app">
+    <div class="screen">
+      <p class="screen-mark">ΖΗΛΟΣ</p>
+      <div class="meander" aria-hidden="true"></div>
+      <p class="screen-line">Opening the board…</p>
+    </div>
+  </div>
+  <noscript>
+    <div class="screen">
+      <p class="screen-mark">ΖΗΛΟΣ</p>
+      <h1 class="screen-title">Zelos needs JavaScript</h1>
+      <p class="screen-line">The board is built in the page from your own local database. There is no server-rendered fallback, and no CDN to load it from.</p>
+    </div>
+  </noscript>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

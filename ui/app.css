@@ -1,0 +1,1811 @@
+/* ==========================================================================
+   Zelos — the app's stylesheet.
+
+   A black room with glass in it. Surfaces are translucent panes floating over
+   pure black, lit from behind by soft pools of ONE accent — the single colour
+   the user chooses, defaulting to blue. The accent means "this needs you" and
+   is used nowhere it does not. If a screen here is mostly accent, it is wrong.
+
+   The single ornament is a meander — a Greek key — drawn as a CSS mask over
+   currentColor so it inherits ink or accent from whatever it divides and ships
+   no image file. It is the section rule and the active-tab marker, and it is
+   not used for anything else.
+
+   Structure:
+     1. tokens            5. chrome (topbar, rail, tabs)
+     2. reset + base      6. items, sections, states
+     3. meander           7. calendar
+     4. controls          8. views (ask, owed, settings, onboarding)
+   ========================================================================== */
+
+/* ------------------------------------------------------------------ 1. tokens */
+
+:root {
+  /*
+     THE ONE THING A USER CHOOSES. Settings writes this single hex to
+     config.ui.accent and applies it here; every other accent value below is
+     derived with color-mix, so one choice re-tints the whole app — including
+     the ambient light behind the glass. Default is blue.
+  */
+  --accent: #5b8cff;
+
+  --ground: #000000;
+  /* Not opaque greys: these are the translucent fills that make a surface read
+     as glass sitting ON the black rather than as a lighter rectangle. */
+  --ground-2: rgba(255, 255, 255, 0.055);
+  --ground-3: rgba(255, 255, 255, 0.095);
+  --paper: rgba(255, 255, 255, 0.045);
+
+  --ink: #ededf0;    /* 19.8:1 on black */
+  --ink-2: #a6a9b4;  /*  8.9:1 */
+  --ink-3: #7c808c;  /*  5.3:1 — still AA at body size */
+
+  /*
+     The accent as *type*. A user is free to pick something dark, and a dark hex
+     on a black ground is unreadable — so glyph colour is always the chosen hue
+     lifted toward white. That keeps the picker from being able to produce an
+     illegible screen no matter what is chosen.
+  */
+  --accent-text: color-mix(in srgb, var(--accent) 70%, #ffffff);
+  --accent-wash: color-mix(in srgb, var(--accent) 15%, transparent);
+  --accent-edge: color-mix(in srgb, var(--accent) 42%, transparent);
+  --accent-glow: color-mix(in srgb, var(--accent) 55%, transparent);
+  /*
+     Type that sits ON a filled accent. It is its own token because --paper is a
+     translucent surface tint, not a colour: used as a label it renders at about
+     4% white and disappears. Every filled-accent chip in the app takes this.
+  */
+  --on-accent: color-mix(in srgb, var(--accent) 20%, #000000);
+
+  --olive: #97a08c;
+  /* Calendar time used to be lapis. It now follows the accent, so the one
+     colour on screen stays one colour. */
+  --lapis: var(--accent-text);
+  --lapis-wash: var(--accent-wash);
+
+  --line: rgba(255, 255, 255, 0.12);
+  --line-strong: rgba(255, 255, 255, 0.26);
+  --shadow: 0 1px 0 rgba(255, 255, 255, 0.05), 0 18px 44px -26px #000;
+
+  --glass-blur: 18px;
+
+  --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua",
+    "Sitka Text", Constantia, Georgia, "Times New Roman", serif;
+  --sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas,
+    "Cascadia Mono", "Roboto Mono", monospace;
+
+  --gap: 1.25rem;
+  /* Glass wants a little softness. 3px was right for something carved. */
+  --radius: 12px;
+  --tap: 44px;
+  --topbar-h: 5.75rem;
+}
+
+/* --------------------------------------------------------- 2. reset + base */
+
+*,
+*::before,
+*::after { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  background: var(--ground);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 16px;
+  line-height: 1.5;
+  /* No overflow:hidden anywhere on html/body — it silently kills position:sticky. */
+}
+
+/*
+   The UA's `[hidden]{display:none}` is a plain type-selector rule, so ANY class
+   that sets `display` — .stack, .capture, .month-list — silently outranks it and
+   the "collapsed" panel is on screen. Every disclosure in this app hides with
+   the attribute, so this rule is load-bearing, not tidying.
+*/
+[hidden] { display: none !important; }
+
+h1, h2, h3, h4 { margin: 0; font-weight: 600; line-height: 1.2; }
+p { margin: 0; }
+ul, ol { margin: 0; padding: 0; list-style: none; }
+a { color: inherit; text-decoration: none; }
+
+.mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+:focus-visible {
+  outline: 2px solid var(--accent-text);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+.offscreen {
+  position: absolute;
+  left: -9999px;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+}
+
+.skip-link {
+  position: absolute;
+  left: 0.5rem;
+  top: -4rem;
+  z-index: 50;
+  padding: 0.6rem 0.9rem;
+  /* opaque: a skip link that shows the page through it is unreadable */
+  background: #0d0f14;
+  border: 1px solid var(--line-strong);
+  transition: top 0.15s ease;
+}
+.skip-link:focus { top: 0.5rem; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ---------------------------------------------------------------- 3. meander */
+
+/*
+   One tile of a Greek key, repeated along x. Used as a MASK, so the visible
+   colour is `background-color: currentColor` and the ornament takes the colour
+   of whatever it is dividing — ink for a section rule, terracotta for the
+   active tab.
+*/
+:root {
+  --meander: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 12'%3E%3Cpath d='M0 11H1V1H15V9H7V5H11V11H20' fill='none' stroke='%23000' stroke-width='2'/%3E%3C/svg%3E");
+}
+
+.meander {
+  height: 12px;
+  margin: 0.55rem 0 0.9rem;
+  color: var(--line-strong);
+  background-color: currentColor;
+  -webkit-mask-image: var(--meander);
+  mask-image: var(--meander);
+  -webkit-mask-repeat: repeat-x;
+  mask-repeat: repeat-x;
+  -webkit-mask-size: 20px 12px;
+  mask-size: 20px 12px;
+  opacity: 0.85;
+}
+
+/* --------------------------------------------------------------- 4. controls */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  min-height: var(--tap);
+  padding: 0.55rem 1rem;
+  font: inherit;
+  font-size: 0.9375rem;
+  color: var(--ink);
+  background: transparent;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition: background-color 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+.btn:hover { background: var(--ground-2); }
+.btn[disabled] { opacity: 0.45; cursor: default; }
+
+.btn.solid {
+  color: var(--on-accent);
+  background: var(--accent);
+  border-color: var(--accent);
+  font-weight: 600;
+}
+.btn.solid:hover {
+  background: color-mix(in srgb, var(--accent) 78%, #ffffff);
+  border-color: color-mix(in srgb, var(--accent) 78%, #ffffff);
+}
+
+.btn.quiet { color: var(--ink-2); border-color: var(--line); }
+.btn.quiet:hover { color: var(--ink); border-color: var(--line-strong); }
+
+.btn.icon {
+  min-width: var(--tap);
+  padding: 0.4rem 0.7rem;
+  font-size: 1.25rem;
+  line-height: 1;
+}
+
+.link {
+  min-height: var(--tap);
+  padding: 0 0.15rem;
+  font: inherit;
+  color: var(--accent-text);
+  background: none;
+  border: 0;
+  border-bottom: 1px solid currentColor;
+  cursor: pointer;
+}
+
+.pill {
+  min-height: 2rem;
+  margin: 0 0.3rem 0.3rem 0;
+  padding: 0.15rem 0.55rem;
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  color: var(--ink-2);
+  background: var(--ground-2);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  cursor: pointer;
+}
+.pill:hover { color: var(--ink); border-color: var(--line-strong); }
+
+.input {
+  width: 100%;
+  min-height: var(--tap);
+  padding: 0.55rem 0.7rem;
+  font: inherit;
+  /* 16px minimum, or iOS Safari zooms the whole page on focus. */
+  font-size: 1rem;
+  color: var(--ink);
+  background: var(--paper);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+}
+.input:read-only { color: var(--ink-3); background: var(--ground-2); }
+
+textarea.input, .draft-body, .ask-field, .capture-field {
+  width: 100%;
+  padding: 0.7rem 0.8rem;
+  font-family: var(--sans);
+  font-size: 1rem;
+  line-height: 1.55;
+  color: var(--ink);
+  background: var(--paper);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  resize: vertical;
+}
+
+.checkbox {
+  width: 1.15rem;
+  height: 1.15rem;
+  accent-color: var(--accent);
+}
+
+.row-inline {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  align-items: center;
+}
+
+.stack { display: flex; flex-direction: column; gap: 0.75rem; }
+
+.grid-2 { display: grid; gap: 0.75rem; grid-template-columns: minmax(0, 1fr); }
+@media (min-width: 40rem) {
+  .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+/* ----------------------------------------------------------------- 5. chrome */
+
+.shell {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-areas: "top" "main";
+  min-height: 100dvh;
+}
+
+/*
+   The chrome is repainted as one unit but must not BE a box: `display:contents`
+   dissolves the wrapper so topbar, rail and tab bar are direct children of the
+   shell grid and land in their own named areas.
+*/
+.chrome { display: contents; }
+
+.topbar {
+  grid-area: top;
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  padding: 0.6rem clamp(0.9rem, 3vw, 2rem) 0;
+  background: var(--ground);
+  border-bottom: 1px solid var(--line);
+}
+
+.topbar-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  align-items: baseline;
+}
+
+.wordmark { display: flex; align-items: baseline; gap: 0.55rem; }
+.wordmark-name {
+  font-family: var(--serif);
+  font-size: 1.5rem;
+  letter-spacing: 0.01em;
+}
+.wordmark-greek {
+  font-family: var(--serif);
+  font-size: 0.75rem;
+  letter-spacing: 0.28em;
+  color: var(--ink-3);
+}
+
+.topbar-date { flex: 1; font-size: 0.8125rem; color: var(--ink-3); }
+.topbar-actions { display: flex; gap: 0.5rem; margin-left: auto; }
+
+/* On a phone the header keeps the name and the two controls; the date is a
+   tap away in every view that needs it, and a three-row header is not. */
+@media (max-width: 34rem) {
+  .topbar-date { display: none; }
+  .wordmark-greek { display: none; }
+  .topbar-actions .btn { padding: 0.5rem 0.7rem; }
+}
+
+.sweepline { padding: 0.35rem 0 0.4rem; }
+.sweepline-text {
+  font-size: 0.75rem;
+  color: var(--ink-3);
+  overflow-wrap: anywhere;
+}
+.sweepline.is-bad .sweepline-text { color: var(--accent-text); }
+
+.sweepbar {
+  height: 2px;
+  margin-top: 0.3rem;
+  background: var(--line);
+  overflow: hidden;
+}
+.sweepbar-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.25s ease;
+}
+.sweepbar.is-indeterminate .sweepbar-fill {
+  width: 40% !important;
+  animation: slide 1.4s ease-in-out infinite;
+}
+@keyframes slide {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(250%); }
+}
+
+.capture { padding: 0.6rem 0 0.4rem; display: grid; gap: 0.5rem; }
+
+.rail { display: none; }
+
+.main {
+  grid-area: main;
+  padding: clamp(1rem, 3vw, 2rem) clamp(0.9rem, 3vw, 2rem) 6rem;
+  min-width: 0;
+}
+.main:focus { outline: none; }
+
+.view { max-width: 52rem; margin: 0 auto; display: grid; gap: var(--gap); align-content: start; }
+.view-calendar { max-width: 96rem; }
+
+.tabbar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 25;
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  background: var(--ground);
+  border-top: 1px solid var(--line);
+  padding-bottom: env(safe-area-inset-bottom, 0);
+}
+.tab {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.1rem;
+  min-height: var(--tap);
+  padding: 0.5rem 0.15rem 0.7rem;
+  font-size: 0.6875rem;
+  color: var(--ink-3);
+}
+.tab.is-current { color: var(--ink); font-weight: 600; }
+.tab-count { font-size: 0.625rem; color: var(--accent-text); }
+.tab-marker {
+  position: absolute;
+  left: 15%;
+  right: 15%;
+  bottom: 0.25rem;
+  height: 8px;
+  color: var(--accent);
+  background-color: currentColor;
+  -webkit-mask-image: var(--meander);
+  mask-image: var(--meander);
+  -webkit-mask-repeat: repeat-x;
+  mask-repeat: repeat-x;
+  -webkit-mask-size: 14px 8px;
+  mask-size: 14px 8px;
+  opacity: 0;
+}
+.tab.is-current .tab-marker { opacity: 1; }
+
+@media (min-width: 60rem) {
+  .shell {
+    grid-template-columns: 15.5rem minmax(0, 1fr);
+    grid-template-areas: "top top" "rail main";
+  }
+  .rail {
+    display: block;
+    grid-area: rail;
+    position: sticky;
+    top: var(--topbar-h);
+    align-self: start;
+    max-height: calc(100dvh - var(--topbar-h));
+    overflow-y: auto;
+    padding: 1.25rem 0.75rem 2rem 1.5rem;
+    border-right: 1px solid var(--line);
+  }
+  .tabbar { display: none; }
+  .main { padding-bottom: 3rem; }
+}
+
+.nav { display: grid; gap: 0.1rem; }
+.nav-link {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: var(--tap);
+  padding: 0.4rem 0.5rem 0.4rem 0.75rem;
+  color: var(--ink-2);
+  border-radius: var(--radius);
+}
+.nav-link:hover { background: var(--ground-2); color: var(--ink); }
+.nav-link.is-current { color: var(--ink); font-weight: 600; background: var(--ground-2); }
+.nav-label { flex: 1; }
+.nav-count { font-size: 0.8125rem; color: var(--ink-3); }
+.nav-count.has-some { color: var(--accent-text); font-weight: 600; }
+.nav-marker {
+  position: absolute;
+  left: 0;
+  top: 50%;
+  width: 6px;
+  height: 20px;
+  transform: translateY(-50%);
+  color: var(--accent);
+  background-color: currentColor;
+  -webkit-mask-image: var(--meander);
+  mask-image: var(--meander);
+  -webkit-mask-size: 20px 12px;
+  mask-size: 20px 12px;
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+  opacity: 0;
+}
+.nav-link.is-current .nav-marker { opacity: 1; }
+
+.rail-rule { margin: 1.1rem 0; color: var(--line); }
+.rail-heading {
+  font-family: var(--serif);
+  font-size: 0.8125rem;
+  font-weight: 400;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  margin-bottom: 0.4rem;
+}
+.bucket-list { display: grid; gap: 0.05rem; }
+.bucket-line {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: 2rem;
+  padding: 0.2rem 0.5rem 0.2rem 0.75rem;
+  font-size: 0.875rem;
+  color: var(--ink-2);
+  border-radius: var(--radius);
+}
+.bucket-line:hover { background: var(--ground-2); }
+.bucket-name { flex: 1; }
+.bucket-count { color: var(--accent-text); font-weight: 600; }
+.bucket-line.is-zero { color: var(--ink-3); }
+.bucket-line.is-zero .bucket-count { color: var(--ink-3); font-weight: 400; }
+
+.rail-foot {
+  margin-top: 1.5rem;
+  font-size: 0.6875rem;
+  color: var(--ink-3);
+  overflow-wrap: anywhere;
+}
+
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 5.5rem;
+  z-index: 40;
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+  max-width: min(38rem, calc(100vw - 2rem));
+  transform: translateX(-50%);
+  padding: 0.7rem 1rem;
+  font-size: 0.875rem;
+  background: var(--paper);
+  border: 1px solid var(--line-strong);
+  border-left: 3px solid var(--accent);
+  box-shadow: var(--shadow);
+}
+@media (min-width: 60rem) { .toast { bottom: 1.5rem; } }
+
+/* --------------------------------------------------- 6. sections and items */
+
+.section { display: grid; gap: 0.25rem; }
+.section-title {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  font-family: var(--serif);
+  font-size: 1.0625rem;
+  font-weight: 400;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+}
+.section-count { font-size: 0.8125rem; color: var(--ink-3); }
+.section-note { margin-bottom: 0.5rem; font-size: 0.875rem; color: var(--ink-3); }
+.section .meander { color: var(--line); opacity: 0.6; }
+
+.view-title { font-family: var(--serif); font-size: 1.75rem; font-weight: 500; }
+
+.quiet-note { font-size: 0.875rem; color: var(--ink-3); }
+
+/* --- the hero ------------------------------------------------------------ */
+
+.hero {
+  padding: 1.25rem 1.35rem 1.35rem;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+.hero-eyebrow {
+  font-family: var(--mono);
+  font-size: 0.6875rem;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--accent-text);
+}
+/* Short, so the ornament reads as a mark rather than as wallpaper. */
+.hero-rule { width: 5rem; color: var(--accent); opacity: 0.7; margin: 0.45rem 0 0.8rem; }
+.hero-headline {
+  font-family: var(--serif);
+  font-size: clamp(1.5rem, 1.1rem + 1.8vw, 2.125rem);
+  font-weight: 500;
+  line-height: 1.15;
+  letter-spacing: -0.005em;
+}
+.hero-why { margin-top: 0.7rem; font-size: 1rem; color: var(--ink-2); max-width: 42ch; }
+.hero-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.9rem;
+  margin-top: 0.9rem;
+  font-size: 0.75rem;
+  color: var(--ink-3);
+}
+.hero-actions { display: flex; flex-wrap: wrap; gap: 0.6rem; margin-top: 1.1rem; }
+
+/* --- the dense row ------------------------------------------------------- */
+
+.row {
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-left: 3px solid transparent;
+  border-radius: var(--radius);
+}
+.row.sev-2 { border-left-color: var(--olive); }
+.row.sev-3 { border-left-color: var(--accent); }
+.row.is-snoozed { opacity: 0.6; }
+
+.row-main { display: flex; align-items: flex-start; gap: 0.5rem; padding: 0.55rem 0.6rem; }
+
+.tick {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: var(--tap);
+  height: var(--tap);
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+.tick-mark {
+  width: 1.15rem;
+  height: 1.15rem;
+  border: 1.5px solid var(--line-strong);
+  border-radius: 2px;
+}
+.tick:hover .tick-mark { border-color: var(--ink-2); }
+.tick[aria-checked="true"] .tick-mark {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.row-body { flex: 1; min-width: 0; padding-top: 0.55rem; }
+.row-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.5rem; }
+.headline { font-size: 1rem; font-weight: 600; overflow-wrap: anywhere; }
+.why { margin-top: 0.2rem; font-size: 0.875rem; color: var(--ink-2); overflow-wrap: anywhere; }
+
+.meta { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.35rem; font-size: 0.6875rem; color: var(--ink-3); }
+.meta-hot { color: var(--accent-text); font-weight: 600; }
+.meta-carried { color: var(--olive); }
+
+.row-tools { display: flex; align-items: center; gap: 0.25rem; }
+.row-tools .btn { min-height: 2.25rem; padding: 0.3rem 0.6rem; font-size: 0.8125rem; }
+
+.disclosure {
+  width: var(--tap);
+  height: var(--tap);
+  color: var(--ink-3);
+  background: none;
+  border: 0;
+  border-radius: var(--radius);
+  cursor: pointer;
+  font-size: 1rem;
+}
+.disclosure:hover { color: var(--ink); background: var(--ground-2); }
+
+.row-more {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  padding: 0 0.6rem 0.6rem calc(var(--tap) + 0.6rem);
+}
+.row-more .btn { min-height: 2.25rem; padding: 0.3rem 0.7rem; font-size: 0.8125rem; }
+
+.chip {
+  padding: 0.1rem 0.45rem;
+  font-family: var(--mono);
+  font-size: 0.6875rem;
+  color: var(--ink-3);
+  background: var(--ground-2);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+}
+
+.fold {
+  justify-self: start;
+  min-height: var(--tap);
+  padding: 0.4rem 0.9rem;
+  font: inherit;
+  font-size: 0.875rem;
+  color: var(--ink-2);
+  background: none;
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+.fold:hover { color: var(--ink); background: var(--ground-2); }
+
+/* --- worth knowing ------------------------------------------------------- */
+
+.worth-toggle {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  width: 100%;
+  min-height: var(--tap);
+  padding: 0.4rem 0;
+  font-family: var(--serif);
+  font-size: 1.0625rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+  background: none;
+  border: 0;
+  cursor: pointer;
+  text-align: left;
+}
+.worth-count { font-size: 0.8125rem; color: var(--ink-3); }
+.worth-body { display: grid; gap: 0.75rem; }
+.notes { display: grid; gap: 0.5rem; }
+.notes li {
+  padding-left: 0.9rem;
+  font-size: 0.9375rem;
+  color: var(--ink-2);
+  border-left: 2px solid var(--line);
+}
+
+.handoff { font-size: 0.875rem; color: var(--ink-3); }
+
+/* --- empty, banner, screens ---------------------------------------------- */
+
+.empty {
+  padding: 2.5rem 1.5rem 3rem;
+  text-align: center;
+  border: 1px dashed var(--line);
+  border-radius: var(--radius);
+}
+.empty-rule { width: 6rem; margin: 0 auto 1.1rem; color: var(--line-strong); }
+.empty-title { font-family: var(--serif); font-size: 1.5rem; font-weight: 500; }
+.empty-detail {
+  max-width: 44ch;
+  margin: 0.6rem auto 1.2rem;
+  font-size: 0.9375rem;
+  color: var(--ink-2);
+}
+
+.banner {
+  padding: 0.9rem 1rem;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius);
+}
+.banner-warn { border-left-color: var(--olive); }
+.banner-title { font-size: 0.9375rem; }
+.banner-detail { margin-top: 0.3rem; font-size: 0.875rem; color: var(--ink-2); overflow-wrap: anywhere; }
+.banner-list { margin-top: 0.5rem; display: grid; gap: 0.25rem; font-size: 0.8125rem; color: var(--ink-2); }
+.banner-list li { padding-left: 0.8rem; border-left: 2px solid var(--line); overflow-wrap: anywhere; }
+.banner-actions { margin-top: 0.8rem; }
+
+.screen {
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 0.5rem;
+  min-height: 100dvh;
+  padding: 2rem;
+  text-align: center;
+}
+.screen .meander { width: 8rem; color: var(--line-strong); }
+.screen-mark {
+  font-family: var(--serif);
+  font-size: 0.875rem;
+  letter-spacing: 0.4em;
+  color: var(--ink-3);
+}
+.screen-title { font-family: var(--serif); font-size: 1.75rem; font-weight: 500; }
+.screen-line { max-width: 48ch; font-size: 0.9375rem; color: var(--ink-2); }
+
+/* --- the agenda strip ---------------------------------------------------- */
+
+.agenda { display: grid; gap: 0.15rem; }
+.agenda-item {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  align-items: baseline;
+  padding: 0.4rem 0.5rem;
+  border-left: 2px solid var(--lapis);
+  background: var(--lapis-wash);
+}
+.agenda-time { flex: none; font-size: 0.75rem; color: var(--lapis); }
+.agenda-title { font-size: 0.9375rem; }
+.agenda-where { font-size: 0.75rem; color: var(--ink-3); }
+.agenda-item.is-past { opacity: 0.5; }
+.agenda-item.is-live { border-left-color: var(--accent); background: var(--accent-wash); }
+
+/* ------------------------------------------------------------- 7. calendar */
+
+.cal-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  align-items: center;
+}
+.cal-nav { display: flex; gap: 0.35rem; }
+.cal-title {
+  flex: 1;
+  min-width: 10rem;
+  font-family: var(--serif);
+  font-size: 1.25rem;
+  font-weight: 500;
+}
+
+.segmented { display: flex; border: 1px solid var(--line-strong); border-radius: var(--radius); overflow: hidden; }
+.seg {
+  min-height: var(--tap);
+  padding: 0.4rem 0.9rem;
+  font: inherit;
+  font-size: 0.875rem;
+  color: var(--ink-2);
+  background: transparent;
+  border: 0;
+  border-left: 1px solid var(--line);
+  cursor: pointer;
+}
+.seg:first-child { border-left: 0; }
+.seg[aria-pressed="true"] { color: var(--ground); background: var(--ink); font-weight: 600; }
+
+.cal-grid {
+  --gutter: 3.25rem;
+  --min-h: 0.72px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--paper);
+  overflow: hidden;
+}
+.cal-grid.mode-day { --min-h: 1.05px; }
+
+/*
+   On a narrow screen a seven-column week is legible only if it may exceed the
+   viewport. The whole grid scrolls sideways as ONE box — header, all-day strip
+   and time body inside the same scroller — so the columns never drift out of
+   register with their dates.
+*/
+@media (max-width: 47.99rem) {
+  .cal-grid.mode-week { overflow-x: auto; }
+  .cal-grid.mode-week .cal-head,
+  .cal-grid.mode-week .cal-allday,
+  .cal-grid.mode-week .cal-body { min-width: calc(var(--gutter) + var(--cols) * 4.75rem); }
+  .cal-grid.mode-week .cal-scroll { overflow-x: visible; }
+}
+
+.cal-head {
+  display: grid;
+  grid-template-columns: var(--gutter) minmax(0, 1fr);
+  border-bottom: 1px solid var(--line);
+}
+.cal-head-days { display: grid; grid-template-columns: repeat(var(--cols), minmax(0, 1fr)); }
+.cal-head-cell {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.05rem;
+  padding: 0.5rem 0.25rem;
+  border-left: 1px solid var(--line);
+}
+.cal-head-dow {
+  font-size: 0.625rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.cal-head-num { font-size: 1rem; }
+.cal-head-cell.is-today .cal-head-num {
+  color: var(--on-accent);
+  background: var(--accent);
+  border-radius: 999px;
+  padding: 0 0.4rem;
+}
+
+.cal-allday {
+  display: grid;
+  grid-template-columns: var(--gutter) minmax(0, 1fr);
+  border-bottom: 1px solid var(--line);
+  background: var(--ground-2);
+}
+.cal-allday-days { display: grid; grid-template-columns: repeat(var(--cols), minmax(0, 1fr)); }
+.cal-allday-cell {
+  display: grid;
+  gap: 0.15rem;
+  padding: 0.25rem;
+  border-left: 1px solid var(--line);
+  min-height: 1.9rem;
+}
+.chip-allday {
+  padding: 0.1rem 0.35rem;
+  font-size: 0.6875rem;
+  color: var(--lapis);
+  background: var(--lapis-wash);
+  border-left: 2px solid var(--lapis);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cal-gutter-cell {
+  padding: 0.35rem 0.4rem;
+  font-size: 0.625rem;
+  color: var(--ink-3);
+  text-align: right;
+}
+
+.cal-scroll { max-height: min(70dvh, 44rem); overflow-y: auto; overflow-x: hidden; }
+.cal-body { display: grid; grid-template-columns: var(--gutter) minmax(0, 1fr); }
+
+.cal-gutter { position: relative; height: calc(1440 * var(--min-h)); }
+.cal-hour {
+  position: absolute;
+  right: 0.45rem;
+  transform: translateY(-0.55em);
+  font-size: 0.625rem;
+  color: var(--ink-3);
+  white-space: nowrap;
+}
+
+.cal-days {
+  position: relative;
+  display: grid;
+  grid-template-columns: repeat(var(--cols), minmax(0, 1fr));
+  height: calc(1440 * var(--min-h));
+}
+.cal-col {
+  position: relative;
+  border-left: 1px solid var(--line);
+  background-image: repeating-linear-gradient(
+    to bottom,
+    var(--line) 0,
+    var(--line) 1px,
+    transparent 1px,
+    transparent calc(60 * var(--min-h))
+  );
+}
+/* Today is marked, not painted: the accent belongs to the header pill and the
+   now-line, and a whole terracotta column would drown both. */
+.cal-col.is-today { background-color: rgba(193, 68, 14, 0.045); }
+
+.chip-ev {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  gap: 0.05rem;
+  padding: 0.15rem 0.3rem;
+  overflow: hidden;
+  color: var(--ink);
+  background: var(--lapis-wash);
+  border: 1px solid var(--line);
+  border-left: 2px solid var(--lapis);
+  border-radius: 2px;
+}
+.chip-ev.is-short {
+  flex-direction: row;
+  align-items: baseline;
+  gap: 0.3rem;
+  padding-top: 0.05rem;
+}
+.chip-ev.is-short .chip-time { flex: none; }
+.chip-ev.is-short .chip-title { display: block; white-space: nowrap; }
+.chip-ev.is-packed { border-right: 1px solid var(--paper); }
+.chip-ev.is-past { opacity: 0.5; }
+.chip-ev.is-live { border-left-color: var(--accent); background: var(--accent-wash); }
+.chip-time { font-size: 0.625rem; color: var(--lapis); }
+.chip-ev.is-live .chip-time { color: var(--accent-text); }
+/*
+   `text-overflow: ellipsis` only ever fires on a SINGLE line, so a wrapped
+   title in a short chip was being cut mid-word with no mark at all — which
+   reads as a rendering fault rather than as "there is more here". The box
+   clamp gives a real ellipsis on the last line that fits; `--chip-lines` is
+   measured per chip after layout (ui/views/calendar.js) so it is right at every
+   grid density instead of being a constant duplicated out of this file. The
+   fallback is deliberately generous: an unmeasured chip clips as before rather
+   than losing a line it had room for.
+*/
+.chip-title {
+  font-size: 0.75rem;
+  font-weight: 600;
+  line-height: 1.2;
+  min-height: 0;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: var(--chip-lines, 20);
+}
+.chip-where { font-size: 0.625rem; color: var(--ink-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.now-line {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 0;
+  border-top: 1.5px solid var(--accent);
+  pointer-events: none;
+  z-index: 3;
+}
+.now-dot {
+  position: absolute;
+  left: -3px;
+  top: -3.5px;
+  width: 7px;
+  height: 7px;
+  background: var(--accent);
+  border-radius: 999px;
+}
+
+/* --- month --------------------------------------------------------------- */
+
+.month { border: 1px solid var(--line); border-radius: var(--radius); background: var(--paper); overflow: hidden; }
+.month-dow { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); border-bottom: 1px solid var(--line); }
+.month-dow-cell {
+  padding: 0.4rem 0.3rem;
+  font-size: 0.625rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  text-align: center;
+}
+.month-cells { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); }
+.month-cell {
+  display: grid;
+  align-content: start;
+  gap: 0.15rem;
+  min-height: 6.5rem;
+  padding: 0.3rem 0.35rem 0.45rem;
+  border-top: 1px solid var(--line);
+  border-left: 1px solid var(--line);
+}
+.month-cell.is-outside { background: var(--ground-2); }
+.month-cell.is-outside .month-num { color: var(--ink-3); }
+.month-cell.is-today .month-num {
+  color: var(--on-accent);
+  background: var(--accent);
+  border-radius: 999px;
+  padding: 0 0.35rem;
+}
+.month-num-row { display: flex; align-items: baseline; justify-content: space-between; gap: 0.3rem; }
+.month-num { font-size: 0.8125rem; }
+.month-flag {
+  font-family: var(--mono);
+  font-size: 0.5625rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--accent-text);
+}
+.month-list { display: grid; gap: 0.1rem; min-width: 0; }
+.month-ev {
+  display: flex;
+  gap: 0.3rem;
+  min-width: 0;
+  font-size: 0.6875rem;
+  border-left: 2px solid var(--lapis);
+  padding-left: 0.3rem;
+}
+.month-ev.is-conflict { border-left-color: var(--accent); }
+.month-ev-time { flex: none; color: var(--lapis); }
+.month-ev.is-conflict .month-ev-time { color: var(--accent-text); }
+.month-ev-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.month-more {
+  justify-self: start;
+  min-height: 1.6rem;
+  padding: 0 0.2rem;
+  font: inherit;
+  font-size: 0.625rem;
+  color: var(--ink-3);
+  background: none;
+  border: 0;
+  border-bottom: 1px dotted var(--line-strong);
+  cursor: pointer;
+}
+.month-more:hover { color: var(--ink); }
+
+@media (max-width: 47.99rem) {
+  .month-cell { min-height: 4.5rem; }
+  .month-ev-time { display: none; }
+}
+
+/* ---------------------------------------------------------------- 8. views */
+
+/* --- owed / drafts ------------------------------------------------------- */
+
+.draft {
+  padding: 0.9rem 1rem 1rem;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--olive);
+  border-radius: var(--radius);
+}
+.draft-head { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: baseline; }
+.draft-to { display: flex; gap: 0.45rem; align-items: baseline; min-width: 0; }
+.draft-label {
+  font-size: 0.625rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.draft-addr { font-size: 0.875rem; overflow-wrap: anywhere; }
+.draft-status { margin-left: auto; font-size: 0.6875rem; color: var(--ink-3); }
+.draft-status.is-bad { color: var(--accent-text); }
+.draft-subject { margin-top: 0.35rem; font-family: var(--serif); font-size: 1.125rem; font-weight: 500; }
+.draft-because { margin-top: 0.15rem; font-size: 0.75rem; color: var(--ink-3); }
+.draft-body { margin-top: 0.7rem; overflow: hidden; }
+.draft-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.7rem; }
+.draft-actions .btn { min-height: 2.5rem; padding: 0.35rem 0.8rem; font-size: 0.875rem; }
+
+/* --- ask ----------------------------------------------------------------- */
+
+.ask-lede { font-size: 0.9375rem; color: var(--ink-2); max-width: 46ch; }
+.ask-form { display: grid; gap: 0.6rem; }
+.ask-actions { display: flex; gap: 0.6rem; align-items: center; }
+.ask-hint { font-size: 0.6875rem; color: var(--ink-3); }
+
+.transcript { display: grid; gap: 1.5rem; }
+.exchange { display: grid; gap: 0.6rem; }
+.question { display: flex; gap: 0.6rem; font-family: var(--serif); font-size: 1.1875rem; }
+.question-mark { font-size: 0.75rem; color: var(--accent-text); padding-top: 0.35rem; }
+.answer { white-space: pre-wrap; font-size: 0.9375rem; color: var(--ink); overflow-wrap: anywhere; }
+.answer.is-waiting { color: var(--ink-3); font-style: italic; }
+.answer.is-bad { color: var(--accent-text); }
+
+.sources { padding: 0.6rem 0.75rem; background: var(--ground-2); border-radius: var(--radius); }
+.sources-title {
+  font-size: 0.625rem;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.sources-list { display: grid; gap: 0.35rem; margin-top: 0.4rem; }
+.source { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: baseline; font-size: 0.8125rem; }
+.source-kind { font-size: 0.625rem; color: var(--olive); text-transform: uppercase; letter-spacing: 0.1em; }
+.source-title { font-weight: 600; overflow-wrap: anywhere; }
+.source-excerpt { color: var(--ink-3); overflow-wrap: anywhere; }
+
+/* --- settings ------------------------------------------------------------ */
+
+.settings-head { display: flex; flex-wrap: wrap; gap: 1rem; align-items: center; justify-content: space-between; }
+
+.theme-choice { display: flex; gap: 0.5rem; }
+.theme-swatch {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-height: var(--tap);
+  padding: 0.4rem 0.75rem;
+  font: inherit;
+  font-size: 0.8125rem;
+  color: var(--ink-2);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+.theme-swatch[aria-pressed="true"] { color: var(--ink); border-color: var(--line-strong); font-weight: 600; }
+.swatch-key {
+  width: 1.5rem;
+  height: 12px;
+  background-color: currentColor;
+  -webkit-mask-image: var(--meander);
+  mask-image: var(--meander);
+  -webkit-mask-size: 20px 12px;
+  mask-size: 20px 12px;
+}
+.theme-swatch.marble .swatch-key { color: #c1440e; }
+.theme-swatch.blackfigure .swatch-key { color: #8f8474; }
+
+.subtabs { display: flex; flex-wrap: wrap; gap: 0.25rem; }
+.subtab {
+  min-height: var(--tap);
+  padding: 0.4rem 0.8rem;
+  font: inherit;
+  font-size: 0.875rem;
+  color: var(--ink-3);
+  background: none;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+}
+.subtab:hover { color: var(--ink); }
+.subtab[aria-selected="true"] { color: var(--ink); font-weight: 600; border-bottom-color: var(--accent); }
+
+.panel { display: grid; gap: 1.25rem; }
+.panel-lede { font-size: 0.9375rem; color: var(--ink-2); max-width: 60ch; }
+
+.field { display: grid; gap: 0.3rem; }
+.field-label { font-size: 0.8125rem; font-weight: 600; color: var(--ink-2); }
+.field-hint { font-size: 0.75rem; color: var(--ink-3); max-width: 60ch; }
+.field-check { gap: 0.35rem; }
+.check-row { display: flex; align-items: center; gap: 0.5rem; min-height: var(--tap); }
+.check-label { font-size: 0.9375rem; }
+
+.status { font-size: 0.8125rem; color: var(--ink-3); overflow-wrap: anywhere; }
+.status.is-working { color: var(--ink-2); }
+.status.is-good { color: var(--olive); font-weight: 600; }
+.status.is-bad { color: var(--accent-text); font-weight: 600; }
+
+.runtime-list { display: grid; gap: 0.5rem; }
+.runtime {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  align-items: center;
+  padding: 0.7rem 0.85rem;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--olive);
+  border-radius: var(--radius);
+}
+.runtime-body { display: grid; gap: 0.1rem; flex: 1; min-width: 12rem; }
+.runtime-label { font-weight: 600; }
+.runtime-url { font-size: 0.75rem; color: var(--ink-3); }
+
+.preset-grid { display: grid; gap: 0.5rem; grid-template-columns: minmax(0, 1fr); }
+@media (min-width: 44rem) { .preset-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (min-width: 80rem) { .preset-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+
+.preset {
+  display: grid;
+  gap: 0.15rem;
+  min-height: var(--tap);
+  padding: 0.65rem 0.8rem;
+  font: inherit;
+  text-align: left;
+  color: var(--ink);
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+.preset:hover { border-color: var(--line-strong); }
+.preset-label { font-weight: 600; }
+.preset-note { font-size: 0.75rem; color: var(--ink-3); }
+
+.chosen { display: grid; gap: 0.9rem; padding: 1rem; background: var(--paper); border: 1px solid var(--line); border-radius: var(--radius); }
+.chosen-head { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: baseline; }
+.chosen-label { font-family: var(--serif); font-size: 1.25rem; }
+.chosen-proto { font-size: 0.6875rem; color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.14em; }
+.badge-local {
+  padding: 0.1rem 0.45rem;
+  font-size: 0.6875rem;
+  color: var(--olive);
+  border: 1px solid var(--olive);
+  border-radius: 999px;
+}
+.suggestions { display: flex; flex-wrap: wrap; align-items: center; gap: 0.25rem; }
+
+.account {
+  display: grid;
+  gap: 0.4rem;
+  padding: 0.8rem 0.9rem;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+.account-head { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: baseline; }
+.account-label { font-weight: 600; }
+.account-host { font-size: 0.75rem; color: var(--ink-3); }
+.account-form {
+  display: grid;
+  gap: 0.75rem;
+  padding: 1rem;
+  background: var(--ground-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+.editor:empty { display: none; }
+
+.facts { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 0.35rem 1rem; font-size: 0.875rem; }
+.facts dt { color: var(--ink-3); }
+.facts dd { margin: 0; overflow-wrap: anywhere; }
+
+.plain-list { display: grid; gap: 0.6rem; }
+.plain-list li {
+  padding-left: 0.9rem;
+  font-size: 0.9375rem;
+  color: var(--ink-2);
+  border-left: 2px solid var(--line);
+  max-width: 66ch;
+}
+
+.code {
+  margin: 0;
+  padding: 0.6rem 0.8rem;
+  font-family: var(--mono);
+  font-size: 0.8125rem;
+  background: var(--ground-3);
+  border-radius: var(--radius);
+  overflow-x: auto;
+}
+
+/* --- onboarding ---------------------------------------------------------- */
+
+.shell-bare { display: block; }
+.view-onboarding {
+  display: grid;
+  gap: var(--gap);
+  max-width: 46rem;
+  margin: 0 auto;
+  padding: clamp(1.5rem, 5vh, 3.5rem) 0 4rem;
+}
+.ob-head { display: grid; gap: 1rem; }
+.ob-mark {
+  font-family: var(--serif);
+  font-size: 0.75rem;
+  letter-spacing: 0.4em;
+  color: var(--ink-3);
+}
+.ob-rail { display: flex; flex-wrap: wrap; gap: 0.25rem; }
+.ob-step-btn {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  min-height: var(--tap);
+  padding: 0.3rem 0.6rem;
+  font: inherit;
+  font-size: 0.8125rem;
+  color: var(--ink-3);
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+.ob-step-num {
+  display: grid;
+  place-items: center;
+  width: 1.4rem;
+  height: 1.4rem;
+  font-size: 0.6875rem;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+}
+.ob-step.is-current .ob-step-btn { color: var(--ink); font-weight: 600; }
+.ob-step.is-current .ob-step-num { color: var(--on-accent); background: var(--accent); border-color: var(--accent); }
+.ob-step.is-done .ob-step-num { color: var(--olive); border-color: var(--olive); }
+@media (max-width: 34rem) { .ob-step-label { display: none; } }
+
+.ob-rule { color: var(--line-strong); }
+.ob-title {
+  font-family: var(--serif);
+  font-size: clamp(1.6rem, 1.1rem + 2.2vw, 2.5rem);
+  font-weight: 500;
+  line-height: 1.12;
+  max-width: 20ch;
+}
+.ob-lede { font-size: 1rem; color: var(--ink-2); max-width: 56ch; }
+.ob-body { display: grid; gap: 1rem; }
+.ob-points { display: grid; gap: 0.6rem; }
+.ob-points li {
+  padding-left: 1rem;
+  font-size: 0.9375rem;
+  color: var(--ink-2);
+  border-left: 2px solid var(--line);
+}
+.ob-actions { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: center; }
+
+.ob-progress { display: grid; gap: 0.5rem; }
+.ob-progress-line { font-size: 0.9375rem; color: var(--ink-2); }
+.ob-bar { height: 4px; background: var(--line); overflow: hidden; }
+.ob-bar-fill { height: 100%; width: 0; background: var(--accent); transition: width 0.25s ease; }
+.ob-bar.is-indeterminate .ob-bar-fill { width: 40% !important; animation: slide 1.4s ease-in-out infinite; }
+.ob-outcome:empty { display: none; }
+
+/* ----------------------------------------------- two columns, but only wide */
+
+/*
+   Explicit column counts, never auto-fill: auto-fill happily produces a cramped
+   three-column wall on a 1600px screen, which is not a layout, it is arithmetic.
+*/
+@media (min-width: 80rem) {
+  .view-today,
+  .view-owed {
+    max-width: 76rem;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    align-items: start;
+  }
+  .view-today > .section:first-child,
+  .view-owed > .section:first-child,
+  .view-today > .empty,
+  .view-owed > .empty { grid-column: 1 / -1; }
+
+  .view-now { max-width: 60rem; }
+}
+
+/* ------------------------------------------------- 9. black + glass surfaces
+
+   Two things make this work, and the order matters.
+
+   FIRST the ambient field. backdrop-filter over pure black blurs nothing and a
+   glass pane renders as a flat grey rectangle — the frosting only reads if
+   there is something behind it with structure. So the body carries soft pools
+   of the chosen accent, which also means re-picking the accent re-lights the
+   whole app rather than just recolouring a few glyphs.
+
+   THEN the panes. Every surface in sections 1-8 already routes through --paper
+   or --ground-2, so they are already translucent; these rules only add the
+   frosting, the edge and the specular highlight that sell them as glass.
+*/
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(48rem 34rem at 12% 8%, var(--accent-wash), transparent 60%),
+    radial-gradient(42rem 32rem at 88% 82%, var(--accent-wash), transparent 62%),
+    radial-gradient(56rem 40rem at 50% 50%, color-mix(in srgb, var(--accent) 7%, transparent), transparent 68%);
+}
+
+.hero,
+.row,
+.draft,
+.banner,
+.toast,
+.cal-grid,
+.month,
+.runtime,
+.preset,
+.chosen,
+.sources,
+.capture,
+.stack > .section {
+  backdrop-filter: blur(var(--glass-blur)) saturate(1.3);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(1.3);
+  border-radius: var(--radius);
+}
+
+/* The specular sheen. One highlight along the top edge and nothing else — this
+   is the detail that separates "translucent div" from "pane of glass". */
+.hero,
+.row,
+.draft,
+.banner,
+.runtime,
+.preset,
+.chosen { position: relative; }
+
+.hero::after,
+.row::after,
+.draft::after,
+.banner::after,
+.runtime::after,
+.preset::after,
+.chosen::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  background: linear-gradient(158deg,
+    rgba(255, 255, 255, 0.075) 0%,
+    rgba(255, 255, 255, 0.015) 24%,
+    transparent 48%);
+}
+
+/* The topbar and rail float over content, so they get a heavier frost and an
+   actual tint — at 4.5% white they would let text scroll through and read. */
+.topbar,
+.tabbar {
+  background: rgba(0, 0, 0, 0.62);
+  backdrop-filter: blur(20px) saturate(1.25);
+  -webkit-backdrop-filter: blur(20px) saturate(1.25);
+}
+
+/* Inputs sit *inside* glass, so they invert: darker than their container
+   rather than lighter, or they disappear into the pane they live on. */
+.input,
+textarea.input,
+.draft-body,
+.ask-field,
+.capture-field {
+  background: rgba(0, 0, 0, 0.34);
+  border-color: var(--line);
+}
+.input:focus,
+textarea.input:focus,
+.draft-body:focus,
+.ask-field:focus,
+.capture-field:focus {
+  border-color: var(--accent-edge);
+  background: rgba(0, 0, 0, 0.5);
+}
+
+/* The accent, used as light rather than as paint. */
+.dot,
+.badge-now { box-shadow: 0 0 12px var(--accent-glow); }
+
+@media (max-width: 48rem) { :root { --glass-blur: 12px; } }
+
+@media (prefers-reduced-transparency: reduce) {
+  /* Some people get motion-sick or simply cannot read through frosting. */
+  .hero, .row, .draft, .banner, .toast, .cal-grid, .month,
+  .runtime, .preset, .chosen, .sources, .capture {
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+    background: #0d0f14;
+  }
+  .topbar, .tabbar { background: #000; backdrop-filter: none; }
+}
+
+/* --------------------------------------------------- 10. the accent picker */
+
+.accent-choice { display: grid; gap: 1rem; }
+.accent-row { display: flex; flex-wrap: wrap; gap: 0.6rem; }
+.accent-swatch {
+  width: var(--tap);
+  height: var(--tap);
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--swatch);
+  cursor: pointer;
+  transition: transform 0.12s ease, border-color 0.12s ease, box-shadow 0.12s ease;
+}
+.accent-swatch:hover { transform: translateY(-2px); border-color: var(--line-strong); }
+.accent-swatch.is-chosen {
+  border-color: #fff;
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.25), 0 0 18px var(--swatch);
+}
+.accent-custom-row { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
+.accent-input {
+  width: 3.5rem;
+  height: var(--tap);
+  padding: 2px;
+  background: rgba(0, 0, 0, 0.34);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  cursor: pointer;
+}
+
+/* ------------------------------------------------------ 11. the AI access panel
+
+   The one screen where the app hands the user's mail to something else, so it
+   is styled to slow a reader down rather than to move them along.
+
+   The accent does one job here and it is the job it does everywhere else in
+   Zelos: it marks the thing that needs attention. On this panel that is the
+   live switch and the single scope — mail.bodies — that gives away the whole
+   text of someone's correspondence. Every other scope is ink on glass. If this
+   page ever reads as mostly accent, the one row that should stand out no longer
+   does.
+*/
+
+.panel-ai { gap: 1.75rem; }
+
+/* --- the master switch ---------------------------------------------------- */
+
+.ai-master {
+  display: grid;
+  gap: 0.7rem;
+  padding: 1.1rem;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-left: 2px solid var(--line-strong);
+  border-radius: var(--radius);
+}
+.ai-master.is-on { border-left-color: var(--accent); }
+
+.switch {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  min-height: var(--tap);
+  padding: 0.35rem 0.6rem 0.35rem 0.35rem;
+  color: var(--ink);
+  font: inherit;
+  text-align: left;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+.switch:hover { background: var(--ground-2); }
+
+.switch-track {
+  flex: none;
+  position: relative;
+  width: 3.1rem;
+  height: 1.75rem;
+  background: rgba(0, 0, 0, 0.45);
+  border: 1px solid var(--line-strong);
+  border-radius: 1rem;
+  transition: background-color 0.14s ease, border-color 0.14s ease;
+}
+.switch-knob {
+  position: absolute;
+  top: 0.2rem;
+  left: 0.2rem;
+  width: 1.15rem;
+  height: 1.15rem;
+  background: var(--ink-2);
+  border-radius: 50%;
+  transition: transform 0.14s ease, background-color 0.14s ease;
+}
+.switch[aria-checked="true"] .switch-track {
+  background: var(--accent-wash);
+  border-color: var(--accent);
+}
+.switch[aria-checked="true"] .switch-knob {
+  background: var(--accent);
+  transform: translateX(1.3rem);
+  box-shadow: 0 0 12px var(--accent-glow);
+}
+.switch-text { font-size: 1.0625rem; font-weight: 600; }
+.switch[aria-checked="true"] .switch-text { color: var(--accent-text); }
+
+.ai-master-note { font-size: 0.875rem; color: var(--ink-2); max-width: 62ch; }
+.ai-summary {
+  padding-left: 0.8rem;
+  border-left: 2px solid var(--line);
+  font-family: var(--serif);
+  font-size: 1.0625rem;
+  line-height: 1.45;
+  max-width: 56ch;
+}
+.ai-master.is-on .ai-summary { border-left-color: var(--accent); }
+
+/* --- one row per scope ---------------------------------------------------- */
+
+.scope-list { display: grid; gap: 0.75rem; }
+
+.scope {
+  display: grid;
+  gap: 0.4rem;
+  padding: 0.85rem 1rem;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-left: 2px solid var(--line);
+  border-radius: var(--radius);
+}
+.scope.is-on { border-left-color: var(--olive); }
+
+.scope-toggle { display: flex; align-items: flex-start; gap: 0.65rem; min-height: var(--tap); }
+.scope-toggle .checkbox { margin-top: 0.85rem; }
+.scope-toggle-label { display: block; flex: 1; min-width: 0; padding-top: 0.6rem; cursor: pointer; }
+
+.scope-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.5rem; }
+.scope-label { font-size: 1rem; font-weight: 600; }
+.scope-name { font-size: 0.75rem; color: var(--ink-3); }
+
+.scope-what { font-size: 0.9375rem; color: var(--ink-2); max-width: 64ch; }
+.scope-also { font-size: 0.875rem; color: var(--ink-2); max-width: 64ch; }
+
+.scope-tools { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.4rem; }
+.scope-tools-label {
+  font-size: 0.625rem;
+  color: var(--ink-3);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+}
+.scope-tool { font-size: 0.75rem; color: var(--ink-3); }
+
+/*
+   mail.bodies. It gets the accent edge, a filled marker and a heavier ground,
+   and in the markup it is a button rather than a tick — the difference is meant
+   to be legible before the sentence under it is read.
+*/
+.scope-exposing {
+  gap: 0.6rem;
+  padding: 1.1rem 1rem;
+  border-left: 2px solid var(--accent);
+  background: var(--accent-wash);
+}
+.scope-exposing .scope-label { font-family: var(--serif); font-size: 1.1875rem; font-weight: 500; }
+.scope-exposing .scope-what { color: var(--ink); }
+
+.scope-mark {
+  padding: 0.15rem 0.5rem;
+  color: var(--on-accent);
+  background: var(--accent);
+  border-radius: 999px;
+  font-size: 0.625rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+
+.scope-state { font-size: 0.8125rem; color: var(--ink-3); }
+.scope-state.is-on { color: var(--accent-text); font-weight: 600; }
+
+.scope-confirm {
+  display: grid;
+  gap: 0.6rem;
+  padding: 0.9rem;
+  background: rgba(0, 0, 0, 0.42);
+  border: 1px solid var(--accent-edge);
+  border-radius: var(--radius);
+}
+.scope-confirm-q { font-family: var(--serif); font-size: 1.125rem; }
+.scope-confirm-what { font-size: 0.875rem; color: var(--ink-2); max-width: 60ch; }
+
+/* --- tokens --------------------------------------------------------------- */
+
+.ai-tokens { display: grid; gap: 1rem; }
+.ai-mint { display: grid; gap: 0.6rem; max-width: 34rem; }
+
+.ai-token {
+  display: grid;
+  gap: 0.35rem;
+  padding: 0.8rem 0.9rem;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+.ai-token-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.6rem; }
+.ai-token-label { font-weight: 600; overflow-wrap: anywhere; }
+.ai-token-id { font-size: 0.75rem; color: var(--ink-3); }
+.ai-token-meta { font-size: 0.8125rem; color: var(--ink-3); }
+.ai-token-confirm {
+  display: grid;
+  gap: 0.6rem;
+  padding: 0.75rem;
+  background: rgba(0, 0, 0, 0.42);
+  border: 1px solid var(--accent-edge);
+  border-radius: var(--radius);
+}
+.ai-token-confirm-q { font-size: 0.9375rem; max-width: 60ch; }
+
+/* The value, shown once. Wide, monospaced and selectable, because the only
+   thing that matters in this box is getting it out intact. */
+.ai-reveal {
+  display: grid;
+  gap: 0.6rem;
+  padding: 1rem;
+  background: rgba(0, 0, 0, 0.42);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+}
+.ai-reveal-eyebrow {
+  font-size: 0.625rem;
+  color: var(--accent-text);
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  font-weight: 700;
+}
+.ai-reveal-value {
+  padding: 0.7rem 0.8rem;
+  font-size: 0.9375rem;
+  line-height: 1.5;
+  background: rgba(0, 0, 0, 0.5);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+.ai-reveal-warn { font-size: 0.875rem; color: var(--ink-2); max-width: 60ch; }
+
+/* --- the access log ------------------------------------------------------- */
+
+.ai-log-wrap { display: grid; gap: 0.75rem; }
+.ai-log { display: grid; gap: 0.15rem; }
+.ai-log-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.6rem;
+  padding: 0.5rem 0.7rem;
+  border-left: 2px solid var(--line);
+  background: var(--ground-2);
+  border-radius: 0 8px 8px 0;
+  font-size: 0.8125rem;
+}
+.ai-log-row.is-refused { border-left-color: var(--accent); }
+.ai-log-tool { font-size: 0.8125rem; color: var(--ink); }
+.ai-log-scope { color: var(--ink-2); }
+.ai-log-rows { color: var(--ink-3); }
+.ai-log-row.is-refused .ai-log-rows { color: var(--accent-text); font-weight: 600; }
+.ai-log-when { margin-left: auto; color: var(--ink-3); }
+.ai-log-label { color: var(--ink-3); }
+
+/* --- the copy-paste blocks ------------------------------------------------ */
+
+.ai-connect { display: grid; gap: 1rem; }
+.ai-code { display: grid; gap: 0.4rem; }
+.ai-code-head { display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem; }
+.ai-code-title { font-weight: 600; }
+.ai-code-head .btn { min-height: var(--tap); padding: 0.35rem 0.9rem; }
+.ai-code .code { max-height: 22rem; overflow: auto; }
+
+/* --- glass, and the way out of it ---------------------------------------- */
+
+.ai-master,
+.scope,
+.ai-token,
+.ai-reveal {
+  backdrop-filter: blur(var(--glass-blur)) saturate(1.3);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(1.3);
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .ai-master, .scope, .ai-token, .ai-reveal {
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+    background: #0d0f14;
+  }
+  .scope-exposing { background: #16121a; }
+}
+
+/* Columns, but only where there is room for them. Fixed widths rather than
+   min-widths: a long tool name must wrap inside its own column, not push the
+   row wider than the page. */
+@media (min-width: 40rem) {
+  .ai-log-row { flex-wrap: nowrap; }
+  .ai-log-tool { flex: none; width: 11rem; overflow-wrap: anywhere; }
+  .ai-log-scope { flex: none; width: 9rem; overflow-wrap: anywhere; }
+}

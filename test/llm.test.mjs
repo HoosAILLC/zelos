@@ -1,0 +1,1133 @@
+/**
+ * test/llm.test.mjs — the model adapter, against a real socket.
+ *
+ * Every protocol claim here is proved by what arrives at a node:http server:
+ * the request path, the headers, and the parsed body. Nothing is stubbed, so a
+ * refactor that quietly stops sending `anthropic-version` fails here.
+ *
+ * Two testing notes worth knowing before you edit this file:
+ *
+ * 1. No third-party host is ever contacted. The mock binds 127.0.0.1:0.
+ *
+ * 2. To exercise the NON-local code paths (key required, `response_format`
+ *    sent) we need an address that `isLocalAddress` calls remote but that still
+ *    reaches the mock. Every literal that routes to loopback is — correctly —
+ *    classified local, and resolving a real hostname would mean a DNS lookup to
+ *    a third party. So `pinOrigin` rewrites one fixed origin onto the mock at
+ *    the fetch layer: an in-process /etc/hosts entry. The adapter still builds
+ *    and sends its own real request, and the mock still records what arrived —
+ *    only the connection target is redirected. The fake origin uses the
+ *    reserved `.invalid` TLD, which can never resolve, so a pin that failed to
+ *    install produces a loud failure instead of a silent real request.
+ */
+
+import { test, before, after, beforeEach } from 'node:test';
+import assert from 'node:assert/strict';
+import http from 'node:http';
+import os from 'node:os';
+import fs from 'node:fs';
+import path from 'node:path';
+
+import {
+  LLMError,
+  PRESETS,
+  complete,
+  extractJSON,
+  isLocalAddress,
+  listModels,
+  probeLocal,
+  stream,
+} from '../core/llm.mjs';
+
+// The adapter never touches disk, but no test in this project is allowed near
+// the real ~/.zelos, so point HOME at a throwaway directory regardless.
+process.env.ZELOS_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'zelos-llm-test-'));
+
+const FAKE_ORIGIN = 'https://api.example.invalid';
+
+/* ------------------------------------------------------------------ *
+ * Mock server implementing both wire protocols
+ * ------------------------------------------------------------------ */
+
+const OPENAI_COMPLETION = {
+  id: 'chatcmpl-mock',
+  object: 'chat.completion',
+  model: 'mock-openai-model',
+  choices: [{ index: 0, message: { role: 'assistant', content: 'pong' }, finish_reason: 'stop' }],
+  usage: { prompt_tokens: 11, completion_tokens: 3, total_tokens: 14 },
+};
+
+const ANTHROPIC_MESSAGE = {
+  id: 'msg_mock',
+  type: 'message',
+  role: 'assistant',
+  model: 'mock-anthropic-model',
+  content: [
+    { type: 'text', text: 'po' },
+    { type: 'text', text: 'ng' },
+  ],
+  usage: { input_tokens: 7, output_tokens: 2 },
+};
+
+const OPENAI_MODELS = {
+  object: 'list',
+  data: [
+    { id: 'llama3.2', object: 'model' },
+    { id: 'qwen2.5', object: 'model' },
+    { id: 'llama3.2', object: 'model' }, // duplicate — must be collapsed
+  ],
+};
+
+const ANTHROPIC_MODELS = {
+  data: [
+    { type: 'model', id: 'claude-opus-5', display_name: 'Claude Opus 5' },
+    { type: 'model', id: 'claude-sonnet-5' }, // no display_name — label falls back to id
+  ],
+  has_more: false,
+};
+
+const OPENAI_SSE = [
+  'data: {"id":"chatcmpl-mock","choices":[{"index":0,"delta":{"role":"assistant"}}]}\n\n',
+  'data: {"choices":[{"index":0,"delta":{"content":"Hel"}}]}\n\n',
+  'data: {"choices":[{"index":0,"delta":{"content":"lo"}}]}\n\n',
+  'data: {"model":"mock-openai-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],' +
+    '"usage":{"prompt_tokens":9,"completion_tokens":4}}\n\n',
+  'data: [DONE]\n\n',
+];
+
+const ANTHROPIC_SSE = [
+  'event: message_start\r\n' +
+    'data: {"type":"message_start","message":{"id":"msg_mock","model":"mock-anthropic-model",' +
+    '"usage":{"input_tokens":12,"output_tokens":1}}}\r\n\r\n',
+  'event: content_block_delta\n' +
+    'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hel"}}\n\n',
+  // A non-text delta the reader must ignore rather than concatenate.
+  'event: content_block_delta\n' +
+    'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"a\\":"}}\n\n',
+  'event: content_block_delta\n' +
+    'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"lo"}}\n\n',
+  'event: ping\ndata: {"type":"ping"}\n\n',
+  'event: message_delta\n' +
+    'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}\n\n',
+  'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+];
+
+const SSE_HEADERS = { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' };
+
+function sendJson(res, status, value) {
+  const payload = JSON.stringify(value);
+  res.writeHead(status, {
+    'content-type': 'application/json',
+    'content-length': Buffer.byteLength(payload),
+  });
+  res.end(payload);
+}
+
+function sendChunks(res, canned) {
+  res.writeHead(canned.status ?? 200, canned.headers ?? SSE_HEADERS);
+  const delay = canned.delayMs ?? 0;
+  let i = 0;
+  const next = () => {
+    if (i >= canned.chunks.length) {
+      res.end();
+      return;
+    }
+    res.write(canned.chunks[i++]);
+    setTimeout(next, delay);
+  };
+  next();
+}
+
+async function startMock() {
+  const state = { requests: [], plan: [], hung: new Set() };
+
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      const raw = Buffer.concat(chunks).toString('utf8');
+      const url = new URL(req.url, 'http://127.0.0.1');
+      let body = null;
+      try {
+        body = raw ? JSON.parse(raw) : null;
+      } catch {
+        body = null;
+      }
+      state.requests.push({
+        method: req.method,
+        path: url.pathname,
+        query: url.searchParams,
+        headers: req.headers,
+        raw,
+        body,
+      });
+
+      const canned = state.plan.shift();
+      if (canned) {
+        if (canned.hang) {
+          state.hung.add(res);
+          res.on('close', () => state.hung.delete(res));
+          return;
+        }
+        if (canned.chunks) return sendChunks(res, canned);
+        const payload = typeof canned.body === 'string' ? canned.body : JSON.stringify(canned.body ?? {});
+        res.writeHead(canned.status ?? 200, {
+          'content-type': 'application/json',
+          ...(canned.headers ?? {}),
+        });
+        res.end(payload);
+        return;
+      }
+
+      // Default behaviour: act like a correct server for both protocols.
+      if (req.method === 'POST' && url.pathname === '/chat/completions') {
+        if (body?.stream) return sendChunks(res, { chunks: OPENAI_SSE });
+        return sendJson(res, 200, OPENAI_COMPLETION);
+      }
+      if (req.method === 'POST' && url.pathname === '/v1/messages') {
+        if (body?.stream) return sendChunks(res, { chunks: ANTHROPIC_SSE });
+        return sendJson(res, 200, ANTHROPIC_MESSAGE);
+      }
+      if (req.method === 'GET' && url.pathname === '/models') return sendJson(res, 200, OPENAI_MODELS);
+      if (req.method === 'GET' && url.pathname === '/v1/models') {
+        return sendJson(res, 200, ANTHROPIC_MODELS);
+      }
+      return sendJson(res, 404, { error: { message: `no mock route for ${req.method} ${url.pathname}` } });
+    });
+  });
+
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+
+  return {
+    origin: `http://127.0.0.1:${port}`,
+    requests: state.requests,
+    plan: state.plan,
+    last() {
+      return state.requests[state.requests.length - 1];
+    },
+    reset() {
+      state.requests.length = 0;
+      state.plan.length = 0;
+    },
+    async close() {
+      for (const res of state.hung) {
+        try {
+          res.destroy();
+        } catch {
+          /* already gone */
+        }
+      }
+      server.closeAllConnections?.();
+      await new Promise((resolve) => server.close(resolve));
+    },
+  };
+}
+
+/** An in-process hosts entry: `fakeOrigin` connects to `realOrigin`. */
+function pinOrigin(fakeOrigin, realOrigin) {
+  const original = globalThis.fetch;
+  globalThis.fetch = (input, init) => {
+    const url = typeof input === 'string' ? input : input?.url;
+    if (typeof url === 'string' && url.startsWith(fakeOrigin)) {
+      return original(realOrigin + url.slice(fakeOrigin.length), init);
+    }
+    return original(input, init);
+  };
+  return () => {
+    globalThis.fetch = original;
+  };
+}
+
+async function unusedPort() {
+  const server = http.createServer();
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+  await new Promise((resolve) => server.close(resolve));
+  return port;
+}
+
+async function collect(iterable) {
+  const out = [];
+  for await (const item of iterable) out.push(item);
+  return out;
+}
+
+let mock;
+let unpin;
+
+before(async () => {
+  mock = await startMock();
+  unpin = pinOrigin(FAKE_ORIGIN, mock.origin);
+});
+
+after(async () => {
+  unpin();
+  await mock.close();
+  fs.rmSync(process.env.ZELOS_HOME, { recursive: true, force: true });
+});
+
+beforeEach(() => mock.reset());
+
+/* ------------------------------------------------------------------ *
+ * isLocalAddress
+ * ------------------------------------------------------------------ */
+
+test('isLocalAddress recognises this machine and this LAN', () => {
+  const local = [
+    'http://localhost:11434/v1',
+    'http://LOCALHOST:1234',
+    'http://127.0.0.1:8080/v1',
+    'http://127.1.2.3:8080',
+    'http://[::1]:8000/v1',
+    'http://[0:0:0:0:0:0:0:1]:8000',
+    'http://[::ffff:127.0.0.1]:8000',
+    'http://[::ffff:7f00:1]:8000', // the same address, as URL normalises it
+    'http://[fe80::1]:8000',
+    'http://[fd00::5]:8000',
+    'http://studio.local:1234/v1',
+    'http://192.168.1.50:11434/v1',
+    'http://10.0.0.7:8000',
+    'http://172.16.0.1:8000',
+    'http://172.31.255.255:8000',
+    'http://0.0.0.0:8080',
+    'localhost:1234',
+    '127.0.0.1:11434',
+  ];
+  for (const url of local) assert.equal(isLocalAddress(url), true, `${url} should be local`);
+
+  const remote = [
+    'https://api.anthropic.com',
+    'https://api.openai.com/v1',
+    'http://172.15.0.1:8000',
+    'http://172.32.0.1:8000',
+    'http://11.0.0.1:8000',
+    'http://8.8.8.8',
+    'http://[::ffff:8.8.8.8]:8000', // a mapped PUBLIC address is not local
+    'http://[2606:4700::1111]:8000',
+    'https://notlocalhost.com',
+    'https://localhost.evil.com',
+    'https://api.example.invalid',
+    'https://local',
+  ];
+  for (const url of remote) assert.equal(isLocalAddress(url), false, `${url} should be remote`);
+
+  assert.equal(isLocalAddress(''), false);
+  assert.equal(isLocalAddress(null), false);
+  assert.equal(isLocalAddress(undefined), false);
+  assert.equal(isLocalAddress(42), false);
+  assert.equal(isLocalAddress('   '), false);
+});
+
+/* ------------------------------------------------------------------ *
+ * extractJSON
+ * ------------------------------------------------------------------ */
+
+test('extractJSON parses clean output', () => {
+  assert.deepEqual(extractJSON('{"a":1}'), { a: 1 });
+  assert.deepEqual(extractJSON('  \n {"a": [1,2,3]} \n '), { a: [1, 2, 3] });
+  assert.deepEqual(extractJSON('[{"a":1},{"b":2}]'), [{ a: 1 }, { b: 2 }]);
+});
+
+test('extractJSON strips markdown fences', () => {
+  assert.deepEqual(extractJSON('```json\n{"items":[]}\n```'), { items: [] });
+  assert.deepEqual(extractJSON('```\n{"items":[1]}\n```'), { items: [1] });
+  assert.deepEqual(extractJSON('```JSON\n{"ok":true}\n```'), { ok: true });
+  // Truncated output: the closing fence never arrived.
+  assert.deepEqual(extractJSON('```json\n{"ok":true}'), { ok: true });
+});
+
+test('extractJSON recovers JSON wrapped in prose', () => {
+  const wrapped = 'Sure! Here is the JSON you asked for:\n\n{"bucket":"now"}\n\nLet me know if that helps.';
+  assert.deepEqual(extractJSON(wrapped), { bucket: 'now' });
+  assert.deepEqual(extractJSON('Result: [1,2,3] — done.'), [1, 2, 3]);
+});
+
+test('extractJSON prefers the fenced block over braces in the surrounding prose', () => {
+  // The naive "first balanced {...}" scan would return {} from the prose.
+  const text = 'Use {} for an empty object. My answer:\n```json\n{"answer":42}\n```\nThanks.';
+  assert.deepEqual(extractJSON(text), { answer: 42 });
+});
+
+test('extractJSON handles nested braces and braces inside strings', () => {
+  const nested = '{"a":{"b":{"c":[{"d":1}]}}}';
+  assert.deepEqual(extractJSON(`prefix ${nested} suffix`), { a: { b: { c: [{ d: 1 }] } } });
+
+  const braceInString = '{"headline":"Reply to Bob about the } brace","why":"has { and } in it"}';
+  assert.deepEqual(extractJSON(`Here:\n${braceInString}`), {
+    headline: 'Reply to Bob about the } brace',
+    why: 'has { and } in it',
+  });
+
+  const escapedQuote = '{"note":"he said \\"} done\\" loudly"}';
+  assert.deepEqual(extractJSON(`text ${escapedQuote} text`), { note: 'he said "} done" loudly' });
+});
+
+test('extractJSON skips unparseable candidates and keeps looking', () => {
+  // `{not json}` is balanced but invalid; the scan must move to the next opener.
+  assert.deepEqual(extractJSON('I would write {not json} normally, but here: {"ok":1}'), { ok: 1 });
+});
+
+test('extractJSON returns null when there is nothing to recover', () => {
+  assert.equal(extractJSON('I cannot help with that.'), null);
+  assert.equal(extractJSON(''), null);
+  assert.equal(extractJSON('   '), null);
+  assert.equal(extractJSON(null), null);
+  assert.equal(extractJSON(undefined), null);
+  assert.equal(extractJSON({ a: 1 }), null);
+  assert.equal(extractJSON('{"unclosed": 1'), null);
+});
+
+/* ------------------------------------------------------------------ *
+ * PRESETS
+ * ------------------------------------------------------------------ */
+
+test('PRESETS covers every provider the spec names, with a consistent shape', () => {
+  const required = [
+    'anthropic', 'openai', 'gemini', 'groq', 'mistral', 'deepseek', 'xai',
+    'together', 'openrouter', 'fireworks', 'cerebras',
+    'ollama', 'lmstudio', 'llamacpp', 'vllm', 'localai',
+  ];
+  const byId = new Map(PRESETS.map((p) => [p.id, p]));
+  for (const id of required) assert.ok(byId.has(id), `missing preset: ${id}`);
+  assert.equal(byId.size, PRESETS.length, 'preset ids must be unique');
+
+  for (const preset of PRESETS) {
+    assert.equal(typeof preset.label, 'string', `${preset.id}.label`);
+    assert.ok(['openai', 'anthropic'].includes(preset.protocol), `${preset.id}.protocol`);
+    assert.equal(typeof preset.baseUrl, 'string', `${preset.id}.baseUrl`);
+    assert.equal(typeof preset.docsUrl, 'string', `${preset.id}.docsUrl`);
+    assert.ok(preset.keyUrl === null || typeof preset.keyUrl === 'string', `${preset.id}.keyUrl`);
+    assert.equal(typeof preset.local, 'boolean', `${preset.id}.local`);
+    assert.ok(Array.isArray(preset.suggestedModels), `${preset.id}.suggestedModels`);
+    assert.equal(typeof preset.keyless, 'boolean', `${preset.id}.keyless`);
+    assert.equal(typeof preset.note, 'string', `${preset.id}.note`);
+    // The flag and the address must agree, or the UI will demand a key for Ollama.
+    assert.equal(isLocalAddress(preset.baseUrl), preset.local, `${preset.id} locality mismatch`);
+    if (preset.keyless) assert.equal(preset.local, true, `${preset.id} keyless but remote`);
+  }
+
+  assert.equal(byId.get('anthropic').protocol, 'anthropic');
+  assert.equal(byId.get('anthropic').baseUrl, 'https://api.anthropic.com');
+  assert.equal(byId.get('ollama').protocol, 'openai', 'Ollama speaks the openai protocol');
+  assert.equal(byId.get('ollama').keyless, true);
+});
+
+/* ------------------------------------------------------------------ *
+ * openai protocol — what hits the socket
+ * ------------------------------------------------------------------ */
+
+test('openai complete() sends the documented request and parses the reply', async () => {
+  const result = await complete({
+    protocol: 'openai',
+    baseUrl: mock.origin,
+    model: 'llama3.2',
+    system: 'You are Zelos.',
+    messages: [
+      { role: 'user', content: 'first' },
+      { role: 'assistant', content: 'ack' },
+      { role: 'user', content: 'second' },
+    ],
+    maxTokens: 512,
+    temperature: 0,
+    retries: 0,
+  });
+
+  assert.equal(mock.requests.length, 1);
+  const req = mock.last();
+  assert.equal(req.method, 'POST');
+  assert.equal(req.path, '/chat/completions');
+  assert.equal(req.headers['content-type'], 'application/json');
+  assert.equal(req.body.model, 'llama3.2');
+  assert.equal(req.body.max_tokens, 512);
+  assert.equal(req.body.temperature, 0);
+  assert.equal(req.body.stream, undefined, 'non-streaming requests must not set stream');
+  assert.deepEqual(req.body.messages, [
+    { role: 'system', content: 'You are Zelos.' },
+    { role: 'user', content: 'first' },
+    { role: 'assistant', content: 'ack' },
+    { role: 'user', content: 'second' },
+  ]);
+
+  assert.equal(result.text, 'pong');
+  assert.deepEqual(result.usage, { input: 11, output: 3 });
+  assert.equal(result.model, 'mock-openai-model');
+  assert.equal(result.raw.id, 'chatcmpl-mock');
+});
+
+test('openai sends Authorization: Bearer when a key is configured', async () => {
+  await complete({
+    protocol: 'openai',
+    baseUrl: mock.origin,
+    model: 'llama3.2',
+    apiKey: 'sk-test-key-value',
+    messages: [{ role: 'user', content: 'hi' }],
+    retries: 0,
+  });
+  const req = mock.last();
+  assert.equal(req.headers.authorization, 'Bearer sk-test-key-value');
+  assert.equal(req.headers['x-api-key'], undefined, 'openai must not send x-api-key');
+});
+
+test('a keyless local endpoint works and sends no Authorization header', async () => {
+  const result = await complete({
+    protocol: 'openai',
+    baseUrl: mock.origin, // 127.0.0.1 — local
+    model: 'llama3.2',
+    messages: [{ role: 'user', content: 'hi' }],
+    retries: 0,
+  });
+  assert.equal(result.text, 'pong');
+  assert.equal(mock.last().headers.authorization, undefined);
+});
+
+test('a missing key is an error for a remote address, before any socket is opened', async () => {
+  await assert.rejects(
+    () =>
+      complete({
+        protocol: 'openai',
+        baseUrl: FAKE_ORIGIN,
+        model: 'gpt-4.1',
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    (err) => {
+      assert.ok(err instanceof LLMError);
+      assert.match(err.message, /No API key/i);
+      assert.match(err.message, /api\.example\.invalid/, 'the error must name the address');
+      assert.equal(err.address, FAKE_ORIGIN);
+      return true;
+    },
+  );
+  assert.equal(mock.requests.length, 0, 'no request should have been attempted');
+});
+
+test('json:true sets response_format on a remote openai endpoint only', async () => {
+  await complete({
+    protocol: 'openai',
+    baseUrl: FAKE_ORIGIN,
+    model: 'gpt-4.1',
+    apiKey: 'sk-remote',
+    system: 'Be terse.',
+    messages: [{ role: 'user', content: 'hi' }],
+    json: true,
+    retries: 0,
+  });
+  const remote = mock.last();
+  assert.deepEqual(remote.body.response_format, { type: 'json_object' });
+  assert.equal(remote.headers.authorization, 'Bearer sk-remote');
+  assert.equal(remote.body.messages[0].content, 'Be terse.', 'remote prompt is left alone');
+});
+
+test('json:true never sends response_format to a local endpoint; it prompts instead', async () => {
+  await complete({
+    protocol: 'openai',
+    baseUrl: mock.origin,
+    model: 'llama3.2',
+    system: 'Be terse.',
+    messages: [{ role: 'user', content: 'hi' }],
+    json: true,
+    retries: 0,
+  });
+  const local = mock.last();
+  assert.equal(local.body.response_format, undefined, 'local servers reject response_format');
+  assert.match(local.body.messages[0].content, /^Be terse\./);
+  assert.match(local.body.messages[0].content, /single JSON object/i);
+});
+
+test('json:true on anthropic prompts rather than sending response_format', async () => {
+  await complete({
+    protocol: 'anthropic',
+    baseUrl: FAKE_ORIGIN,
+    model: 'claude-opus-5',
+    apiKey: 'sk-ant-remote',
+    messages: [{ role: 'user', content: 'hi' }],
+    json: true,
+    retries: 0,
+  });
+  const req = mock.last();
+  assert.equal(req.body.response_format, undefined);
+  assert.match(req.body.system, /single JSON object/i);
+});
+
+/* ------------------------------------------------------------------ *
+ * anthropic protocol — what hits the socket
+ * ------------------------------------------------------------------ */
+
+test('anthropic complete() sends the documented request and parses the reply', async () => {
+  const result = await complete({
+    protocol: 'anthropic',
+    baseUrl: mock.origin,
+    model: 'claude-opus-5',
+    apiKey: 'sk-ant-test-key',
+    system: 'You are Zelos.',
+    messages: [{ role: 'user', content: 'hi' }],
+    retries: 0,
+  });
+
+  const req = mock.last();
+  assert.equal(req.method, 'POST');
+  assert.equal(req.path, '/v1/messages');
+  assert.equal(req.headers['x-api-key'], 'sk-ant-test-key');
+  assert.equal(req.headers['anthropic-version'], '2023-06-01');
+  assert.equal(req.headers.authorization, undefined, 'anthropic must not send a Bearer token');
+  assert.equal(req.body.system, 'You are Zelos.', 'system belongs at the top level');
+  assert.deepEqual(req.body.messages, [{ role: 'user', content: 'hi' }]);
+  assert.ok(
+    req.body.messages.every((m) => m.role !== 'system'),
+    'system must not appear as a message',
+  );
+  assert.equal(typeof req.body.max_tokens, 'number', 'anthropic requires max_tokens');
+  assert.ok(req.body.max_tokens > 0);
+
+  assert.equal(result.text, 'pong', 'text blocks are joined');
+  assert.deepEqual(result.usage, { input: 7, output: 2 });
+  assert.equal(result.model, 'mock-anthropic-model');
+});
+
+test('anthropic does not double up /v1 when the base URL already has it', async () => {
+  await complete({
+    protocol: 'anthropic',
+    baseUrl: `${mock.origin}/v1`,
+    model: 'claude-opus-5',
+    apiKey: 'k',
+    messages: [{ role: 'user', content: 'hi' }],
+    retries: 0,
+  });
+  assert.equal(mock.last().path, '/v1/messages');
+});
+
+test('system-role messages are folded into the top-level system prompt', async () => {
+  await complete({
+    protocol: 'anthropic',
+    baseUrl: mock.origin,
+    model: 'claude-opus-5',
+    apiKey: 'k',
+    system: 'Base rules.',
+    messages: [
+      { role: 'system', content: 'Extra rules.' },
+      { role: 'user', content: 'hi' },
+    ],
+    retries: 0,
+  });
+  const req = mock.last();
+  assert.equal(req.body.system, 'Base rules.\n\nExtra rules.');
+  assert.deepEqual(req.body.messages, [{ role: 'user', content: 'hi' }]);
+});
+
+/* ------------------------------------------------------------------ *
+ * Streaming
+ * ------------------------------------------------------------------ */
+
+test('stream() parses openai SSE and reports usage on done', async () => {
+  const events = await collect(
+    stream({
+      protocol: 'openai',
+      baseUrl: mock.origin,
+      model: 'llama3.2',
+      messages: [{ role: 'user', content: 'hi' }],
+      retries: 0,
+    }),
+  );
+
+  assert.equal(mock.last().body.stream, true, 'streaming requests must set stream:true');
+  assert.equal(
+    mock.last().body.stream_options,
+    undefined,
+    'stream_options is provider-only; local servers reject it',
+  );
+
+  const deltas = events.filter((e) => e.type === 'delta');
+  assert.deepEqual(deltas.map((d) => d.text), ['Hel', 'lo']);
+  const done = events.at(-1);
+  assert.equal(done.type, 'done');
+  assert.equal(done.text, 'Hello');
+  assert.deepEqual(done.usage, { input: 9, output: 4 });
+  assert.equal(done.model, 'mock-openai-model');
+});
+
+test('stream() asks a remote openai endpoint for usage via stream_options', async () => {
+  mock.plan.push({ chunks: OPENAI_SSE });
+  await collect(
+    stream({
+      protocol: 'openai',
+      baseUrl: FAKE_ORIGIN,
+      model: 'gpt-4.1',
+      apiKey: 'sk-remote',
+      messages: [{ role: 'user', content: 'hi' }],
+      retries: 0,
+    }),
+  );
+  assert.deepEqual(mock.last().body.stream_options, { include_usage: true });
+});
+
+test('stream() parses anthropic SSE and ignores non-text deltas', async () => {
+  const events = await collect(
+    stream({
+      protocol: 'anthropic',
+      baseUrl: mock.origin,
+      model: 'claude-opus-5',
+      apiKey: 'k',
+      messages: [{ role: 'user', content: 'hi' }],
+      retries: 0,
+    }),
+  );
+
+  const req = mock.last();
+  assert.equal(req.path, '/v1/messages');
+  assert.equal(req.body.stream, true);
+  assert.equal(req.headers['anthropic-version'], '2023-06-01');
+
+  const deltas = events.filter((e) => e.type === 'delta');
+  assert.deepEqual(deltas.map((d) => d.text), ['Hel', 'lo'], 'input_json_delta must be skipped');
+  const done = events.at(-1);
+  assert.equal(done.type, 'done');
+  assert.equal(done.text, 'Hello');
+  assert.deepEqual(done.usage, { input: 12, output: 5 });
+  assert.equal(done.model, 'mock-anthropic-model');
+});
+
+test('stream() reassembles events split across packets, including multibyte characters', async () => {
+  // "café ☕" — the ☕ is three bytes, deliberately torn across two writes,
+  // and one SSE event boundary lands mid-frame.
+  const frame = Buffer.from(
+    'data: {"choices":[{"delta":{"content":"café ☕"}}]}\n\ndata: [DONE]\n\n',
+    'utf8',
+  );
+  const tearAt = frame.indexOf(Buffer.from('☕', 'utf8')) + 1;
+  mock.plan.push({
+    chunks: [frame.subarray(0, tearAt), frame.subarray(tearAt)],
+    delayMs: 10,
+  });
+
+  const events = await collect(
+    stream({
+      protocol: 'openai',
+      baseUrl: mock.origin,
+      model: 'llama3.2',
+      messages: [{ role: 'user', content: 'hi' }],
+      retries: 0,
+    }),
+  );
+  const text = events.filter((e) => e.type === 'delta').map((d) => d.text).join('');
+  assert.equal(text, 'café ☕');
+  assert.equal(events.at(-1).type, 'done');
+});
+
+test('stream() surfaces a mid-stream anthropic error event', async () => {
+  mock.plan.push({
+    chunks: [
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}\n\n',
+      'event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"upstream is busy"}}\n\n',
+    ],
+  });
+
+  const seen = [];
+  await assert.rejects(
+    async () => {
+      for await (const event of stream({
+        protocol: 'anthropic',
+        baseUrl: mock.origin,
+        model: 'claude-opus-5',
+        apiKey: 'k',
+        messages: [{ role: 'user', content: 'hi' }],
+        retries: 0,
+      })) {
+        seen.push(event);
+      }
+    },
+    (err) => {
+      assert.ok(err instanceof LLMError);
+      assert.match(err.message, /upstream is busy/);
+      assert.match(err.message, /127\.0\.0\.1/, 'the error must name the address');
+      return true;
+    },
+  );
+  assert.deepEqual(seen.map((e) => e.text), ['partial'], 'deltas before the error still arrive');
+});
+
+/* ------------------------------------------------------------------ *
+ * Retry policy
+ * ------------------------------------------------------------------ */
+
+test('a 500 is retried and the retry succeeds', async () => {
+  mock.plan.push({ status: 500, body: { error: { message: 'boom' } } });
+  const result = await complete({
+    protocol: 'openai',
+    baseUrl: mock.origin,
+    model: 'llama3.2',
+    messages: [{ role: 'user', content: 'hi' }],
+    retries: 2,
+  });
+  assert.equal(result.text, 'pong');
+  assert.equal(mock.requests.length, 2, 'exactly one retry');
+  assert.equal(mock.requests[0].path, '/chat/completions');
+});
+
+test('a 429 honours Retry-After', async () => {
+  mock.plan.push({ status: 429, headers: { 'retry-after': '1' }, body: { error: { message: 'slow down' } } });
+  const started = Date.now();
+  const result = await complete({
+    protocol: 'openai',
+    baseUrl: mock.origin,
+    model: 'llama3.2',
+    messages: [{ role: 'user', content: 'hi' }],
+    retries: 2,
+  });
+  const elapsed = Date.now() - started;
+  assert.equal(result.text, 'pong');
+  assert.equal(mock.requests.length, 2);
+  assert.ok(elapsed >= 900, `expected to wait ~1s, waited ${elapsed}ms`);
+});
+
+test('a 401 is never retried and the message names the address', async () => {
+  mock.plan.push({ status: 401, body: { error: { message: 'invalid x-api-key' } } });
+  await assert.rejects(
+    () =>
+      complete({
+        protocol: 'openai',
+        baseUrl: mock.origin,
+        model: 'llama3.2',
+        apiKey: 'sk-wrong',
+        messages: [{ role: 'user', content: 'hi' }],
+        retries: 3,
+      }),
+    (err) => {
+      assert.ok(err instanceof LLMError);
+      assert.equal(err.status, 401);
+      assert.equal(err.retriable, false);
+      assert.equal(err.address, mock.origin);
+      assert.match(err.message, /127\.0\.0\.1/);
+      assert.match(err.message, /check the API key/);
+      assert.match(err.message, /invalid x-api-key/, 'the provider detail is preserved');
+      return true;
+    },
+  );
+  assert.equal(mock.requests.length, 1, '401 must not be retried');
+});
+
+test('a 403 is never retried', async () => {
+  mock.plan.push({ status: 403, body: { error: { message: 'no access to this model' } } });
+  await assert.rejects(
+    () =>
+      complete({
+        protocol: 'anthropic',
+        baseUrl: mock.origin,
+        model: 'claude-opus-5',
+        apiKey: 'k',
+        messages: [{ role: 'user', content: 'hi' }],
+        retries: 3,
+      }),
+    (err) => {
+      assert.equal(err.status, 403);
+      assert.equal(err.retriable, false);
+      return true;
+    },
+  );
+  assert.equal(mock.requests.length, 1, '403 must not be retried');
+});
+
+test('retries are bounded — a permanent 429 gives up after `retries` attempts', async () => {
+  for (let i = 0; i < 5; i++) {
+    mock.plan.push({ status: 429, headers: { 'retry-after': '0' }, body: { error: { message: 'nope' } } });
+  }
+  await assert.rejects(
+    () =>
+      complete({
+        protocol: 'openai',
+        baseUrl: mock.origin,
+        model: 'llama3.2',
+        messages: [{ role: 'user', content: 'hi' }],
+        retries: 2,
+      }),
+    (err) => {
+      assert.equal(err.status, 429);
+      assert.equal(err.retriable, true);
+      return true;
+    },
+  );
+  assert.equal(mock.requests.length, 3, 'initial attempt plus two retries');
+});
+
+test('a Retry-After longer than the retry budget fails fast instead of sleeping', async () => {
+  mock.plan.push({ status: 429, headers: { 'retry-after': '3600' }, body: { error: { message: 'come back later' } } });
+  const started = Date.now();
+  await assert.rejects(
+    () =>
+      complete({
+        protocol: 'openai',
+        baseUrl: mock.origin,
+        model: 'llama3.2',
+        messages: [{ role: 'user', content: 'hi' }],
+        retries: 3,
+      }),
+    (err) => {
+      assert.equal(err.status, 429);
+      return true;
+    },
+  );
+  assert.ok(Date.now() - started < 1000, 'must not sleep for the requested hour');
+  assert.equal(mock.requests.length, 1);
+});
+
+test('an AbortSignal interrupts a backoff sleep promptly', async () => {
+  mock.plan.push({ status: 503, headers: { 'retry-after': '5' }, body: { error: { message: 'down' } } });
+  const controller = new AbortController();
+  const started = Date.now();
+  setTimeout(() => controller.abort(), 80);
+
+  await assert.rejects(
+    () =>
+      complete({
+        protocol: 'openai',
+        baseUrl: mock.origin,
+        model: 'llama3.2',
+        messages: [{ role: 'user', content: 'hi' }],
+        retries: 3,
+        signal: controller.signal,
+      }),
+    (err) => {
+      assert.ok(err instanceof LLMError);
+      assert.match(err.message, /cancelled/i);
+      assert.match(err.message, /127\.0\.0\.1/);
+      return true;
+    },
+  );
+  assert.ok(Date.now() - started < 2000, 'abort must not wait out the Retry-After');
+});
+
+test('an already-aborted signal fails without opening a socket', async () => {
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(
+    () =>
+      complete({
+        protocol: 'openai',
+        baseUrl: mock.origin,
+        model: 'llama3.2',
+        messages: [{ role: 'user', content: 'hi' }],
+        signal: controller.signal,
+      }),
+    (err) => {
+      assert.match(err.message, /cancelled/i);
+      return true;
+    },
+  );
+  assert.equal(mock.requests.length, 0);
+});
+
+/* ------------------------------------------------------------------ *
+ * Transport failures
+ * ------------------------------------------------------------------ */
+
+test('a redirect is refused rather than followed with the key attached', async () => {
+  mock.plan.push({ status: 302, headers: { location: 'https://elsewhere.invalid/v1/messages' }, body: '' });
+  await assert.rejects(
+    () =>
+      complete({
+        protocol: 'anthropic',
+        baseUrl: mock.origin,
+        model: 'claude-opus-5',
+        apiKey: 'sk-secret',
+        messages: [{ role: 'user', content: 'hi' }],
+        retries: 2,
+      }),
+    (err) => {
+      assert.ok(err instanceof LLMError);
+      assert.equal(err.retriable, false);
+      assert.match(err.message, /redirected to https:\/\/elsewhere\.invalid/);
+      assert.match(err.message, /127\.0\.0\.1/);
+      return true;
+    },
+  );
+  assert.equal(mock.requests.length, 1, 'a redirect must not be retried or followed');
+});
+
+test('a request timeout names the address and is marked retriable', async () => {
+  mock.plan.push({ hang: true });
+  await assert.rejects(
+    () =>
+      complete({
+        protocol: 'openai',
+        baseUrl: mock.origin,
+        model: 'llama3.2',
+        messages: [{ role: 'user', content: 'hi' }],
+        timeoutMs: 150,
+        retries: 0,
+      }),
+    (err) => {
+      assert.ok(err instanceof LLMError);
+      assert.equal(err.retriable, true);
+      assert.match(err.message, /did not respond in time/);
+      assert.match(err.message, /127\.0\.0\.1/);
+      return true;
+    },
+  );
+});
+
+test('a refused connection reads as "is it running?", naming the address', async () => {
+  const port = await unusedPort();
+  const dead = `http://127.0.0.1:${port}/v1`;
+  await assert.rejects(
+    () =>
+      complete({
+        protocol: 'openai',
+        baseUrl: dead,
+        model: 'llama3.2',
+        messages: [{ role: 'user', content: 'hi' }],
+        retries: 0,
+      }),
+    (err) => {
+      assert.ok(err instanceof LLMError);
+      assert.equal(err.address, dead);
+      assert.match(err.message, new RegExp(`Could not reach the model at http://127\\.0\\.0\\.1:${port}`));
+      assert.match(err.message, /is it running/);
+      return true;
+    },
+  );
+});
+
+test('an HTML response (wrong base URL) produces a legible error', async () => {
+  mock.plan.push({ status: 200, headers: { 'content-type': 'text/html' }, body: '<html>Not the API</html>' });
+  await assert.rejects(
+    () =>
+      complete({
+        protocol: 'openai',
+        baseUrl: mock.origin,
+        model: 'llama3.2',
+        messages: [{ role: 'user', content: 'hi' }],
+        retries: 0,
+      }),
+    (err) => {
+      assert.match(err.message, /non-JSON response/);
+      assert.match(err.message, /127\.0\.0\.1/);
+      return true;
+    },
+  );
+});
+
+/* ------------------------------------------------------------------ *
+ * Argument validation
+ * ------------------------------------------------------------------ */
+
+test('bad options fail with an LLMError that names the address', async () => {
+  await assert.rejects(
+    () => complete({ protocol: 'ollama', baseUrl: mock.origin, model: 'x', messages: [{ role: 'user', content: 'hi' }] }),
+    (err) => {
+      assert.ok(err instanceof LLMError);
+      assert.match(err.message, /Unknown model protocol "ollama"/);
+      return true;
+    },
+  );
+
+  await assert.rejects(
+    () => complete({ protocol: 'openai', baseUrl: mock.origin, model: '', messages: [{ role: 'user', content: 'hi' }] }),
+    (err) => {
+      assert.match(err.message, /No model selected for http:\/\/127\.0\.0\.1/);
+      return true;
+    },
+  );
+
+  await assert.rejects(
+    () => complete({ protocol: 'openai', baseUrl: mock.origin, model: 'llama3.2', messages: [] }),
+    (err) => {
+      assert.match(err.message, /No messages to send/);
+      return true;
+    },
+  );
+
+  assert.equal(mock.requests.length, 0);
+});
+
+test('LLMError is a real Error carrying status, address and retriable', () => {
+  const err = new LLMError('nope', { status: 503, address: 'http://x', retriable: true });
+  assert.ok(err instanceof Error);
+  assert.equal(err.name, 'LLMError');
+  assert.equal(err.status, 503);
+  assert.equal(err.address, 'http://x');
+  assert.equal(err.retriable, true);
+});
+
+/* ------------------------------------------------------------------ *
+ * listModels + probeLocal
+ * ------------------------------------------------------------------ */
+
+test('listModels hits GET /models on the openai protocol and dedupes', async () => {
+  const models = await listModels({ protocol: 'openai', baseUrl: mock.origin, apiKey: 'sk-list' });
+  const req = mock.last();
+  assert.equal(req.method, 'GET');
+  assert.equal(req.path, '/models');
+  assert.equal(req.headers.authorization, 'Bearer sk-list');
+  assert.deepEqual(models, [
+    { id: 'llama3.2', label: 'llama3.2' },
+    { id: 'qwen2.5', label: 'qwen2.5' },
+  ]);
+});
+
+test('listModels hits GET /v1/models on the anthropic protocol with its own headers', async () => {
+  const models = await listModels({
+    protocol: 'anthropic',
+    baseUrl: mock.origin,
+    apiKey: 'sk-ant-list',
+  });
+  const req = mock.last();
+  assert.equal(req.path, '/v1/models');
+  assert.equal(req.headers['x-api-key'], 'sk-ant-list');
+  assert.equal(req.headers['anthropic-version'], '2023-06-01');
+  assert.equal(req.query.get('limit'), '1000', 'the default page size is too small');
+  assert.deepEqual(models, [
+    { id: 'claude-opus-5', label: 'Claude Opus 5' },
+    { id: 'claude-sonnet-5', label: 'claude-sonnet-5' },
+  ]);
+});
+
+test('listModels refuses a remote address with no key, and reports server errors', async () => {
+  await assert.rejects(
+    () => listModels({ protocol: 'openai', baseUrl: FAKE_ORIGIN }),
+    (err) => {
+      assert.match(err.message, /No API key/);
+      assert.match(err.message, /api\.example\.invalid/);
+      return true;
+    },
+  );
+
+  mock.plan.push({ status: 404, body: { error: { message: 'no such route' } } });
+  await assert.rejects(
+    () => listModels({ protocol: 'openai', baseUrl: mock.origin, retries: 0 }),
+    (err) => {
+      assert.ok(err instanceof LLMError);
+      assert.equal(err.status, 404);
+      assert.match(err.message, /check the base URL/);
+      return true;
+    },
+  );
+});
+
+test('probeLocal returns runtimes that answer and stays silent about ones that do not', async () => {
+  const deadPort = await unusedPort();
+  const found = await probeLocal({
+    targets: [
+      { label: 'Mock runtime', baseUrl: mock.origin },
+      { label: 'Not running', baseUrl: `http://127.0.0.1:${deadPort}/v1` },
+    ],
+    timeoutMs: 1200,
+  });
+
+  assert.equal(found.length, 1, 'the dead port must fail silently');
+  assert.equal(found[0].label, 'Mock runtime');
+  assert.equal(found[0].baseUrl, mock.origin);
+  assert.equal(found[0].protocol, 'openai');
+  assert.deepEqual(found[0].models.map((m) => m.id), ['llama3.2', 'qwen2.5']);
+  assert.equal(mock.requests.length, 1);
+  assert.equal(mock.requests[0].path, '/models');
+});
+
+test('probeLocal with no arguments probes the four documented ports and never throws', async () => {
+  const started = Date.now();
+  const found = await probeLocal();
+  assert.ok(Array.isArray(found), 'probeLocal always resolves to an array');
+  assert.ok(Date.now() - started < 5000, 'the probe is time-boxed');
+  for (const entry of found) {
+    assert.equal(entry.protocol, 'openai');
+    assert.equal(isLocalAddress(entry.baseUrl), true);
+  }
+});

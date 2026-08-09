@@ -1,0 +1,841 @@
+/**
+ * test/ics.test.mjs — RFC 5545 parsing and recurrence expansion.
+ *
+ * Fixtures are inline strings. Nothing here touches the network, the real
+ * ~/.zelos, or any file on disk.
+ *
+ * Every test pins an explicit `tzid` so results do not depend on the machine
+ * running them, and every emitted time is checked for a carried offset — that
+ * property is the whole reason this module exists.
+ */
+
+import test from 'node:test';
+import assert from 'node:assert/strict';
+
+import { unfold, parseICS, expand, parseICS_toEvents } from '../core/sources/ics.mjs';
+
+const NY = 'America/New_York';
+
+/** Join fixture lines with CRLF, the wire form of an .ics file. */
+function ics(...lines) {
+  return ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//zelos//test//EN', ...lines, 'END:VCALENDAR'].join('\r\n');
+}
+
+function vevent(...lines) {
+  return ['BEGIN:VEVENT', ...lines, 'END:VEVENT'];
+}
+
+const OFFSET_RE = /[+-]\d{2}:\d{2}$/;
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/** The invariant: an offset, or a bare date paired with allDay. */
+function assertCarriesOffset(events) {
+  for (const ev of events) {
+    for (const key of ['startsAt', 'endsAt']) {
+      const value = ev[key];
+      assert.equal(typeof value, 'string', `${key} must be a string`);
+      if (ev.allDay) {
+        assert.match(value, DATE_RE, `all-day ${key} must be a bare date, got ${value}`);
+      } else {
+        assert.match(value, OFFSET_RE, `${key} must carry an explicit offset, got ${value}`);
+      }
+    }
+  }
+}
+
+function starts(events) {
+  return events.map((e) => e.startsAt);
+}
+
+/** Expand a single-VEVENT fixture over a wide window in New York. */
+function expandFixture(lines, opts = {}) {
+  const events = parseICS_toEvents(ics(...lines), {
+    from: '2020-01-01T00:00:00Z',
+    to: '2035-01-01T00:00:00Z',
+    tzid: NY,
+    ...opts,
+  });
+  assertCarriesOffset(events);
+  return events;
+}
+
+/* ------------------------------------------------------------------ *
+ * Line handling and escaping
+ * ------------------------------------------------------------------ */
+
+test('unfold removes CRLF+space and LF+tab continuations, whitespace included', () => {
+  // RFC 5545 \u00A73.1: folding inserts a line break AND one whitespace character;
+  // unfolding removes both, so no space appears in the rejoined value.
+  assert.equal(unfold('DESCRIPTION:one\r\n two'), 'DESCRIPTION:onetwo');
+  assert.equal(unfold('DESCRIPTION:one\n\tthree'), 'DESCRIPTION:onethree');
+  assert.equal(unfold('DESCRIPTION:one\r\n  two'), 'DESCRIPTION:one two', 'only the first WSP is the fold');
+  assert.equal(unfold('A:1\r\nB:2'), 'A:1\r\nB:2', 'a plain line break is not a fold');
+  assert.equal(unfold('\uFEFFBEGIN:VCALENDAR'), 'BEGIN:VCALENDAR', 'BOM is stripped');
+  assert.equal(unfold(null), '');
+});
+
+test('folded lines and TEXT escapes survive parsing', () => {
+  const [ev] = expandFixture(
+    vevent(
+      'UID:escapes-1',
+      'DTSTART;TZID=America/New_York:20260811T140000',
+      'DTEND;TZID=America/New_York:20260811T150000',
+      'SUMMARY:Budget\\, Q4\\; final',
+      'DESCRIPTION:line one\\nline two — a very long descrip',
+      ' tion folded across lines\\, with a path C:\\\\Users\\\\nemo',
+      'LOCATION:Room 4\\, floor 2',
+    ),
+  );
+  assert.equal(ev.title, 'Budget, Q4; final');
+  assert.equal(ev.location, 'Room 4, floor 2');
+  assert.equal(
+    ev.description,
+    'line one\nline two — a very long description folded across lines, with a path C:\\Users\\nemo',
+  );
+});
+
+test('quoted params may contain colons and semicolons', () => {
+  const { vevents } = parseICS(
+    ics(
+      ...vevent(
+        'UID:quoted-1',
+        'DTSTART;TZID="(GMT-05:00) Eastern; custom":20260811T140000',
+        'ATTENDEE;CN="Doe, Jane";PARTSTAT=ACCEPTED:mailto:jane@example.test',
+        'SUMMARY:Quoted',
+      ),
+    ),
+  );
+  assert.equal(vevents.length, 1);
+  assert.equal(vevents[0].dtstart.tzid, '(GMT-05:00) Eastern; custom');
+  assert.deepEqual(vevents[0].attendees, [
+    { name: 'Doe, Jane', email: 'jane@example.test', rsvp: 'ACCEPTED' },
+  ]);
+});
+
+/* ------------------------------------------------------------------ *
+ * The four DTSTART forms
+ * ------------------------------------------------------------------ */
+
+test('DTSTART;VALUE=DATE yields a bare date and allDay', () => {
+  const [ev] = expandFixture(
+    vevent('UID:date-1', 'DTSTART;VALUE=DATE:20260811', 'DTEND;VALUE=DATE:20260812', 'SUMMARY:All day'),
+  );
+  assert.equal(ev.allDay, true);
+  assert.equal(ev.startsAt, '2026-08-11');
+  assert.equal(ev.endsAt, '2026-08-12');
+});
+
+test('a multi-day all-day event keeps RFC-exclusive DTEND', () => {
+  const [ev] = expandFixture(
+    vevent('UID:date-2', 'DTSTART;VALUE=DATE:20260811', 'DTEND;VALUE=DATE:20260814', 'SUMMARY:Conference'),
+  );
+  assert.equal(ev.startsAt, '2026-08-11');
+  assert.equal(ev.endsAt, '2026-08-14');
+});
+
+test('an all-day event with no DTEND covers exactly one day', () => {
+  const [ev] = expandFixture(vevent('UID:date-3', 'DTSTART;VALUE=DATE:20260811', 'SUMMARY:Holiday'));
+  assert.equal(ev.startsAt, '2026-08-11');
+  assert.equal(ev.endsAt, '2026-08-12');
+});
+
+test('DTSTART;TZID keeps its wall clock and gains the right offset', () => {
+  const [ev] = expandFixture(
+    vevent(
+      'UID:tzid-1',
+      'DTSTART;TZID=America/New_York:20260811T140000',
+      'DTEND;TZID=America/New_York:20260811T153000',
+      'SUMMARY:Tzid',
+    ),
+  );
+  assert.equal(ev.startsAt, '2026-08-11T14:00:00-04:00');
+  assert.equal(ev.endsAt, '2026-08-11T15:30:00-04:00');
+});
+
+test('DTSTART with a trailing Z is re-expressed in the target zone, same instant', () => {
+  const [ev] = expandFixture(
+    vevent('UID:utc-1', 'DTSTART:20260811T180000Z', 'DTEND:20260811T190000Z', 'SUMMARY:Utc'),
+  );
+  assert.equal(ev.startsAt, '2026-08-11T14:00:00-04:00');
+  assert.equal(Date.parse(ev.startsAt), Date.parse('2026-08-11T18:00:00Z'));
+});
+
+test('floating DTSTART is read as local time in the target zone', () => {
+  const [ev] = expandFixture(
+    vevent('UID:float-1', 'DTSTART:20260811T140000', 'DTEND:20260811T150000', 'SUMMARY:Floating'),
+  );
+  assert.equal(ev.startsAt, '2026-08-11T14:00:00-04:00');
+
+  const [inLondon] = expandFixture(
+    vevent('UID:float-1', 'DTSTART:20260811T140000', 'DTEND:20260811T150000', 'SUMMARY:Floating'),
+    { tzid: 'Europe/London' },
+  );
+  assert.equal(inLondon.startsAt, '2026-08-11T14:00:00+01:00', 'floating time follows the viewer');
+});
+
+test('a foreign TZID keeps its instant when re-expressed', () => {
+  const [ev] = expandFixture(
+    vevent(
+      'UID:tzid-2',
+      'DTSTART;TZID=Europe/London:20260811T140000',
+      'DTEND;TZID=Europe/London:20260811T150000',
+      'SUMMARY:London standup',
+    ),
+  );
+  assert.equal(ev.startsAt, '2026-08-11T09:00:00-04:00');
+  assert.equal(Date.parse(ev.startsAt), Date.parse('2026-08-11T13:00:00Z'));
+});
+
+/* ------------------------------------------------------------------ *
+ * DST, in both directions
+ * ------------------------------------------------------------------ */
+
+test('a zoned weekly series keeps its wall clock across spring-forward', () => {
+  // US DST 2026 begins Sunday 8 March.
+  const events = expandFixture(
+    vevent(
+      'UID:dst-spring',
+      'DTSTART;TZID=America/New_York:20260305T090000',
+      'DTEND;TZID=America/New_York:20260305T100000',
+      'RRULE:FREQ=WEEKLY;COUNT=2',
+      'SUMMARY:Thursday sync',
+    ),
+  );
+  assert.deepEqual(starts(events), ['2026-03-05T09:00:00-05:00', '2026-03-12T09:00:00-04:00']);
+  assert.deepEqual(
+    events.map((e) => e.endsAt),
+    ['2026-03-05T10:00:00-05:00', '2026-03-12T10:00:00-04:00'],
+    'the hour-long meeting stays an hour long',
+  );
+});
+
+test('a zoned weekly series keeps its wall clock across fall-back', () => {
+  // US DST 2026 ends Sunday 1 November.
+  const events = expandFixture(
+    vevent(
+      'UID:dst-fall',
+      'DTSTART;TZID=America/New_York:20261029T090000',
+      'DTEND;TZID=America/New_York:20261029T100000',
+      'RRULE:FREQ=WEEKLY;COUNT=2',
+      'SUMMARY:Thursday sync',
+    ),
+  );
+  assert.deepEqual(starts(events), ['2026-10-29T09:00:00-04:00', '2026-11-05T09:00:00-05:00']);
+});
+
+test('UTC instants land on the right side of a DST change', () => {
+  const before = expandFixture(vevent('UID:z-before', 'DTSTART:20260305T140000Z', 'SUMMARY:Before'));
+  const after = expandFixture(vevent('UID:z-after', 'DTSTART:20260312T140000Z', 'SUMMARY:After'));
+  assert.equal(before[0].startsAt, '2026-03-05T09:00:00-05:00');
+  assert.equal(after[0].startsAt, '2026-03-12T10:00:00-04:00');
+});
+
+test('an all-day series is unaffected by the DST change it spans', () => {
+  const events = expandFixture(
+    vevent('UID:dst-allday', 'DTSTART;VALUE=DATE:20261029', 'RRULE:FREQ=WEEKLY;COUNT=2', 'SUMMARY:Bins'),
+  );
+  assert.deepEqual(starts(events), ['2026-10-29', '2026-11-05']);
+  assert.equal(events[0].allDay, true);
+});
+
+/* ------------------------------------------------------------------ *
+ * RRULE — one test per feature
+ * ------------------------------------------------------------------ */
+
+test('FREQ=DAILY with INTERVAL and COUNT', () => {
+  const events = expandFixture(
+    vevent(
+      'UID:rr-daily',
+      'DTSTART;TZID=America/New_York:20260811T080000',
+      'RRULE:FREQ=DAILY;INTERVAL=3;COUNT=4',
+      'SUMMARY:Every third day',
+    ),
+  );
+  assert.deepEqual(
+    starts(events),
+    [
+      '2026-08-11T08:00:00-04:00',
+      '2026-08-14T08:00:00-04:00',
+      '2026-08-17T08:00:00-04:00',
+      '2026-08-20T08:00:00-04:00',
+    ],
+  );
+});
+
+test('FREQ=DAILY with UNTIL stops on the boundary', () => {
+  const events = expandFixture(
+    vevent(
+      'UID:rr-until',
+      'DTSTART;TZID=America/New_York:20260811T080000',
+      'RRULE:FREQ=DAILY;UNTIL=20260814T120000Z',
+      'SUMMARY:Until',
+    ),
+  );
+  assert.deepEqual(
+    starts(events).map((s) => s.slice(0, 10)),
+    ['2026-08-11', '2026-08-12', '2026-08-13', '2026-08-14'],
+  );
+});
+
+test('FREQ=WEEKLY with BYDAY picks the named weekdays', () => {
+  const events = expandFixture(
+    vevent(
+      'UID:rr-weekly-byday',
+      'DTSTART;TZID=America/New_York:20260907T093000',
+      'RRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR;COUNT=6',
+      'SUMMARY:Standup',
+    ),
+  );
+  assert.deepEqual(
+    starts(events).map((s) => s.slice(0, 10)),
+    ['2026-09-07', '2026-09-09', '2026-09-11', '2026-09-14', '2026-09-16', '2026-09-18'],
+  );
+});
+
+test('WKST changes which instances an every-other-week rule produces', () => {
+  // The worked example from RFC 5545 §3.8.5.3.
+  const base = (wkst) =>
+    starts(
+      expandFixture(
+        vevent(
+          'UID:rr-wkst',
+          'DTSTART;TZID=America/New_York:19970805T090000',
+          `RRULE:FREQ=WEEKLY;INTERVAL=2;COUNT=4;BYDAY=TU,SU;WKST=${wkst}`,
+          'SUMMARY:Wkst',
+        ),
+        { from: '1997-01-01T00:00:00Z', to: '1998-01-01T00:00:00Z' },
+      ),
+    ).map((s) => s.slice(0, 10));
+
+  assert.deepEqual(base('MO'), ['1997-08-05', '1997-08-10', '1997-08-19', '1997-08-24']);
+  assert.deepEqual(base('SU'), ['1997-08-05', '1997-08-17', '1997-08-19', '1997-08-31']);
+});
+
+test('FREQ=MONTHLY with an ordinal BYDAY (2TU)', () => {
+  const events = expandFixture(
+    vevent(
+      'UID:rr-2tu',
+      'DTSTART;TZID=America/New_York:20260908T190000',
+      'RRULE:FREQ=MONTHLY;BYDAY=2TU;COUNT=3',
+      'SUMMARY:Board meeting',
+    ),
+  );
+  assert.deepEqual(
+    starts(events).map((s) => s.slice(0, 10)),
+    ['2026-09-08', '2026-10-13', '2026-11-10'],
+  );
+});
+
+test('FREQ=MONTHLY with a negative ordinal BYDAY (-1FR)', () => {
+  const events = expandFixture(
+    vevent(
+      'UID:rr-last-fri',
+      'DTSTART;TZID=America/New_York:20260925T160000',
+      'RRULE:FREQ=MONTHLY;BYDAY=-1FR;COUNT=3',
+      'SUMMARY:Retro',
+    ),
+  );
+  assert.deepEqual(
+    starts(events).map((s) => s.slice(0, 10)),
+    ['2026-09-25', '2026-10-30', '2026-11-27'],
+  );
+});
+
+test('FREQ=MONTHLY with BYMONTHDAY, including a negative day', () => {
+  const positive = expandFixture(
+    vevent(
+      'UID:rr-bymd',
+      'DTSTART;TZID=America/New_York:20260901T090000',
+      'RRULE:FREQ=MONTHLY;BYMONTHDAY=1,15;COUNT=4',
+      'SUMMARY:Payroll',
+    ),
+  );
+  assert.deepEqual(
+    starts(positive).map((s) => s.slice(0, 10)),
+    ['2026-09-01', '2026-09-15', '2026-10-01', '2026-10-15'],
+  );
+
+  const negative = expandFixture(
+    vevent(
+      'UID:rr-bymd-neg',
+      'DTSTART;TZID=America/New_York:20260930T170000',
+      'RRULE:FREQ=MONTHLY;BYMONTHDAY=-1;COUNT=3',
+      'SUMMARY:Month end',
+    ),
+  );
+  assert.deepEqual(
+    starts(negative).map((s) => s.slice(0, 10)),
+    ['2026-09-30', '2026-10-31', '2026-11-30'],
+  );
+});
+
+test('BYMONTH restricts a monthly rule to named months', () => {
+  const events = expandFixture(
+    vevent(
+      'UID:rr-bymonth',
+      'DTSTART;TZID=America/New_York:20260115T100000',
+      'RRULE:FREQ=MONTHLY;BYMONTH=1,7;COUNT=4',
+      'SUMMARY:Semiannual review',
+    ),
+  );
+  assert.deepEqual(
+    starts(events).map((s) => s.slice(0, 10)),
+    ['2026-01-15', '2026-07-15', '2027-01-15', '2027-07-15'],
+  );
+});
+
+test('FREQ=YEARLY repeats the anniversary', () => {
+  const events = expandFixture(
+    vevent('UID:rr-yearly', 'DTSTART;VALUE=DATE:20260811', 'RRULE:FREQ=YEARLY;COUNT=3', 'SUMMARY:Anniversary'),
+  );
+  assert.deepEqual(starts(events), ['2026-08-11', '2027-08-11', '2028-08-11']);
+});
+
+test('FREQ=YEARLY with an ordinal BYDAY counts across the whole year', () => {
+  const events = expandFixture(
+    vevent(
+      'UID:rr-yearly-byday',
+      'DTSTART;TZID=America/New_York:20260119T090000',
+      'RRULE:FREQ=YEARLY;BYDAY=3MO;COUNT=2',
+      'SUMMARY:Third Monday of the year',
+    ),
+  );
+  assert.deepEqual(
+    starts(events).map((s) => s.slice(0, 10)),
+    ['2026-01-19', '2027-01-18'],
+  );
+});
+
+test('BYSETPOS selects within the generated set', () => {
+  const events = expandFixture(
+    vevent(
+      'UID:rr-setpos',
+      'DTSTART;TZID=America/New_York:20260930T170000',
+      'RRULE:FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1;COUNT=3',
+      'SUMMARY:Last working day',
+    ),
+  );
+  assert.deepEqual(
+    starts(events).map((s) => s.slice(0, 10)),
+    ['2026-09-30', '2026-10-30', '2026-11-30'],
+  );
+});
+
+test('a sparse rule still finds its next hit years later', () => {
+  const events = expandFixture(
+    vevent(
+      'UID:rr-leap',
+      'DTSTART;VALUE=DATE:20280229',
+      'RRULE:FREQ=DAILY;BYMONTH=2;BYMONTHDAY=29;COUNT=2',
+      'SUMMARY:Leap day',
+    ),
+  );
+  assert.deepEqual(starts(events), ['2028-02-29', '2032-02-29']);
+});
+
+test('DTSTART is emitted even when it does not satisfy its own rule', () => {
+  // Real feeds break this constantly; dropping the stated start of an event
+  // that plainly exists is the worse failure.
+  const events = expandFixture(
+    vevent(
+      'UID:rr-nonconforming',
+      'DTSTART;TZID=America/New_York:20260908T090000', // a Tuesday
+      'RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=3',
+      'SUMMARY:Mislabelled',
+    ),
+  );
+  assert.deepEqual(
+    starts(events).map((s) => s.slice(0, 10)),
+    ['2026-09-08', '2026-09-14', '2026-09-21'],
+  );
+});
+
+/* ------------------------------------------------------------------ *
+ * EXDATE, RDATE, RECURRENCE-ID
+ * ------------------------------------------------------------------ */
+
+test('EXDATE removes an instance without extending the series', () => {
+  const events = expandFixture(
+    vevent(
+      'UID:exdate-1',
+      'DTSTART;TZID=America/New_York:20260907T090000',
+      'RRULE:FREQ=WEEKLY;COUNT=4',
+      'EXDATE;TZID=America/New_York:20260914T090000',
+      'SUMMARY:Weekly',
+    ),
+  );
+  assert.deepEqual(
+    starts(events).map((s) => s.slice(0, 10)),
+    ['2026-09-07', '2026-09-21', '2026-09-28'],
+    'COUNT counts the excluded occurrence',
+  );
+});
+
+test('EXDATE written in another zone still matches by instant', () => {
+  const events = expandFixture(
+    vevent(
+      'UID:exdate-2',
+      'DTSTART;TZID=America/New_York:20260907T090000',
+      'RRULE:FREQ=WEEKLY;COUNT=3',
+      'EXDATE:20260914T130000Z',
+      'SUMMARY:Weekly',
+    ),
+  );
+  assert.deepEqual(
+    starts(events).map((s) => s.slice(0, 10)),
+    ['2026-09-07', '2026-09-21'],
+  );
+});
+
+test('a comma-separated EXDATE removes every listed instance', () => {
+  const events = expandFixture(
+    vevent(
+      'UID:exdate-3',
+      'DTSTART;VALUE=DATE:20260907',
+      'RRULE:FREQ=DAILY;COUNT=5',
+      'EXDATE;VALUE=DATE:20260908,20260910',
+      'SUMMARY:Daily',
+    ),
+  );
+  assert.deepEqual(starts(events), ['2026-09-07', '2026-09-09', '2026-09-11']);
+});
+
+test('RDATE adds instances outside the rule', () => {
+  const events = expandFixture(
+    vevent(
+      'UID:rdate-1',
+      'DTSTART;TZID=America/New_York:20260907T090000',
+      'RRULE:FREQ=WEEKLY;COUNT=2',
+      'RDATE;TZID=America/New_York:20260910T150000',
+      'SUMMARY:Weekly plus one',
+    ),
+  );
+  assert.deepEqual(starts(events), [
+    '2026-09-07T09:00:00-04:00',
+    '2026-09-10T15:00:00-04:00',
+    '2026-09-14T09:00:00-04:00',
+  ]);
+});
+
+test('RDATE with a PERIOD value carries its own length', () => {
+  const events = expandFixture(
+    vevent(
+      'UID:rdate-2',
+      'DTSTART;TZID=America/New_York:20260907T090000',
+      'DTEND;TZID=America/New_York:20260907T093000',
+      'RDATE;VALUE=PERIOD:20260910T190000Z/PT2H',
+      'SUMMARY:Usually short',
+    ),
+  );
+  assert.equal(events.length, 2);
+  assert.equal(events[1].startsAt, '2026-09-10T15:00:00-04:00');
+  assert.equal(events[1].endsAt, '2026-09-10T17:00:00-04:00');
+});
+
+test('RECURRENCE-ID replaces the generated instance and keeps its identity', () => {
+  const events = expandFixture([
+    ...vevent(
+      'UID:override-1',
+      'DTSTART;TZID=America/New_York:20260811T140000',
+      'DTEND;TZID=America/New_York:20260811T150000',
+      'RRULE:FREQ=WEEKLY;COUNT=3',
+      'SUMMARY:Weekly 1:1',
+    ),
+    ...vevent(
+      'UID:override-1',
+      'RECURRENCE-ID;TZID=America/New_York:20260818T140000',
+      'DTSTART;TZID=America/New_York:20260818T163000',
+      'DTEND;TZID=America/New_York:20260818T173000',
+      'SUMMARY:Weekly 1:1 (moved)',
+    ),
+  ]);
+
+  assert.equal(events.length, 3, 'the override replaces, it does not add');
+  assert.deepEqual(starts(events), [
+    '2026-08-11T14:00:00-04:00',
+    '2026-08-18T16:30:00-04:00',
+    '2026-08-25T14:00:00-04:00',
+  ]);
+  assert.equal(events[1].title, 'Weekly 1:1 (moved)');
+  assert.equal(
+    events[1].recurrenceId,
+    '2026-08-18T14:00:00-04:00',
+    'identity stays with the original slot so the row is updated, not duplicated',
+  );
+  assert.equal(events[0].recurrenceId, '2026-08-11T14:00:00-04:00');
+  assert.equal(new Set(events.map((e) => e.recurrenceId)).size, 3, 'each instance is addressable');
+});
+
+test('a cancelled override is surfaced as CANCELLED rather than silently dropped', () => {
+  const events = expandFixture([
+    ...vevent(
+      'UID:override-2',
+      'DTSTART;TZID=America/New_York:20260811T140000',
+      'RRULE:FREQ=WEEKLY;COUNT=2',
+      'SUMMARY:Weekly',
+    ),
+    ...vevent(
+      'UID:override-2',
+      'RECURRENCE-ID;TZID=America/New_York:20260818T140000',
+      'DTSTART;TZID=America/New_York:20260818T140000',
+      'STATUS:CANCELLED',
+      'SUMMARY:Weekly',
+    ),
+  ]);
+  assert.equal(events.length, 2);
+  assert.equal(events[1].status, 'CANCELLED');
+});
+
+test('an override with no matching instance is still emitted', () => {
+  const events = expandFixture([
+    ...vevent(
+      'UID:override-3',
+      'RECURRENCE-ID;TZID=America/New_York:20260818T140000',
+      'DTSTART;TZID=America/New_York:20260818T160000',
+      'SUMMARY:Orphan override',
+    ),
+  ]);
+  assert.equal(events.length, 1);
+  assert.equal(events[0].startsAt, '2026-08-18T16:00:00-04:00');
+  assert.equal(events[0].recurrenceId, '2026-08-18T14:00:00-04:00');
+});
+
+test('a non-recurring event has a null recurrenceId', () => {
+  const [ev] = expandFixture(
+    vevent('UID:single-1', 'DTSTART;TZID=America/New_York:20260811T140000', 'SUMMARY:One-off'),
+  );
+  assert.equal(ev.recurrenceId, null);
+});
+
+/* ------------------------------------------------------------------ *
+ * Runaway and malformed input
+ * ------------------------------------------------------------------ */
+
+test('an unbounded rule is capped at max and returns promptly', () => {
+  const started = Date.now();
+  const events = parseICS_toEvents(
+    ics(
+      ...vevent(
+        'UID:runaway-1',
+        'DTSTART;TZID=America/New_York:20260101T090000',
+        'RRULE:FREQ=DAILY;INTERVAL=0',
+        'SUMMARY:Forever',
+      ),
+    ),
+    { tzid: NY, max: 25 }, // no window at all: only the cap can stop this
+  );
+  assert.equal(events.length, 25);
+  assert.ok(Date.now() - started < 3000, 'capping must be cheap');
+  assertCarriesOffset(events);
+});
+
+test('a rule that can never match terminates instead of spinning', () => {
+  const started = Date.now();
+  const events = parseICS_toEvents(
+    ics(
+      ...vevent(
+        'UID:runaway-2',
+        'DTSTART;TZID=America/New_York:20260101T090000',
+        'RRULE:FREQ=MONTHLY;BYMONTH=2;BYMONTHDAY=31',
+        'SUMMARY:31 February',
+      ),
+    ),
+    { tzid: NY, max: 500 },
+  );
+  assert.equal(events.length, 1, 'only DTSTART itself survives');
+  assert.ok(Date.now() - started < 5000, 'the empty-period fuse must trip fast');
+});
+
+test('an unsupported FREQ degrades to a single occurrence', () => {
+  const events = expandFixture(
+    vevent(
+      'UID:bad-freq',
+      'DTSTART;TZID=America/New_York:20260811T140000',
+      'RRULE:FREQ=FORTNIGHTLY;COUNT=99',
+      'SUMMARY:Nonsense',
+    ),
+  );
+  assert.equal(events.length, 1);
+});
+
+test('garbage in does not throw', () => {
+  for (const junk of ['', 'not a calendar at all', 'BEGIN:VCALENDAR', 'END:VEVENT\r\nBEGIN:VEVENT']) {
+    assert.deepEqual(parseICS_toEvents(junk, { tzid: NY }), []);
+  }
+  const { vevents } = parseICS(ics(...vevent('UID:no-start', 'SUMMARY:Missing DTSTART')));
+  assert.deepEqual(vevents, [], 'an event with no usable DTSTART is dropped, not half-built');
+});
+
+test('max caps the total across several events', () => {
+  const events = parseICS_toEvents(
+    ics(
+      ...vevent('UID:cap-a', 'DTSTART;VALUE=DATE:20260101', 'RRULE:FREQ=DAILY;COUNT=100', 'SUMMARY:A'),
+      ...vevent('UID:cap-b', 'DTSTART;VALUE=DATE:20260101', 'RRULE:FREQ=DAILY;COUNT=100', 'SUMMARY:B'),
+    ),
+    { from: '2026-01-01', to: '2027-01-01', tzid: NY, max: 30 },
+  );
+  assert.equal(events.length, 30);
+});
+
+/* ------------------------------------------------------------------ *
+ * VTIMEZONE fallback
+ * ------------------------------------------------------------------ */
+
+const WINDOWS_VTIMEZONE = [
+  'BEGIN:VTIMEZONE',
+  'TZID:Eastern Standard Time',
+  'BEGIN:STANDARD',
+  'DTSTART:16011101T020000',
+  'TZOFFSETFROM:-0400',
+  'TZOFFSETTO:-0500',
+  'RRULE:FREQ=YEARLY;BYDAY=1SU;BYMONTH=11',
+  'END:STANDARD',
+  'BEGIN:DAYLIGHT',
+  'DTSTART:16010308T020000',
+  'TZOFFSETFROM:-0500',
+  'TZOFFSETTO:-0400',
+  'RRULE:FREQ=YEARLY;BYDAY=2SU;BYMONTH=3',
+  'END:DAYLIGHT',
+  'END:VTIMEZONE',
+];
+
+test('an embedded VTIMEZONE resolves a TZID that Intl rejects', () => {
+  const summer = parseICS_toEvents(
+    ics(
+      ...WINDOWS_VTIMEZONE,
+      ...vevent('UID:vtz-summer', 'DTSTART;TZID=Eastern Standard Time:20260811T140000', 'SUMMARY:Summer'),
+    ),
+    { from: '2026-01-01', to: '2027-01-01', tzid: 'UTC' },
+  );
+  const winter = parseICS_toEvents(
+    ics(
+      ...WINDOWS_VTIMEZONE,
+      ...vevent('UID:vtz-winter', 'DTSTART;TZID=Eastern Standard Time:20260115T140000', 'SUMMARY:Winter'),
+    ),
+    { from: '2026-01-01', to: '2027-01-01', tzid: 'UTC' },
+  );
+
+  assertCarriesOffset(summer);
+  assertCarriesOffset(winter);
+  assert.equal(summer[0].startsAt, '2026-08-11T18:00:00+00:00', 'August is -04:00 under the embedded rules');
+  assert.equal(winter[0].startsAt, '2026-01-15T19:00:00+00:00', 'January is -05:00');
+});
+
+test('parseICS exposes the VTIMEZONE map and the calendar name', () => {
+  const { vtimezones, calname, vevents } = parseICS(
+    ics(
+      'X-WR-CALNAME:Nemo — Work',
+      ...WINDOWS_VTIMEZONE,
+      ...vevent('UID:vtz-map', 'DTSTART;TZID=Eastern Standard Time:20260811T140000', 'SUMMARY:X'),
+    ),
+  );
+  assert.equal(calname, 'Nemo — Work');
+  assert.equal(vevents[0].calendarName, 'Nemo — Work');
+  assert.ok(vtimezones.has('Eastern Standard Time'));
+  assert.equal(vtimezones.get('Eastern Standard Time').observances.length, 2);
+});
+
+test('an unresolvable TZID degrades to UTC rather than throwing', () => {
+  const events = expandFixture(
+    vevent('UID:vtz-missing', 'DTSTART;TZID=Mars/Olympus:20260811T140000', 'SUMMARY:Unknown zone'),
+  );
+  assert.equal(events.length, 1);
+  assert.equal(events[0].startsAt, '2026-08-11T10:00:00-04:00', '14:00 read as UTC, shown in New York');
+});
+
+/* ------------------------------------------------------------------ *
+ * Window, ordering and event fields
+ * ------------------------------------------------------------------ */
+
+test('the window keeps events that overlap it and drops the rest', () => {
+  const fixture = ics(
+    ...vevent(
+      'UID:window-1',
+      'DTSTART;TZID=America/New_York:20260811T230000',
+      'DTEND;TZID=America/New_York:20260812T010000',
+      'SUMMARY:Straddles midnight',
+    ),
+    ...vevent('UID:window-2', 'DTSTART;TZID=America/New_York:20260901T090000', 'SUMMARY:Far future'),
+  );
+  const events = parseICS_toEvents(fixture, {
+    from: '2026-08-12T00:00:00-04:00',
+    to: '2026-08-13T00:00:00-04:00',
+    tzid: NY,
+  });
+  assert.deepEqual(
+    events.map((e) => e.uid),
+    ['window-1'],
+    'an event already running when the window opens still counts',
+  );
+});
+
+test('results are ordered by true instant across calendars and zones', () => {
+  const events = parseICS_toEvents(
+    ics(
+      ...vevent('UID:order-a', 'DTSTART;TZID=Europe/London:20260811T160000', 'SUMMARY:London 4pm'),
+      ...vevent('UID:order-b', 'DTSTART;TZID=America/New_York:20260811T090000', 'SUMMARY:NY 9am'),
+      ...vevent('UID:order-c', 'DTSTART:20260811T200000Z', 'SUMMARY:8pm UTC'),
+    ),
+    { from: '2026-08-01', to: '2026-09-01', tzid: NY },
+  );
+  // 09:00 EDT = 13:00Z beats 16:00 BST = 15:00Z, which beats 20:00Z.
+  assert.deepEqual(
+    events.map((e) => e.uid),
+    ['order-b', 'order-a', 'order-c'],
+  );
+  assert.deepEqual(starts(events), [
+    '2026-08-11T09:00:00-04:00',
+    '2026-08-11T11:00:00-04:00',
+    '2026-08-11T16:00:00-04:00',
+  ]);
+});
+
+test('organizer, attendees and rsvp are carried through', () => {
+  const lines = vevent(
+    'UID:people-1',
+    'DTSTART;TZID=America/New_York:20260811T140000',
+    'ORGANIZER;CN=Marcus Reyes:mailto:marcus@riverstone.test',
+    'ATTENDEE;CN=Nemo Hale;PARTSTAT=NEEDS-ACTION:mailto:nemo@northgate.test',
+    'ATTENDEE;CN=Jane Doe;PARTSTAT=ACCEPTED:mailto:jane@riverstone.test',
+    'STATUS:CONFIRMED',
+    'SUMMARY:Kickoff',
+  );
+  const [ev] = expandFixture(lines, { email: 'NEMO@northgate.test' });
+  assert.equal(ev.organizer, 'Marcus Reyes <marcus@riverstone.test>');
+  assert.equal(ev.status, 'CONFIRMED');
+  assert.equal(ev.rsvp, 'NEEDS-ACTION', 'rsvp is mine, matched case-insensitively');
+  assert.deepEqual(ev.attendees, [
+    { name: 'Nemo Hale', email: 'nemo@northgate.test', rsvp: 'NEEDS-ACTION' },
+    { name: 'Jane Doe', email: 'jane@riverstone.test', rsvp: 'ACCEPTED' },
+  ]);
+});
+
+test('only http, https and mailto URLs escape the parser', () => {
+  const [good] = expandFixture(
+    vevent('UID:url-1', 'DTSTART;VALUE=DATE:20260811', 'URL:https://meet.example.test/abc', 'SUMMARY:Good'),
+  );
+  assert.equal(good.url, 'https://meet.example.test/abc');
+
+  for (const hostile of ['javascript:alert(1)', 'data:text/html,<script>x</script>', 'file:///etc/passwd']) {
+    const [ev] = expandFixture(
+      vevent('UID:url-2', 'DTSTART;VALUE=DATE:20260811', `URL:${hostile}`, 'SUMMARY:Hostile'),
+    );
+    assert.equal(ev.url, null, `${hostile} must not survive`);
+  }
+});
+
+test('expand accepts hand-built VEvents and honours max', () => {
+  const { vevents, vtimezones } = parseICS(
+    ics(
+      ...vevent(
+        'UID:direct-1',
+        'DTSTART;TZID=America/New_York:20260811T140000',
+        'RRULE:FREQ=DAILY;COUNT=50',
+        'SUMMARY:Direct',
+      ),
+    ),
+  );
+  const events = expand(vevents, { from: '2026-08-01', to: '2026-12-01', max: 7, tzid: NY, vtimezones });
+  assert.equal(events.length, 7);
+  assertCarriesOffset(events);
+});
