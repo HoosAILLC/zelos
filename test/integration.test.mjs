@@ -29,7 +29,10 @@ process.env.ZELOS_HOME = home;
 // must never be able to write into the developer's login keychain.
 process.env.ZELOS_SECRETS_BACKEND = 'encrypted-file';
 process.env.ZELOS_LOG_LEVEL = 'silent';
-after(() => fs.rmSync(home, { recursive: true, force: true }));
+// The temp home is removed at the very bottom of the teardown, not here — see
+// the hook below the one that closes the stack. It has to run after the
+// database inside it is closed, and node:test runs root `after` hooks in the
+// order they were registered.
 
 const { open: openDb, migrate, close: closeDb, listMessages, getItemByKey, itemRowId, getKV } =
   await import('../core/db.mjs');
@@ -427,6 +430,21 @@ after(async () => {
   closeDb(db);
   await Promise.all([imap.close(), calendar.close(), model.close()]);
 });
+
+/**
+ * And only now the home itself.
+ *
+ * This used to be registered beside the `mkdtemp` at the top of the file, and
+ * node:test runs root `after` hooks in the order they were registered — so the
+ * directory was being removed while the SQLite database inside it was still
+ * open. POSIX unlinks a file a process still holds without complaint, which is
+ * why that was invisible on macOS and Linux; Windows refuses, and `rmSync`
+ * answered EPERM/EBUSY from a root hook, which fails the whole file rather than
+ * one test. The retries are for the same platform: a handle can outlive
+ * `close()` by a few milliseconds, and Node documents exactly these errors as
+ * the ones `maxRetries` exists for.
+ */
+after(() => fs.rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }));
 
 const apiGet = async (p) => {
   const res = await fetch(base + p, { headers: { 'X-Zelos-Token': token } });

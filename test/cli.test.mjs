@@ -38,7 +38,12 @@ const { diagnose, formatReport, compareVersions, MIN_NODE } = await import('../c
 const { parseArgs, COMMANDS, browserLaunchPlan, openBrowser } = await import('../zelos.mjs');
 
 after(() => {
-  fs.rmSync(SCRATCH, { recursive: true, force: true });
+  /* The retries are for Windows. This suite extracts a tarball and then runs
+     Node out of the extract, and on Windows a file can stay locked for a moment
+     after the process that read it has exited, which turns the tidy-up into an
+     EBUSY and fails the run over nothing. On macOS and Linux the first attempt
+     always succeeds, so the retries cost nothing there. */
+  fs.rmSync(SCRATCH, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 /* ------------------------------------------------------------------ *
@@ -151,7 +156,89 @@ describe('package.json is ready to publish as zelos-app', () => {
   });
 });
 
-describe('npm pack produces a tarball that runs', () => {
+/**
+ * Find a way to run npm that does not go through a shell.
+ *
+ * On macOS and Linux `npm` on PATH is an ordinary executable and spawning it by
+ * name has always worked. On Windows there is no `npm` executable at all —
+ * there is `npm.cmd`, a batch shim — so `spawn('npm', …)` fails with ENOENT and
+ * takes every test in the suite below down with it before a single assertion
+ * runs. That is what the Windows job was reporting.
+ *
+ * The obvious repair, spawning `npm.cmd`, does not work either: since the fix
+ * for CVE-2024-27980 Node refuses to spawn a `.cmd` or `.bat` file unless
+ * `shell: true` is set, and every Node in this project's matrix carries that
+ * fix. And `shell: true` is the wrong answer regardless — it hands the argument
+ * list to cmd.exe to re-parse, so a temp path with a space in it (which is
+ * exactly what os.tmpdir() can hand us) stops being one argument. A test whose
+ * job is to check what we publish must not introduce a quoting bug of its own.
+ *
+ * So skip the shim and do what the shim does: run npm's own entry script under
+ * this Node. That is one code path on all three platforms with no shell and no
+ * quoting rules anywhere in it, and it has the side benefit of pinning the test
+ * to the npm that ships with the Node under test rather than whatever npm
+ * happens to be first on PATH.
+ *
+ * @returns {string[]|null} argv prefix to run npm, or null if npm cannot be found.
+ */
+function resolveNpm() {
+  const candidates = [];
+
+  /* Set whenever the suite is run through `npm test`. CI runs the test files
+     directly, so this is a convenience rather than the main route. The name is
+     checked because this variable names whichever package manager is running,
+     not npm specifically — under yarn or pnpm it points at their entry script,
+     and `node yarn.js pack --pack-destination …` is not a thing. */
+  const fromEnv = process.env.npm_execpath;
+  if (fromEnv && path.basename(fromEnv) === 'npm-cli.js') candidates.push(fromEnv);
+
+  /* The npm that ships beside this Node. The three layouts are: Windows and the
+     official zips (npm inside the Node directory), the standard POSIX prefix
+     (../lib), and Homebrew (../libexec/lib). */
+  const nodeDir = path.dirname(process.execPath);
+  candidates.push(
+    path.join(nodeDir, 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+    path.join(nodeDir, '..', 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+    path.join(nodeDir, '..', 'libexec', 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+    path.join(nodeDir, '..', 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+  );
+
+  /* Windows only, and only if the layouts above missed: find the shim on PATH
+     and read the npm package that sits beside it. We never run the shim — we
+     just use where it lives to locate the JavaScript it would have run. */
+  if (process.platform === 'win32') {
+    for (const dir of (process.env.PATH ?? '').split(path.delimiter)) {
+      if (!dir) continue;
+      if (fs.existsSync(path.join(dir, 'npm.cmd'))) {
+        candidates.push(path.join(dir, 'node_modules', 'npm', 'bin', 'npm-cli.js'));
+      }
+    }
+  }
+
+  for (const cli of candidates) {
+    if (fs.existsSync(cli)) return [process.execPath, cli];
+  }
+
+  /* Nothing found. On macOS and Linux a bare `npm` is still spawnable, so fall
+     back to what this suite always did rather than skipping a check that can
+     plainly still run. On Windows there is nothing left to try, and saying so
+     is better than a green tick. */
+  return process.platform === 'win32' ? null : ['npm'];
+}
+
+const NPM = resolveNpm();
+
+/**
+ * `npm pack` is the whole point of this suite — it is the only place anything
+ * proves the published artefact runs with no node_modules near it — so it is
+ * skipped only when npm genuinely cannot be run, and it says which npm it
+ * looked for. It is never skipped merely for being on Windows.
+ */
+const PACK_SKIP = NPM
+  ? false
+  : 'npm cannot be run without a shell on this machine: Windows ships npm.cmd, which Node refuses to spawn since CVE-2024-27980, and npm-cli.js was not found beside this Node or beside npm.cmd on PATH';
+
+describe('npm pack produces a tarball that runs', { skip: PACK_SKIP }, () => {
   const packDir = path.join(SCRATCH, 'pack');
   const extractDir = path.join(SCRATCH, 'extract');
   let tarball = null;
@@ -162,8 +249,9 @@ describe('npm pack produces a tarball that runs', () => {
     fs.mkdirSync(packDir, { recursive: true });
     fs.mkdirSync(extractDir, { recursive: true });
 
+    const [npmExe, ...npmPrefix] = NPM;
     const packed = await new Promise((resolve, reject) => {
-      const child = spawn('npm', ['pack', '--json', '--pack-destination', packDir], {
+      const child = spawn(npmExe, [...npmPrefix, 'pack', '--json', '--pack-destination', packDir], {
         cwd: ROOT,
         env: process.env,
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -172,25 +260,54 @@ describe('npm pack produces a tarball that runs', () => {
       let err = '';
       child.stdout.on('data', (d) => { out += d; });
       child.stderr.on('data', (d) => { err += d; });
-      child.on('error', reject);
+      /* Without this the ENOENT that started all of this arrives as an
+         unhandled rejection with no hint of which program was missing. */
+      child.on('error', (e) => reject(new Error(`could not run npm (${npmExe}): ${e.message}`)));
       child.on('close', (code) => {
         if (code !== 0) reject(new Error(`npm pack exited ${code}: ${err}`));
         else resolve(out);
       });
     });
-    tarball = path.join(packDir, JSON.parse(packed)[0].filename);
+    /* `--json` is supposed to make stdout nothing but JSON, and usually does.
+       Some npm versions still print a line of their own alongside it, so find
+       the array rather than assuming it starts at the first character — and if
+       there is no array at all, fail with what npm actually said instead of a
+       bare SyntaxError. */
+    const packedJson = (() => {
+      const open = packed.indexOf('[');
+      const close = packed.lastIndexOf(']');
+      if (open === -1 || close < open) throw new Error(`npm pack --json printed no JSON array:\n${packed}`);
+      return JSON.parse(packed.slice(open, close + 1));
+    })();
+    tarball = path.join(packDir, packedJson[0].filename);
 
+    /* These two shell out to `tar`, which is safe on all three platforms but
+       not for the reason it looks. Windows 10 and Server 2019 onwards ship
+       bsdtar as tar.exe, and macOS ships bsdtar too — so the runner this suite
+       is already green on uses the very same implementation Windows will. The
+       flags are held to what bsdtar and GNU tar both document: -t, -x, -z, -f
+       and -C. Nothing GNU-only (--wildcards, --warning, --occurrence) may go in
+       here, because those are the flags that would pass on Linux and fail on
+       the other two. */
     entries = (await new Promise((resolve, reject) => {
       const child = spawn('tar', ['-tzf', tarball], { stdio: ['ignore', 'pipe', 'inherit'] });
       let out = '';
       child.stdout.on('data', (d) => { out += d; });
-      child.on('error', reject);
-      child.on('close', () => resolve(out));
-    })).split('\n').map((l) => l.trim()).filter(Boolean).map((l) => l.replace(/^package\//, ''));
+      child.on('error', (e) => reject(new Error(`could not run tar: ${e.message}`)));
+      child.on('close', (code) => (code === 0
+        ? resolve(out)
+        /* An empty listing would otherwise read as "the tarball is empty" and
+           point every assertion below at the wrong culprit. */
+        : reject(new Error(`tar could not list ${tarball} (exited ${code})`))));
+    }))
+      /* Split on \n and trim, not split on os.EOL: tar member names are stored
+         with forward slashes and the listing is line-based, but the pipe may
+         still carry \r on Windows. */
+      .split('\n').map((l) => l.trim()).filter(Boolean).map((l) => l.replace(/^package\//, ''));
 
     await new Promise((resolve, reject) => {
       const child = spawn('tar', ['-xzf', tarball, '-C', extractDir], { stdio: ['ignore', 'inherit', 'inherit'] });
-      child.on('error', reject);
+      child.on('error', (e) => reject(new Error(`could not run tar: ${e.message}`)));
       child.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`tar exited ${code}`))));
     });
     extracted = path.join(extractDir, 'package');
@@ -343,6 +460,11 @@ describe('doctor', () => {
     assert.equal(compareVersions('26.0.0-nightly', '26.0.0'), 0);
   });
 
+  /* This one runs on Windows too, and deliberately so. The `home` check passing
+     here does not depend on a mode: checkHome() reads the mode only on the
+     platforms that have one, so on Windows a folder that exists and is writable
+     is a pass on its own terms. Do not add a win32 skip — it would stop testing
+     the path Windows users actually take. */
   test('a brand-new install is not broken, just unfinished', async () => {
     process.env.ZELOS_HOME = freshHome();
     const report = await diagnose({ deps: SILENT_DEPS });
@@ -365,8 +487,24 @@ describe('doctor', () => {
     assert.equal(report.ok, false);
   });
 
+  /**
+   * Skipped on Windows, and the skip is the honest answer rather than a way
+   * round a red tick. Zelos's at-rest protection on macOS and Linux is the POSIX
+   * mode — home 0700, files 0600 — and Windows does not implement those: chmod
+   * there sets little beyond the read-only flag, so `chmodSync(home, 0o755)`
+   * would not open the folder to anyone and the failure this test exists to
+   * provoke cannot be provoked. checkHome() in core/doctor.mjs skips the mode
+   * branch on win32 for the same reason, and docs/SECURITY.md already says so
+   * rather than claiming a protection Windows does not give.
+   *
+   * Only the mode assertion is skipped. Everything else about the data folder —
+   * that it exists, that it is a folder, that this account can write to it — is
+   * checked on all three platforms by the tests around this one.
+   */
   test('a home directory other accounts can read is a failure, and says how to close it', async (t) => {
-    if (process.platform === 'win32') return t.skip('POSIX modes do not apply on Windows');
+    if (process.platform === 'win32') {
+      return t.skip('Windows has no POSIX modes: chmod cannot open the folder to other accounts, so the condition under test cannot exist here (see docs/SECURITY.md)');
+    }
     const home = freshHome();
     fs.chmodSync(home, 0o755);
     process.env.ZELOS_HOME = home;

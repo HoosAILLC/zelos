@@ -285,6 +285,19 @@ const BUILTINS = new Set(
   [...builtinModules, ...ALWAYS_BUILTIN].flatMap((m) => [m, `node:${m}`]),
 );
 
+/**
+ * Why several assertions below stop at the Windows line. Zelos's at-rest
+ * protection on macOS and Linux is POSIX modes — 0700 on the home, 0600 on
+ * everything in it. Windows does not implement them: chmod there sets little
+ * more than the read-only flag and stat synthesises a mode, so asserting one
+ * would be testing Node's emulation rather than anything Zelos did. The claim
+ * is skipped there, out loud and with a reason, and docs/SECURITY.md says what
+ * does protect the data on Windows instead.
+ */
+const WINDOWS_NO_POSIX_MODES = process.platform === 'win32'
+  ? 'POSIX modes are not implemented on Windows; see docs/SECURITY.md section 5.'
+  : false;
+
 describe('every import in core/, ui/ and test/', () => {
   test('the scan actually found the imports (a broken scanner must not pass)', () => {
     assert.ok(SCANNED.length >= 30, `expected to scan the whole tree, found ${SCANNED.length} files`);
@@ -528,13 +541,16 @@ describe('a first launch with nothing configured', () => {
     assert.equal(health.home, home);
   });
 
-  test('it laid out its home with the permissions it promises', () => {
+  test('it laid out its home the way it says it does', () => {
     assert.ok(fs.existsSync(home), 'the home directory should have been created');
-    assert.equal(fs.statSync(home).mode & 0o777, 0o700, 'the Zelos home must not be group- or world-readable');
     for (const dir of ['logs', 'cache']) {
       assert.ok(fs.existsSync(path.join(home, dir)), `${dir}/ was not created`);
     }
     assert.ok(fs.existsSync(path.join(home, 'zelos.db')), 'the database should have been created and migrated');
+  });
+
+  test('the home is 0700', { skip: WINDOWS_NO_POSIX_MODES }, () => {
+    assert.equal(fs.statSync(home).mode & 0o777, 0o700, 'the Zelos home must not be group- or world-readable');
   });
 
   test('the config the first save writes holds no secrets', async () => {
@@ -546,7 +562,7 @@ describe('a first launch with nothing configured', () => {
     assert.equal(res.status, 200);
 
     const file = path.join(home, 'config.json');
-    assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+    if (!WINDOWS_NO_POSIX_MODES) assert.equal(fs.statSync(file).mode & 0o777, 0o600);
     const raw = fs.readFileSync(file, 'utf8');
     assert.ok(!/"(pass|password|apiKey|api_key|secret)"\s*:/i.test(raw),
       `config.json contains a secret-shaped field:\n${raw}`);

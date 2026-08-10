@@ -15,17 +15,58 @@ const { DEFAULTS, MAIL_ACCOUNT_DEFAULTS, paths, loadConfig, saveConfig, validate
 
 const mode = (p) => fs.statSync(p).mode & 0o777;
 
+/**
+ * POSIX modes are the whole at-rest story on macOS and Linux, and Windows does
+ * not implement them: fs.chmod there sets little more than the read-only flag,
+ * and fs.stat reports a synthesised 0777/0666 no matter what Zelos asked for.
+ * A `0700` assertion on Windows would therefore succeed or fail for reasons
+ * that have nothing to do with the guarantee it exists to protect, so the mode
+ * claims are split out and skipped there by name rather than being weakened
+ * for every platform to accommodate one. docs/SECURITY.md §5 tells the user the
+ * same thing: on Windows the real access control is the NTFS ACL the user
+ * profile already carries, which Zelos does not currently set.
+ *
+ * node:test prints this string as the reason, so a reader of the Windows run
+ * learns why the gap is there instead of finding a silent hole.
+ */
+const WINDOWS_NO_POSIX_MODES = process.platform === 'win32'
+  ? 'POSIX modes are not implemented on Windows: chmod sets little more than the read-only flag, so this could not assert what it claims (docs/SECURITY.md §5)'
+  : false;
+
 function freshHome(name) {
   const home = path.join(HOME_ROOT, name);
   process.env.ZELOS_HOME = home;
   return home;
 }
 
+/**
+ * Point the platform's idea of "the user's home" at a sandbox. os.homedir()
+ * reads $HOME on macOS and Linux and %USERPROFILE% on Windows, so a test that
+ * only sets HOME leaves Windows resolving the fallback home to the real
+ * profile — and paths() would then create a live ~/.zelos on the CI runner.
+ * Both are set, and both are restored to *absence* rather than to the string
+ * "undefined", which is what assigning an undefined value to process.env does.
+ */
+function withSandboxedUserHome(dir, fn) {
+  const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+  fs.mkdirSync(dir, { recursive: true });
+  process.env.HOME = dir;
+  process.env.USERPROFILE = dir;
+  try {
+    return fn();
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
 test.after(() => {
   fs.rmSync(HOME_ROOT, { recursive: true, force: true });
 });
 
-test('paths() creates the home at 0700 and never touches the real one', () => {
+test('paths() creates the home where it says and never touches the real one', () => {
   const home = freshHome('paths');
   const p = paths();
 
@@ -35,35 +76,44 @@ test('paths() creates the home at 0700 and never touches the real one', () => {
   assert.equal(p.logsDir, path.join(home, 'logs'));
   assert.equal(p.cacheDir, path.join(home, 'cache'));
 
+  // That the three directories are created at all is the half that matters on
+  // every platform, and it used to be asserted only as a side effect of asking
+  // for their mode — which left nothing checking it where modes are a fiction.
+  for (const dir of [p.home, p.logsDir, p.cacheDir]) {
+    assert.ok(fs.statSync(dir).isDirectory(), `${dir} must exist as a directory`);
+  }
+  assert.ok(!p.home.includes(os.homedir() + path.sep + '.zelos'));
+});
+
+test('paths() creates the home, logs and cache at 0700', { skip: WINDOWS_NO_POSIX_MODES }, () => {
+  freshHome('paths-mode');
+  const p = paths();
   assert.equal(mode(p.home), 0o700);
   assert.equal(mode(p.logsDir), 0o700);
   assert.equal(mode(p.cacheDir), 0o700);
-  assert.ok(!p.home.includes(os.homedir() + path.sep + '.zelos'));
 });
 
 test('paths() treats ZELOS_HOME=undefined as no override, not a directory name', () => {
   // A launcher that interpolates an unset variable produces the literal
   // string "undefined" — the old code resolved it to <cwd>/undefined and put
-  // a real data directory there. Point $HOME at a sandbox so the fallback
-  // lands inside HOME_ROOT instead of the user's real ~/.zelos.
-  const realHome = process.env.HOME;
+  // a real data directory there. The user's home is sandboxed so the fallback
+  // lands inside HOME_ROOT instead of the real ~/.zelos on any platform.
   const fakeHome = path.join(HOME_ROOT, 'fake-user');
-  fs.mkdirSync(fakeHome, { recursive: true });
-  process.env.HOME = fakeHome;
   try {
-    for (const junk of ['undefined', 'null', ' Undefined ', 'NULL']) {
-      process.env.ZELOS_HOME = junk;
-      const p = paths();
-      assert.equal(p.home, path.join(fakeHome, '.zelos'), JSON.stringify(junk));
-      assert.ok(!fs.existsSync(path.resolve(process.cwd(), junk.trim())), JSON.stringify(junk));
-    }
+    withSandboxedUserHome(fakeHome, () => {
+      for (const junk of ['undefined', 'null', ' Undefined ', 'NULL']) {
+        process.env.ZELOS_HOME = junk;
+        const p = paths();
+        assert.equal(p.home, path.join(fakeHome, '.zelos'), JSON.stringify(junk));
+        assert.ok(!fs.existsSync(path.resolve(process.cwd(), junk.trim())), JSON.stringify(junk));
+      }
+    });
   } finally {
-    process.env.HOME = realHome;
     freshHome('after-junk');
   }
 });
 
-test('paths() tightens a home somebody left world-readable', () => {
+test('paths() tightens a home somebody left world-readable', { skip: WINDOWS_NO_POSIX_MODES }, () => {
   const home = freshHome('loose');
   fs.mkdirSync(home, { recursive: true, mode: 0o755 });
   fs.chmodSync(home, 0o755);
@@ -71,6 +121,23 @@ test('paths() tightens a home somebody left world-readable', () => {
 
   paths();
   assert.equal(mode(home), 0o700);
+});
+
+/**
+ * The Windows-meaningful half of the test above. Tightening cannot be observed
+ * there, but the code path that would do the tightening still runs on every
+ * launch — ensureDir() stats an existing directory, sees the 0777 Windows
+ * synthesises, and calls chmod on it. If that ever threw, Zelos would refuse to
+ * start on Windows for a directory that was perfectly fine.
+ */
+test('paths() adopts a home that already exists instead of failing on it', () => {
+  const home = freshHome('pre-existing');
+  fs.mkdirSync(path.join(home, 'logs'), { recursive: true });
+
+  const p = paths();
+  assert.equal(p.home, home);
+  assert.ok(fs.statSync(p.cacheDir).isDirectory(), 'the missing sibling is filled in');
+  assert.equal(paths().home, home, 'and a second call is a no-op, not an error');
 });
 
 test('loadConfig() returns the full default shape with a resolved timezone', () => {
@@ -93,7 +160,7 @@ test('loadConfig() returns the full default shape with a resolved timezone', () 
   assert.ok(Object.isFrozen(DEFAULTS));
 });
 
-test('saveConfig() deep-merges, writes 0600, and leaves untouched keys alone', () => {
+test('saveConfig() deep-merges and leaves untouched keys alone', () => {
   const home = freshHome('save');
   saveConfig({ identity: { name: 'Nemo' }, model: { model: 'claude-x', maxTokens: 4096 } });
   const after = saveConfig({ model: { temperature: 0.4 } });
@@ -103,11 +170,15 @@ test('saveConfig() deep-merges, writes 0600, and leaves untouched keys alone', (
   assert.equal(after.model.maxTokens, 4096, 'second save must not reset the first');
   assert.equal(after.model.temperature, 0.4);
 
-  const file = path.join(home, 'config.json');
-  assert.equal(mode(file), 0o600);
-  const onDisk = JSON.parse(fs.readFileSync(file, 'utf8'));
+  const onDisk = JSON.parse(fs.readFileSync(path.join(home, 'config.json'), 'utf8'));
   assert.equal(onDisk.model.model, 'claude-x');
   assert.equal(onDisk.identity.timezone, '', 'a timezone resolved at runtime is not frozen into the file');
+});
+
+test('saveConfig() writes config.json 0600', { skip: WINDOWS_NO_POSIX_MODES }, () => {
+  const home = freshHome('save-mode');
+  saveConfig({ identity: { name: 'Nemo' } });
+  assert.equal(mode(path.join(home, 'config.json')), 0o600);
 });
 
 test('saveConfig() replaces arrays wholesale so an account can be removed', () => {

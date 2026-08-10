@@ -960,7 +960,38 @@ test('the layout cache holds no credentials', async (t) => {
     const raw = fs.readFileSync(path.join(dir, name), 'utf8');
     assert.equal(raw.includes(PASS), false, 'the calendar password must never be written down');
     assert.equal(raw.includes(USER), false, 'nor the username the key was derived from');
-    assert.equal(fs.statSync(path.join(dir, name)).mode & 0o777, 0o600);
+  }
+});
+
+/**
+ * The mode the cache is written with, split out from what is *in* it so the two
+ * halves can be judged separately: the contents claim holds everywhere and must
+ * keep running everywhere, while the mode is a POSIX promise Windows does not
+ * implement. There `fs.chmod` sets little beyond the read-only flag and `fs.stat`
+ * reports a synthesised 0666, so 0600 is not observable and asserting anything
+ * looser would be dressing up an unenforced claim as a passing test. Windows
+ * protects this the way docs/SECURITY.md now says it does — with the ACL on the
+ * user's profile directory — which is not something this test can read.
+ */
+test('the layout cache is written 0600', {
+  skip: process.platform === 'win32'
+    ? 'Windows has no POSIX file modes: fs.chmod sets little more than the read-only flag and fs.stat reports a synthesised 0666, so the 0600 this asserts is unobservable there. At-rest protection on Windows is the profile-directory ACL (see docs/SECURITY.md), which this test cannot verify.'
+    : false,
+}, async (t) => {
+  const mock = await startServer(NEXTCLOUD_ROUTES);
+  t.after(() => mock.close());
+
+  await fetchRange({ url: mock.origin, user: USER, pass: PASS });
+
+  const dir = path.join(HOME, 'cache', 'caldav');
+  const files = fs.readdirSync(dir);
+  assert.ok(files.length >= 1, 'something was remembered');
+  for (const name of files) {
+    assert.equal(
+      fs.statSync(path.join(dir, name)).mode & 0o777,
+      0o600,
+      `${name} is readable by every other account on the machine`,
+    );
   }
 });
 

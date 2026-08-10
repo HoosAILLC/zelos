@@ -48,7 +48,10 @@ Exactly three things, and you chose all three: your mail provider, your calendar
 model endpoint. Point it at a local model and that becomes none. No telemetry, no analytics, no
 update pings, no crash reports.
 
-Your keys live in your operating system's keychain. The database is `0600` in your Zelos home.
+Your keys live in your operating system's keychain. On macOS and Linux the database is `0600` inside
+a `0700` home; on Windows there are no POSIX modes to set, so the protection is the ACL on your user
+profile — see [docs/SECURITY.md](docs/SECURITY.md#5-what-leaves-your-machine) for what that does and
+does not buy you.
 The local server binds `127.0.0.1` only, mints a new session token every launch, requires it on
 every `/api/*` request, and rejects foreign origins.
 

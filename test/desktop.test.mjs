@@ -241,10 +241,34 @@ describe('WindowState', () => {
     const written = JSON.parse(fs.readFileSync(file, 'utf8'));
     assert.deepEqual(written.bounds, { x: 42, y: 24, width: 1000, height: 700 });
     assert.equal(written.maximized, false);
-    assert.equal(fs.statSync(file).mode & 0o777, 0o600);
 
     // A fresh instance reads it back.
     assert.equal(new WindowState({ file }).initial([]).width, 1000);
+  });
+
+  /**
+   * The mode is a separate test because it is the one part of the promise that
+   * only two of the three platforms can keep, and a skip with a name in the
+   * output is honest where an `if` buried in an assertion is not.
+   *
+   * A window rectangle is not a secret, but this file lives in the Zelos home
+   * beside the mail database, and everything Zelos writes there is 0600 — one
+   * file written 0644 is the one a later `cp -p` or synced folder carries out
+   * wide open. On Windows that promise is not available to make: there are no
+   * POSIX modes, `fs.chmod` sets little beyond the read-only flag, and the mode
+   * `statSync` reports back is a synthesised 0666 no matter what the writer
+   * asked for. What protects the file there is the ACL on the user's profile
+   * directory, which is what docs/SECURITY.md says on Windows — so this asserts
+   * nothing there rather than asserting something weaker and calling it a pass.
+   */
+  it('writes it 0600, like everything else in the Zelos home', {
+    skip: process.platform === 'win32'
+      ? 'Windows has no POSIX file modes: fs.chmod sets little more than the read-only flag and fs.stat reports a synthesised 0666, so a 0600 request is unobservable. At-rest protection on Windows is the profile-directory ACL (see docs/SECURITY.md), which this test cannot speak to.'
+      : false,
+  }, () => {
+    const file = path.join(dir, 'mode.json');
+    new WindowState({ file }).track(fakeWindow({ x: 1, y: 2, width: 900, height: 600 })).capture();
+    assert.equal(fs.statSync(file).mode & 0o777, 0o600);
   });
 
   it('remembers the restored size of a maximised window, not the screen', () => {
@@ -1305,15 +1329,23 @@ describe('a home on a filesystem that cannot do the lock', () => {
     // The warning is a guess about another process, so the way out of a wrong
     // guess has to be in the warning itself — naming the file, by full path.
     const home = path.join(dir, 'wayout');
+    const lockFile = path.join(home, 'zelos.lock');
     const held = acquireHomeLock({ home, kind: 'desktop' });
     try {
       const next = acquireHomeLock({ home, kind: 'cli' });
       assert.ok(next.contested);
-      assert.match(
-        next.contested.message,
-        new RegExp(`delete ${path.join(home, 'zelos.lock')}`.replace(/[.]/g, '\\.')),
+      // Compared literally, not as a pattern. This used to build a RegExp out
+      // of the path and escape only the dots, which is fine as long as the
+      // separator is `/` — on Windows the path is `C:\Users\…\zelos.lock` and
+      // every separator is a regex escape, so `\U` and `\z` compiled into
+      // something that could not match the path they came from. The assertion
+      // is about a literal string appearing in a sentence; `includes` is what
+      // that means, and it holds identically on all three platforms.
+      assert.ok(
+        next.contested.message.includes(`delete ${lockFile}`),
+        `the warning must name the file to delete, in full: ${next.contested.message}`,
       );
-      assert.equal(next.contested.lockFile, path.join(home, 'zelos.lock'));
+      assert.equal(next.contested.lockFile, lockFile);
       next.release();
     } finally {
       held.release();

@@ -17,6 +17,24 @@ const {
 
 const mode = (p) => fs.statSync(p).mode & 0o777;
 
+/**
+ * POSIX modes are the whole at-rest story on macOS and Linux, and Windows does
+ * not implement them: fs.chmod there sets little more than the read-only flag,
+ * and fs.stat reports a synthesised 0666 no matter what Zelos asked for. A
+ * `0600` assertion on Windows would therefore succeed or fail for reasons that
+ * have nothing to do with the guarantee it exists to protect, so the mode
+ * claims are split out and skipped there by name rather than being weakened for
+ * every platform to accommodate one. docs/SECURITY.md §5 and §7 say the same
+ * thing to the user: on Windows the protection of the fallback store is its
+ * encryption, not its mode.
+ *
+ * node:test prints this string as the reason, so a reader of the Windows run
+ * learns why the gap is there instead of finding a silent hole.
+ */
+const WINDOWS_NO_POSIX_MODES = process.platform === 'win32'
+  ? 'POSIX modes are not implemented on Windows: chmod sets little more than the read-only flag, so this could not assert what it claims (docs/SECURITY.md §5)'
+  : false;
+
 function useHome(name) {
   process.env.ZELOS_HOME = path.join(HOME_ROOT, name);
   resetBackendCache();
@@ -118,7 +136,7 @@ test('the module exposes no way to enumerate values', () => {
 
 /* ------------------------------------------------ encrypted-file fallback */
 
-test('encrypted-file fallback: honest note, 0600 files, real round-trip', async () => {
+test('encrypted-file fallback: honest note, real round-trip', async () => {
   forceFallback('fallback');
   const home = process.env.ZELOS_HOME;
 
@@ -134,8 +152,6 @@ test('encrypted-file fallback: honest note, 0600 files, real round-trip', async 
 
   const store = path.join(home, 'secrets.enc');
   const seed = path.join(home, '.seed');
-  assert.equal(mode(store), 0o600);
-  assert.equal(mode(seed), 0o600);
   assert.match(fs.readFileSync(seed, 'utf8').trim(), /^[0-9a-f]{64}$/);
 
   const raw = fs.readFileSync(store, 'utf8');
@@ -159,6 +175,18 @@ test('encrypted-file fallback: honest note, 0600 files, real round-trip', async 
   assert.equal(await getSecret('model.default'), null);
   assert.deepEqual(await listRefs(), ['mail.m_9f3a1c']);
   assert.deepEqual(await deleteSecret('model.default'), { ok: true, deleted: false });
+});
+
+test('encrypted-file fallback: the store and the seed are 0600', { skip: WINDOWS_NO_POSIX_MODES }, async () => {
+  // The seed matters as much as the store: it is the key, it sits beside the
+  // ciphertext, and a mode that let another account read it would give away
+  // everything the encryption was protecting.
+  forceFallback('fallback-modes');
+  const home = process.env.ZELOS_HOME;
+  await setSecret('model.default', 'sk-ant-api03-mode-check');
+
+  assert.equal(mode(path.join(home, 'secrets.enc')), 0o600);
+  assert.equal(mode(path.join(home, '.seed')), 0o600);
 });
 
 test('encrypted-file fallback: a tampered ciphertext fails closed', async () => {
@@ -244,19 +272,26 @@ test('this machine\'s real backend round-trips a hostile-looking value', async (
   assert.ok(!(await listRefs()).includes(ref));
 });
 
-test('the index file records refs and nothing else', async () => {
+test('the index file records refs and nothing else', async (t) => {
   useHome('index');
   unforce();
   const b = await backend();
   if (b.name === 'encrypted-file') return; // no index file in that mode
 
   const ref = `test.zelos-${crypto.randomBytes(6).toString('hex')}`;
+  const indexFile = path.join(process.env.ZELOS_HOME, 'secrets.index.json');
   try {
     await setSecret(ref, 'a-value-that-must-not-be-indexed');
-    const text = fs.readFileSync(path.join(process.env.ZELOS_HOME, 'secrets.index.json'), 'utf8');
+    const text = fs.readFileSync(indexFile, 'utf8');
     assert.ok(!text.includes('a-value-that-must-not-be-indexed'));
     assert.deepEqual(JSON.parse(text), { refs: [ref] });
-    assert.equal(mode(path.join(process.env.ZELOS_HOME, 'secrets.index.json')), 0o600);
+
+    // The contents above are the claim that holds everywhere. The mode is the
+    // POSIX half, and it is a subtest so that it can skip by name on Windows
+    // without taking the contents check with it.
+    await t.test('and the index is written 0600', { skip: WINDOWS_NO_POSIX_MODES }, () => {
+      assert.equal(mode(indexFile), 0o600);
+    });
   } finally {
     await deleteSecret(ref).catch(() => {});
   }

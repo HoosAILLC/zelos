@@ -660,3 +660,52 @@ test('the FTS5 refusal names what to install, and does not leave a database behi
   close(probe);
   fs.rmSync(home, { recursive: true, force: true });
 });
+
+/**
+ * The one at-rest guarantee SECURITY.md makes loudest, and until now the only
+ * one nothing tested. `tightenDbFiles()` exists because SQLite creates its
+ * files 0666-masked-by-umask — 0644 on the usual one — and a mode travels with
+ * a file into backups and synced folders long after it leaves a 0700 home. It
+ * also swallows every error by design, so a regression here would be silent:
+ * the database would simply start shipping world-readable, and nothing would
+ * say so. That is exactly the shape of bug a test has to catch.
+ */
+const WINDOWS_NO_POSIX_MODES = process.platform === 'win32'
+  ? 'POSIX modes are not implemented on Windows: chmod sets little more than the read-only flag, and stat synthesises a mode. See docs/SECURITY.md §5.'
+  : false;
+
+test('the database and both its sidecars are 0600', { skip: WINDOWS_NO_POSIX_MODES }, () => {
+  const file = path.join(HOME_ROOT, 'modes.db');
+  const db = open(file);
+  dbs.push(db);
+  migrate(db);
+
+  // A write, so WAL actually materialises the sidecars rather than leaving
+  // this test asserting about files that do not exist yet.
+  upsertItem(db, ITEM, { runId: 'run_modes' });
+
+  const seen = [];
+  for (const f of [file, `${file}-wal`, `${file}-shm`]) {
+    if (!fs.existsSync(f)) continue;
+    seen.push(path.basename(f));
+    assert.equal(fs.statSync(f).mode & 0o777, 0o600, `${path.basename(f)} is not 0600`);
+  }
+  assert.ok(seen.includes('modes.db'), 'the database itself must have been checked');
+  assert.ok(seen.length >= 2, `WAL should have produced a sidecar to check, saw ${seen.join(', ')}`);
+});
+
+test('a database left world-readable is tightened when it is opened again', { skip: WINDOWS_NO_POSIX_MODES }, () => {
+  // The repair path, not just the create path: a file copied out of a backup,
+  // or written by an older Zelos, arrives 0644 and must not stay that way.
+  const file = path.join(HOME_ROOT, 'loose.db');
+  const first = open(file);
+  migrate(first);
+  close(first);
+
+  fs.chmodSync(file, 0o644);
+  assert.equal(fs.statSync(file).mode & 0o777, 0o644, 'the precondition: it really is loose');
+
+  const again = open(file);
+  dbs.push(again);
+  assert.equal(fs.statSync(file).mode & 0o777, 0o600, 'opening a loose database must tighten it');
+});

@@ -306,12 +306,24 @@ Everything read from your mail and calendar is stored **on your machine**, in
 encrypted. Anyone who can read your home directory can read your mail cache —
 the same as with any local mail client.
 
-What it does have is permissions. The Zelos home is `0700` and every file
-Zelos writes in it is `0600`, including the database and its `-wal` and `-shm`
-sidecars — SQLite would otherwise create those `0644`, which is invisible while
-they sit inside a `0700` directory and stops being invisible the moment one is
-copied into a backup, a synced folder, or a support bundle. A mode travels with
-a file; the directory it used to live in does not.
+What it does have, **on macOS and Linux**, is permissions. The Zelos home is
+`0700` and every file Zelos writes in it is `0600`, including the database and
+its `-wal` and `-shm` sidecars — SQLite would otherwise create those `0644`,
+which is invisible while they sit inside a `0700` directory and stops being
+invisible the moment one is copied into a backup, a synced folder, or a support
+bundle. A mode travels with a file; the directory it used to live in does not.
+
+**On Windows this paragraph does not apply, and it would be dishonest to let it
+stand unqualified.** Windows does not implement POSIX modes; `chmod` there sets
+little more than the read-only flag, so the `0600` and `0700` calls Zelos makes
+are close to no-ops and the real access control is the NTFS ACL your user
+profile already carries. In practice a file under `C:\Users\you\.zelos` is
+readable by you and by Administrators, which is roughly what `0600` buys you on
+a single-user machine and materially weaker on a shared or managed one. Zelos
+does not currently set an explicit ACL, so if you are on a Windows machine you
+do not solely control, treat the Zelos home as readable by whoever administers
+it — and note that the same caveat applies to the encrypted secrets fallback
+file, whose protection is its encryption rather than its mode.
 
 ---
 
