@@ -80,51 +80,275 @@ describe('the test suite stays inside its sandbox', () => {
        does — and detection then runs against the operator's own login keychain
        for the rest of the file. The textual check above passed happily while
        exactly that was happening, which is how two tests came to be writing
-       into a real keychain on every developer machine that ran the suite.
-
-       So a file that opts back out has to say who is allowed to: every
-       `delete process.env.ZELOS_SECRETS_BACKEND` must sit in a file that also
-       gates those tests on CI. This is a heuristic and it is deliberately a
-       loud one — if it fires on something legitimate, the fix is to name the
-       gate, not to widen the pattern. */
+       into a real keychain on every developer machine that ran the suite. */
     const optOut = [];
-    for (const name of fs.readdirSync(path.join(ROOT, 'test')).sort()) {
-      if (!name.endsWith('.test.mjs')) continue;
+    for (const name of testFiles()) {
       const src = fs.readFileSync(path.join(ROOT, 'test', name), 'utf8');
-      const delRe = /delete\s+process\.env\.ZELOS_SECRETS_BACKEND/g;
-      let hit;
-      while ((hit = delRe.exec(src)) !== null) {
-        /* Deleting it in a teardown hook is the opposite of a hazard — it is
-           the file putting the environment back. What matters is a delete that
-           lands mid-run, before something that can reach the secret store. The
-           two are told apart by which came last before this line: an `after(`
-           means teardown, a `test(`/`it(` means we are inside a live test. */
-        const before = src.slice(0, hit.index);
-        const lastHook = Math.max(before.lastIndexOf('after('), before.lastIndexOf('afterEach('));
-        const lastTest = Math.max(before.lastIndexOf('\ntest('), before.lastIndexOf('\n  it('));
-        if (lastHook > lastTest) continue;
-        // A conditional restore — `if (previous === undefined) delete …` — is
-        // putting the environment back the way it was found, which is the same
-        // intent as a teardown and equally safe. The hazard is an
-        // UNCONDITIONAL delete in the middle of a run, which is what turns
-        // detection loose on the operator's own keychain.
-        const line = src.slice(before.lastIndexOf('\n') + 1, src.indexOf('\n', hit.index));
-        if (/\b(previous|prior|saved|original)/i.test(line)) continue;
-        if (/process\.env\.CI/.test(src)) continue;
-        optOut.push(name);
-        break;
+      const lines = src.split('\n');
+      for (const [index, line] of lines.entries()) {
+        if (COMMENT.test(line) || !UNFORCE.test(line)) continue;
+        const verdict = classifyUnforce(lines, index, indentOf(line), line);
+        if (!verdict) optOut.push(`${name}:${index + 1} — ${line.trim()}`);
       }
     }
-    assert.deepEqual(optOut, [], 'these tests un-force the secret backend without gating on CI, '
+    assert.deepEqual(optOut, [], 'these un-force the secret backend where nothing establishes it is safe, '
       + 'so they use the real keychain of whatever machine runs them:\n  '
       + `${optOut.join('\n  ')}\n`
-      + 'Gate them on process.env.CI, the way test/secrets.test.mjs does.');
+      + 'Put it in a teardown hook, make it a conditional restore, or call it from a helper '
+      + 'whose every caller is gated on process.env.CI, the way test/secrets.test.mjs does.');
 
     assert.deepEqual(unforced, [], 'these tests can reach the real secret store and do not force a backend:\n  '
       + `${unforced.join('\n  ')}\n`
       + "Add process.env.ZELOS_SECRETS_BACKEND = 'encrypted-file' before the core modules load.");
   });
+
+  /**
+   * The guard above is only worth having if it can SEE the suite, and the
+   * version it replaced could not. It decided where a delete sat by asking
+   * which of `after(` and `\ntest(` came last anywhere earlier in the file, and
+   * a separate clause waved through every file containing the string
+   * `process.env.CI` at all.
+   *
+   * Both are measured failures, not theory. Injecting an unconditional delete
+   * into every test body in the suite and replaying the old guard left 261 of
+   * 975 bodies — 27% — unflagged, including **100%** of cli.test.mjs,
+   * mcp.test.mjs, integration.test.mjs, repo.test.mjs and secrets.test.mjs:
+   * exactly the five files that spawn the real CLI or boot the real core. Those
+   * files open with a module-level `after(` and declare their tests inside a
+   * `describe(`, so `\ntest(` never matched, `lastTest` was −1 for the whole
+   * file, and every delete below read as teardown. The `process.env.CI` clause
+   * covered the rest: secrets.test.mjs mentions it, so any delete anywhere in
+   * that file was excused.
+   *
+   * So the classifier is now fail-CLOSED — a site it cannot place is a
+   * complaint, not a shrug — and this replays the same measurement against it.
+   * The injection points are found with a deliberately dumber locator than the
+   * classifier's own (any line that opens a `test(`/`it(` with a string, at any
+   * indentation, in any nesting), because the whole defect was a locator that
+   * only knew two shapes.
+   */
+  test('the guard sees every test body in the suite, not the 73% it used to', () => {
+    const bodies = [];
+    const unflagged = [];
+    for (const name of testFiles()) {
+      const lines = fs.readFileSync(path.join(ROOT, 'test', name), 'utf8').split('\n');
+      for (const [index, line] of lines.entries()) {
+        if (!/\b(?:test|it)\s*\(\s*['"`]/.test(line)) continue;
+        // The first statement of that body: one line down, one level in.
+        const site = index + 1;
+        const indent = indentOf(line) + 2;
+        bodies.push(`${name}:${site}`);
+        if (classifyUnforce(lines, site, indent, INJECTED)) unflagged.push(`${name}:${site} — ${line.trim()}`);
+      }
+    }
+
+    assert.ok(bodies.length >= 900, `only ${bodies.length} test bodies were found — the sweep is broken`);
+    for (const file of ['cli.test.mjs', 'mcp.test.mjs', 'integration.test.mjs', 'repo.test.mjs', 'secrets.test.mjs']) {
+      assert.ok(bodies.some((b) => b.startsWith(`${file}:`)), `${file} contributed no test bodies to the sweep`);
+    }
+    assert.deepEqual(unflagged, [], `${unflagged.length} of ${bodies.length} test bodies could take an `
+      + 'unconditional delete of ZELOS_SECRETS_BACKEND without the guard saying anything:\n  '
+      + `${unflagged.join('\n  ')}`);
+  });
 });
+
+/* ================================================================== *
+ * The legs only CI can run
+ * ================================================================== */
+
+/**
+ * Three of the four credential backends can only be exercised where a real one
+ * exists, so the tests for them are gated on an environment a developer's
+ * machine does not have — and a gate is a promise made in one file and kept in
+ * another. Nothing linked them. `LIBSECRET_LIVE_ONLY` reads an environment
+ * variable that only .github/workflows/ci.yml sets; delete that job, or rename
+ * the variable on either side, and the test does not fail, it stops running,
+ * silently, forever. That is the same shape as the vacuous pass the gate exists
+ * to end.
+ *
+ * So the workflow and the suite are held to naming each other. This cannot
+ * prove the job is green — only a push can — but it can prove the two halves
+ * still refer to the same thing.
+ */
+describe('the workflow runs what only it can run', () => {
+  const workflowSource = fs.readFileSync(path.join(ROOT, '.github', 'workflows', 'ci.yml'), 'utf8');
+  /* Comments are stripped before anything is looked for. That file explains
+     itself at length, and this whole test would otherwise be satisfied by the
+     paragraph describing the step rather than by the step. */
+  const workflow = workflowSource.split('\n').filter((line) => !/^\s*#/.test(line)).join('\n');
+  const secretsTest = fs.readFileSync(path.join(ROOT, 'test', 'secrets.test.mjs'), 'utf8');
+
+  test('the Linux keyring leg installs one, runs on a bus, and sets the flag the gate reads', () => {
+    for (const pkg of ['libsecret-tools', 'gnome-keyring', 'dbus-x11']) {
+      assert.match(workflow, new RegExp(`\\b${pkg}\\b`),
+        `ci.yml installs no ${pkg}, so detection on that leg falls back to the encrypted file and the `
+        + 'libsecret backend goes unexecuted again');
+    }
+    assert.match(workflow, /dbus-run-session/,
+      'the keyring daemon needs a session bus; without one secret-tool cannot reach it');
+    assert.match(workflow, /ZELOS_LIBSECRET_LIVE:/, 'ci.yml sets no ZELOS_LIBSECRET_LIVE');
+    // `\b` will not do here: `_` is a word character, so it would match a
+    // renamed ZELOS_LIBSECRET_LIVE_SOMETHING and the two halves could drift
+    // apart while this stayed green. The name has to end where it ends.
+    assert.match(secretsTest, /process\.env\.ZELOS_LIBSECRET_LIVE(?![\w$])/,
+      'test/secrets.test.mjs no longer reads the variable ci.yml sets, so the live leg runs nothing');
+  });
+
+  /**
+   * The two "leave nothing behind" steps look at a service name written into
+   * the YAML by hand. Rename SERVICE in core/secrets.mjs and they keep passing
+   * while searching for something no test could ever have stored — a check that
+   * has quietly become a decoration.
+   */
+  test('the credential-litter checks name the service the code actually uses', () => {
+    const secrets = fs.readFileSync(path.join(ROOT, 'core', 'secrets.mjs'), 'utf8');
+    const service = /export const SERVICE = '([^']+)'/.exec(secrets);
+    assert.ok(service, 'core/secrets.mjs no longer exports SERVICE as a literal');
+
+    for (const tool of ['security find-generic-password', 'secret-tool search']) {
+      const line = workflow.split('\n').find((l) => l.includes(tool));
+      assert.ok(line, `ci.yml has no ${tool} step, so nothing checks that leg's credential store is clean`);
+      assert.ok(line.includes(service[1]),
+        `${tool} in ci.yml searches for something other than ${service[1]}: ${line.trim()}`);
+    }
+  });
+
+  /**
+   * `CI` is what tells three tests they are on a throwaway runner and may write
+   * into a real credential store. GitHub sets it for every step of every job,
+   * including through `shell: bash` on Windows, so the workflow never needs to —
+   * and the moment it sets one by hand, that gate means nothing wherever it was
+   * set. ci.yml says this in a comment; this is the comment with teeth.
+   */
+  test('the workflow never sets CI by hand', () => {
+    const offenders = workflow.split('\n').filter((line) => /^\s*CI\s*:/.test(line));
+    assert.deepEqual(offenders, [], `ci.yml sets CI itself: ${offenders.join('; ')}`);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * The classifier the two tests above share.
+ *
+ * It answers one question about one site: is there something HERE that makes
+ * un-forcing the secret backend safe? Three answers count, and each of them is
+ * a property of the ten or so lines around the site rather than of the file:
+ *
+ *   1. a teardown hook — the file putting the environment back on its way out;
+ *   2. a conditional restore — the same intent written inline;
+ *   3. a helper whose every caller is a test gated on process.env.CI, which is
+ *      how test/secrets.test.mjs reaches a real store on a throwaway runner and
+ *      nowhere else.
+ *
+ * Anything else is a complaint. That is the important half: the old guard
+ * answered "safe" whenever it could not tell, which is how a blind spot the
+ * size of five files stayed quiet. If this fires on something legitimate, the
+ * fix is to give the site one of the three shapes — not to widen the pattern.
+ * ------------------------------------------------------------------ */
+
+/** What an injected hazard looks like: unconditional, unexplained. */
+const INJECTED = 'delete process.env.ZELOS_SECRETS_BACKEND;';
+
+/** How far above a site a hook or a helper may be and still enclose it. */
+const HOOK_REACH = 40;
+const HELPER_REACH = 6;
+
+const HOOK = /^\s*(?:(?:test|t)\.)?(?:after|afterEach)\s*\(/;
+const TEST_DECL = /^\s*(?:await\s+)?(?:t\.)?(?:test|it)(?:\.(?:only|skip|todo|concurrent))?\s*\(/;
+const HELPER = /^\s*(?:async\s+)?function\s+(\w+)\s*\(/;
+
+/**
+ * A delete that is really a delete. `const INJECTED = 'delete process.env.…'`
+ * in this very file is a string, and the prose above quotes the same statement
+ * inside a comment; neither un-forces anything. Requiring the character in
+ * front to be the start of the line, whitespace, or a closing paren separates
+ * the statement from every way of naming it.
+ */
+const UNFORCE = /(?:^|[\s)])delete\s+process\.env\.ZELOS_SECRETS_BACKEND/;
+
+/** A line that is only prose. The suite's comments talk about all of this. */
+const COMMENT = /^\s*(?:\/\/|\/\*|\*)/;
+
+const indentOf = (line) => /^\s*/.exec(line)[0].replace(/\t/g, '  ').length;
+
+function testFiles() {
+  return fs.readdirSync(path.join(ROOT, 'test')).filter((n) => n.endsWith('.test.mjs')).sort();
+}
+
+/**
+ * Walk up from `index` looking for a line that matches `opener` at a shallower
+ * indent, giving up after `reach` lines or at the first test declaration —
+ * because a test declaration between the two means the site is inside the test,
+ * not inside whatever came before it. This is what the old `lastIndexOf` could
+ * not express: a module-level `after(` on line 37 does not enclose line 600.
+ */
+function encloser(lines, index, indent, opener, reach) {
+  for (let i = index - 1; i >= 0 && index - i <= reach; i -= 1) {
+    const line = lines[i];
+    if (!line.trim() || COMMENT.test(line)) continue;
+    if (indentOf(line) >= indent) continue;
+    // The opener is read first: `test.after(` opens a hook and also reads as a
+    // test declaration, and it is the hook that matters.
+    const m = opener.exec(line);
+    if (m) return m;
+    if (TEST_DECL.test(line)) return null;
+  }
+  return null;
+}
+
+/** The nearest test declaration above `index` that could contain it. */
+function enclosingTest(lines, index, indent) {
+  for (let i = index - 1; i >= 0; i -= 1) {
+    const line = lines[i];
+    if (!line.trim() || indentOf(line) >= indent) continue;
+    if (TEST_DECL.test(line)) return i;
+  }
+  return -1;
+}
+
+/**
+ * Is this test declaration gated on CI? Either it says so in the header, or its
+ * `skip:` names a constant whose definition does. `REAL_STORE_ONLY_ON_CI` and
+ * `DPAPI_LIVE_ONLY` in test/secrets.test.mjs are both the second shape.
+ */
+function gatedOnCI(lines, declLine) {
+  const header = lines.slice(declLine, declLine + 3).join('\n');
+  if (/process\.env\.CI/.test(header)) return true;
+  const named = /\bskip\s*:\s*([A-Za-z_$][\w$]*)/.exec(header);
+  if (!named) return false;
+  const src = lines.join('\n');
+  // `$` is a legal identifier character and a regex anchor, so the name is
+  // escaped rather than interpolated raw.
+  const definition = new RegExp(`\\nconst ${named[1].replace(/\$/g, '\\$')}\\s*=([\\s\\S]{0,600})`).exec(src);
+  return Boolean(definition && /process\.env\.CI/.test(definition[1]));
+}
+
+/** -> a reason the site is safe, or null, which means "complain about it". */
+function classifyUnforce(lines, index, indent, text) {
+  // A conditional restore — `if (previous === undefined) delete …` — puts the
+  // environment back the way it was found. The hazard is the UNCONDITIONAL
+  // delete mid-run, which is what turns detection loose on a real keychain.
+  if (/\bif\s*\(/.test(text) && /\b(previous|prior|saved|original)/i.test(text)) return 'conditional restore';
+
+  if (encloser(lines, index, indent, HOOK, HOOK_REACH)) return 'teardown hook';
+
+  const helper = encloser(lines, index, indent, HELPER, HELPER_REACH);
+  if (helper) {
+    const name = helper[1];
+    const callers = [];
+    for (const [i, line] of lines.entries()) {
+      if (i === index || HELPER.test(line) || COMMENT.test(line)) continue;
+      if (!new RegExp(`\\b${name}\\s*\\(`).test(line)) continue;
+      const decl = enclosingTest(lines, i, indentOf(line));
+      if (decl < 0 || !gatedOnCI(lines, decl)) return null;
+      callers.push(i);
+    }
+    // A helper nobody calls proves nothing, and neither does one called from
+    // module scope, where there is no gate to read.
+    return callers.length > 0 ? `helper ${name}(), called only from CI-gated tests` : null;
+  }
+
+  return null;
+}
 
 /* ================================================================== *
  * Zero dependencies

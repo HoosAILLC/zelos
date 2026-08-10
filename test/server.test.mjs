@@ -935,6 +935,49 @@ test('/api/state returns the board', async (t) => {
 });
 
 /**
+ * REGRESSION (#27). `events` is one window around today, and the payload never
+ * said so — so ui/views/calendar.js, whose ‹ and › are unclamped and which has
+ * no route to fetch another range, drew fully styled empty grids for months it
+ * had simply not been sent. The window itself was also too narrow for the view
+ * the comment in core/server.mjs named: the month grid runs whole weeks, so the
+ * CURRENT month's grid starts on the Sunday on or before the 1st, and measured
+ * 2026-08-10 the eight cells 2026-07-26…08-02 fell before `from` — a week of
+ * confidently empty days, with no navigation involved at all, for events that
+ * were in the events table the whole time.
+ *
+ * Asserted against the grid the UI actually builds rather than against a number
+ * of days, because that is the claim: whatever the calendar draws for the month
+ * it opens on, the server has answered for.
+ */
+test('/api/state declares its event window, and it covers the whole current month grid', async (t) => {
+  const ctx = await startServer(t);
+  const res = await call(ctx, 'GET', '/api/state');
+  assert.equal(res.status, 200);
+
+  const window = res.json.eventWindow;
+  assert.ok(window, '/api/state must say which days its events are an answer about');
+  assert.match(window.from, /^\d{4}-\d{2}-\d{2}$/, 'day keys, because every reader compares day keys');
+  assert.match(window.to, /^\d{4}-\d{2}-\d{2}$/);
+  assert.ok(window.from < window.to);
+
+  // The month grid ui/views/calendar.js builds for today, computed the way it
+  // does: whole weeks from the Sunday on or before the 1st.
+  const today = todayKey();
+  const first = `${today.slice(0, 7)}-01`;
+  const gridStart = addDaysToKey(first, -new Date(`${first}T00:00:00Z`).getUTCDay());
+  assert.ok(window.from <= gridStart,
+    `the served window (${window.from}) must reach the first cell of this month's grid (${gridStart})`);
+  assert.ok(window.to >= today);
+
+  // ...and the window is a claim about the events beside it, so it has to be
+  // consistent with them: nothing served may fall outside what was declared.
+  for (const ev of res.json.events) {
+    assert.ok(String(ev.starts_at).slice(0, 10) <= window.to,
+      `served an event at ${ev.starts_at} past the declared window end ${window.to}`);
+  }
+});
+
+/**
  * REGRESSION. core/sweep.mjs wrote the counter, ui/lib/format.js rendered it and
  * ui/app.js read `state.board.tokens` — and nothing ever put it in the payload
  * between them, so a feature that existed at both ends existed nowhere.
@@ -1168,6 +1211,70 @@ test('config round-trips through GET and PUT', async (t) => {
   assert.equal(bad.status, 400);
 });
 
+/**
+ * REGRESSION (#2). The Scheduler holds the config object it was CONSTRUCTED
+ * with. `ctx.setConfig` replaced only the route-facing copy, so on a default
+ * install — `sweep.auto: true`, which is where the Scheduler exists — nothing a
+ * person changed in Settings reached a sweep until the process was restarted.
+ * Not the interval, not the active hours, and not "Send message bodies to the
+ * model", whose own hint in the UI reads "This setting genuinely changes what is
+ * sent — it is not a label."
+ *
+ * The Scheduler is also what "Sweep now" runs through when there is one
+ * (SweepSupervisor prefers it), so the button did not escape it either. Both
+ * halves are asserted here: the object handed over, and the fact that the sweep
+ * that actually runs is the one carrying it.
+ */
+test('a config save reaches the scheduler, not just the route', async (t) => {
+  const seen = [];
+  const sweptWith = [];
+  const scheduler = {
+    config: null,
+    reconfigure(next) { seen.push(next); this.config = next; },
+    status: () => ({ running: true, busy: false }),
+    runNow() { sweptWith.push(this.config); return Promise.resolve({ ok: true, runId: 'r1', stats: {} }); },
+  };
+  const ctx = await startServer(t, { scheduler });
+
+  const saved = await call(ctx, 'PUT', '/api/config', {
+    body: { privacy: { sendBodies: false }, sweep: { intervalMinutes: 45 } },
+  });
+  assert.equal(saved.status, 200);
+
+  assert.equal(seen.length, 1, 'PUT /api/config must hand the saved config to the scheduler');
+  assert.equal(seen[0].privacy.sendBodies, false,
+    'the scheduler must be holding the privacy setting the user just unticked');
+  assert.equal(seen[0].sweep.intervalMinutes, 45);
+  // The same object the route answered with, so the two can never describe
+  // different configs to two different readers.
+  assert.deepEqual(seen[0].privacy, saved.json.config.privacy);
+
+  // ...and the sweep that runs is the one holding it.
+  assert.equal((await call(ctx, 'POST', '/api/sweep', { body: { mode: 'auto' } })).status, 202);
+  await delay(50);
+  assert.equal(sweptWith.length, 1);
+  assert.equal(sweptWith[0].privacy.sendBodies, false,
+    '"Sweep now" goes through the scheduler, so it must sweep with the new config too');
+});
+
+/**
+ * REGRESSION. core/config.mjs refuses a patch that would write a config
+ * `loadConfig()` could not read back, and it refuses it by throwing before the
+ * write. That is the caller's mistake, and it came back as a 500 with the reason
+ * stripped — the branch that deliberately says nothing about an unexpected
+ * error, because an unexpected error's text is not ours to echo. This one IS
+ * ours: it names the section the request got wrong.
+ */
+test('a config patch with a malformed section is a 400 that says which', async (t) => {
+  const ctx = await startServer(t);
+  const res = await call(ctx, 'PUT', '/api/config', { body: { identity: 5 } });
+  assert.equal(res.status, 400, 'a bad patch is the caller\'s fault, not the server\'s');
+  assert.match(res.json.error, /identity/);
+  assert.equal(res.json.detail, undefined);
+  // Nothing was written, and the server is still serving the config it had.
+  assert.equal((await call(ctx, 'GET', '/api/config')).status, 200);
+});
+
 test('saving calendars forgets what CalDAV remembered about them', async (t) => {
   // The CalDAV client keeps the layout it discovered — principal, home set, the
   // URL whose listing produced calendars — so a sweep costs one request instead
@@ -1215,9 +1322,38 @@ test('an unexpected failure is a 500 that says nothing about itself', async (t) 
   const res = await call(ctx, 'GET', '/api/state');
   assert.equal(res.status, 500);
   assert.equal(res.json.error, 'internal error');
-  assert.match(res.json.detail, /zelos\.log$/);
+  assert.match(res.json.detail, /terminal/);
   // The server is still standing.
   assert.equal((await call(ctx, 'GET', '/api/model/presets')).status, 200);
+});
+
+/**
+ * The 500 body used to send everyone to `~/.zelos/logs/zelos.log`, and nothing
+ * in the repo writes that file: the default logger is built with `dir: null` and
+ * goes to stderr, and the one file logger belongs to the desktop shell and is
+ * called `desktop.log`. `paths()` creates and chmods an empty `logs/` on every
+ * launch, so the wrong answer even looked plausible when a stuck person went and
+ * checked. The previous assertion pinned the wrong name — it matched the string
+ * without ever asking whether the file existed — so this one asks.
+ */
+test('the 500 detail names a log that exists, or no log at all', async (t) => {
+  const bare = await startServer(t);
+  db.close(bare.db);
+  const noFile = await call(bare, 'GET', '/api/state');
+  assert.equal(noFile.status, 500);
+  assert.doesNotMatch(noFile.json.detail, /\.log\b/,
+    'a server whose logger has no file must not send anybody looking for one');
+  assert.match(noFile.json.detail, /terminal/);
+  assert.deepEqual(fs.readdirSync(path.join(HOME, 'logs')), [],
+    'nothing writes into logs/, which is the whole reason the old string was wrong');
+
+  // ...and a launcher that DOES keep a file says which one, because it is the
+  // half of this that knows.
+  const named = path.join(HOME, 'logs', 'desktop.log');
+  const withFile = await startServer(t, { logFile: named });
+  db.close(withFile.db);
+  const detail = (await call(withFile, 'GET', '/api/state')).json.detail;
+  assert.ok(detail.includes(named), `the 500 should name the log the launcher gave it, got: ${detail}`);
 });
 
 test('the wrong method on a real route is a 405 with an Allow list', async (t) => {
@@ -1329,6 +1465,165 @@ test('/api/calendar/test reads an ics feed and refuses a dangerous url', async (
   assert.equal(missing.status, 200);
   assert.equal(missing.json.ok, false);
 });
+
+/**
+ * A calendar host that redirects, and counts who was asked.
+ *
+ * Each one is a separate listener on its own port, which makes each a separate
+ * ORIGIN — that is the whole point: the rule under test is about origins, and a
+ * chain of paths on one host would pass a broken implementation.
+ */
+async function startRedirectingIcs(t, { to = null } = {}) {
+  const hits = [];
+  const server = http.createServer((req, res) => {
+    hits.push({ url: req.url, authorization: req.headers.authorization ?? null });
+    if (to) {
+      res.writeHead(302, { Location: typeof to === 'function' ? to() : to });
+      res.end();
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'text/calendar' });
+    res.end(ICS_BODY);
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const { port } = server.address();
+  t.after(() => new Promise((r) => { server.closeAllConnections(); server.close(r); }));
+  return { port, baseUrl: `http://127.0.0.1:${port}`, hits };
+}
+
+/**
+ * REGRESSION (#43). This route and core/doctor.mjs were the only two network
+ * readers in the repo that handed redirect policy to `fetch`. `redirect:
+ * 'follow'` is not a policy — it is undici's, and undici's is twenty. Measured
+ * on Node 26.3.0: a 6-origin chain returned 200 having contacted six hosts, and
+ * a 22-origin chain contacted twenty-one before giving up. So pressing "Test" on
+ * a calendar address opened connections to up to twenty hosts the user never
+ * typed, inside the same passage of docs/SECURITY.md that invites the reader to
+ * check with tcpdump and promises "one hop".
+ */
+test('/api/calendar/test follows one hop, and only one', async (t) => {
+  const third = await startRedirectingIcs(t);
+  const second = await startRedirectingIcs(t, { to: `${third.baseUrl}/calendar.ics` });
+  const first = await startRedirectingIcs(t, { to: `${second.baseUrl}/calendar.ics` });
+  const ctx = await startServer(t);
+
+  const res = await call(ctx, 'POST', '/api/calendar/test', {
+    body: { kind: 'ics', url: `${first.baseUrl}/calendar.ics` },
+  });
+  assert.equal(res.status, 200);
+  assert.equal(res.json.ok, false, 'a second redirect is not followed, so the read did not succeed');
+  assert.equal(first.hits.length, 1);
+  assert.equal(second.hits.length, 1);
+  assert.equal(third.hits.length, 0,
+    'the third host was never typed by anybody and must never be contacted');
+
+  // ...and it says which end of the chain went wrong. Handing the second 3xx
+  // back as a response reaches the `!response.ok` arm and prints "<the address
+  // you typed> answered 302 Found" — true of nothing that happened, and it
+  // sends the reader to inspect the one host in the chain that behaved.
+  assert.match(res.json.error, /redirected more than once/);
+  assert.ok(res.json.error.includes(second.baseUrl),
+    `the hop that redirected again has to be named, got: ${res.json.error}`);
+  assert.equal(/answered 30\d/.test(res.json.error), false,
+    `"answered 302" describes the first host, which answered exactly one redirect as allowed: ${res.json.error}`);
+});
+
+/**
+ * REGRESSION (#43, the deadline half). `AbortSignal.timeout` minted inside the
+ * per-hop helper reads as harmless and is not: a host that stalls for
+ * twenty-nine seconds and then answers 302 hands the redirect target a whole
+ * fresh thirty, so "Test it" can hold the panel for a minute on a budget that
+ * says thirty seconds — and the stall is the hostile half, freely chosen by the
+ * host. core/doctor.mjs holds one signal across both of its hops and says so.
+ *
+ * Thirty seconds is not a thing a test can sit through, so the pair is compared
+ * by identity instead of by the clock: two `AbortSignal.timeout` calls cannot
+ * return the same object, and one deadline shared cannot return two.
+ */
+test('/api/calendar/test spends one deadline on both hops, not one each', async (t) => {
+  const target = await startRedirectingIcs(t);
+  const entry = await startRedirectingIcs(t, { to: `${target.baseUrl}/calendar.ics` });
+  const ctx = await startServer(t);
+
+  // Only the calendar hops are recorded; `call()` below reaches the server under
+  // test through this same global, and it must pass through untouched.
+  const realFetch = globalThis.fetch;
+  const signals = [];
+  globalThis.fetch = (input, init) => {
+    const href = typeof input === 'string' ? input : String(input?.url ?? input);
+    if (href.includes(`:${entry.port}/`) || href.includes(`:${target.port}/`)) signals.push(init?.signal);
+    return realFetch(input, init);
+  };
+  t.after(() => { globalThis.fetch = realFetch; });
+
+  const res = await call(ctx, 'POST', '/api/calendar/test', {
+    body: { kind: 'ics', url: `${entry.baseUrl}/calendar.ics` },
+  });
+  globalThis.fetch = realFetch;
+
+  assert.equal(res.json.ok, true, `the one allowed hop still has to work: ${res.json.error}`);
+  assert.equal(signals.length, 2, 'the redirect was followed, so there are two hops to compare');
+  assert.ok(signals[0] instanceof AbortSignal, 'a hop with no deadline at all can hang forever');
+  assert.equal(signals[0], signals[1],
+    'the second hop must inherit the first hop\'s deadline, not open a new one');
+});
+
+/**
+ * The credential half of the same rule, mirroring test/security.test.mjs against
+ * the sweep reader: one hop is allowed, and the stored password crosses it only
+ * when the hop stayed on the origin the user typed.
+ */
+test('/api/calendar/test re-sends the calendar password on a same-origin hop and not across one', async (t) => {
+  await setSecret('calendar.c_hop', SECRET_VALUE);
+  t.after(() => deleteSecret('calendar.c_hop').catch(() => {}));
+
+  const elsewhere = await startRedirectingIcs(t);
+  const home = await startRedirectingIcs(t, { to: `${elsewhere.baseUrl}/calendar.ics` });
+  const ctx = await startServer(t);
+
+  const away = await call(ctx, 'POST', '/api/calendar/test', {
+    body: { kind: 'ics', url: `${home.baseUrl}/calendar.ics`, user: 'nemo', keyRef: 'calendar.c_hop' },
+  });
+  assert.equal(away.status, 200);
+  assert.equal(away.json.ok, true, 'one hop is still followed — webcal hosts answer 301 to their CDN');
+  assert.ok(home.hits[0].authorization?.startsWith('Basic '),
+    'the host the user typed is the host they meant to authenticate to');
+  assert.equal(elsewhere.hits[0].authorization, null,
+    'the password must not cross an origin the user never typed');
+  // Belt and braces: the value itself, not merely the header's absence.
+  const raw = elsewhere.hits.map((h) => h.authorization ?? '').join('|');
+  assert.equal(raw.includes(Buffer.from(`nemo:${SECRET_VALUE}`).toString('base64')), false);
+
+  // ...and a hop that stays put keeps it.
+  const samePort = await startSameOriginRedirect(t);
+  const stayed = await call(ctx, 'POST', '/api/calendar/test', {
+    body: { kind: 'ics', url: `${samePort.baseUrl}/redirect.ics`, user: 'nemo', keyRef: 'calendar.c_hop' },
+  });
+  assert.equal(stayed.status, 200);
+  assert.equal(stayed.json.ok, true);
+  assert.equal(samePort.hits.length, 2);
+  assert.ok(samePort.hits[1].authorization?.startsWith('Basic '),
+    'a redirect that stayed on the same host must still be authenticated, or every webcal CDN hop breaks');
+});
+
+/** One host that redirects `/redirect.ics` to `/calendar.ics` on itself. */
+async function startSameOriginRedirect(t) {
+  const hits = [];
+  const server = http.createServer((req, res) => {
+    hits.push({ url: req.url, authorization: req.headers.authorization ?? null });
+    if (req.url.startsWith('/redirect.ics')) {
+      res.writeHead(302, { Location: '/calendar.ics' });
+      res.end();
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'text/calendar' });
+    res.end(ICS_BODY);
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const { port } = server.address();
+  t.after(() => new Promise((r) => { server.closeAllConnections(); server.close(r); }));
+  return { port, baseUrl: `http://127.0.0.1:${port}`, hits };
+}
 
 /* ================================================================== *
  * The mail test, under the account's own TLS rule

@@ -128,20 +128,114 @@ function rawRequest(port, requestLine, extraHeaders = [], body = '') {
 
 const statusOf = (raw) => Number(/^HTTP\/1\.\d (\d{3})/.exec(raw)?.[1] ?? 0);
 
-/** SPEC §8, every route with the method it actually answers on. */
-const API_ROUTES = [
-  ['GET', '/api/health'], ['GET', '/api/state'], ['POST', '/api/sweep'],
-  ['GET', '/api/sweep/stream'], ['POST', '/api/items/abc/state'], ['POST', '/api/capture'],
-  ['GET', '/api/config'], ['PUT', '/api/config'], ['POST', '/api/secrets'],
-  ['DELETE', '/api/secrets/model.default'], ['POST', '/api/model/test'],
-  ['GET', '/api/model/list'], ['GET', '/api/model/presets'], ['GET', '/api/local/probe'],
-  ['POST', '/api/mail/test'], ['POST', '/api/calendar/test'], ['POST', '/api/ask'],
-  ['PUT', '/api/drafts/d1'], ['GET', '/api/search?q=x'],
-];
+/**
+ * Every route the router serves, with the method it answers on — read out of
+ * the router rather than restated beside it.
+ *
+ * The two tests below are the whole "no /api route answers a stranger" claim,
+ * and while this was a hand-written literal they made that claim about 19 of the
+ * server's 27 routes. `/api/sample-data` — three handlers that seed and destroy
+ * board rows — was in this list and in `ROUTES_THAT_ARE_NOT_MCP` in
+ * test/ai-security.test.mjs, which is the same shape of literal, in neither. An
+ * unauthenticated carve-out that answered all three was invisible to the suite:
+ * measured by mutation, gutting both write handlers and adding a pre-gate
+ * carve-out that returned the whole config each left it at 1022 pass / 0 fail.
+ * The same carve-out on `POST /api/ai/test` — a route that IS in the literal —
+ * turned it red, which is what isolated the gap to the list rather than the
+ * gate.
+ *
+ * Nothing warned, because nothing compared the list with the table: a route
+ * added to core/server.mjs arrived already exempt from the adversarial pass.
+ * So the table is parsed out of core/server.mjs's `ROUTES` array, and the probe
+ * below proves every entry this parser produced really names a live route. A
+ * route added there is covered here the moment it is added, and a route this
+ * parser cannot read is a failure rather than a silent omission.
+ */
+/** Routes whose handler needs a query string to be worth requesting at all. */
+const ROUTE_QUERY = { '/api/search': '?q=x' };
+
+const API_ROUTES = readRouterTable();
+
+function readRouterTable() {
+  const source = fs.readFileSync(path.join(REPO, 'core', 'server.mjs'), 'utf8');
+  const block = /\nconst ROUTES = \[\n([\s\S]*?)\n\];/.exec(source);
+  if (!block) throw new Error('core/server.mjs has no ROUTES array this parser can read — fix the parser, do not restate the table');
+
+  // `const ID = '([A-Za-z0-9_.:-]{1,80})'` — the segment pattern the table
+  // interpolates for :id routes. A sample id stands in for it.
+  const idConst = /\nconst ID = '(.+?)';/.exec(source);
+  if (!idConst) throw new Error('core/server.mjs no longer defines ID; the :id routes cannot be turned into paths');
+  const SAMPLE_ID = 'probe.id-1';
+  if (!new RegExp(`^${idConst[1]}$`).test(SAMPLE_ID)) {
+    throw new Error(`the sample id ${SAMPLE_ID} no longer matches the router's ID pattern ${idConst[1]}`);
+  }
+
+  // Two shapes appear in the table: a regex literal, and `new RegExp(`…`)` for
+  // the ones that interpolate ID. `\/(.+?)\/\s*,` is anchored on the `/,` that
+  // closes a literal, because the pattern bodies contain escaped slashes.
+  const ROUTE = /\[\s*'([A-Z]+)'\s*,\s*(?:\/(.+?)\/\s*,|new RegExp\(`(.+?)`\)\s*,)/g;
+  const rows = [];
+  for (const m of block[1].matchAll(ROUTE)) {
+    const method = m[1];
+    const pattern = (m[2] ?? m[3])
+      .replaceAll('${ID}', SAMPLE_ID)      // the interpolated segment
+      .replaceAll('\\/', '/')              // an escaped slash is just a slash
+      .replace(/^\^/, '')
+      .replace(/\$$/, '');
+    if (/[\\^$*+?()[\]{}|]/.test(pattern)) {
+      throw new Error(`this parser cannot turn ${method} ${m[2] ?? m[3]} into a request path — it left ${pattern}`);
+    }
+    rows.push([method, `${pattern}${ROUTE_QUERY[pattern] ?? ''}`]);
+  }
+
+  // Every line of the table has to have been read. A row this regex skipped
+  // would be a route silently exempt from both tests below, which is the exact
+  // failure this derivation exists to end.
+  const declared = block[1].split('\n').filter((line) => /^\s*\['[A-Z]+'/.test(line)).length;
+  if (rows.length !== declared) {
+    throw new Error(`core/server.mjs declares ${declared} routes and this parser read ${rows.length}`);
+  }
+  if (rows.length < 25) throw new Error(`only ${rows.length} routes were read — the parser is broken`);
+  return rows;
+}
 
 /* ================================================================== *
  * 1. The local HTTP surface
  * ================================================================== */
+
+/**
+ * The derivation above is only worth having if what it produces reaches the
+ * router. A parser that quietly emitted "/api/heXlth" would leave the two tests
+ * below asserting 401 on a path that does not exist — which every path answers,
+ * because the session gate runs before routing. That is a green test proving
+ * nothing, and it is the same failure as the literal it replaced.
+ *
+ * OPTIONS is the probe on purpose, as it is in test/repo.test.mjs: it matches no
+ * route, so the router answers out of the table alone — 404 for a path it does
+ * not have, 405 plus `allowed` for one it does — and no handler runs. Nothing is
+ * swept, no model is called, no stream is opened, and nothing is seeded.
+ */
+test('every route this file tests against is one the router really serves', async (t) => {
+  const ctx = await startServer(t);
+  const unknown = [];
+  for (const [method, route] of API_ROUTES) {
+    const res = await fetch(`${ctx.base}${route.split('?')[0]}`, {
+      method: 'OPTIONS',
+      headers: { 'X-Zelos-Token': ctx.token },
+    });
+    const body = await res.json().catch(() => ({}));
+    const allowed = new Set(body.allowed || []);
+    if (res.status !== 405 || !allowed.has(method)) {
+      unknown.push(`${method} ${route} — OPTIONS answered ${res.status}, allowing ${[...allowed].join(', ') || 'nothing'}`);
+    }
+  }
+  assert.deepEqual(unknown, [], `the derived table names routes the server does not serve:\n  ${unknown.join('\n  ')}`);
+
+  // And the route whose absence started this: three handlers at one path.
+  const sample = API_ROUTES.filter(([, route]) => route === '/api/sample-data').map(([m]) => m).sort();
+  assert.deepEqual(sample, ['DELETE', 'GET', 'POST'],
+    'the sample-data handlers must be in the table the auth tests iterate');
+});
 
 test('no /api route answers an unauthenticated caller — the whole table, SSE included', async (t) => {
   const ctx = await startServer(t);
@@ -319,6 +413,168 @@ test('the token is only ever read from its own header', async (t) => {
   assert.equal((await call(ctx, 'GET', '/api/state', { token: `${ctx.token}0` })).status, 401);
 });
 
+/**
+ * The other end of the same credential: what the page does with the token once
+ * the launch URL has handed it over.
+ *
+ * docs/SECURITY.md promises three things about it, and until now the suite
+ * asserted none of them — three separate mutations to `readToken()` in
+ * ui/lib/api.js each left the run at 1022 pass / 0 fail:
+ *
+ *   A. deleting the `history.replaceState` strip, so the token stays in the
+ *      address bar, in the back/forward history, in a bookmark, in a Referer,
+ *      and in every screenshot anybody takes of the app;
+ *   B. swapping `sessionStorage` for `localStorage`, so it outlives the tab and
+ *      lands on disk in the browser profile;
+ *   C. adding it to a second outbound header.
+ *
+ * The `?t=` branch was never the problem — test/integration.test.mjs does import
+ * the real module with a token in `location.href`. What was missing is anybody
+ * looking: its `history.replaceState` is a stub nobody inspects and its
+ * sessionStorage Map is written and never read. Mutation B stayed green partly
+ * because that file defines no `localStorage` at all, so the `setItem` threw
+ * into api.js's bare catch and the token still reached the page by return value.
+ *
+ * So the stubs here record, the assertions read what they recorded, and
+ * `localStorage` is present and watched rather than absent and assumed.
+ */
+test('the session token leaves the address bar, and never reaches localStorage', async (t) => {
+  const TOKEN = 'b'.repeat(64);
+  const rewritten = [];
+  const session = new Map();
+  const local = new Map();
+  const storage = (store) => ({
+    getItem: (k) => (store.has(k) ? store.get(k) : null),
+    setItem: (k, v) => store.set(k, String(v)),
+    removeItem: (k) => store.delete(k),
+  });
+
+  // ui/lib/api.js is browser code and reads these at import time. Put the
+  // globals back exactly as they were found — Node defines `localStorage`
+  // itself, so `delete` is not the same thing as "restore".
+  const saved = ['window', 'sessionStorage', 'localStorage']
+    .map((name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)]);
+  t.after(() => {
+    for (const [name, descriptor] of saved) {
+      if (descriptor) Object.defineProperty(globalThis, name, descriptor);
+      else delete globalThis[name];
+    }
+  });
+
+  globalThis.window = {
+    location: { href: `http://127.0.0.1:7777/?t=${TOKEN}&view=board`, host: '127.0.0.1:7777' },
+    history: { replaceState: (state, title, url) => rewritten.push(url) },
+  };
+  globalThis.sessionStorage = storage(session);
+  globalThis.localStorage = storage(local);
+
+  // A fresh module instance: api.js reads the token once, at evaluation.
+  const api = await import(`../ui/lib/api.js?token-probe=${Date.now()}-${process.pid}`);
+
+  assert.equal(api.hasToken(), true, 'the page did not find the token the launcher put in the URL');
+
+  // (A) The address bar.
+  assert.equal(rewritten.length, 1, 'the address was never rewritten, so the token is still on screen');
+  assert.ok(!/[?&]t=/.test(rewritten[0]), `the rewritten address still carries the token: ${rewritten[0]}`);
+  assert.ok(!rewritten[0].includes(TOKEN), `the rewritten address still carries the token: ${rewritten[0]}`);
+  assert.match(rewritten[0], /view=board/, 'the strip took the rest of the query with it');
+
+  // (B) Where it is kept.
+  assert.deepEqual([...session.values()], [TOKEN], 'the token is not in sessionStorage, which dies with the tab');
+  assert.deepEqual([...local.entries()], [], 'the token was written to localStorage, which outlives the tab and lands on disk');
+
+  // (C) What goes out on the wire. One header carries it, and it is the one the
+  // server reads; nothing else does, and it is never a query parameter.
+  const sent = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    sent.push({ url, init });
+    return new Response('{"ok":true}', { status: 200, headers: { 'Content-Type': 'application/json' } });
+  };
+  t.after(() => { globalThis.fetch = realFetch; });
+
+  await api.request('/api/state');
+  await api.request('/api/capture', { method: 'POST', body: { text: 'x' } });
+  assert.equal(sent.length, 2);
+  for (const { url, init } of sent) {
+    assert.ok(!String(url).includes(TOKEN), `the token was put in the path: ${url}`);
+    const carrying = Object.entries(init.headers)
+      .filter(([, value]) => String(value).includes(TOKEN))
+      .map(([name]) => name);
+    assert.deepEqual(carrying, ['X-Zelos-Token'], `the token went out in ${carrying.join(', ') || 'no header at all'}`);
+  }
+});
+
+/**
+ * The three `/api/sample-data` handlers, over HTTP, with a token.
+ *
+ * They needed a test of their own rather than a line in the table above,
+ * because a route can be in the table, pass the auth pass, and still have a body
+ * that never executes: a `throw` at the top of all three handlers left the suite
+ * at 1022 pass / 0 fail. `core/sample-data.mjs` itself is well covered — gutting
+ * `seedSampleData` fails eight tests in test/sample-data.test.mjs — but the
+ * three lines in core/server.mjs that connect it to a request were run by
+ * nothing, in a repository that has already shipped this exact seam broken once
+ * (the button called a route the router did not have; see test/repo.test.mjs).
+ *
+ * So this drives the real HTTP surface end to end: seed, read the status back,
+ * seed again, clear. The security interest is the third response — clearing must
+ * take the sample rows and nothing else, and it is the one path that deletes
+ * board rows the user can see.
+ */
+test('the sample-data handlers seed, report and clear over HTTP, and touch nothing else', async (t) => {
+  const ctx = await startServer(t);
+  const json = async (method, body) => {
+    const res = await call(ctx, method, '/api/sample-data', body === undefined ? {} : { body });
+    return { status: res.status, body: JSON.parse(res.text) };
+  };
+
+  // A row of the user's own, written before the sample data arrives. Nothing
+  // below is allowed to remove it: `clearSampleData` deletes by recorded id.
+  db.insertCapture(ctx.db, 'a note the user typed');
+  const mine = db.listCaptures(ctx.db, {}).length;
+  assert.equal(mine, 1);
+
+  const empty = await json('GET');
+  assert.equal(empty.status, 200);
+  assert.equal(empty.body.installed, false);
+  assert.equal(empty.body.counts, null);
+
+  const seeded = await json('POST');
+  assert.equal(seeded.status, 201, 'the first seed created rows, so it is a 201');
+  assert.equal(seeded.body.installed, true);
+  assert.equal(seeded.body.alreadyInstalled, false);
+  assert.ok(seeded.body.counts.items > 0, 'the seed reported no items');
+  assert.ok(db.listBoard(ctx.db, { states: ['open'], limit: 200 }).length > 0, 'nothing reached the board');
+
+  // Everything it wrote is marked as sample data, on the board a person reads.
+  for (const row of db.listBoard(ctx.db, { states: ['open'], limit: 200 })) {
+    assert.match(row.headline, /^Sample · /, `an unmarked row reached the board: ${row.headline}`);
+  }
+
+  const again = await json('POST');
+  assert.equal(again.status, 200, 'a second seed created nothing, so it is not a 201');
+  assert.equal(again.body.alreadyInstalled, true);
+  assert.equal(again.body.counts.items, seeded.body.counts.items, 'a double-click produced a second demo week');
+
+  const status = await json('GET');
+  assert.equal(status.body.installed, true);
+  assert.deepEqual(status.body.counts, seeded.body.counts);
+
+  const cleared = await json('DELETE');
+  assert.equal(cleared.status, 200);
+  assert.equal(cleared.body.cleared, true);
+  assert.equal(cleared.body.installed, false);
+  assert.ok(cleared.body.removed.items > 0);
+  assert.equal(db.listBoard(ctx.db, { states: ['open'], limit: 200 }).length, 0, 'sample rows survived the clear');
+  assert.equal(db.listCaptures(ctx.db, {}).length, mine, "the clear took a row that was not the sample data's");
+
+  // And clearing what is not there is a 200 that says so, not a 500.
+  const twice = await json('DELETE');
+  assert.equal(twice.status, 200);
+  assert.equal(twice.body.cleared, false);
+});
+
 /* ================================================================== *
  * 2. Secrets
  * ================================================================== */
@@ -441,6 +697,101 @@ test('CalDAV credentials never follow an href the server chose', async (t) => {
   for (const auth of seen) {
     assert.equal(auth, null, 'Basic credentials went to a host named by the server');
   }
+});
+
+/**
+ * The same claim on the .ics path, which is the one a Google or Outlook "secret
+ * address" subscription takes — and it was the only credential control in the
+ * repository with no regression test at all.
+ *
+ * Measured: replacing `res = await request(next, sameOrigin)` in
+ * `fetchIcsText` (core/sweep.mjs) with `request(next, true)` left the suite at
+ * 1022 pass / 0 fail, and an end-to-end repro of that mutant handed
+ * `me@example.com:<the stored password>` to whatever host the redirect named.
+ * The equivalent mutations to core/llm.mjs and core/sources/caldav.mjs were both
+ * caught, by the two tests above and their siblings; the ics reader was simply
+ * never asked. It IS exercised — four tests read an .ics over HTTP — but always
+ * with `keyRef: null` and never through a redirect, and the uncovered
+ * combination is exactly the dangerous one: a stored credential, plus a hop.
+ *
+ * It goes through `runSweep` rather than calling the reader directly, because
+ * `fetchIcsText` is private to core/sweep.mjs and the thing worth pinning is the
+ * whole path a 07:00 sweep takes: the keyRef is looked up, the password is
+ * handed to the reader, and the reader decides what crosses an origin.
+ */
+test('an .ics credential never follows a redirect off the origin the user typed', async (t) => {
+  const attackerSaw = [];
+  const startsAt = Date.now() + 26 * 3_600_000;
+  const stamp = (ms) => new Date(ms).toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '');
+  const document = [
+    'BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//Zelos security probe//EN',
+    'BEGIN:VEVENT', 'UID:redirected-9001', `DTSTAMP:${stamp(startsAt - 86_400_000)}`,
+    `DTSTART:${stamp(startsAt)}`, `DTEND:${stamp(startsAt + 3_600_000)}`,
+    'SUMMARY:Pre-con with Alder & Vance', 'END:VEVENT', 'END:VCALENDAR', '',
+  ].join('\r\n');
+
+  const attacker = await httpMock(t, (req, res) => {
+    attackerSaw.push(req.headers);
+    res.writeHead(200, { 'Content-Type': 'text/calendar; charset=utf-8' });
+    res.end(document);
+  });
+  const redirectorSaw = [];
+  const redirector = await httpMock(t, (req, res) => {
+    redirectorSaw.push(req.headers);
+    res.writeHead(302, { Location: `${attacker.base}/moved.ics` });
+    res.end();
+  });
+
+  const handle = db.open(':memory:');
+  db.migrate(handle);
+  t.after(() => db.close(handle));
+
+  const config = loadConfig();
+  config.mail = [];
+  config.calendars = [{
+    id: 'c_probe', enabled: true, label: 'Work', kind: 'ics',
+    url: `${redirector.base}/work.ics`, user: 'me@example.com', keyRef: 'cal.c_probe',
+  }];
+
+  const result = await runSweep({
+    db: handle,
+    config,
+    mode: 'full',
+    deps: {
+      getSecret: async (ref) => (ref === 'cal.c_probe' ? CAL_PASS : null),
+      complete: async () => ({
+        text: JSON.stringify({ first: null, items: [], notes: [] }),
+        usage: { input: 1, output: 1 },
+        model: 'test-model',
+        raw: {},
+      }),
+    },
+  });
+
+  // The credential does reach the host the user typed — otherwise this would
+  // pass just as well on a reader that had stopped sending it anywhere.
+  const expected = `Basic ${Buffer.from(`me@example.com:${CAL_PASS}`).toString('base64')}`;
+  assert.equal(redirectorSaw.length, 1);
+  assert.equal(redirectorSaw[0].authorization, expected,
+    'the calendar the user configured was not sent the password it was given');
+
+  // And it stops there.
+  assert.ok(attackerSaw.length > 0, 'the redirect was never followed — the test proves nothing');
+  for (const headers of attackerSaw) {
+    assert.equal(headers.authorization ?? null, null, 'Basic credentials crossed an origin on a redirect');
+    for (const [name, value] of Object.entries(headers)) {
+      assert.ok(!String(value).includes(CAL_PASS), `the password rode along in ${name}: ${value}`);
+      assert.ok(!String(value).includes(Buffer.from(`me@example.com:${CAL_PASS}`).toString('base64')),
+        `the encoded credential rode along in ${name}`);
+    }
+  }
+
+  // The redirect is still followed and the calendar still read — the pin is not
+  // "refuse to work", which would pass every assertion above and lose the feature.
+  const source = result.stats.sources.find((s) => s.kind === 'calendar');
+  assert.equal(source.ok, true, `the calendar failed instead: ${source.error}`);
+  assert.equal(source.count, 1);
+  assert.equal(db.listEvents(handle).length, 1);
 });
 
 test('a cross-origin hop that demands a password says so, instead of blaming the password', async (t) => {

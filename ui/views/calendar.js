@@ -17,6 +17,16 @@
  * when the range moves — never on the re-render a finished sweep causes, which
  * would drag a reader back to the morning while they were looking at Thursday
  * evening.
+ *
+ * And the second rule, which the arrows used to break: THIS GRID IS ONLY EVER A
+ * VIEW OF ONE WINDOW. `/api/state` serves the events around today and says so in
+ * `eventWindow`; there is no route that fetches another range, and nothing here
+ * refetches. So ‹ and › stop at the served edge, and any day inside a range that
+ * the window does not cover is drawn as unserved rather than as free. Without
+ * that the calendar answered questions it had not been given the data for:
+ * measured 2026-08-10, November drew 35 fully styled empty cells, October drew
+ * 22, and August's own grid — which begins 2026-07-26 — drew eight, for days
+ * whose events were sitting in the local database the whole time.
  */
 
 import { el, button, meander } from '../lib/dom.js';
@@ -25,7 +35,7 @@ import {
   dayKey, addDaysToKey, startOfWeekKey, weekdayOfKey, dayName, monthName, formatTime,
 } from '../lib/time.js';
 import { eventSpanOnDay, eventTimeLabel, packColumns, conflictsFirst } from '../lib/format.js';
-import { state, nowMark } from '../lib/store.js';
+import { state, nowMark, eventWindow, dayIsLoaded } from '../lib/store.js';
 
 const MODES = [
   { id: 'day', label: 'Day' },
@@ -140,10 +150,6 @@ function anchorKey() {
   return view.anchor;
 }
 
-function move(days) {
-  view.anchor = addDaysToKey(anchorKey(), days);
-}
-
 /**
  * The day named by the route, when the route is naming one worth honouring.
  *
@@ -165,10 +171,16 @@ export function anchorFromRoute(sub, applied, arriving = false) {
   return sub;
 }
 
-function keysForRange() {
-  const key = anchorKey();
-  if (view.mode === 'day') return [key];
-  if (view.mode === 'week') {
+/**
+ * The days one range covers, for a mode and an anchor.
+ *
+ * Pure, and exported, because the ‹ and › buttons now have to know what the
+ * range they would move to CONTAINS before they decide whether to be clickable
+ * — which means computing a range for an anchor that is not the current one.
+ */
+export function keysForAnchor(mode, key) {
+  if (mode === 'day') return [key];
+  if (mode === 'week') {
     const start = startOfWeekKey(key, 0);
     return Array.from({ length: 7 }, (_, i) => addDaysToKey(start, i));
   }
@@ -182,6 +194,47 @@ function keysForRange() {
     cells.length -= 7;
   }
   return cells;
+}
+
+function keysForRange() {
+  return keysForAnchor(view.mode, anchorKey());
+}
+
+/**
+ * Where ‹ and › land: one day, one week, or the 1st of the neighbouring month.
+ *
+ * Pulled out of the two button handlers, which held one copy each of the
+ * month-wrap arithmetic, so that the buttons and the enabled/disabled test that
+ * now sits beside them cannot disagree about where a press would go.
+ */
+export function stepAnchor(mode, key, direction) {
+  if (mode === 'day') return addDaysToKey(key, direction);
+  if (mode === 'week') return addDaysToKey(key, 7 * direction);
+  const [y, m] = key.split('-').map(Number);
+  const raw = m + direction;
+  const month = ((raw - 1 + 12) % 12) + 1;
+  const year = y + Math.floor((raw - 1) / 12);
+  return `${year}-${String(month).padStart(2, '0')}-01`;
+}
+
+/**
+ * Whether a range is worth letting somebody walk to.
+ *
+ * OVERLAP, not containment, and the difference is the whole design. `/api/state`
+ * serves one window and there is no route that asks for another, so a range past
+ * its edge can only ever be drawn empty — which is what the arrows did, silently,
+ * for as many presses as anyone cared to make. Refusing anything not FULLY inside
+ * the window would be the other failure: the month grid begins on the Sunday
+ * before the 1st, so the month before this one always spills over the back edge
+ * and month mode would collapse to a single reachable month.
+ *
+ * So: any range still holding a served day stays reachable, its unserved days
+ * are drawn as unserved rather than as empty, and a range holding none at all is
+ * where the arrows stop. With no window declared, nothing is refused.
+ */
+export function rangeIsReachable(keys, served) {
+  if (!served) return true;
+  return (keys || []).some((k) => k >= served.from && k <= served.to);
 }
 
 /** Every event that touches `key`, already clamped to that day's minutes. */
@@ -227,45 +280,60 @@ function segmented(rerender) {
 }
 
 function toolbar(keys, rerender) {
-  const step = view.mode === 'day' ? 1 : view.mode === 'week' ? 7 : 0;
+  // Named `served`, not `window`: this file runs in a browser, and shadowing the
+  // global inside a function that builds DOM is a trap for whoever edits it next.
+  const served = eventWindow();
+  const arrow = (label, direction, ariaLabel) => {
+    const target = stepAnchor(view.mode, anchorKey(), direction);
+    const reachable = rangeIsReachable(keysForAnchor(view.mode, target), served);
+    return button(label, {
+      class: 'btn icon',
+      'aria-label': ariaLabel,
+      ...(reachable ? {} : {
+        disabled: true,
+        title: `Zelos is holding ${served.from} to ${served.to}. There is nothing loaded past that — a sweep moves the window.`,
+      }),
+      onClick: () => {
+        if (!reachable) return;
+        view.anchor = target;
+        rerender();
+      },
+    });
+  };
+
   return el('div', { class: 'cal-bar' }, [
     el('div', { class: 'cal-nav' }, [
-      button('‹', {
-        class: 'btn icon',
-        'aria-label': 'Previous',
-        onClick: () => {
-          if (step) move(-step);
-          else {
-            const [y, m] = anchorKey().split('-').map(Number);
-            const pm = m === 1 ? 12 : m - 1;
-            const py = m === 1 ? y - 1 : y;
-            view.anchor = `${py}-${String(pm).padStart(2, '0')}-01`;
-          }
-          rerender();
-        },
-      }),
+      arrow('‹', -1, 'Previous'),
       button('Today', {
         class: 'btn quiet',
         onClick: () => { view.anchor = nowMark().key || dayKey(state.board.now); rerender(); },
       }),
-      button('›', {
-        class: 'btn icon',
-        'aria-label': 'Next',
-        onClick: () => {
-          if (step) move(step);
-          else {
-            const [y, m] = anchorKey().split('-').map(Number);
-            const nm = m === 12 ? 1 : m + 1;
-            const ny = m === 12 ? y + 1 : y;
-            view.anchor = `${ny}-${String(nm).padStart(2, '0')}-01`;
-          }
-          rerender();
-        },
-      }),
+      arrow('›', 1, 'Next'),
     ]),
     el('h2', { class: 'cal-title', text: rangeTitle(keys) }),
     segmented(rerender),
   ]);
+}
+
+/**
+ * The line under the toolbar that says the grid is only part of an answer.
+ *
+ * It appears only when the range on screen actually straddles the edge, so the
+ * common case — a week inside the window — carries no chrome at all. The count
+ * is measured off the keys rather than described, because "some days" beside a
+ * grid with two marked cells is the kind of vagueness that makes a reader
+ * distrust the marked cells too.
+ */
+function windowNote(keys) {
+  const served = eventWindow();
+  if (!served) return null;
+  const missing = keys.filter((k) => !dayIsLoaded(k)).length;
+  if (!missing) return null;
+  return el('p', {
+    class: 'meta',
+    role: 'status',
+    text: `${missing === 1 ? 'One day here is' : `${missing} days here are`} outside what Zelos has loaded (${served.from} to ${served.to}) — they are marked, not empty.`,
+  });
 }
 
 /* ----------------------------------------------------------------- time grid */
@@ -295,14 +363,45 @@ function chip({ event, start, end, col, cols }, { today, nowMinutes, compact }) 
   ]);
 }
 
+/**
+ * The mark a day that was never served wears.
+ *
+ * Styled inline rather than with a class, because ui/app.css has no rule for
+ * this and inventing one there is not this change's to make. It is deliberately
+ * quiet — this is not an error, it is the edge of an answer — but it is text, in
+ * the cell, saying the thing: an empty grid that means "nothing on" and an empty
+ * grid that means "nobody asked" are the same picture, and the second one is the
+ * one that gets believed.
+ */
+const NOT_LOADED_TITLE =
+  'Zelos has not loaded this day. The board carries a window around today; sweep, or come back when it has moved.';
+
+function notLoadedMark({ block = false } = {}) {
+  return el('span', {
+    class: 'cal-unloaded mono',
+    title: NOT_LOADED_TITLE,
+    style: {
+      'font-size': '0.5625rem',
+      'letter-spacing': '0.08em',
+      'text-transform': 'uppercase',
+      color: 'var(--ink-3)',
+      opacity: '0.75',
+      ...(block ? { display: 'block', 'text-align': 'center', 'margin-top': '0.6rem' } : {}),
+    },
+    text: 'not loaded',
+  });
+}
+
 function dayColumn(key, { todayKeyStr, nowMinutes, compact }) {
   const spans = spansForDay(key).filter((s) => !s.allDay);
   const packed = packColumns(spans);
   const isToday = key === todayKeyStr;
+  const loaded = dayIsLoaded(key);
 
   return el('div', {
-    class: `cal-col${isToday ? ' is-today' : ''}`,
+    class: `cal-col${isToday ? ' is-today' : ''}${loaded ? '' : ' is-unloaded'}`,
     dataset: { day: key },
+    ...(loaded ? {} : { title: NOT_LOADED_TITLE }),
   }, [
     ...packed.map((entry) => chip(entry, { today: isToday, nowMinutes, compact })),
     isToday && nowMinutes !== null
@@ -334,9 +433,18 @@ function timeGrid(keys, { wasOnScreen }) {
     el('div', { class: 'cal-gutter-cell' }),
     el('div', { class: 'cal-head-days' }, keys.map((key) => {
       const [, , d] = key.split('-').map(Number);
-      return el('div', { class: `cal-head-cell${key === todayKeyStr ? ' is-today' : ''}` }, [
+      const loaded = dayIsLoaded(key);
+      /* The mark goes in the HEADER, not in the column below it. The column is
+         1,440 minutes tall and holds absolutely-positioned chips, so a note
+         dropped into it lands at an arbitrary hour and reads as an event. The
+         header is where the date already is, which is where a reader is already
+         looking to ask what day this is. */
+      return el('div', {
+        class: `cal-head-cell${key === todayKeyStr ? ' is-today' : ''}${loaded ? '' : ' is-unloaded'}`,
+      }, [
         el('span', { class: 'cal-head-dow', text: dayName(weekdayOfKey(key)).slice(0, 3) }),
         el('span', { class: 'cal-head-num mono', text: String(d) }),
+        loaded ? null : notLoadedMark({ block: true }),
       ]);
     })),
   ]);
@@ -462,17 +570,24 @@ function monthCell(key, { todayKeyStr, monthPrefix }) {
   const [, , d] = key.split('-').map(Number);
   const outside = key.slice(0, 7) !== monthPrefix;
   const hasConflict = spans.some((s) => s.conflict);
+  /* `outside` and `loaded` are two different facts about a cell and the grid has
+     to keep them apart: `is-outside` means "this day belongs to the neighbouring
+     month", which is a layout note about a day that IS drawn correctly, and
+     `is-unloaded` means "the board carries no answer about this day at all". */
+  const loaded = dayIsLoaded(key);
 
   const list = el('div', { class: 'month-list' });
   const shown = spans.slice(0, MONTH_VISIBLE);
   for (const span of shown) list.appendChild(monthEntry(span));
 
   const cell = el('div', {
-    class: `month-cell${outside ? ' is-outside' : ''}${key === todayKeyStr ? ' is-today' : ''}${hasConflict ? ' has-conflict' : ''}`,
+    class: `month-cell${outside ? ' is-outside' : ''}${key === todayKeyStr ? ' is-today' : ''}${hasConflict ? ' has-conflict' : ''}${loaded ? '' : ' is-unloaded'}`,
+    ...(loaded ? {} : { title: NOT_LOADED_TITLE }),
   }, [
     el('div', { class: 'month-num-row' }, [
       el('span', { class: 'month-num mono', text: String(d) }),
       hasConflict ? el('span', { class: 'month-flag', title: 'Overlapping events', text: 'clash' }) : null,
+      hasConflict || loaded ? null : notLoadedMark(),
     ]),
     list,
   ]);
@@ -614,6 +729,8 @@ export function renderCalendar(ctx) {
     return body;
   }
 
+  const note = windowNote(keys);
+  if (note) body.appendChild(note);
   body.appendChild(view.mode === 'month' ? monthGrid(keys) : timeGrid(keys, { wasOnScreen }));
   return body;
 }

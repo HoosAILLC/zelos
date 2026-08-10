@@ -213,13 +213,41 @@ function textOf(node) {
  * ------------------------------------------------------------------ */
 
 class CalDavError extends Error {
-  constructor(message, { status = 0, host = '' } = {}) {
+  constructor(message, { status = 0, host = '', anonymous = false } = {}) {
     super(message);
     this.name = 'CalDavError';
     this.status = status;
     this.host = host;
+    /**
+     * Set only on a 401/403 from a hop the origin pin deliberately sent without
+     * the credential. It is the difference between "your password is wrong" and
+     * "we never offered one", and discovery has to be able to tell them apart —
+     * see `isCredentialVerdict`.
+     */
+    this.anonymous = anonymous;
   }
 }
+
+/**
+ * Is this 401/403 an answer *about the credential*?
+ *
+ * It is when the request carried the credential and the server refused it, and
+ * it is when there was no credential to carry — both mean the walk cannot get
+ * any further and the caller needs to hear about it now.
+ *
+ * It is not when the origin pin withheld the credential on purpose. That host
+ * declined an anonymous caller, which is a fact about the pin, not about the
+ * password; treating it as a verdict abandons every remaining search root —
+ * including `base`, the URL the user typed, which has not been asked at Depth:1
+ * yet. Servers that partition an account across hosts (iCloud answers an
+ * unauthenticated PROPFIND with `x-apple-user-partition`) hand back exactly this
+ * shape as their ordinary layout, not as an attack.
+ */
+const isCredentialVerdict = (err) =>
+  err instanceof CalDavError && (err.status === 401 || err.status === 403) && !err.anonymous;
+
+/** The other half of that split: a hop refused because we withheld the password. */
+const wasDeclinedAnonymously = (err) => err instanceof CalDavError && err.anonymous;
 
 function hostOf(url) {
   try {
@@ -338,7 +366,7 @@ async function request(method, url, { user, pass, body = null, depth = null, tim
           `${hostOf(url)} asked for a password, but it is not the calendar host you configured — ` +
             'Zelos will not send your calendar password to a host a server redirected it to. ' +
             `If ${hostOf(url)} really is your calendar, put its address in the calendar URL directly.`,
-          { status: response.status, host: hostOf(url) },
+          { status: response.status, host: hostOf(url), anonymous: true },
         );
       }
       throw new CalDavError(
@@ -808,7 +836,10 @@ export function invalidate({ url = null, user = null } = {}) {
  * Walk current-user-principal -> calendar-home-set -> calendar collections.
  * -> {principal, homeSet, listRoot, calendars:[{href, name, color, ctag, components}]}
  * Throws CalDavError (with .status and .host) when the server cannot be
- * reached or rejects the credentials.
+ * reached, when it rejects the credentials, and when the only thing standing
+ * between the walk and a calendar is a host the origin pin would not spend the
+ * password on — that last one is a real failure with a real remedy in its
+ * message, and it must never come back as an empty, unexplained calendar list.
  *
  * `listRoot` is the URL whose Depth:1 listing produced the calendars — the one
  * hop worth repeating on its own later, and null when nothing produced any.
@@ -825,6 +856,15 @@ export async function discover({ url, user, pass, timeoutMs = DEFAULT_TIMEOUT_MS
   // The failure worth reporting is the one on the URL the user actually typed,
   // not whatever /.well-known said afterwards — so this is only ever set once.
   let probeError = null;
+  // The first hop the pin refused to authenticate, kept rather than thrown. It
+  // must not end the walk — a partitioned account puts its calendars behind a
+  // second host and its *listing* behind the first — but if the walk then turns
+  // up nothing at all, this is the error to report, because its message is the
+  // only one that names the host to paste into the calendar URL.
+  let declined = null;
+  const note = (err) => {
+    if (!declined && wasDeclinedAnonymously(err)) declined = err;
+  };
 
   for (const root of candidateRoots(base)) {
     try {
@@ -835,7 +875,8 @@ export async function discover({ url, user, pass, timeoutMs = DEFAULT_TIMEOUT_MS
       if (principal) break;
     } catch (err) {
       if (!probeError) probeError = err;
-      if (err instanceof CalDavError && (err.status === 401 || err.status === 403)) throw err;
+      if (isCredentialVerdict(err)) throw err;
+      note(err);
     }
   }
 
@@ -847,6 +888,7 @@ export async function discover({ url, user, pass, timeoutMs = DEFAULT_TIMEOUT_MS
       const res = await request('PROPFIND', principal, { ...opts, body: BODY_HOME_SET, depth: 0 });
       homeSet = hrefUnder(parseXml(res.text), res.url, 'calendar-home-set');
     } catch (err) {
+      note(err);
       dav.debug(`calendar-home-set lookup failed: ${err.message}`);
     }
   }
@@ -870,16 +912,25 @@ export async function discover({ url, user, pass, timeoutMs = DEFAULT_TIMEOUT_MS
       if (calendars.length) return { principal, homeSet, listRoot: res.url, calendars };
     } catch (err) {
       listError = err;
-      if (err instanceof CalDavError && (err.status === 401 || err.status === 403)) throw err;
+      if (isCredentialVerdict(err)) throw err;
+      note(err);
       dav.debug(`collection listing failed at ${hostOf(root)}: ${err.message}`);
     }
   }
 
   // A listing that succeeded and simply held no calendars is an answer, not an
   // error — only report a failure when nothing could be listed at all.
+  //
+  // Unless a hop was declined anonymously: then "no calendars" is not an answer,
+  // it is the part of the account we were not allowed to look at, and returning
+  // an empty list makes the source contribute nothing for ever and say nothing
+  // about why. `declined` comes first in both throws because it is the error
+  // this walk used to raise on the spot, and the one that carries the fix.
   if (!listed) {
-    throw listError || probeError || new CalDavError(`No DAV collections at ${hostOf(base)}`, { host: hostOf(base) });
+    throw declined || listError || probeError
+      || new CalDavError(`No DAV collections at ${hostOf(base)}`, { host: hostOf(base) });
   }
+  if (declined) throw declined;
   return { principal, homeSet, listRoot: null, calendars: [] };
 }
 
@@ -889,7 +940,9 @@ export async function discover({ url, user, pass, timeoutMs = DEFAULT_TIMEOUT_MS
  * A 401 or 403 is rethrown rather than reported as "no calendars here": that is
  * an answer about credentials, not about layout, and it belongs to the caller
  * exactly as it would from a fresh walk. Anything else is this URL being wrong,
- * which is a thing the next candidate might fix.
+ * which is a thing the next candidate might fix — and a remembered home set on
+ * a partition host, refused because the origin pin sent no password, is exactly
+ * that: the next rung down still has to be tried.
  */
 async function listCalendarsAt(root, opts) {
   try {
@@ -898,7 +951,7 @@ async function listCalendarsAt(root, opts) {
     if (calendars.length) return { listRoot: res.url, calendars };
     dav.debug(`the remembered listing at ${hostOf(root)} holds no calendars any more`);
   } catch (err) {
-    if (err instanceof CalDavError && (err.status === 401 || err.status === 403)) throw err;
+    if (isCredentialVerdict(err)) throw err;
     dav.debug(`the remembered listing at ${hostOf(root)} failed: ${err.message}`);
   }
   return null;
@@ -946,7 +999,7 @@ async function targetsFor(base, key, opts) {
         const res = await request('PROPFIND', known.principal, { ...opts, body: BODY_HOME_SET, depth: 0 });
         homeSet = hrefUnder(parseXml(res.text), res.url, 'calendar-home-set');
       } catch (err) {
-        if (err instanceof CalDavError && (err.status === 401 || err.status === 403)) throw err;
+        if (isCredentialVerdict(err)) throw err;
         dav.debug(`the remembered principal at ${hostOf(known.principal)} failed: ${err.message}`);
       }
       if (homeSet && !tried.has(homeSet)) {

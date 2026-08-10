@@ -35,6 +35,10 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const MCP_SOURCE = fs.readFileSync(path.join(ROOT, 'core', 'mcp.mjs'), 'utf8');
 
 const dbm = await import('../core/db.mjs');
+/* Imported for its export list, not to run a sweep: the read-only guard below
+   asks what core/mcp.mjs names from HERE as well as from db.mjs, because the one
+   function that can change a row lives on this side. */
+const sweepm = await import('../core/sweep.mjs');
 const mcp = await import('../core/mcp.mjs');
 const {
   SCOPES, SCOPE_INFO, TOOLS, AI_DEFAULTS, ERROR_CODES,
@@ -647,6 +651,101 @@ describe('the access log', () => {
     assert.deepEqual(listAccessLog(db, { tool: 'zelos_board' }).map((r) => r.tool), ['zelos_board']);
   });
 
+  /**
+   * "How many rows came back" is the only number the panel ever shows about a
+   * call, and it was written from the count the tool FOUND rather than the count
+   * that left. `fitPayload` drops rows off the end of an oversized answer, and
+   * that is reachable at the defaults: MAX_BODY_CHARS against MAX_RESULT_CHARS
+   * means about twenty-five full bodies fill one response, `maxRows` defaults to
+   * fifty, and nothing caps stored body text at ingestion.
+   *
+   * The truncation IS recorded — in `detail` — but ui/views/ai-access.js renders
+   * tool, scope, rows, caller and time and nothing else, so the note never
+   * reaches the screen and the row simply over-reports what an AI read.
+   */
+  function bigThread(count = 40, chars = 45_000) {
+    const db = freshDb();
+    for (let i = 0; i < count; i += 1) {
+      dbm.upsertMessage(db, message({
+        uid: 9_000 + i,
+        messageId: `<bulk-${i}@example.test>`,
+        threadKey: 'thread-bulk',
+        subject: `Bulk ${i}`,
+        snippet: 'a long one',
+        text: 'z'.repeat(chars),
+      }));
+    }
+    return db;
+  }
+
+  test('REGRESSION: a truncated answer is logged as the rows the client received', async () => {
+    const db = bigThread();
+    const res = await call({ db, config: cfg(ALL_ON) }, 'zelos_thread', { thread: 'thread-bulk', limit: 50 });
+    const payload = res.result.structuredContent;
+
+    assert.equal(payload.truncated, true, 'the fixture has to actually overflow MAX_RESULT_CHARS');
+    assert.ok(payload.messages.length < 40, 'rows must have been dropped for this test to mean anything');
+    assert.equal(payload.returned, payload.messages.length, 'the payload already corrected itself');
+
+    const row = listAccessLog(db, { limit: 1 })[0];
+    assert.equal(row.rows, payload.messages.length,
+      'the log reported rows the client never received');
+    assert.match(row.detail, /response truncated to fit/);
+  });
+
+  test('REGRESSION: the same holds for the tool with no returned field to read back', async () => {
+    /* zelos_item counts 1 + sources + drafts and puts no `returned` on the wire,
+       so correcting the payload's own count would have left this one wrong. The
+       count is taken from how many rows fitPayload dropped, which every tool
+       has. */
+    const db = bigThread(30);
+    const refs = db.prepare('SELECT id FROM messages ORDER BY uid').all().map((r) => `msg:${r.id}`);
+    const itemId = dbm.upsertItem(db, {
+      key: 'bulk-item',
+      kind: 'money',
+      bucket: 'now',
+      headline: 'An item with a great many sources',
+      why: 'the fixture needs one',
+      severity: 3,
+      sourceRefs: refs,
+    }, { runId: 'run_1' }).id;
+
+    const res = await call({ db, config: cfg(ALL_ON) }, 'zelos_item', { id: itemId });
+    const payload = res.result.structuredContent;
+    assert.equal(payload.truncated, true, 'the fixture has to actually overflow');
+    assert.ok(payload.sources.length < refs.length);
+
+    const row = listAccessLog(db, { limit: 1 })[0];
+    assert.equal(row.rows, 1 + payload.sources.length + payload.drafts.length,
+      'the log counted sources that were dropped before the answer went out');
+  });
+
+  /**
+   * `zelos_search` reaches a path where it reads no table at all: every kind
+   * asked for belongs to a scope that is off. It used to report no scopes, and
+   * the fallback then wrote whichever grants happened to be on — so a
+   * board+calendar client asking for `message` got a row reading
+   * `calendar+board`, naming two scopes the call never spent.
+   */
+  test('REGRESSION: a search that spent nothing is not logged as spending the grants that were on', async () => {
+    const { db } = fourKinds();
+    const ctx = { db, config: cfg({ board: true, calendar: true }) };
+
+    const res = await call(ctx, 'zelos_search', { query: ONLY.message, kinds: ['message'] });
+    assert.deepEqual(res.result.structuredContent.kinds, [], 'the one kind asked for belongs to a scope that is off');
+    assert.equal(res.result.structuredContent.returned, 0);
+
+    const row = listAccessLog(db, { limit: 1 })[0];
+    assert.equal(row.ok, true);
+    assert.equal(row.rows, 0);
+    assert.equal(row.scope, null, 'the row named scopes the call never touched; the panel renders null as "no scope"');
+
+    // And a search that really did look still says what it looked at, so the
+    // two zero-row rows are no longer the same row.
+    await call(ctx, 'zelos_search', { query: 'nothingonthisboardmatchesthisword' });
+    assert.equal(listAccessLog(db, { limit: 1 })[0].scope, 'calendar+board');
+  });
+
   test('a log that cannot be written does not fail the read', async () => {
     const { db, itemId } = seeded();
     const broken = {
@@ -698,6 +797,31 @@ describe('JSON-RPC 2.0', () => {
     assert.match(noBodies.result.instructions, /bodies are NOT shared/i);
     const bodies = await handle(rpc('initialize'), { db: null, config: cfg(ALL_ON) });
     assert.match(bodies.result.instructions, /Full message bodies are shared/i);
+  });
+
+  /**
+   * The instructions are the first thing a connected model reads, and they used
+   * to open with "Everything here is read-only — there is no tool that sends,
+   * writes, deletes or changes a setting." The second half is true. The first
+   * half was not: reading the board wakes a snooze that has come due and holds
+   * the four-item `now` bar, which is the app's own rule but is still a write.
+   *
+   * Derived from the annotations rather than written out twice, so the two
+   * cannot drift: whichever tools do not claim `readOnlyHint` are the tools the
+   * instructions have to name.
+   */
+  test('REGRESSION: the instructions do not claim the whole surface is read-only', async () => {
+    const said = (await handle(rpc('initialize'), { db: null, config: cfg(ALL_ON) })).result.instructions;
+
+    assert.equal(/everything here is read-only/i.test(said), false,
+      'a blanket read-only claim is false while zelos_board holds the now bar');
+    assert.match(said, /sends, deletes, or changes a setting/i, 'the part that IS true still has to be said');
+
+    const changes = TOOLS.filter((t) => t.annotations.readOnlyHint !== true).map((t) => t.name);
+    assert.ok(changes.length > 0, 'if nothing changes a row, this test and the annotations both need revisiting');
+    for (const name of changes) {
+      assert.ok(said.includes(name), `${name} is not annotated read-only, so the instructions must name it`);
+    }
   });
 
   test('ping is an empty result', async () => {
@@ -800,34 +924,92 @@ describe('JSON-RPC 2.0', () => {
  * Read-only, structurally
  * ================================================================== */
 
-describe('nothing here writes', () => {
-  const WRITE_HELPERS = [
-    'upsertMessage', 'upsertMessages', 'upsertEvent', 'upsertEvents', 'upsertItem', 'setItemState',
-    'upsertDraft', 'updateDraft', 'insertCapture', 'markCaptureProcessed', 'startRun', 'finishRun',
-    'setKV', 'deleteKV', 'indexDoc', 'removeDoc', 'reindex', 'withTransaction',
-  ];
+describe('nothing here writes, except the one thing that says it does', () => {
+  /**
+   * An ALLOWLIST, not a blocklist, and the difference is the whole repair.
+   *
+   * This was a hand-written list of core/db.mjs write helpers, and it passed
+   * while `zelos_board` rewrote the board on every call — because the write it
+   * reaches for is `capNowBucket`, which lives in core/sweep.mjs, and a list of
+   * db.mjs names cannot see a sweep.mjs name however carefully it is maintained.
+   * Inverted, the question answers itself: every name core/mcp.mjs mentions from
+   * EITHER module has to be on this list, so a helper added to db.mjs tomorrow —
+   * or a second function pulled out of the sweep — fails here without anyone
+   * remembering to add it anywhere.
+   *
+   * Exactly one entry can change a row, and it is called out for that reason.
+   */
+  const MAY_NAME = new Set([
+    // Constants.
+    'BUCKETS', 'DRAFT_STATES', 'ITEM_STATES',
+    // Readers, and the two lifecycle calls the stdio server needs.
+    'close', 'migrate', 'open',
+    'getItem', 'getMessage', 'listBoard', 'listDrafts', 'listEvents', 'listMessages',
+    'messagesInThread', 'resolveRef', 'search',
+    // The one exception: the four-item `now` bar, the same rule core/server.mjs
+    // holds on /api/state. `zelos_board` is annotated accordingly — see below.
+    'capNowBucket',
+  ]);
+  const WRITERS_IT_MAY_NAME = ['capNowBucket'];
 
-  test('core/mcp.mjs never names a db helper that can change a row', () => {
-    const found = WRITE_HELPERS.filter((name) => new RegExp(`\\b${name}\\b`).test(MCP_SOURCE));
-    assert.deepEqual(found, [], `core/mcp.mjs reaches for a write helper: ${found.join(', ')}`);
+  test('core/mcp.mjs names nothing from db.mjs or sweep.mjs beyond its allowlist', () => {
+    const exported = [...new Set([...Object.keys(dbm), ...Object.keys(sweepm)])].sort();
+    assert.ok(exported.length > 40, 'the export scan came back too thin to be believed');
+    const named = exported.filter((name) => new RegExp(`\\b${name}\\b`).test(MCP_SOURCE));
+    const unexpected = named.filter((name) => !MAY_NAME.has(name));
+    assert.deepEqual(unexpected, [],
+      `core/mcp.mjs reaches into db.mjs or sweep.mjs for something new: ${unexpected.join(', ')}`);
+    // The list must still be reaching the module it was written about: if the
+    // read helpers stopped appearing, the scan is broken rather than clean.
+    assert.ok(named.includes('listBoard') && named.includes('capNowBucket'),
+      'the scan no longer finds names it certainly should — it must be broken');
   });
 
-  test('the only table it writes to is its own audit log', () => {
+  test('the SQL in this file targets its own audit log, and the borrowed write targets items', () => {
     const targets = [...MCP_SOURCE.matchAll(/\b(insert\s+into|update|delete\s+from)\s+([A-Za-z_][A-Za-z0-9_]*)/gi)]
       .map((m) => m[2].toLowerCase());
     assert.ok(targets.length > 0, 'the scan found nothing — it must be broken');
     assert.deepEqual([...new Set(targets)], ['ai_access_log']);
+
+    /* Half the question, and for a long time it was mistaken for all of it: the
+       board repair is not this file's SQL, it is sweep.mjs's, run through the
+       one helper the allowlist above permits. So the other half is asserted
+       where the statement actually lives. `items` and nothing else, and no
+       DELETE anywhere in it — an item that loses its place is demoted, never
+       removed. */
+    const sweepSource = fs.readFileSync(path.join(ROOT, 'core', 'sweep.mjs'), 'utf8');
+    const borrowed = sweepSource.slice(sweepSource.indexOf('export function capNowBucket'));
+    const body = borrowed.slice(0, borrowed.indexOf('\n}\n') + 2);
+    assert.ok(body.includes('DEMOTE_ITEM_BUCKET'), 'capNowBucket no longer runs the statement this test knows about');
+    const demote = sweepSource.match(/const DEMOTE_ITEM_BUCKET = `([^`]*)`/);
+    assert.ok(demote, 'the demotion statement moved');
+    assert.match(demote[1], /^\s*UPDATE items SET\b/);
+    assert.equal(/delete\s+from/i.test(demote[1]), false, 'the demotion must never delete a row');
   });
 
-  test('no tool is write-shaped, and every one is annotated read-only', () => {
+  test('no tool is write-shaped, and the annotation matches what the tool does', () => {
     const forbidden = /^(send|delete|remove|write|create|update|set|move|archive|reply|forward|mark|sync|fetch|run)$/i;
     for (const tool of TOOLS) {
       for (const word of tool.name.split('_')) {
         assert.equal(forbidden.test(word), false, `${tool.name} reads like it changes something`);
       }
-      assert.equal(tool.annotations.readOnlyHint, true, `${tool.name} is not annotated read-only`);
       assert.equal(tool.annotations.destructiveHint, false);
+      assert.equal(tool.annotations.openWorldHint, false);
     }
+    /* `readOnlyHint` used to be asserted true for all seven, which is how the
+       false one survived a suite that was looking straight at it. It is the
+       field an MCP host reads to decide it may run a tool WITHOUT asking the
+       owner, so it is now pinned per tool, by name, and the behavioural test
+       below re-derives the same split from the database. */
+    assert.deepEqual(
+      TOOLS.filter((t) => t.annotations.readOnlyHint === true).map((t) => t.name).sort(),
+      ['zelos_calendar', 'zelos_drafts', 'zelos_item', 'zelos_people', 'zelos_search', 'zelos_thread'],
+    );
+    assert.deepEqual(
+      TOOLS.filter((t) => t.annotations.readOnlyHint !== true).map((t) => t.name),
+      ['zelos_board'],
+      'zelos_board holds the four-item now bar, so it may not claim readOnlyHint',
+    );
     assert.deepEqual(TOOLS.map((t) => t.name).sort(), [
       'zelos_board', 'zelos_calendar', 'zelos_drafts', 'zelos_item', 'zelos_people', 'zelos_search', 'zelos_thread',
     ], 'the tool set changed — was a write added?');
@@ -839,21 +1021,114 @@ describe('nothing here writes', () => {
     }
   });
 
-  test('running every tool leaves the data exactly as it was', async () => {
-    const { db, itemId, msgId } = seeded();
-    const snapshot = () => ({
-      messages: db.prepare('SELECT * FROM messages ORDER BY id').all(),
-      events: db.prepare('SELECT * FROM events ORDER BY id').all(),
-      items: db.prepare('SELECT * FROM items ORDER BY id').all(),
-      drafts: db.prepare('SELECT * FROM drafts ORDER BY id').all(),
-      captures: db.prepare('SELECT * FROM captures ORDER BY id').all(),
-      kv: db.prepare('SELECT * FROM kv ORDER BY k').all(),
-      search: db.prepare('SELECT ref, kind FROM search ORDER BY ref').all(),
-    });
-    const before = JSON.stringify(snapshot());
+  /**
+   * The fixture this suite lacked.
+   *
+   * It used to be `seeded()`: one open `now` item, no snooze. `capNowBucket`
+   * returns 0 below five, and `WAKE_DUE_SNOOZES` updates nothing when nothing is
+   * asleep — so every table hash held still and the test reported "a read
+   * changed nothing" about a tool that rewrites the board whenever there is
+   * anything to rewrite. Five `now` items and one snooze past its wake-up time
+   * is the smallest board on which both writes actually fire.
+   */
+  function boardTheRepairWillTouch() {
+    const s = seeded();
+    for (let i = 0; i < 4; i += 1) {
+      dbm.upsertItem(s.db, {
+        key: `filler-now-${i}`,
+        kind: 'money',
+        bucket: 'now',
+        headline: `Filler now item ${i}`,
+        why: 'it is already on the board',
+        severity: 3,
+        sourceRefs: [],
+      }, { runId: 'run_1' });
+    }
+    const asleep = dbm.upsertItem(s.db, {
+      key: 'asleep-and-due',
+      kind: 'money',
+      bucket: 'now',
+      headline: 'The one that was asleep',
+      why: 'it was snoozed until this morning',
+      severity: 1,
+      sourceRefs: [],
+    }, { runId: 'run_1' }).id;
+    dbm.setItemState(s.db, asleep, 'snoozed', { snoozedUntil: '2020-01-01T09:00:00-05:00' });
+    return { ...s, asleep };
+  }
+
+  const TABLES = ['messages', 'events', 'drafts', 'captures', 'kv', 'runs'];
+  const hashOf = (db, table) => JSON.stringify(db.prepare(`SELECT * FROM "${table}"`).all());
+
+  test('running every tool touches items and nothing else, on a board the repair has work to do on', async () => {
+    const { db, itemId, msgId, asleep } = boardTheRepairWillTouch();
+    const before = Object.fromEntries(TABLES.map((t) => [t, hashOf(db, t)]));
+    const searchBefore = JSON.stringify(db.prepare('SELECT ref, kind FROM search ORDER BY ref').all());
+    const itemsBefore = db.prepare('SELECT * FROM items ORDER BY id').all();
+
     const ctx = { db, config: cfg(ALL_ON) };
     for (const [name, args] of everyCall({ itemId, msgId })) await call(ctx, name, args);
-    assert.equal(JSON.stringify(snapshot()), before, 'a read changed something');
+
+    for (const t of TABLES) {
+      assert.equal(hashOf(db, t), before[t], `a read changed the ${t} table`);
+    }
+    assert.equal(JSON.stringify(db.prepare('SELECT ref, kind FROM search ORDER BY ref').all()), searchBefore,
+      'a read reindexed something');
+
+    // `items` did move, and this is the whole extent of it: the snoozed one is
+    // awake, one of the five is a bucket down, nothing was deleted, nothing was
+    // finished, and no text an item carries was rewritten.
+    const itemsAfter = db.prepare('SELECT * FROM items ORDER BY id').all();
+    assert.notEqual(JSON.stringify(itemsAfter), JSON.stringify(itemsBefore),
+      'the fixture is back to being one the repair has nothing to do on — this test proves nothing again');
+    assert.equal(itemsAfter.length, itemsBefore.length, 'a read deleted an item');
+    const by = new Map(itemsBefore.map((r) => [r.id, r]));
+    for (const after of itemsAfter) {
+      const was = by.get(after.id);
+      assert.ok(was, 'a read invented an item');
+      for (const col of ['headline', 'why', 'person', 'person_email', 'due_at', 'severity',
+        'kind', 'source_refs_json', 'payload_json', 'first_seen', 'link']) {
+        assert.equal(after[col], was[col], `a read rewrote items.${col}`);
+      }
+      assert.ok(['open', 'snoozed'].includes(after.state), `a read moved an item to ${after.state}`);
+      if (after.id !== asleep) assert.equal(after.bucket === was.bucket || after.bucket === 'today', true);
+    }
+    assert.equal(db.prepare("SELECT COUNT(*) AS n FROM items WHERE state = 'open' AND bucket = 'now'").get().n, 4,
+      'the bar the repair exists to hold');
+    assert.equal(dbm.getItem(db, asleep).state, 'open', 'the due snooze woke, which is what makes a fifth appear');
+  });
+
+  /**
+   * The invariant the annotation is FOR, measured rather than asserted about the
+   * source: a host reads `readOnlyHint` to decide it need not ask the owner, so
+   * the tools that move a row must be exactly the tools that do not claim it.
+   *
+   * This is the test that would have caught the original: with `zelos_board`
+   * annotated `readOnlyHint: true`, it goes red on the first tool it tries.
+   */
+  test('the tools that change a row are exactly the tools not annotated read-only', async () => {
+    const ARGS = {
+      zelos_board: {},
+      zelos_calendar: { from: '2026-08-01', to: '2026-09-01' },
+      zelos_drafts: {},
+      zelos_item: null, // filled per fixture
+      zelos_people: {},
+      zelos_search: { query: 'invoice' },
+      zelos_thread: { thread: 'thread-invoice' },
+    };
+
+    for (const tool of TOOLS) {
+      const { db, itemId } = boardTheRepairWillTouch();
+      const before = JSON.stringify(db.prepare('SELECT * FROM items ORDER BY id').all());
+      const res = await call({ db, config: cfg(ALL_ON) }, tool.name, ARGS[tool.name] ?? { id: itemId });
+      assert.ok(res.result, `${tool.name} did not run: ${JSON.stringify(res.error)}`);
+      const changed = JSON.stringify(db.prepare('SELECT * FROM items ORDER BY id').all()) !== before;
+      assert.equal(changed, tool.annotations.readOnlyHint !== true,
+        changed
+          ? `${tool.name} changed a row while telling the host readOnlyHint — that is the field a client `
+            + 'consults to skip asking the owner'
+          : `${tool.name} does not claim readOnlyHint but changed nothing; say what is true`);
+    }
   });
 });
 
@@ -1313,6 +1588,79 @@ describe('a scope reaches its own kind and no other', () => {
     assert.equal(payload.sources[0].ref, `msg:${msgId}`);
     assert.equal(JSON.stringify(res).includes(ONLY.capture), false);
     assert.equal(JSON.stringify(res).includes('what the doctor said'), false);
+  });
+});
+
+/* ================================================================== *
+ * Source ids
+ *
+ * The `sources` array was filtered scope by scope from the day it was written.
+ * `itemView` was not: it emitted `row.sourceRefs` raw, and did not even receive
+ * the runtime, so a client holding nothing but `board` got a correctly-empty
+ * `sources` sitting beside `sourceRefs: ["cap:…", "msg:…"]`.
+ *
+ * No content escaped that way — those ids dereference under none of the 64
+ * scope combinations. An id is still an answer: it says a private note exists,
+ * how many there are, and it is a stable handle to diff across calls and watch
+ * new mail arrive. That is the same existence oracle `searchColumns` exists to
+ * close, one door down.
+ * ================================================================== */
+
+describe('a source id is as visible as the thing it points at', () => {
+  test('REGRESSION: a board-only client gets no ids it was never granted', async () => {
+    const { db, itemId, captureId, msgId } = fourKinds();
+    const res = await call({ db, config: cfg({ board: true }) }, 'zelos_item', { id: itemId });
+    const payload = res.result.structuredContent;
+
+    assert.deepEqual(payload.sources, [], 'the mail source needs mail, and the capture belongs to nobody');
+    assert.deepEqual(payload.item.sourceRefs, [],
+      'sourceRefs went out raw beside a correctly-filtered sources array');
+    const wire = JSON.stringify(res);
+    assert.equal(wire.includes(captureId), false, 'a capture id reached a client granted only the board');
+    assert.equal(wire.includes(msgId), false, 'a message id reached a client granted only the board');
+  });
+
+  test('the filter is a filter, not a blanket: mail buys the message ref and not the note', async () => {
+    const { db, itemId, captureId, msgId } = fourKinds();
+    const ctx = { db, config: cfg({ board: true, 'mail.metadata': true }) };
+
+    for (const [name, args] of [['zelos_item', { id: itemId }], ['zelos_board', {}], ['zelos_search', { query: ONLY.item }]]) {
+      const res = await call(ctx, name, args);
+      const item = name === 'zelos_item'
+        ? res.result.structuredContent.item
+        : (res.result.structuredContent.items || res.result.structuredContent.results.map((r) => r.item))[0];
+      assert.deepEqual(item.sourceRefs, [`msg:${msgId}`], `${name} did not return the granted ref`);
+      assert.equal(JSON.stringify(res).includes(captureId), false, `${name}: mail does not buy the capture`);
+    }
+  });
+
+  test('REGRESSION: no combination of scopes leaks a source id, through any tool that returns an item', async () => {
+    const { db, itemId, captureId, msgId } = fourKinds();
+    let answered = 0;
+
+    for (let mask = 0; mask < (1 << SCOPES.length); mask += 1) {
+      const on = Object.fromEntries(SCOPES.map((s, i) => [s, Boolean(mask & (1 << i))]));
+      const ctx = { db, config: cfg(on) };
+      for (const [name, args] of [
+        ['zelos_item', { id: itemId }],
+        ['zelos_board', {}],
+        ['zelos_search', { query: ONLY.item }],
+      ]) {
+        const res = await call(ctx, name, args);
+        if (!res.result) continue; // the scope is off; there was nothing to leak
+        answered += 1;
+        const wire = JSON.stringify(res);
+        assert.equal(wire.includes(captureId), false,
+          `${name} handed over a capture id with ${JSON.stringify(on)}`);
+        // `mail.bodies` implies `mail.metadata` — the one implication in the set
+        // — so a bodies grant legitimately buys the message ref too.
+        if (!on['mail.metadata'] && !on['mail.bodies']) {
+          assert.equal(wire.includes(msgId), false,
+            `${name} handed over a message id with ${JSON.stringify(on)}`);
+        }
+      }
+    }
+    assert.ok(answered >= 64, `the sweep has to actually reach the tools; it answered ${answered} times`);
   });
 });
 

@@ -476,8 +476,38 @@ const SOURCE_REF_RE = /^(?:msg|evt|cap):[A-Za-z0-9._:@+-]{1,72}$/;
  * template, not a message, and a human who clicks send embarrasses themselves.
  * Angle brackets are deliberately not treated as placeholders: `Bob
  * <bob@example.com>` is ordinary inside a real body.
+ *
+ * The earlier spelling was `/\[[^\]\n]{1,80}\]|\{\{[^}\n]{0,80}\}\}/`, and both
+ * of its bounds were bypasses rather than safeguards:
+ *
+ *  - **The 80-character ceiling.** Measured: a bracket of 80 characters was
+ *    rejected and one of 81 was kept. The realistic vector is not an exotic
+ *    input, it is the model talking to the reader in the middle of the prose —
+ *    `[Confirm the delivery date with the supplier before sending - I could not
+ *    find it in the thread]` is 94 characters and shipped as "Ready to send".
+ *    There is no length at which a bracketed aside becomes a sendable sentence,
+ *    so there is no ceiling now; the span is bounded only so the scan stays
+ *    linear against the 4,000-character body cap above it.
+ *  - **`[^\]\n]`, which stopped at a newline.** `:600` screens the body with
+ *    `collapse:false`, so a bracket opened on one line and closed on the next
+ *    was invisible in the body while the same text in a subject — collapsed
+ *    before the test at `:599` — was caught. One gate, two behaviours,
+ *    depending on which field it was pointed at.
+ *
+ * The word list is the other half of a contract, not a new opinion: the prompt
+ * at core/triage.mjs:251 has always told the model "No [name], no [date], no
+ * {{thing}}, no TODO, no TBD, no insert...". Everything it names is now
+ * actually rejected here — before this, `TODO` and `insert the figure here`
+ * passed the gate untouched and reached the board under "Ready to send".
+ * Matched case-sensitively and on word boundaries: "todo list" in ordinary
+ * prose is a phrase, `TODO` is a note to self.
  */
-const PLACEHOLDER_RE = /\[[^\]\n]{1,80}\]|\{\{[^}\n]{0,80}\}\}/;
+const PLACEHOLDER_RE = new RegExp([
+  '\\[[^\\]]{1,400}\\]',        // [anything], including across a line break
+  '\\{\\{[^}]{0,400}\\}\\}',    // {{mustache}}
+  '\\b(?:TODO|TBD|FIXME)\\b',   // the model leaving itself a note
+  '\\b[Ii]nsert\\b[^.\\n]{0,40}\\bhere\\b', // "insert the figure here"
+].join('|'));
 
 /**
  * Returns '' for absent, null when the value was rejected by screening (the
@@ -524,7 +554,35 @@ function normalizeKey(raw) {
     .replace(/^-+|-+$/g, '');
 }
 
-/** A key the model failed to give us, derived so it is stable across runs. */
+/**
+ * A key the model failed to give us. Deterministic per call — and only per
+ * call. This comment used to say "derived so it is stable across runs", which
+ * was not true and is the sentence that made the defect invisible.
+ *
+ * The hash is over the headline and the person, and the headline is prose the
+ * model rewrites: `core/triage.mjs` asks for headlines that carry a moving day
+ * count in one paragraph and bans exactly that input from KEYS in another.
+ * Reproduced against a real database: three phrasings of one obligation gave
+ * three keys, so an item marked done on Monday came back on Tuesday under a
+ * reworded headline — `getItemByKey` missed, `inserted: true`, `state: 'open'`,
+ * back on the board.
+ *
+ * Anchoring on a `msg:`/`evt:`/`cap:` sourceRef instead was tried and taken
+ * back out, and the reason is worth writing down so nobody spends the afternoon
+ * on it again. Those ids are stable where the headline is not — but they are
+ * not *unique per obligation*. One email routinely yields two items ("reply to
+ * Dana about the forecast" and "send Dana the invoice"), both citing the same
+ * `msg:` id, and `validateSweep` drops a duplicate key outright (`:836`). So
+ * that trade converts a visible duplicate on the board into an item that
+ * silently never arrives, which is the worse of the two failures by the same
+ * rule `demoteOverflow` is written under. Any scheme that makes this more
+ * stable makes it more collision-prone, and the collision end of that is where
+ * work disappears.
+ *
+ * What is fixed is the silence: the caller records the derived key by name, and
+ * says which of the two derivations it got, so a board that grows a duplicate
+ * can be traced to the run that minted it instead of being guessed at.
+ */
 function derivedKey(headline, personEmail) {
   const digest = createHash('sha256').update(`${headline}|${personEmail}`).digest('hex');
   return `auto-${digest.slice(0, 12)}`;
@@ -656,8 +714,17 @@ function validateItem(raw, index, errors) {
   }
 
   const givenKey = normalizeKey(raw.key);
+  const key = givenKey || derivedKey(headline, personEmail);
   if (!givenKey) {
-    errors.push({ path: `${path}.key`, message: 'missing or unusable key; derived one instead' });
+    // Named, not merely announced. This string is what decides whether the item
+    // is the one that was finished yesterday, and it is derived from a headline
+    // the model is free to reword — so the run that minted it is the only place
+    // the connection can still be made. "derived one instead" left a reader
+    // comparing two boards with nothing to compare.
+    errors.push({
+      path: `${path}.key`,
+      message: `missing or unusable key; derived "${key}" from the headline and person, which will not survive the model rewording either`,
+    });
   }
 
   const bucket = normalizeBucket(raw.bucket, `${path}.bucket`, errors);
@@ -669,7 +736,7 @@ function validateItem(raw, index, errors) {
   }
 
   return {
-    key: givenKey || derivedKey(headline, personEmail),
+    key,
     bucket,
     headline,
     why,

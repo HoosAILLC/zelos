@@ -104,6 +104,82 @@ test('the prompt argues the rules it is judged on', () => {
   assert.match(system, /reuse that exact key/);
 });
 
+/**
+ * The other end of `PLACEHOLDER_RE` in core/safety.mjs.
+ *
+ * The gate rejects `TODO`, `TBD` and an "insert … here", and it stopped caring
+ * about the length of a bracket or whether one spans a line break — measured, a
+ * bracket of 80 characters was rejected and one of 81 kept, and a bracket
+ * opened on one line and closed on the next was invisible in a body while the
+ * same text in a subject was caught. A gate that rejects words the prompt never
+ * banned drops drafts for a reason the model was never given, so the two lists
+ * have to be one list. This is the assertion that keeps them one.
+ */
+test('the prompt bans exactly what the draft gate rejects', () => {
+  const { system } = buildSweepPrompt({ identity: IDENTITY, now: NOW, privacy: PRIVACY });
+  for (const banned of ['[name]', '[date]', '{{thing}}', 'TODO', 'TBD', 'insert...']) {
+    assert.ok(system.includes(banned), `the prompt does not ban ${banned}, but core/safety.mjs rejects it`);
+  }
+  // And it says the two things about brackets that the old regex got wrong, so
+  // a model reading this cannot conclude that a long aside or a wrapped one is
+  // somewhere the rule does not reach.
+  assert.match(system, /a note to the reader mid-paragraph counts,\s+however\s+long/);
+  assert.match(system, /opened on one line and closed on the next/);
+});
+
+/**
+ * `identity.email` had a schema, a validator, and these two readers — and until
+ * Settings grew a "You" panel, nothing a user could reach ever set it. It
+ * stayed `''`, `sameEmail(a, '')` is false for every message, and both branches
+ * below were dead code on every install in existence.
+ *
+ * This is the reader half of that contract, asserted on behaviour rather than
+ * on the string: the writer is `ui/views/settings.js` (the You panel, and the
+ * mail form adopting the first account's address), pinned in test/ui.test.mjs.
+ */
+test('an address in identity.email lifts mail written TO you over mail you were copied on', () => {
+  // Separate threads on purpose: two messages in one thread cannot both be its
+  // latest, and that +5 would decide the order before the To:/Cc: branches got
+  // a say — which is the whole thing under test.
+  const addressed = message({
+    id: 'to-me',
+    thread_key: 'thread-to',
+    subject: 'Straight to you',
+    to: [{ name: 'Nemo', email: 'nemo@example.com' }],
+    cc: [],
+  });
+  const copied = message({
+    id: 'cc-me',
+    thread_key: 'thread-cc',
+    subject: 'Only copied in',
+    to: [{ name: 'Someone else', email: 'other@example.com' }],
+    cc: [{ name: 'Nemo', email: 'nemo@example.com' }],
+  });
+  const args = { now: NOW, messages: [copied, addressed], privacy: PRIVACY };
+
+  const order = (identity) => {
+    const { messages } = buildSweepPrompt({ ...args, identity });
+    const text = messages[0].content;
+    return [text.indexOf('Straight to you'), text.indexOf('Only copied in')];
+  };
+
+  const [toSet, ccSet] = order(IDENTITY);
+  assert.ok(toSet >= 0 && ccSet >= 0, 'both messages should be in the prompt');
+  assert.ok(toSet < ccSet, 'the +6 To: and -2 Cc: branches did nothing');
+
+  // ...and with no address, which is what every install had, the two are ranked
+  // on recency alone and arrive in the order they were handed over. That is the
+  // dead code the You panel exists to bring back to life.
+  const [toBlank, ccBlank] = order({ ...IDENTITY, email: '' });
+  assert.ok(toBlank > ccBlank, 'the premise of this test has moved: blank identity already ranks these');
+
+  // The name is the other consumer, and its absence has its own visible cost.
+  const named = buildSweepPrompt({ ...args, identity: IDENTITY });
+  assert.match(named.messages[0].content, /name: Nemo Hale/);
+  const unnamed = buildSweepPrompt({ ...args, identity: { ...IDENTITY, name: '' } });
+  assert.match(unnamed.messages[0].content, /name: \(not set — do not invent one/);
+});
+
 test('untrusted mail is fenced and injection framing is neutralised', () => {
   const hostile = message({
     id: 'hostile1',

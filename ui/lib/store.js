@@ -33,6 +33,24 @@ const EMPTY_BOARD = Object.freeze({
   // is null rather than a zeroed pair on purpose: "nothing has been spent" and
   // "this build never counted" must not render as the same line.
   tokens: null,
+  /**
+   * WHICH DAYS `events` IS AN ANSWER ABOUT — `{from, to}` as day keys, straight
+   * from /api/state.
+   *
+   * `events` is not the whole calendar and never was; it is one window around
+   * today, and until this field existed nothing said so. The calendar's ‹ and ›
+   * are unclamped and there is no route that fetches another range, so paging
+   * out of the window drew a fully styled grid of empty cells for months whose
+   * events were sitting in the local database the whole time — measured
+   * 2026-08-10: November, 35 empty cells; October, 22; and August's own grid,
+   * which begins 2026-07-26, eight.
+   *
+   * Null means the server made no claim — an older build, or the blank board
+   * below before the first fetch — and the calendar then draws everything
+   * without markings, exactly as it always did. It is not a stand-in for "empty
+   * window": an empty window is a `{from, to}` that excludes the day.
+   */
+  eventWindow: null,
 });
 
 export const state = {
@@ -471,11 +489,33 @@ export function openDrafts() {
   return state.board.drafts.filter((d) => d.state === 'pending' || d.state === 'edited');
 }
 
-/** What the rail shows: every bucket, plus the two counts that are not buckets. */
+/**
+ * The model's narrative notes from the last sweep, filtered the one way.
+ *
+ * They are counted in two places — the rail's "Worth knowing" row and the
+ * section of that name on Now — and this export exists because those two
+ * numbers disagreeing is exactly the bug below.
+ */
+export function boardNotes() {
+  return (state.board.notes || []).filter((n) => typeof n === 'string' && n.trim());
+}
+
+/**
+ * What the rail shows: every bucket, plus the two counts that are not buckets.
+ *
+ * `note` is the one bucket whose row is not merely its bucket. That row is a
+ * LINK to the "Worth knowing" section on Now, and that section shows the note
+ * items PLUS the model's narrative notes for the sweep, which no bucket count
+ * has ever included. So the rail read "Worth knowing 0" beside a section
+ * headed "Worth knowing 3" — on a quiet day by design, since core/triage.mjs
+ * is instructed to report a quiet day in `notes` and nowhere else. A number on
+ * a link is a claim about what the link opens.
+ */
 export function railCounts() {
   const counts = state.board.counts || EMPTY_BOARD.counts;
   return {
     ...counts,
+    note: (counts.note || 0) + boardNotes().length,
     drafts: openDrafts().length,
     events: eventsToday().length,
   };
@@ -485,6 +525,44 @@ export function eventsToday() {
   const { key } = nowMark();
   if (!key) return [];
   return state.board.events.filter((e) => dayKey(e.starts_at) === key);
+}
+
+/* ------------------------------------------------------------ event window */
+
+/**
+ * The `{from, to}` day keys /api/state said its `events` covers, or null when it
+ * said nothing.
+ *
+ * Validated rather than trusted, and shaped so a partial answer is no answer:
+ * a window with one end missing cannot decide whether a day is inside it, and
+ * half a claim used as a whole one is how a grid ends up marking arbitrary days
+ * "not loaded". Both ends or nothing.
+ */
+export function eventWindow() {
+  const w = state.board.eventWindow;
+  if (!w || typeof w !== 'object') return null;
+  const key = /^\d{4}-\d{2}-\d{2}$/;
+  if (!key.test(String(w.from ?? '')) || !key.test(String(w.to ?? ''))) return null;
+  return { from: w.from, to: w.to };
+}
+
+/**
+ * Whether `events` is an answer about this day at all.
+ *
+ * The distinction the calendar needs is not "are there events on this day" but
+ * "was this day in the question" — a day inside the window with nothing on it is
+ * a genuinely free day, and a day outside it is a day nobody asked about. Those
+ * two rendered identically, and the second is the one that reads as a confident
+ * lie. With no window (an older server, or before the first fetch) every day is
+ * loaded, which is the behaviour every build before this one had.
+ *
+ * Day keys are `YYYY-MM-DD`, so `<=`/`>=` on the strings IS the date comparison.
+ */
+export function dayIsLoaded(key) {
+  const w = eventWindow();
+  if (!w) return true;
+  if (typeof key !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(key)) return true;
+  return key >= w.from && key <= w.to;
 }
 
 /* -------------------------------------------------------------- item actions */

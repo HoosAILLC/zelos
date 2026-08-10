@@ -227,19 +227,31 @@ function isValidTimeZone(tz) {
  *
  * The offset depends on the instant and the instant depends on the offset, so
  * this converges: guess with the nominal value read as UTC, then re-read the
- * offset at the candidate instant. Two refinements settle every real zone; in a
- * DST gap or fold it lands on the later of the two readings, which is what a
- * calendar server does too.
+ * offset at the candidate instant. Two refinements settle every wall clock that
+ * exists, including both readings of a fall-back fold.
+ *
+ * A spring-forward gap is the one that cannot converge — the wall clock is not
+ * a time, so the loop oscillates between the offsets either side of the jump.
+ * It used to just return whichever it held after the second pass, and which one
+ * that was depended on where the very first guess happened to fall: New York's
+ * 02:30 on 2027-03-14 pushed forward to 03:30-04:00 while London's 01:30 on
+ * 2027-03-28 pulled *backward* to 00:30Z, so a 00:30–01:30 London meeting came
+ * out zero minutes long. A gap is always a jump forward, so the smaller of the
+ * two readings is the offset in force just before it; taking it shifts every
+ * such wall clock into the hour that does exist, in every zone alike, which is
+ * what a calendar server does with the same input.
  */
 function zoneOffsetMinutesForWall(tz, nominal, vtimezones) {
   if (isValidTimeZone(tz)) {
     let off = offsetMinutes(offsetFor(tz, new Date(nominal)));
+    let prev = off;
     for (let pass = 0; pass < 2; pass++) {
       const next = offsetMinutes(offsetFor(tz, new Date(nominal - off * 60_000)));
-      if (next === off) break;
+      if (next === off) return off;
+      prev = off;
       off = next;
     }
-    return off;
+    return Math.min(prev, off);
   }
   const vtz = vtimezones?.get?.(tz);
   if (vtz) return vtimezoneOffsetMinutes(vtz, nominal);
@@ -569,6 +581,15 @@ function buildVEvent(comp, vtimezones) {
     exdates,
     rdates,
     recurrenceId: recurProp ? parseDateValue(recurProp.value, recurProp.params) : null,
+    // RANGE is the only parameter that changes what a RECURRENCE-ID *means*:
+    // THISANDFUTURE claims the named instance and every one after it, so an
+    // override carrying it has to be applied to a range rather than to a single
+    // slot. It lives on the VEvent rather than inside the parsed value because
+    // no other property can carry it.
+    recurrenceRange:
+      recurProp && String(recurProp.params.RANGE || '').trim().toUpperCase() === 'THISANDFUTURE'
+        ? 'THISANDFUTURE'
+        : null,
     calendarName: null,
     vtimezones,
   };
@@ -856,11 +877,44 @@ function toMs(value) {
   return Number.isNaN(parsed) ? null : parsed;
 }
 
-/** Everything one VEvent needs to turn a nominal wall clock into a real instant. */
+/**
+ * Everything one VEvent needs to turn a nominal wall clock into a real instant.
+ *
+ * A *floating* value — no TZID, no trailing Z — is the trap. Reading it as the
+ * viewer's zone anchors it to a frame the calendar never named, and every value
+ * that has to line up with a generated instance then lands somewhere else.
+ * Measured on a New York daily series carrying a floating EXDATE: 2 instances
+ * for a New York viewer (right), 3 for London, UTC and Tokyo — the cancelled
+ * meeting is back on the board. A floating RECURRENCE-ID stops replacing the
+ * instance it moves, so the old time and the new one both render, with
+ * different ids, and nothing downstream dedupes them; a UTC master with a
+ * floating RECURRENCE-ID ghosts in *every* zone, its own included. A floating
+ * UNTIL trims a weekly series a Monday early or a Monday late.
+ *
+ * So a floating value borrows `ctx.floatingAnchor` — the frame the group's own
+ * DTSTART is written in — and only falls back to the viewer's zone when there
+ * is nothing to borrow, which is exactly the case the RFC's "read it as local
+ * time" rule is about.
+ */
 function anchorFor(dt, ctx) {
   if (dt.kind === 'utc') return { kind: 'utc' };
   if (dt.kind === 'date') return { kind: 'date' };
-  return { kind: 'zoned', tz: dt.kind === 'tzid' ? dt.tzid : ctx.targetTz };
+  if (dt.kind === 'tzid') return { kind: 'zoned', tz: dt.tzid };
+  return ctx.floatingAnchor || { kind: 'zoned', tz: ctx.targetTz };
+}
+
+/**
+ * The frame a group's floating values belong to: whatever DTSTART the master —
+ * or, for an orphan override, the override itself — is written in. Null when
+ * that DTSTART is floating or all-day, because then there is no named frame to
+ * borrow and every floating value in the group reduces to the viewer's zone,
+ * which is what it already did.
+ */
+function seriesAnchor(dt) {
+  if (!dt) return null;
+  if (dt.kind === 'utc') return { kind: 'utc' };
+  if (dt.kind === 'tzid') return { kind: 'zoned', tz: dt.tzid };
+  return null;
 }
 
 function nominalToInstant(nominal, anchor, ctx) {
@@ -916,51 +970,127 @@ export function expand(vevents, { from, to, max = 1500, tzid, email = null, vtim
     (ev.recurrenceId ? groups.get(key).overrides : groups.get(key).masters).push(ev);
   }
 
-  const collected = [];
+  // `max` used to be spent in document order: `expandOne` returned the moment
+  // the shared array reached the cap, groups were walked in file order, and the
+  // sort ran afterwards. Measured on 40 weekday-recurring meetings in one
+  // document at the default 1500: 31 UIDs came back and meetings 31–40 were
+  // gone outright, the same UIDs every sweep — and because the survivors ran to
+  // the last day of the window, the result looked complete. The sink keeps the
+  // globally earliest `cap` instead, so what gets cut is the tail of the
+  // *window*, not whichever meetings a shared calendar happens to list last.
+  const sink = { cap, items: [], horizon: toMsBound, dropped: 0 };
+
   for (const [, group] of groups) {
     const ctx = {
       targetTz: requested,
+      floatingAnchor: seriesAnchor(group.masters[0]?.dtstart || group.overrides[0]?.dtstart || null),
       vtimezones: vtimezones || group.masters[0]?.vtimezones || group.overrides[0]?.vtimezones || null,
       wanted,
       fromMs,
       toMsBound,
     };
 
-    // Overrides, keyed by the instance they replace.
-    const overrideByInstant = new Map();
-    const overrideByDay = new Map();
+    // Overrides, keyed by the instance they replace. A RANGE=THISANDFUTURE one
+    // is additionally kept in instant order: it owns its own slot *and* every
+    // later instance, and where two of them overlap the later one wins.
+    const byInstant = new Map();
+    const byDay = new Map();
+    const future = [];
     for (const ov of group.overrides) {
       const anchor = anchorFor(ov.recurrenceId, ctx);
       const t = nominalToInstant(ov.recurrenceId.nominal, anchor, ctx);
-      overrideByInstant.set(t, ov);
-      overrideByDay.set(dateKeyOfNominal(ov.recurrenceId.nominal), ov);
+      byInstant.set(t, ov);
+      byDay.set(dateKeyOfNominal(ov.recurrenceId.nominal), ov);
+      if (ov.recurrenceRange === 'THISANDFUTURE') future.push({ at: t, ov, shift: null });
     }
-    const usedOverrides = new Set();
+    future.sort((a, b) => a.at - b.at);
+    const overrides = { byInstant, byDay, future, used: new Set() };
 
-    for (const master of group.masters) {
-      expandOne(master, ctx, cap, overrideByInstant, overrideByDay, usedOverrides, collected);
-      if (collected.length >= cap) break;
-    }
+    for (const master of group.masters) expandOne(master, ctx, sink, overrides);
 
     // Overrides that matched no generated instance are still real events.
     for (const ov of group.overrides) {
-      if (usedOverrides.has(ov)) continue;
+      if (overrides.used.has(ov)) continue;
       const anchor = anchorFor(ov.dtstart, ctx);
       const startInstant = nominalToInstant(ov.dtstart.nominal, anchor, ctx);
       const durationMs = durationOf(ov, ctx);
-      if (startInstant + durationMs <= fromMs || startInstant >= toMsBound) continue;
-      collected.push({
-        sortKey: startInstant,
-        event: buildEvent(ov, ov.dtstart.nominal, ctx, ov.recurrenceId, durationMs),
-      });
+      if (startInstant + durationMs <= fromMs || startInstant >= sink.horizon) continue;
+      keep(sink, startInstant, buildEvent(ov, ov.dtstart.nominal, ctx, ov.recurrenceId, durationMs));
     }
   }
 
-  collected.sort((a, b) => a.sortKey - b.sortKey);
-  return collected.slice(0, cap).map((c) => c.event);
+  sink.items.sort((a, b) => a.sortKey - b.sortKey);
+  if (sink.items.length > cap) {
+    sink.dropped += sink.items.length - cap;
+    sink.items.length = cap;
+  }
+  if (sink.dropped > 0) {
+    ics.warn(`more than max=${cap} instances in the window; dropped ${sink.dropped} from the far end of it`);
+  }
+  return sink.items.map((c) => c.event);
 }
 
-function expandOne(master, ctx, cap, overrideByInstant, overrideByDay, usedOverrides, collected) {
+/**
+ * Keep one instance, or let the cap drop it.
+ *
+ * Pruning at twice the cap bounds memory without biasing the answer: the
+ * `cap`-th earliest instant only ever moves *earlier* as more groups arrive, so
+ * anything at or past it is already unreachable and the horizon can be tightened
+ * for every group still to come. That tightening is also what keeps the fix
+ * cheap — once the budget is full, a later group generates almost nothing
+ * instead of enumerating its whole window to have it thrown away.
+ */
+function keep(sink, sortKey, event) {
+  sink.items.push({ sortKey, event });
+  if (sink.items.length < sink.cap * 2) return;
+  sink.items.sort((a, b) => a.sortKey - b.sortKey);
+  sink.dropped += sink.items.length - sink.cap;
+  sink.items.length = sink.cap;
+  sink.horizon = Math.min(sink.horizon, sink.items[sink.cap - 1].sortKey + 1);
+}
+
+/** The latest RANGE=THISANDFUTURE override that has taken effect by `at`, if any. */
+function latestFutureOverride(future, at) {
+  let hit = null;
+  for (const entry of future) {
+    if (entry.at > at) break;
+    hit = entry;
+  }
+  return hit;
+}
+
+/**
+ * Where a generated instance lands once a RANGE=THISANDFUTURE override owns it.
+ *
+ * "This and all following events" states the new shape once, on the first
+ * affected instance: its DTSTART minus its RECURRENCE-ID is the displacement,
+ * and every later instance moves by the same amount and takes the override's
+ * properties. Both readings are taken in the *override's* own frame, so a move
+ * written in a different zone than the master still shifts by the wall-clock
+ * amount its author typed, and the shift survives a DST change intact.
+ *
+ * The one part left unimplemented: an override that carries its own RRULE is
+ * restating the tail's *rule*, not just displacing it. `expandOne` only runs on
+ * masters, so that rule is not expanded — the master's rule still shapes the
+ * tail. Warn rather than emit a half-corrected series silently.
+ */
+function applyThisAndFuture(entry, startInstant, ctx) {
+  if (entry.shift === null) {
+    entry.anchor = anchorFor(entry.ov.dtstart, ctx);
+    entry.shift = entry.ov.dtstart.nominal - instantToNominal(entry.at, entry.anchor, ctx);
+    entry.durationMs = durationOf(entry.ov, ctx);
+    if (entry.ov.rrule) {
+      ics.warn(
+        `RANGE=THISANDFUTURE override carries its own RRULE, which is not expanded; ` +
+          `the master's rule still shapes the tail (UID ${entry.ov.uid || 'unknown'})`,
+      );
+    }
+  }
+  const nominal = instantToNominal(startInstant, entry.anchor, ctx) + entry.shift;
+  return { nominal, startInstant: nominalToInstant(nominal, entry.anchor, ctx), durationMs: entry.durationMs };
+}
+
+function expandOne(master, ctx, sink, overrides) {
   const anchor = anchorFor(master.dtstart, ctx);
   const durationMs = durationOf(master, ctx);
   const isAllDay = master.dtstart.kind === 'date';
@@ -976,7 +1106,9 @@ function expandOne(master, ctx, cap, overrideByInstant, overrideByDay, usedOverr
 
   // Generation bound: the window's upper edge plus a day of slack, since a
   // nominal reading can sit up to ~14h either side of the instant it names.
-  const maxNominal = ctx.toMsBound === Infinity ? Infinity : ctx.toMsBound + 26 * HOUR_MS;
+  // `sink.horizon` is that edge or tighter — tighter once the cap is full and
+  // instances past a known instant can no longer reach the answer.
+  const maxNominal = sink.horizon === Infinity ? Infinity : sink.horizon + 26 * HOUR_MS;
   let untilInstant = Infinity;
   let generationBound = maxNominal;
   if (master.rrule?.until) {
@@ -1003,7 +1135,8 @@ function expandOne(master, ctx, cap, overrideByInstant, overrideByDay, usedOverr
     // reaches (100k instances is centuries of anything), and MAX_PERIODS
     // holds underneath it regardless.
     const minNominal = ctx.fromMs === -Infinity ? -Infinity : ctx.fromMs - Math.max(0, durationMs) - 26 * HOUR_MS;
-    const budget = master.rrule.count !== null ? Math.max(cap, Math.min(master.rrule.count, 100_000)) : cap;
+    const budget =
+      master.rrule.count !== null ? Math.max(sink.cap, Math.min(master.rrule.count, 100_000)) : sink.cap;
     for (const t of recurrenceNominals(master.dtstart.nominal, master.rrule, {
       maxNominal: generationBound,
       minNominal,
@@ -1030,33 +1163,50 @@ function expandOne(master, ctx, cap, overrideByInstant, overrideByDay, usedOverr
   for (const nominal of nominals.sort((a, b) => a - b)) {
     if (seen.has(nominal)) continue;
     seen.add(nominal);
-    if (collected.length >= cap) return;
+    // The horizon can tighten while this very series is being walked, and the
+    // nominals are sorted, so once a reading sits a full day past it nothing
+    // later in the list can still land inside.
+    if (sink.horizon !== Infinity && nominal > sink.horizon + 26 * HOUR_MS) break;
 
     const startInstant = nominalToInstant(nominal, anchor, ctx);
     if (startInstant > untilInstant) continue;
     if (excludedInstants.has(startInstant)) continue;
     if (excludedDays.size && excludedDays.has(dateKeyOfNominal(nominal))) continue;
 
-    const override = overrideByInstant.get(startInstant) || (isAllDay ? overrideByDay.get(dateKeyOfNominal(nominal)) : undefined);
+    const override =
+      overrides.byInstant.get(startInstant) || (isAllDay ? overrides.byDay.get(dateKeyOfNominal(nominal)) : undefined);
     if (override) {
-      usedOverrides.add(override);
+      overrides.used.add(override);
       const ovAnchor = anchorFor(override.dtstart, ctx);
       const ovStart = nominalToInstant(override.dtstart.nominal, ovAnchor, ctx);
       const ovDuration = durationOf(override, ctx);
-      if (ovStart + ovDuration <= ctx.fromMs || ovStart >= ctx.toMsBound) continue;
-      collected.push({
-        sortKey: ovStart,
-        event: buildEvent(override, override.dtstart.nominal, ctx, override.recurrenceId, ovDuration),
-      });
+      if (ovStart + ovDuration <= ctx.fromMs || ovStart >= sink.horizon) continue;
+      keep(sink, ovStart, buildEvent(override, override.dtstart.nominal, ctx, override.recurrenceId, ovDuration));
+      continue;
+    }
+
+    // A "this and all following events" edit owns every instance after its own.
+    // Identity stays with the generated slot, not with the override, so the row
+    // this instance already occupies is updated rather than duplicated.
+    const tail = latestFutureOverride(overrides.future, startInstant);
+    if (tail) {
+      overrides.used.add(tail.ov);
+      const moved = applyThisAndFuture(tail, startInstant, ctx);
+      if (moved.startInstant + moved.durationMs <= ctx.fromMs || moved.startInstant >= sink.horizon) continue;
+      keep(
+        sink,
+        moved.startInstant,
+        buildEvent(tail.ov, moved.nominal, ctx, { ...master.dtstart, nominal }, moved.durationMs),
+      );
       continue;
     }
 
     const thisDuration = extras.has(nominal) ? extras.get(nominal) : durationMs;
-    if (startInstant + thisDuration <= ctx.fromMs || startInstant >= ctx.toMsBound) continue;
+    if (startInstant + thisDuration <= ctx.fromMs || startInstant >= sink.horizon) continue;
 
     const isSeries = Boolean(master.rrule) || master.rdates.length > 0;
     const recurrenceId = isSeries ? { ...master.dtstart, nominal } : null;
-    collected.push({ sortKey: startInstant, event: buildEvent(master, nominal, ctx, recurrenceId, thisDuration) });
+    keep(sink, startInstant, buildEvent(master, nominal, ctx, recurrenceId, thisDuration));
   }
 }
 
@@ -1087,7 +1237,18 @@ function buildEvent(src, startNominal, ctx, recurrenceIdValue, durationMs) {
   } else {
     const anchor = anchorFor(src.dtstart, ctx);
     const startInstant = nominalToInstant(startNominal, anchor, ctx);
-    const endInstant = nominalToInstant(startNominal + durationMs, anchor, ctx);
+    // A wall clock inside a DST spring-forward gap does not exist, so resolving
+    // it pushes it forward into the hour that does: 02:30 in New York on
+    // 2027-03-14 reads back as 03:30-04:00. The end has to travel the same
+    // distance. Resolved on its own it does not — the stated 03:30 end lands on
+    // that *same* instant and the meeting is emitted as "3:30 AM – 3:30 AM",
+    // zero minutes long (measured; the control a day later is a correct 60).
+    // `shift` is 0 for every wall clock that exists, which is every instance of
+    // every event outside this one hour a year, so the fall-back fold — where
+    // the reading is ambiguous rather than absent, and 01:00 -> 02:00 genuinely
+    // is two hours — keeps the behaviour it always had.
+    const shift = instantToNominal(startInstant, anchor, ctx) - startNominal;
+    const endInstant = nominalToInstant(startNominal + shift + durationMs, anchor, ctx);
     startsAt = toZonedISO(new Date(startInstant), ctx.targetTz);
     endsAt = toZonedISO(new Date(endInstant), ctx.targetTz);
   }

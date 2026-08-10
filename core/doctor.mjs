@@ -26,8 +26,10 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 
-import { loadConfig, paths, validateConfig } from './config.mjs';
+import { DEFAULTS, loadConfig, paths, validateConfig } from './config.mjs';
+import { SCHEMA_VERSION, hasFts5 } from './db.mjs';
 import { backend as secretBackend, getSecret as readSecret } from './secrets.mjs';
 import { isLocalAddress, listModels } from './llm.mjs';
 import { guessImapHost, testConnection as testImapConnection } from './sources/imap.mjs';
@@ -173,6 +175,153 @@ function checkHome(home) {
   return check('home', label, 'pass', detail);
 }
 
+/**
+ * Whether THIS runtime's SQLite can build an FTS5 table, asked of a throwaway
+ * in-memory database rather than of the user's file.
+ *
+ * `hasFts5()` works by creating a virtual table, so it cannot be asked of a
+ * read-only handle — the CREATE fails with "attempt to write a readonly
+ * database" and the answer comes back "no FTS5" about a runtime that has it.
+ * The question is about the runtime anyway, not about the file, so an empty
+ * database in memory is the honest place to ask it.
+ */
+function runtimeHasFts5() {
+  let probe = null;
+  try {
+    probe = new DatabaseSync(':memory:');
+    return hasFts5(probe);
+  } catch {
+    return false;
+  } finally {
+    try { probe?.close(); } catch { /* it was never usable */ }
+  }
+}
+
+/**
+ * The database, actually opened.
+ *
+ * `diagnose()` used to import nothing from ./db.mjs and the folder check only
+ * `existsSync`ed the file, so every one of these printed "✓ Data folder …
+ * database present", "Nothing is broken", exit 0, on a home where `node
+ * zelos.mjs` dies at startup with a bare `Error: file is not a database`:
+ *
+ *  - a truncated or half-synced zelos.db (a cloud-sync placeholder, a copy
+ *    interrupted mid-write) — opens, then throws on the first statement;
+ *  - a root-owned or mode-000 zelos.db, which is what one `sudo zelos` or a
+ *    backup restored as root leaves behind — the open itself throws;
+ *  - a zelos.db that is a directory — "disk I/O error" on open;
+ *  - a file written by a NEWER Zelos. `migrate()` only ever moves forward and
+ *    returns `{applied: 0}` without a word, and `SCHEMA_VERSION` is compared to
+ *    nothing outside the tests, so an older build reads a newer file happily
+ *    until it touches a column that is not there.
+ *
+ * Opened read-only, always: the rule at the top of this file is that doctor
+ * diagnoses and does not repair, and a plain `open()` would create the file,
+ * set WAL, tighten modes and run migrations — three of which are exactly the
+ * conditions being measured. Read-only is also safe against a running Zelos:
+ * measured against a live WAL writer holding the same file, the read-only
+ * handle answers both PRAGMAs without disturbing it.
+ */
+function checkDatabase(home) {
+  const label = 'Database';
+  const file = path.join(home, 'zelos.db');
+
+  /* Only the name, not the path, in every `detail` below. `wrap()` never breaks
+     a word, so a full path is one unsplittable token — and a Zelos home under a
+     long temp or profile directory then pushes the line past the terminal the
+     rest of the report is written to fit. The folder is on the line above; the
+     path appears only inside the mv commands, which have to be copy-pasteable. */
+  const aside = `Close Zelos and move the file aside — mv "${file}" "${file}.broken" — then start Zelos again: it writes a fresh one. Your mail and calendars are read from their servers on the next sweep; what is lost is the board history and anything you captured.`;
+
+  if (!fs.existsSync(file)) {
+    return check(
+      'database', label, 'skip',
+      'zelos.db has not been created yet.',
+      'Nothing to do: Zelos creates it, with its tables, the first time it starts.',
+    );
+  }
+
+  if (!runtimeHasFts5()) {
+    return check(
+      'database', label, 'fail',
+      `This copy of Node (${process.version}) has a SQLite without the FTS5 extension, which Zelos's search index is built on — so it cannot open zelos.db at all.`,
+      'Install an official Node from nodejs.org (22.16 or newer, or 24 or newer) and run zelos again. Nothing in your Zelos home has been changed.',
+    );
+  }
+
+  let db;
+  try {
+    db = new DatabaseSync(file, { readOnly: true });
+  } catch (err) {
+    return check('database', label, 'fail', `zelos.db cannot be opened: ${errorText(err)}`, aside);
+  }
+
+  try {
+    // Read the version first. On a file whose header is intact but whose pages
+    // are not, this succeeds and quick_check is what throws — reading them the
+    // other way round would report a corrupt database as an unopenable one.
+    const version = Number(db.prepare('PRAGMA user_version').get()?.user_version) || 0;
+    const rows = db.prepare('PRAGMA quick_check').all();
+    const verdict = rows.map((r) => String(r?.quick_check ?? '')).filter(Boolean);
+    if (!(verdict.length === 1 && verdict[0].toLowerCase() === 'ok')) {
+      return check(
+        'database', label, 'fail',
+        `zelos.db is damaged: ${verdict.slice(0, 3).join('; ') || 'SQLite reported no verdict'}`,
+        aside,
+      );
+    }
+    if (version > SCHEMA_VERSION) {
+      return check(
+        'database', label, 'fail',
+        `zelos.db was written by a newer Zelos: its schema is version ${version} and this build understands ${SCHEMA_VERSION}.`,
+        'Update Zelos. Migrations only ever move forward, so this build will not touch the file — it would simply read columns that are not there and go quiet about it. Do not delete the database: the newer Zelos can still read it.',
+      );
+    }
+    return check(
+      'database', label, 'pass',
+      `zelos.db · schema ${version} of ${SCHEMA_VERSION}${version < SCHEMA_VERSION ? ' (it upgrades itself on the next launch)' : ''} · integrity ok`,
+    );
+  } catch (err) {
+    return check('database', label, 'fail', `zelos.db is not a database Zelos can read: ${errorText(err)}`, aside);
+  } finally {
+    try { db.close(); } catch { /* the handle is going away regardless */ }
+  }
+}
+
+/**
+ * The sections of config.json whose value has to BE an object, named by reading
+ * DEFAULTS rather than by keeping a second copy of the list here: the two
+ * copies would drift the first time a section was added, and this one would go
+ * quiet rather than loud when it did.
+ */
+const OBJECT_SECTIONS = Object.entries(DEFAULTS)
+  .filter(([, v]) => v && typeof v === 'object' && !Array.isArray(v))
+  .map(([k]) => k);
+
+/**
+ * Which sections the FILE gets wrong — not the loaded config.
+ *
+ * `loadConfig()` repairs a scalar section on the way in (it has to: doctor's own
+ * advice is "edit config.json directly", and a typo there must not brick the app
+ * that is supposed to report the typo). The repair is a `log.warn` and nothing
+ * else, so validateConfig sees a perfectly good object and doctor said "valid"
+ * about a file whose `"identity": 5` had just silently thrown the user's name
+ * and address away. This is the one place that can still see it.
+ */
+function malformedSectionsOnDisk(configFile) {
+  let raw;
+  try {
+    raw = JSON.parse(fs.readFileSync(configFile, 'utf8'));
+  } catch {
+    // Unreadable or unparseable is config.mjs's business — it moves the file
+    // aside — and the load error is already reported above.
+    return [];
+  }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return [];
+  return OBJECT_SECTIONS.filter((key) => Object.hasOwn(raw, key)
+    && (!raw[key] || typeof raw[key] !== 'object' || Array.isArray(raw[key])));
+}
+
 function checkConfig(config, configFile, loadError) {
   const label = 'Settings file';
   if (loadError) {
@@ -199,10 +348,33 @@ function checkConfig(config, configFile, loadError) {
       'Nothing to do: the first change you save in Settings creates it.',
     );
   }
+  const malformed = malformedSectionsOnDisk(configFile);
+  if (malformed.length) {
+    const one = malformed.length === 1;
+    return check(
+      'config', label, 'warn',
+      `${configFile} loads, but ${malformed.join(', ')} ${one ? 'is not an object' : 'are not objects'} in the file — Zelos replaced ${one ? 'it' : 'them'} with the built-in defaults to get started, and whatever ${one ? 'that section' : 'those sections'} held is gone.`,
+      `Open ${configFile} and give ${malformed.map((s) => `"${s}"`).join(', ')} ${one ? 'a JSON object' : 'JSON objects'} — "${malformed[0]}": {} is a valid one — then restart Zelos and set ${one ? 'that section' : 'those sections'} again in Settings. Saving anything in Settings also rewrites the file with the defaults in place, which stops the warning but does not bring the old values back.`,
+    );
+  }
   return check('config', label, 'pass', `${configFile} · valid`);
 }
 
-async function checkSecrets(deps) {
+/**
+ * Which store this folder's secrets were actually written to, read straight off
+ * disk. `backend()` returns the store in USE, which since the pin landed is not
+ * the same question — see core/secrets.mjs "the backend on record".
+ */
+function recordedBackend(home) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.join(home, 'secrets.backend.json'), 'utf8'));
+    return typeof parsed?.backend === 'string' && parsed.backend ? parsed.backend : null;
+  } catch {
+    return null;
+  }
+}
+
+async function checkSecrets(deps, home) {
   const label = 'Secret store';
   let info;
   try {
@@ -221,14 +393,48 @@ async function checkSecrets(deps) {
       'Check that your Zelos data folder is writable (the line above), then run zelos doctor again.',
     );
   }
-  if (info.name === 'encrypted-file') {
+
+  /* Where the name came from matters as much as the name. `backend()` answers
+     "which store is in use", and since the first successful write pins the
+     choice in secrets.backend.json, that answer can come from the record rather
+     than from a live probe — which is the whole point of the record, and also
+     why a clean "✓ macos-keychain" here used to be compatible with a keychain
+     that is not answering at all. Doctor cannot re-probe without a seam
+     secrets.mjs does not offer, but it can say which of the two it is looking
+     at, and it can catch the one case where the record LOST. */
+  const recorded = recordedBackend(home);
+  const forced = String(process.env.ZELOS_SECRETS_BACKEND ?? '').trim();
+
+  if (recorded && recorded !== info.name) {
     return check(
       'secrets', label, 'warn',
-      `Using the built-in encrypted file. ${info.note}`,
-      'Nothing is broken. If you would rather your system keychain held these: on Linux install a keyring (gnome-keyring or KWallet) and log back in; on macOS and Windows the system store is used automatically.',
+      `This folder's credentials were stored in ${recorded} — secrets.backend.json says so — but Zelos is using ${info.name} right now, and nothing ${recorded} holds can be read from here.`,
+      forced
+        ? `ZELOS_SECRETS_BACKEND is set to "${forced}" in this shell, and that beats the record on purpose. Unset it and run zelos doctor again. Anything you save while it is set lands in ${info.name} and will not be found by a run without it.`
+        : `${recorded} does not exist on ${process.platform}, so this is a Zelos home that has moved machines. Re-enter your mail passwords and your model key in Settings; they will go into ${info.name} from now on.`,
     );
   }
-  return check('secrets', label, 'pass', `${info.name} · ${info.note}`);
+
+  if (info.name === 'encrypted-file') {
+    const pinned = recorded === 'encrypted-file';
+    const why = process.platform === 'darwin' || process.platform === 'win32'
+      ? `This machine does have a system store, so something stopped Zelos reaching it — a probe that timed out, or a sandbox that refused. `
+      : 'On Linux, install a keyring (gnome-keyring or KWallet) and log back in to be offered one. ';
+    return check(
+      'secrets', label, 'warn',
+      `Using the built-in encrypted file${pinned ? ', and this folder is now pinned to it by its own secrets.backend.json' : ''}. ${info.note}`,
+      pinned
+        ? `${why}Nothing is broken today and no password is lost, but this will not undo itself: once a secret has landed, the record beats the probe precisely so a keychain that turns up later cannot quietly become a second store holding half your credentials. Moving is a deliberate act — close Zelos, delete secrets.enc, .seed and secrets.backend.json from ${home}, then re-enter each password in Settings.`
+        : `${why}Nothing is broken, and nothing has been stored yet — so if a keychain is working before you save your first password, Zelos will use that instead and this line will go away on its own.`,
+    );
+  }
+
+  return check(
+    'secrets', label, 'pass',
+    recorded === info.name
+      ? `${info.name} · recorded in this folder's secrets.backend.json as where its secrets live, so that is where Zelos looks even if a probe blinks. ${info.note}`
+      : `${info.name} · chosen by probing this machine. Nothing has been stored yet, so the choice is not pinned. ${info.note}`,
+  );
 }
 
 async function checkModelKey(config, deps) {
@@ -450,17 +656,41 @@ async function checkMailAccount(account, deps, { timeoutMs }) {
     );
   }
 
-  const names = new Set((result.mailboxes ?? []).map((m) => (typeof m === 'string' ? m : m.name)));
-  const wanted = Array.isArray(account.mailboxes) && account.mailboxes.length ? account.mailboxes : ['INBOX'];
+  const boxes = result.mailboxes ?? [];
+  const names = new Set(boxes.map((m) => (typeof m === 'string' ? m : m?.name)).filter(Boolean));
+
+  /* The sent folder belongs in `wanted`, and leaving it out is why this check
+     could print "pass · 4 folders · reading INBOX" about an account whose every
+     sweep was reporting `Mailbox doesn't exist: Sent` forever. core/sweep.mjs's
+     `mailboxesFor()` appends `account.sentMailbox` to every fetch, and the
+     default is the bare word "Sent" — which is wrong for Gmail
+     ("[Gmail]/Sent Mail"), Microsoft 365 ("Sent Items") and iCloud
+     ("Sent Messages"), three of the eight providers this app hardcodes and the
+     three largest. The list below is built the same way sweep builds it, so the
+     two cannot disagree about what is being read. */
+  const configured = Array.isArray(account.mailboxes) && account.mailboxes.length ? account.mailboxes : ['INBOX'];
+  const sent = typeof account.sentMailbox === 'string' ? account.sentMailbox.trim() : '';
+  const wanted = sent && !configured.includes(sent) ? [...configured, sent] : [...configured];
+
   const missing = wanted.filter((m) => names.size && !names.has(m));
   if (missing.length) {
+    // The server's own SPECIAL-USE \Sent flag, which the client already reads
+    // and nothing outside a test ever looked at. When the missing folder is the
+    // sent one, this turns "pick from these eight names" into the actual answer.
+    const flagged = boxes.find((m) => m && typeof m === 'object' && m.specialUse === 'sent')?.name || '';
+    const sentIsMissing = Boolean(sent) && missing.includes(sent);
     return check(
       id, label, 'warn',
       `Signed in to ${account.host}, but ${missing.join(', ')} ${missing.length === 1 ? 'is' : 'are'} not on the server.`,
-      `Zelos will read nothing from ${missing.length === 1 ? 'that folder' : 'those folders'}. Pick from what the server actually has: ${[...names].slice(0, 8).join(', ')}${names.size > 8 ? ', …' : ''}`,
+      sentIsMissing && flagged
+        ? `This server calls its sent folder "${flagged}" — put that in Settings → Mail → Sent folder. Until then Zelos never reads what you wrote, so "you promised" and half of "waiting on" cannot be built.${missing.length > 1 ? ` The rest: pick from ${[...names].slice(0, 8).join(', ')}${names.size > 8 ? ', …' : ''}` : ''}`
+        : `Zelos will read nothing from ${missing.length === 1 ? 'that folder' : 'those folders'}. Pick from what the server actually has: ${[...names].slice(0, 8).join(', ')}${names.size > 8 ? ', …' : ''}`,
     );
   }
-  return check(id, label, 'pass', `Signed in to ${account.host} · ${names.size} folder${names.size === 1 ? '' : 's'} · reading ${wanted.join(', ')}`);
+  return check(
+    id, label, 'pass',
+    `Signed in to ${account.host} · ${names.size} folder${names.size === 1 ? '' : 's'} · reading ${wanted.join(', ')}${sent ? '' : ' · no sent folder is set, so nothing you wrote is read'}`,
+  );
 }
 
 /** Read a fetch Response with a hard byte cap, so a huge .ics cannot OOM us. */
@@ -537,13 +767,47 @@ async function checkCalendar(calendar, deps, { timeoutMs, signal }) {
   try {
     // The caller's signal must not replace the timeout — a calendar host that
     // accepts the connection and then says nothing would hang the diagnosis
-    // forever, which is the one thing a diagnostic may never do.
+    // forever, which is the one thing a diagnostic may never do. One deadline
+    // covers both hops, so a redirect cannot buy a second full timeout.
     const deadline = AbortSignal.timeout(timeoutMs);
-    const response = await deps.fetchImpl(url, {
-      headers,
-      redirect: 'follow',
-      signal: signal ? AbortSignal.any([signal, deadline]) : deadline,
+    const abortOn = signal ? AbortSignal.any([signal, deadline]) : deadline;
+
+    /* One hop, and the credential does not cross an origin.
+     *
+     * `redirect: 'follow'` handed the policy to fetch, which follows up to
+     * twenty. Measured on Node 26.3.0: a 6-origin chain returns 200 having
+     * contacted six hosts, and a 22-origin chain contacts twenty-one before
+     * giving up — so `zelos doctor` opened connections to as many as twenty
+     * hosts the user never typed, inside the same passage of docs/SECURITY.md
+     * that invites the reader to check it with tcpdump and promises one hop.
+     * core/sweep.mjs's `fetchIcsText` has hand-rolled this rule since the
+     * beginning; this call site and the Settings "Test" button were the only
+     * two readers in the repo that delegated it. (undici does strip
+     * Authorization across origins itself — verified — so no credential leaked;
+     * the traffic is the defect, and re-attaching auth on a same-origin hop is
+     * this code's own decision rather than a library's.)
+     */
+    const request = (target, withAuth) => deps.fetchImpl(target, {
+      headers: withAuth ? headers : { Accept: headers.Accept },
+      redirect: 'manual',
+      signal: abortOn,
     });
+
+    let response = await request(url, true);
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get('location');
+      if (!location) {
+        return check(id, label, 'fail', `${url} answered ${response.status} but did not say where to.`,
+          'That is a broken redirect on the calendar host, not a setting here. Open the link in a browser: whatever it shows you is what Zelos is getting.');
+      }
+      const next = new URL(location, url);
+      const sameOrigin = next.origin === new URL(url).origin;
+      response = await request(next, sameOrigin);
+      if (response.status >= 300 && response.status < 400) {
+        return check(id, label, 'fail', `${url} redirects more than once (via ${next.origin}), and Zelos follows exactly one hop.`,
+          `Copy the address it ends up at and paste that into Settings → Calendars instead. Zelos will not walk a redirect chain: each extra hop is another host contacting${calendar.user && calendar.keyRef ? ', with your calendar password attached whenever the origin has not changed' : ''}.`);
+      }
+    }
     if (!response.ok) {
       const advice = response.status === 401 || response.status === 403
         ? 'That link needs credentials, or it has been revoked. Re-copy the subscription link from your calendar provider.'
@@ -585,6 +849,7 @@ export async function diagnose({ config = null, timeoutMs = 10_000, signal, deps
   const home = homeDirPath();
   checks.push(checkNode());
   checks.push(checkHome(home));
+  checks.push(checkDatabase(home));
 
   let cfg = config;
   let loadError = null;
@@ -598,7 +863,7 @@ export async function diagnose({ config = null, timeoutMs = 10_000, signal, deps
   }
   checks.push(checkConfig(cfg, configFile, loadError));
 
-  checks.push(await checkSecrets(d));
+  checks.push(await checkSecrets(d, home));
 
   if (cfg) {
     const { result: keyCheck, key } = await checkModelKey(cfg, d);

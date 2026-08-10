@@ -248,8 +248,11 @@ DRAFTS
 Attach a draft only to \`waiting\` and \`promised\` items, and only when you can write the whole
 message from what is in front of you.
   - Send-ready prose: a human reads it once and clicks send.
-  - NO PLACEHOLDERS. No [name], no [date], no {{thing}}, no "TODO", no "insert...". A draft
-    carrying a bracket is rejected in code and the item loses its draft entirely.
+  - NO PLACEHOLDERS. No [name], no [date], no {{thing}}, no "TODO", no "TBD", no "insert...".
+    A bracket is a bracket wherever it is: a note to the reader mid-paragraph counts, however
+    long, and so does one opened on one line and closed on the next.
+  - Every one of those is rejected in code, and the item then loses its draft entirely — so a
+    draft you cannot finish is worth less than the sentence in \`why\` that says what is missing.
   - If writing it honestly needs a fact you do not have — a price, a date only they can pick,
     a decision only they can make — DO NOT WRITE THE DRAFT. Say what is missing in \`why\`.
   - Three to six sentences, in their voice: plain, warm, specific, no corporate throat-clearing.

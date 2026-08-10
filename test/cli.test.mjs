@@ -20,6 +20,7 @@ import test, { after, before, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -36,6 +37,11 @@ process.env.ZELOS_SECRETS_BACKEND = 'encrypted-file';
 
 const { diagnose, formatReport, compareVersions, MIN_NODE } = await import('../core/doctor.mjs');
 const { parseArgs, COMMANDS, browserLaunchPlan, openBrowser } = await import('../zelos.mjs');
+/* The launcher's half of the exclusion on the data home. It lives in core/ and
+   not beside the Electron shell for a reason this file is the one to check:
+   `desktop/` is not in the published `files` list, so a lock defined there was
+   a lock no installed copy could take. */
+const { acquireHomeLock, readHomeLock } = await import('../core/home-lock.mjs');
 
 after(() => {
   /* The retries are for Windows. This suite extracts a tarball and then runs
@@ -158,8 +164,29 @@ describe('package.json is ready to publish as zelos-app', () => {
     // README.md is listed even though npm would include it regardless: the
     // allowlist is read by people as the definition of what ships, and a file
     // that ships without appearing in it makes the list a half-truth.
+    //
+    // There are two negations, and both are the same argument: a file nothing
+    // in the published package can reach should not be in the published
+    // package.
+    //
+    // core/sources/oauth.mjs — 989 lines of OAuth that no production code path
+    // can reach (no config key holds it, no Settings surface offers it, and
+    // CALENDAR_KINDS has no google or microsoft branch for a token to hang
+    // off). It stays in the repo, with its test, because the research is real
+    // and the wiring may yet happen.
+    //
+    // assets/icon.png — the 1024px app icon, 290 kB, read only by the desktop
+    // shell (desktop/main.js, and electron-builder's mac and win blocks).
+    // `desktop/` is not in this list, so the icon was shipping to nobody and
+    // was briefly 40% of the packed tarball, in a product whose first claim is
+    // that the whole download is small enough to read. The web UI's icon is
+    // assets/icon.svg, which is 22 kB and does ship — ui/index.html asks for
+    // it by name, so excluding the directory instead would break the favicon.
+    //
+    // That both negations still work is checked against a real tarball further
+    // down, not here.
     assert.deepEqual(pkg.files,
-      ['core/', 'ui/', 'assets/', 'docs/*.md', 'zelos.mjs', 'README.md', 'LICENSE']);
+      ['core/', '!core/sources/oauth.mjs', 'ui/', 'assets/', '!assets/icon.png', 'docs/*.md', 'zelos.mjs', 'README.md', 'LICENSE']);
   });
 });
 
@@ -351,6 +378,58 @@ describe('npm pack produces a tarball that runs', { skip: PACK_SKIP }, () => {
     assert.ok(entries.some((e) => e.startsWith('assets/')), 'no assets shipped');
   });
 
+  test('it carries the home lock, because zelos.mjs cannot take it otherwise', () => {
+    /* REGRESSION. The lock on the data home was defined in
+       desktop/runtime.js — which this same suite asserts, three tests down, is
+       NOT in the tarball. So `zelos.mjs`'s `await import('./desktop/
+       runtime.js')` threw ERR_MODULE_NOT_FOUND into a bare catch on every
+       installed copy, and the whole exclusion existed only for people running
+       out of a git checkout. Measured on the packed tarball before the fix: no
+       zelos.lock was ever written, and a `zelos` started against a home a live
+       process already held produced a second scheduler with no warning at all,
+       both then sweeping one WAL database on their own clocks. */
+    assert.ok(entries.includes('core/home-lock.mjs'),
+      'the home lock is not in the tarball, so an installed zelos cannot take it');
+  });
+
+  test('it leaves out the OAuth module nothing can reach', () => {
+    /* core/sources/oauth.mjs is 989 lines with no production importer: no
+       DEFAULTS key holds `oauth`, Settings has no surface for it,
+       desktop/runtime.js loads a hardcoded five-module list, and the calendar
+       kinds are ics/caldav/file with no google or microsoft branch — so even a
+       hand-written config.json could not put a token on a calendar row. The
+       research is real and the wiring may yet happen, which is why the module
+       and its 851-line test stay in the repo; what should not happen is
+       publishing a thousand lines of unreachable network code to everyone who
+       types `npm i zelos-app`. `files` carries `core/` and then takes this one
+       file back out — hence a `!` entry in an otherwise plain allowlist, and
+       hence this test, because a negation with nothing watching it is exactly
+       the kind of line a later edit drops without noticing. */
+    assert.ok(!entries.includes('core/sources/oauth.mjs'),
+      'the unreachable OAuth module is being published');
+    assert.ok(entries.some((e) => e.startsWith('core/sources/')),
+      'the negation took the rest of core/sources/ with it');
+  });
+
+  test('it leaves out the desktop-only app icon, and keeps the one the UI asks for', () => {
+    /* REGRESSION. assets/icon.png is the 1024px app icon at 290 kB. Only the
+       desktop shell reads it — desktop/main.js for the Linux window and the
+       tray fallback, and electron-builder's mac and win blocks — and
+       `desktop/` is not in the package, so every byte of it was shipping to
+       nobody. It was 40% of the packed tarball (721.8 kB with it, 432.3 kB
+       without) in a product whose first claim is that the whole download is
+       small enough to read in an afternoon.
+
+       The second assertion is the one that matters: the fix must be a negation
+       of the FILE, not of `assets/`. ui/index.html asks for /assets/icon.svg by
+       name, so dropping the directory would ship an app with a broken favicon
+       and nothing would notice until someone opened the board. */
+    assert.ok(!entries.includes('assets/icon.png'),
+      'the desktop-only app icon is being published to CLI users');
+    assert.ok(entries.includes('assets/icon.svg'),
+      'assets/icon.svg is missing — ui/index.html asks for it by name, so the board has no icon');
+  });
+
   test('it does not carry the tests, the Electron shell, or the screenshots', () => {
     const strays = entries.filter((e) => /^(test|desktop)\//.test(e) || e.startsWith('docs/shots/'));
     assert.deepEqual(strays, [], `the tarball ships files it should not:\n  ${strays.join('\n  ')}`);
@@ -411,6 +490,124 @@ describe('npm pack produces a tarball that runs', { skip: PACK_SKIP }, () => {
     }
   });
 
+  test('the installed `zelos` command actually runs, through npm\'s bin symlink', async () => {
+    /* REGRESSION, and the reason "--version runs from the clean extract" above
+       could not catch it: that test spawns `node zelos.mjs`, which is not how
+       anybody who installs this ever invokes it.
+
+       `npm install` writes node_modules/.bin/zelos as a SYMLINK to
+       ../zelos-app/zelos.mjs on macOS and Linux. Node resolves the real path of
+       the ESM main entry but hands `argv[1]` over exactly as the shell wrote
+       it, so the launcher's `path.resolve(process.argv[1]) === fileURLToPath(
+       import.meta.url)` compared the link against its target, never matched,
+       and `main()` was simply never called. Measured on the packed tarball
+       installed three ways — local, `-g` and `npx` — all three produced
+       symlinks, and `zelos --version`, `--help`, `doctor` and `sweep` each
+       printed nothing, exited 0, and never created $ZELOS_HOME.
+
+       Exit 0 with no output is what makes it expensive rather than merely
+       broken: docs/INSTALL.md recommends `zelos sweep` for a cron job
+       precisely because "it exits non-zero if the sweep failed", so that cron
+       job would have reported success every night while sweeping nothing.
+
+       So this installs the real tarball and runs the real bin entry. Anything
+       cheaper — a unit test of the comparison, a spawn of zelos.mjs by path —
+       reproduces the shape of the bug without its cause, which is the symlink
+       only npm creates. Windows never reaches here (this whole suite is
+       skipped there) and could not fail this way anyway: npm writes a .cmd
+       shim carrying a real path rather than a link. */
+    const installDir = path.join(SCRATCH, 'installed');
+    fs.mkdirSync(installDir, { recursive: true });
+    fs.writeFileSync(path.join(installDir, 'package.json'),
+      JSON.stringify({ name: 'zelos-install-probe', version: '1.0.0', private: true }, null, 2));
+
+    const [npmExe, ...npmPrefix] = NPM;
+    await new Promise((resolve, reject) => {
+      /* No scripts, no audit, no funding banner and no lockfile: the package
+         has no dependencies, so none of it needs a network and none of it is
+         what is being tested here. */
+      const child = spawn(npmExe, [...npmPrefix, 'install', tarball,
+        '--no-audit', '--no-fund', '--no-package-lock', '--ignore-scripts'], {
+        cwd: installDir,
+        env: process.env,
+        stdio: ['ignore', 'ignore', 'pipe'],
+      });
+      let err = '';
+      child.stderr.on('data', (d) => { err += d; });
+      child.on('error', (e) => reject(new Error(`could not run npm (${npmExe}): ${e.message}`)));
+      child.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`npm install exited ${code}: ${err}`))));
+    });
+
+    const bin = path.join(installDir, 'node_modules', '.bin', 'zelos');
+    assert.ok(fs.existsSync(bin), 'npm did not install a zelos command at all');
+    // If npm ever stops writing a link here the test still passes, but it
+    // stops being the test it says it is — so say which case ran.
+    const linked = fs.lstatSync(bin).isSymbolicLink();
+
+    const home = freshHome();
+    const result = await new Promise((resolve, reject) => {
+      const child = spawn(bin, ['--version'], {
+        cwd: installDir,
+        env: { ...process.env, ZELOS_HOME: home, ZELOS_SECRETS_BACKEND: 'encrypted-file' },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (d) => { stdout += d; });
+      child.stderr.on('data', (d) => { stderr += d; });
+      child.on('error', reject);
+      child.on('close', (code) => resolve({ code, stdout, stderr }));
+    });
+    assert.equal(result.stdout.trim(), pkg.version,
+      `the installed bin printed nothing${linked ? ' through npm\'s symlink' : ''} — main() was never called${result.stderr ? `\nstderr: ${result.stderr}` : ''}`);
+    assert.equal(result.code, 0, result.stderr);
+  });
+
+  test('a `zelos` installed from the tarball holds the data home', async () => {
+    /* The behavioural half of the missing-lock regression above: the file
+       being in the tarball is necessary and not sufficient, and the failure
+       this replaces was precisely a feature that existed everywhere except
+       where it ran. So start the real launcher out of the extract, against a
+       home nothing else is using, and read the lock it should have written —
+       the pid in it is the only proof that the writer (core/home-lock.mjs's
+       publishLock) and the reader (zelos.mjs's holdHomeQuietly) met. */
+    const home = freshHome();
+    const child = spawn(process.execPath, ['zelos.mjs', '--no-open', '--port', '0'], {
+      cwd: extracted,
+      env: { ...process.env, ZELOS_HOME: home, ZELOS_SECRETS_BACKEND: 'encrypted-file' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (d) => { stdout += d; });
+    child.stderr.on('data', (d) => { stderr += d; });
+    try {
+      // Wait for the banner rather than for a fixed delay: the lock is taken
+      // before the database is opened, so by the time a URL is printed it has
+      // either been written or it never will be.
+      const deadline = Date.now() + 20_000;
+      let port = null;
+      while (port === null) {
+        const m = /Open\s+(http:\/\/\S+)/.exec(stdout);
+        if (m) port = Number(new URL(m[1]).port);
+        else if (child.exitCode !== null) throw new Error(`zelos exited ${child.exitCode}:\n${stdout}\n${stderr}`);
+        else if (Date.now() > deadline) throw new Error(`no URL was printed:\n${stdout}\n${stderr}`);
+        else await new Promise((r) => setTimeout(r, 50));
+      }
+
+      const lockFile = path.join(home, 'zelos.lock');
+      assert.ok(fs.existsSync(lockFile), `an installed zelos did not take the home lock:\n${stdout}${stderr}`);
+      const record = JSON.parse(fs.readFileSync(lockFile, 'utf8'));
+      assert.equal(record.pid, child.pid, 'the lock names a process that is not the one holding the home');
+      assert.equal(record.kind, 'cli', 'a terminal Zelos has to say so, or the warning names the wrong thing to quit');
+      // setPort runs after listen(), so this is also the proof that the record
+      // is updated once the socket exists — the next process warns with a URL.
+      assert.equal(record.port, port, 'the lock does not say where the board is');
+    } finally {
+      child.kill('SIGKILL');
+    }
+  });
+
   test('the bin the tarball declares is the file the tarball contains', () => {
     const shipped = JSON.parse(fs.readFileSync(path.join(extracted, 'package.json'), 'utf8'));
     assert.equal(shipped.name, 'zelos-app');
@@ -464,6 +661,56 @@ describe('parseArgs', () => {
     assert.throws(() => parseArgs(['sweep', 'again']), /unexpected argument again/);
     assert.throws(() => parseArgs(['sweep', '--mode', 'sideways']), /--mode must be one of/);
     assert.throws(() => parseArgs(['--home']), /--home needs a value/);
+  });
+
+  test('a --home that came from an unset shell variable is refused, not resolved', () => {
+    /* REGRESSION, both halves measured before the guard existed.
+       `node zelos.mjs doctor --home=undefined` created a real, live data
+       directory — drwx------ undefined/{cache,logs} — in the working directory
+       and exited 0 with no warning; .gitignore still carries an `undefined/`
+       line from the first time it happened. core/config.mjs's homeDir() does
+       guard those literals, but it guards $ZELOS_HOME, and main() runs the flag
+       through path.resolve on the way into that variable, so by the time the
+       guard reads it the string is an absolute path it has no reason to
+       suspect. The guard downstream can therefore never fire on this path.
+
+       The empty value is worse, because nothing at all appears to go wrong:
+       `--home=` parsed to "", which is falsy, so it was dropped and the command
+       operated on the real ~/.zelos — the one outcome somebody keeping a work
+       home apart from a personal one must never get. */
+    for (const junk of ['undefined', 'null', 'UNDEFINED', ' undefined ']) {
+      assert.throws(() => parseArgs(['doctor', `--home=${junk}`]), /literal string/,
+        `--home=${junk} was accepted`);
+      assert.throws(() => parseArgs(['doctor', '--home', junk]), /literal string/);
+    }
+    for (const empty of ['', '   ', '\t']) {
+      assert.throws(() => parseArgs(['doctor', `--home=${empty}`]), /empty value/,
+        `--home=${JSON.stringify(empty)} silently fell back to the real home`);
+    }
+    // And a directory that merely contains the word is still a directory.
+    assert.equal(parseArgs(['doctor', '--home=/tmp/undefined-ish']).home, '/tmp/undefined-ish');
+    assert.equal(parseArgs(['doctor', '--home=/tmp/z']).home, '/tmp/z');
+  });
+});
+
+describe('--help describes the security posture it actually has', () => {
+  test('it names /api/mcp as the exception to "a new token every launch"', async () => {
+    /* The help said, without qualification, that every request to the API needs
+       the session token printed in the launch URL and that the token is new on
+       every launch. /api/mcp is routed out of the session gate deliberately and
+       authenticates with the AI token minted in Settings, which is persisted —
+       reproduced across a real restart: launch 1's session token 401s at launch
+       2, while the same AI token still returns the board over /api/mcp. Nothing
+       is weaker than advertised (loopback bind, Host and Origin checks, off by
+       default, scope-gated, revocable, audit-logged); the sentence was simply
+       absolute where the system is not, and it is the sentence somebody reads
+       before deciding whether to switch AI access on. */
+    const { code, stdout } = await run(['--help']);
+    assert.equal(code, 0);
+    assert.match(stdout, /\/api\/mcp/, '--help does not mention the one route the session gate skips');
+    assert.match(stdout, /Settings/, 'and it has to say where that other token comes from');
+    assert.match(stdout, /outlive a restart|survives? a restart|until you turn/,
+      'the exception is only useful if it says the AI token is not per-launch');
   });
 });
 
@@ -955,6 +1202,347 @@ describe('zelos sweep, from the command line', () => {
     assert.ok(result.runId, 'the result should name its run');
     assert.ok(result.error, 'a failed run should carry its reason');
   });
+
+  test('it holds the data home too, and says when somebody else has it', async () => {
+    /* `zelos sweep` took no lock on any path — and it is the path that meets
+       the problem most often, because docs/INSTALL.md recommends exactly this
+       command for a crontab. A scheduled sweep landing on the home the desktop
+       app is already sweeping reads the same mail twice and pays for the same
+       model calls twice, with nothing anywhere saying so.
+
+       The lock here is held by this test process, which is alive and
+       signallable, so the subprocess has to find it held rather than reclaim
+       it as stale. What is being proved is the whole chain: the record written
+       by core/home-lock.mjs's publishLock, read back by acquireHomeLock in the
+       child, phrased by contestMessage, and reaching a human through
+       zelos.mjs's holdHomeQuietly → log.warn → stderr. */
+    const home = freshHome();
+    const mine = acquireHomeLock({ home, kind: 'desktop', port: 61234 });
+    try {
+      const { stderr } = await run(['sweep'], { home });
+      assert.match(stderr, /already in use/, `a busy home went unreported:\n${stderr}`);
+      assert.match(stderr, /another copy of the Zelos app/, 'and it has to name what to quit');
+      assert.match(stderr, new RegExp(`process ${process.pid}\\b`));
+      assert.match(stderr, /http:\/\/127\.0\.0\.1:61234\//, 'the port in the lock is what makes the warning actionable');
+      assert.match(stderr, /delete /, 'a warning nobody can clear is a lockout');
+      // Advisory, never a refusal: the sweep still ran and still reported its
+      // own failure (nothing is configured), not the lock's.
+      assert.equal(readHomeLock(home).pid, process.pid, 'the child took a lock that was not its to take');
+    } finally {
+      mine.release();
+    }
+  });
+
+  test('it holds the lock for the length of the run and gives it back at the end', async (t) => {
+    /* This test used to be called 'a sweep still leaves the lock behind it'
+       while asserting that the lock was GONE, with the message 'the lock
+       outlived the sweep that took it'. The title was the odd one out: the
+       assertion and the message agree with the code, because `holdHome`
+       registers its release on 'exit' (core/home-lock.mjs:364) precisely so
+       that the next `zelos sweep` in the crontab is not warned off a home
+       nobody is in.
+
+       Half a test, though. `readHomeLock(home) === null` is also what a home
+       that was never locked at all looks like, so deleting the
+       `holdHomeQuietly` call from `commandSweep` left it green — measured. The
+       missing half is an observation from inside the run, and the sweep hands
+       one over: its model call arrives at this process, in this handler, while
+       the child is still going. The lock file is on disk at that moment or the
+       feature does not exist. */
+    let home;
+    let duringSweep = 'the model was never called, so nothing looked at the lock mid-run';
+    const mock = await mockServer((req, res) => {
+      duringSweep = readHomeLock(home);
+      req.on('data', () => {});
+      req.on('end', () => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          model: 'mock-local',
+          choices: [{ message: { role: 'assistant', content: JSON.stringify({ first: null, items: [], notes: [] }) } }],
+          usage: { prompt_tokens: 1, completion_tokens: 1 },
+        }));
+      });
+    });
+    t.after(() => mock.close());
+
+    home = freshHome({
+      model: { protocol: 'openai', baseUrl: `${mock.origin}/v1`, label: 'Local', model: 'mock-local', keyRef: 'model.default' },
+    });
+    const { code, stdout, stderr } = await run(['sweep'], { home });
+    assert.equal(code, 0, `${stdout}\n${stderr}`);
+
+    assert.ok(duringSweep && typeof duringSweep === 'object',
+      `the sweep was mid-run and the home held no lock: ${JSON.stringify(duringSweep)}`);
+    assert.equal(duringSweep.kind, 'cli', 'the record has to say which half of Zelos is in there');
+    assert.notEqual(duringSweep.pid, process.pid, 'the lock must name the sweeping child, not this test');
+
+    assert.equal(readHomeLock(home), null, 'the lock outlived the sweep that took it');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Stopping a sweep
+ * ------------------------------------------------------------------ */
+
+/**
+ * An IMAP server that answers everything up to SELECT and then talks forever
+ * without ever finishing the command.
+ *
+ * This is the shape the finding was measured against, and the detail that
+ * matters is that it keeps EMITTING. core/sources/imap.mjs has a 30s silence
+ * deadline, so a server that goes quiet is bounded; a server that sends a valid
+ * untagged response every few hundred milliseconds resets that deadline forever
+ * and the read never ends on its own. Nothing here leaves 127.0.0.1.
+ */
+function startChattyImap() {
+  const sockets = new Set();
+  const timers = new Set();
+
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.setNoDelay(true);
+    socket.on('error', () => {});
+    socket.on('close', () => sockets.delete(socket));
+    socket.write('* OK Zelos never-ending mock ready\r\n');
+
+    let buffer = '';
+    socket.on('data', (chunk) => {
+      buffer += chunk.toString('latin1');
+      let idx;
+      while ((idx = buffer.indexOf('\r\n')) >= 0) {
+        const line = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+        const parts = line.split(' ');
+        const tag = parts[0] || '';
+        const verb = (parts[1] || '').toUpperCase();
+
+        if (verb === 'CAPABILITY') socket.write(`* CAPABILITY IMAP4rev1\r\n${tag} OK CAPABILITY completed\r\n`);
+        else if (verb === 'LOGIN') socket.write(`${tag} OK LOGIN completed\r\n`);
+        else if (verb === 'SELECT' || verb === 'EXAMINE') {
+          // No tagged completion, ever — just enough traffic to keep the
+          // client's idle deadline from firing.
+          const beat = setInterval(() => {
+            if (socket.destroyed) return;
+            socket.write('* OK [UNSEEN 1] still here\r\n');
+          }, 250);
+          timers.add(beat);
+        } else socket.write(`${tag} BAD unexpected command in mock\r\n`);
+      }
+    });
+  });
+
+  return new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', () => resolve({
+      port: server.address().port,
+      close: () => {
+        for (const t of timers) clearInterval(t);
+        for (const s of sockets) s.destroy();
+        return new Promise((r) => server.close(r));
+      },
+    }));
+  });
+}
+
+/**
+ * How long the launcher waits for an aborted sweep before leaving anyway, read
+ * out of the launcher.
+ *
+ * `SWEEP_STOP_GRACE_MS` is a private constant of `commandSweep` and has no
+ * business being exported for a test. The two tests below are entirely about
+ * the wait being bounded by it, so a copy of the number here would be a second
+ * place for it to live and a second place for it to go stale — the same trap
+ * as the `const MONTH_VISIBLE = 3` that test/ui.test.mjs used to keep beside a
+ * line reference that had already moved. A grace period raised to 30s must
+ * change what these tests allow, not silently outlive them.
+ */
+function sweepStopGraceMs() {
+  const src = fs.readFileSync(path.join(ROOT, 'zelos.mjs'), 'utf8');
+  const m = /\nconst SWEEP_STOP_GRACE_MS = ([\d_]+);/.exec(src);
+  if (!m) {
+    throw new Error('zelos.mjs no longer declares SWEEP_STOP_GRACE_MS where this reader looks — '
+      + 'fix the reader, do not restate the number');
+  }
+  return Number(m[1].replaceAll('_', ''));
+}
+
+/** Put a password where the sweep will look for it, in this home only. */
+async function seedMailPassword(home, ref, value) {
+  const previous = process.env.ZELOS_HOME;
+  process.env.ZELOS_HOME = home;
+  try {
+    const { setSecret } = await import('../core/secrets.mjs');
+    await setSecret(ref, value);
+  } finally {
+    if (previous === undefined) delete process.env.ZELOS_HOME;
+    else process.env.ZELOS_HOME = previous;
+  }
+}
+
+describe('Ctrl-C during a sweep', { skip: process.platform === 'win32'
+  ? 'Windows does not deliver POSIX signals; a handler that answers one cannot be tested here'
+  : false }, () => {
+  /**
+   * REGRESSION, in two halves that landed a wave apart.
+   *
+   * `commandSweep` attached SIGINT and SIGTERM listeners, which removes Node's
+   * default terminate-on-signal — so from that moment Ctrl-C did whatever those
+   * listeners said and nothing else. What they said was `controller.abort()`,
+   * silently, and abort was observed only between mailboxes while the mail
+   * reader did not forward the signal into its socket at all. Measured against
+   * this same mock: six SIGINTs and a SIGTERM all set `aborted` and changed
+   * nothing, and the process held the terminal for 27 seconds without printing
+   * a character. The `run` path prints "Stopping (SIGINT)."; this one printed
+   * nothing, which is the whole difference between a program that is stopping
+   * and a program that is stuck.
+   *
+   * The first half of the fix was the launcher's: say so, bound the wait with a
+   * 5s unref'd escape timer, and let a second signal through. The tests here
+   * were written against that, and asserted that one signal was NOT enough —
+   * that the read held on and the timer was what ended the run, exit 128+signal.
+   *
+   * The second half then threaded `signal` into the reader
+   * (core/sources/imap.mjs:627-634 — an abort fails the command in flight and
+   * destroys the socket), and that turned those assertions upside down: one
+   * signal now ends the run in about a tenth of a second, the escape timer never
+   * comes due, and the exit code is the sweep's own 1 for a run that did not
+   * finish rather than 130/143 from `leave()`. Both are non-zero, which is what
+   * the crontab in docs/INSTALL.md reads, and "it stopped when I asked" is the
+   * better product.
+   *
+   * So these two tests now assert the opposite of what they used to, and the
+   * assertion that carries the weight is the one saying the timer did NOT fire:
+   * put the reader back to ignoring its signal and the wait goes from ~100ms to
+   * the full grace, with "that source will not let go" underneath it.
+   *
+   * What that leaves untested, said out loud rather than quietly dropped:
+   * `leave()`'s 128+signal exit and the "Stopping now" second-signal branch
+   * (zelos.mjs:539-556) are no longer reachable through the front door, because
+   * every source Zelos has — IMAP, CalDAV/ICS fetches, and the model call —
+   * honours the signal now. They are a net for a source that stops honouring
+   * it, and nothing here can stage one without a hole in production code.
+   */
+  let imap;
+  let home;
+
+  before(async () => {
+    imap = await startChattyImap();
+    home = freshHome({
+      mail: [{
+        id: 'm_stuck', enabled: true, label: 'Work',
+        host: '127.0.0.1', port: imap.port, secure: false, requireTls: false,
+        user: 'nemo@example.com', keyRef: 'mail.m_stuck',
+        mailboxes: ['INBOX'], sentMailbox: '', lookbackDays: 14, maxMessages: 10,
+      }],
+      sweep: { intervalMinutes: 30, activeHours: [0, 24], auto: false },
+    });
+    await seedMailPassword(home, 'mail.m_stuck', 'app-password');
+  });
+
+  after(async () => { await imap?.close(); });
+
+  /** Start a sweep and wait until it is genuinely inside the mail read. */
+  async function sweepingChild() {
+    const child = spawn(process.execPath, ['zelos.mjs', 'sweep'], {
+      cwd: ROOT,
+      env: { ...process.env, ZELOS_HOME: home, ZELOS_SECRETS_BACKEND: 'encrypted-file' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const seen = { stdout: '', stderr: '' };
+    child.stdout.on('data', (d) => { seen.stdout += d; });
+    child.stderr.on('data', (d) => { seen.stderr += d; });
+    const exited = new Promise((resolve) => child.on('close', (code, signal) => resolve({ code, signal })));
+
+    const deadline = Date.now() + 20_000;
+    while (!/Reading mail/.test(seen.stderr)) {
+      if (child.exitCode !== null) throw new Error(`the sweep exited before it read anything:\n${seen.stderr}`);
+      if (Date.now() > deadline) throw new Error(`the sweep never started reading:\n${seen.stderr}`);
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    // The progress line is printed before the socket is opened; give the read
+    // long enough to be sitting on the mock rather than still resolving DNS.
+    await new Promise((r) => setTimeout(r, 400));
+    return { child, seen, exited };
+  }
+
+  test('one Ctrl-C both says so and cuts the read', async () => {
+    const grace = sweepStopGraceMs();
+    const { child, seen, exited } = await sweepingChild();
+    try {
+      const sent = Date.now();
+      child.kill('SIGINT');
+      const result = await Promise.race([
+        exited,
+        new Promise((_, reject) => setTimeout(() => reject(new Error(
+          `one Ctrl-C left the sweep running:\n${seen.stderr}`)), 20_000).unref()),
+      ]);
+      const waited = Date.now() - sent;
+
+      // Half one: it speaks. A silent Ctrl-C is what made this read as a freeze.
+      assert.match(seen.stderr, /Stopping \(SIGINT\)/,
+        `Ctrl-C during a sweep printed nothing, so it reads as a freeze:\n${seen.stderr}`);
+
+      /* Half two, and the assertion this test exists for: the READ let go,
+         rather than the launcher giving up on it. The mock never completes
+         SELECT and emits every 250ms forever, so a client that does not forward
+         its signal into the socket cannot be interrupted at all — it sits there
+         until the escape timer fires at `grace`, prints "will not let go", and
+         is force-exited. Both of those are what a reverted reader looks like. */
+      assert.doesNotMatch(seen.stderr, /will not let go/,
+        `the sweep was ended by the escape hatch, not by the read letting go:\n${seen.stderr}`);
+      assert.ok(waited < grace,
+        `one Ctrl-C took ${waited}ms against a ${grace}ms grace, so the timer is what ended this, `
+        + `not the abort reaching the socket:\n${seen.stderr}`);
+
+      // And it says why it stopped, in the summary a person reads.
+      assert.match(seen.stdout, /Sweep cancelled/, `the summary must name the reason:\n${seen.stdout}`);
+      // Non-zero is the contract the crontab in docs/INSTALL.md depends on. It
+      // is the sweep's own 1 now rather than 130 from `leave()`, because the
+      // run unwinds and returns before the escape hatch is reached at all.
+      assert.equal(result.signal, null, 'the process ended on its own, so it should not report a signal');
+      assert.notEqual(result.code, 0, `an interrupted sweep must not exit 0:\n${seen.stdout}\n${seen.stderr}`);
+    } finally {
+      child.kill('SIGKILL');
+    }
+  });
+
+  test('one SIGTERM on its own still ends it, without a second signal', async () => {
+    /* Cron itself never sends SIGTERM, so a plain crontab never met this. The
+       wrappers do — `timeout N zelos sweep`, systemd's TimeoutStopSec, launchd
+       — and those send one signal and then wait. Before any of this they waited
+       for as long as the server cared to keep talking. */
+    const grace = sweepStopGraceMs();
+    const { child, seen, exited } = await sweepingChild();
+    try {
+      /* The home is locked right now — `commandSweep` takes it before it opens
+         the database — which is what makes the null at the end of this test a
+         release rather than an absence. Without this line the assertion below
+         passes just as well on a sweep that never locked anything. */
+      const held = readHomeLock(home);
+      assert.equal(held?.kind, 'cli',
+        `the sweep is sitting in the mail read and holds no lock: ${JSON.stringify(held)}`);
+
+      const sent = Date.now();
+      child.kill('SIGTERM');
+      const result = await Promise.race([
+        exited,
+        new Promise((_, reject) => setTimeout(() => reject(new Error(
+          `one SIGTERM left the sweep running:\n${seen.stderr}`)), 20_000).unref()),
+      ]);
+      const waited = Date.now() - sent;
+      assert.match(seen.stderr, /Stopping \(SIGTERM\)/);
+      assert.ok(waited < grace,
+        `one SIGTERM took ${waited}ms against a ${grace}ms grace, so it was the escape hatch that `
+        + `ended this rather than the read letting go:\n${seen.stderr}`);
+      assert.notEqual(result.code, 0, `an interrupted sweep must not exit 0:\n${seen.stdout}\n${seen.stderr}`);
+
+      // And the stop still lets go of the home, on the cancelled path as much
+      // as on the finished one — a sweep that stopped mid-read must not leave
+      // the next one warned off a home nobody holds.
+      assert.equal(readHomeLock(home), null, 'a cancelled sweep left its lock behind');
+    } finally {
+      child.kill('SIGKILL');
+    }
+  });
 });
 
 describe('zelos mcp, from the command line', () => {
@@ -993,6 +1581,66 @@ describe('the bare invocation is untouched', () => {
       }
       assert.equal(url.hostname, '127.0.0.1');
       assert.match(url.searchParams.get('t') ?? '', /^[0-9a-f]{64}$/);
+    } finally {
+      child.kill('SIGKILL');
+    }
+  });
+
+  /**
+   * REGRESSION, and a contract rather than a unit. `handleConfigPut` hands the
+   * saved config to `ctx.scheduler`, which repairs the setting that never
+   * reached a running sweep — but only if a scheduler is there to hand it to,
+   * and the launcher used to build one only `if (config.sweep.auto)`. That left
+   * the mirror case wide open: start with the schedule OFF and there is nothing
+   * to reconfigure, so ticking "Sweep on a schedule" wrote to disk and changed
+   * nothing until the next launch.
+   *
+   * The route's own test cannot see this — it supplies a scheduler. Only the
+   * real launcher decides whether one exists, so this starts the real launcher
+   * against a home seeded with `auto: false` and reads /api/health, which is
+   * the one surface that reports `scheduler: null` when none was built.
+   */
+  test('the schedule can be switched on without a relaunch', async () => {
+    const home = freshHome({ sweep: { auto: false } });
+    const child = spawn(process.execPath, ['zelos.mjs', '--no-open', '--port', '0'], {
+      cwd: ROOT,
+      env: { ...process.env, ZELOS_HOME: home, ZELOS_SECRETS_BACKEND: 'encrypted-file' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (d) => { stdout += d; });
+    child.stderr.on('data', (d) => { stderr += d; });
+    try {
+      const deadline = Date.now() + 20_000;
+      let url = null;
+      while (!url) {
+        const m = /Open\s+(http:\/\/\S+)/.exec(stdout);
+        if (m) url = new URL(m[1]);
+        else if (child.exitCode !== null) throw new Error(`zelos exited ${child.exitCode}:\n${stdout}\n${stderr}`);
+        else if (Date.now() > deadline) throw new Error(`no URL was printed:\n${stdout}\n${stderr}`);
+        else await new Promise((r) => setTimeout(r, 50));
+      }
+      const api = (p, init = {}) => fetch(new URL(p, url.origin), {
+        ...init,
+        headers: { 'X-Zelos-Token': url.searchParams.get('t'), 'Content-Type': 'application/json', ...(init.headers || {}) },
+      });
+
+      // A scheduler has to exist even with the schedule off, or there is
+      // nothing for a later save to reach.
+      const before = await (await api('/api/health')).json();
+      assert.ok(before.scheduler, 'launching with sweep.auto:false built no scheduler, so the setting cannot be switched on');
+      assert.equal(before.scheduler.auto, false, 'an idle scheduler must still report the schedule as off');
+
+      const cfg = await (await api('/api/config')).json();
+      const put = await api('/api/config', {
+        method: 'PUT',
+        body: JSON.stringify({ ...cfg.config, sweep: { ...cfg.config.sweep, auto: true } }),
+      });
+      assert.equal(put.status, 200, `saving the config failed:\n${await put.text()}`);
+
+      const after = await (await api('/api/health')).json();
+      assert.equal(after.scheduler?.auto, true, 'the schedule was switched on and the running scheduler never heard');
     } finally {
       child.kill('SIGKILL');
     }

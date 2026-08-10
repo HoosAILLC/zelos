@@ -886,13 +886,27 @@ textarea.input, .draft-body, .ask-field, .capture-field {
    viewport. The whole grid scrolls sideways as ONE box — header, all-day strip
    and time body inside the same scroller — so the columns never drift out of
    register with their dates.
+
+   .cal-scroll must be in the min-width list, and must NOT try to opt out of
+   the clip with `overflow-x: visible`. It carries `overflow-y: auto` for the
+   1440-minute body, and CSS Overflow 3 coerces a `visible` on the other axis
+   to `auto` beside it — so that line never disabled the second scroller, it
+   CREATED one, on the one box here left at min-width 0. Measured in Blink at
+   375px with the shipped rule: `.cal-scroll` computed `overflow-x: auto`,
+   clientWidth 373 against scrollWidth 584, while every sibling sat at
+   min-width 584. Scrolling it to its own end left `.cal-grid` at 0, putting
+   Sunday's column 211px to the left of Sunday's date — which is precisely
+   what the paragraph above says this arrangement exists to prevent. Sized
+   like its siblings it has nothing to scroll (clientWidth 584 = scrollWidth
+   584, register error 0), and the base rule's `overflow-x: hidden` clips
+   nothing.
 */
 @media (max-width: 47.99rem) {
   .cal-grid.mode-week { overflow-x: auto; }
   .cal-grid.mode-week .cal-head,
   .cal-grid.mode-week .cal-allday,
+  .cal-grid.mode-week .cal-scroll,
   .cal-grid.mode-week .cal-body { min-width: calc(var(--gutter) + var(--cols) * 4.75rem); }
-  .cal-grid.mode-week .cal-scroll { overflow-x: visible; }
 }
 
 .cal-head {

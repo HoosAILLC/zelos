@@ -74,7 +74,12 @@ function parseHash() {
 
 function navigate(hash) {
   if (window.location.hash === hash) {
+    // Activating the sub-tab you are already on moves no route, so hashchange
+    // never fires and onRoute never runs — but render() still rebuilds the
+    // view and detaches the button that was pressed. Focus has to be put back
+    // here too, or the one case that changes nothing is the one that loses it.
     render({ force: true });
+    refocusSelectedTab();
     return;
   }
   window.location.hash = hash;
@@ -600,8 +605,50 @@ function measureTopbar() {
   topbarWatcher?.observe(bar);
 }
 
+/**
+ * Where focus lands after a sub-route move.
+ *
+ * A view change starts at the top of the content — that is what <main
+ * tabindex="-1"> is for. A SUB-route change is a different animal: the control
+ * that caused it lives inside the view, and `replace(main, currentView())` has
+ * just detached it, so focus falls to <body>. Every Settings panel did that on
+ * every switch: `aria-selected` was written onto a freshly built button
+ * nobody was focused on, so the change was announced to no one, and the next
+ * Tab restarted from whatever fallback the browser happened to keep.
+ *
+ * The rebuilt TAB is where focus goes back to, and that is now a choice rather
+ * than the only option: settings.js finished the tablist, so the panel it
+ * builds carries `role="tabpanel"`, `aria-labelledby` and `tabindex="-1"`, and
+ * the selected tab carries `aria-controls` (ui/views/settings.js:1172-1199).
+ * Either node can be focused. The tab is still right for two reasons:
+ *
+ *  - It is what the ARIA tabs pattern says, and it is what the reader is owed.
+ *    Landing on the button reads "Privacy, tab, selected" — the selection that
+ *    just happened. Landing on the panel reads its label and says nothing about
+ *    which of the nine tabs is now on.
+ *  - The strip uses a roving tabindex — the selected tab is `tabindex="0"` and
+ *    the other eight are `-1` — so the strip is a single Tab stop. Focus on the
+ *    tab leaves the rest of the panel ahead of the reader; focus on the panel
+ *    would put the whole strip behind them, reachable only by Shift+Tab.
+ *
+ * The selector is `[role="tab"][aria-selected="true"]`, so those roles are
+ * load-bearing in both files; settings.js says so on its side too.
+ *
+ * Two sub-routes are deliberately left where they are, both by the same `if`:
+ * one with no tablist behind it (`#/calendar/2026-08-11`), where yanking focus
+ * on a date change would be this bug pointed the other way, and a Settings hash
+ * naming a panel that does not exist (`#/settings/bogus`), where no tab is
+ * selected and there is nothing truthful to move to.
+ */
+function refocusSelectedTab() {
+  const selected = main?.querySelector('[role="tab"][aria-selected="true"]');
+  if (selected) focusQuietly(selected);
+  return Boolean(selected);
+}
+
 function onRoute() {
   const before = route.view;
+  const beforeSub = route.sub;
   route = parseHash();
   render({ force: true });
   if (before !== route.view) {
@@ -610,6 +657,8 @@ function onRoute() {
     // never yank the scroll position out from under the reader.
     window.scrollTo(0, 0);
     if (main) focusQuietly(main);
+  } else if (beforeSub !== route.sub) {
+    refocusSelectedTab();
   }
 }
 

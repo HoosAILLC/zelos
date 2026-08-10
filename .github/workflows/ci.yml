@@ -66,3 +66,97 @@ jobs:
       - name: Run the suite
         shell: bash
         run: node --test --test-timeout=180000 test/*.test.mjs
+
+      # The macOS legs let detection run for real, which is the point of them:
+      # `CI` is set, so the two "this machine's real backend" tests use the
+      # runner's own login keychain and write a throwaway item into it. This is
+      # the assertion that they took it out again. Anything still filed under
+      # Zelos's service name is a test that wrote into a credential store and
+      # did not clean up — on a developer's machine that would be their keychain,
+      # and nothing else in the suite can notice it.
+      #
+      # `find-generic-password` exits 0 only when it FINDS something, so 0 is
+      # the failure here and 44 (not found) is the pass. The service name is
+      # SERVICE in core/secrets.mjs; test/repo.test.mjs holds the two together,
+      # because a renamed service would leave this step green and looking at
+      # nothing.
+      - name: The suite left nothing in the login keychain
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          if security find-generic-password -s com.zelos.app; then
+            echo "the suite left a credential in the runner's login keychain"
+            exit 1
+          fi
+
+  # --------------------------------------------------------------------
+  # Linux, against a real Secret Service.
+  #
+  # The matrix above runs everything on ubuntu-latest, and that image has
+  # neither `secret-tool` nor a keyring daemon. So detection falls to the
+  # encrypted file, the two "real backend" tests see `encrypted-file` and return
+  # quietly, and a green Ubuntu leg was equally consistent with libsecret
+  # working and with libsecret never having been reached — the identical
+  # vacuous pass that DPAPI_LIVE_ONLY closed on Windows. What went unverified
+  # was libsecret's own conventions: whether `secret-tool` accepts the argv
+  # core/secrets.mjs builds, whether a missing item is really exit 1, and
+  # whether the value survives the newline convention on the way back.
+  #
+  # This is a job of its own rather than a step in the matrix because it needs a
+  # session bus and an unlocked keyring, and because ONLY test/secrets.test.mjs
+  # should run inside one: a live Secret Service under the whole suite would
+  # hand every other file a real credential store to reach.
+  libsecret:
+    name: ubuntu · the real libsecret keyring
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # Deliberately without --no-install-recommends. The keyring daemon's
+      # secrets component pulls in pieces through recommends on some images, and
+      # a leaner install that leaves the daemon half-there would show up as this
+      # leg failing to detect libsecret — a red build about the packaging rather
+      # than about Zelos.
+      - name: Install a real Secret Service
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsecret-tools gnome-keyring dbus-x11
+
+      # `dbus-run-session` gives the daemon a private session bus that dies with
+      # the step, so nothing here can reach a bus anything else is using. The
+      # keyring is created and unlocked with an empty password read from stdin:
+      # this is a throwaway runner, and the alternative is a daemon that waits
+      # for a prompt nobody is there to answer and a step that sits until the
+      # timeout.
+      #
+      # ZELOS_LIBSECRET_LIVE is what test/secrets.test.mjs gates its live
+      # round-trip on, and nothing else sets it. That is deliberate: on every
+      # other leg the test skips out loud, naming what is missing, rather than
+      # passing without having run. test/repo.test.mjs asserts this job and that
+      # gate still name each other.
+      #
+      # The keyring check runs inside the SAME dbus-run-session as the suite. A
+      # second invocation would get a fresh bus and an empty keyring, and would
+      # be a step that always passes while looking like it proves something.
+      - name: The libsecret round-trip, against the real secret-tool
+        env:
+          ZELOS_LIBSECRET_LIVE: '1'
+        run: |
+          dbus-run-session -- bash -c '
+            set -e
+            echo -n "" | gnome-keyring-daemon --unlock --components=secrets
+            node --test --test-timeout=180000 test/secrets.test.mjs
+            # Read the output, not the exit code: secret-tool `search` is
+            # documented to exit 0 whether or not it matched anything, and a
+            # check keyed on its status would be a check that always passes.
+            leftovers="$(secret-tool search --all service com.zelos.app 2>/dev/null || true)"
+            if [ -n "$leftovers" ]; then
+              echo "the suite left credentials in the runner keyring:"
+              echo "$leftovers"
+              exit 1
+            fi
+          '

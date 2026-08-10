@@ -48,6 +48,57 @@ const HEADER_FIELDS = 'FROM TO CC SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES
 const MAX_LITERAL_BYTES = 64 * 1024 * 1024;
 const MAX_RESPONSE_BYTES = 96 * 1024 * 1024;
 
+/**
+ * The third guard rail, and the one that is not a byte count.
+ *
+ * An in-progress response is two arrays — the text segments and the literal
+ * ranges that index them — and a marker line costs an entry in both while
+ * adding *zero* bytes to the response. `{0}\r\n` is the pure form: six bytes on
+ * the wire, an empty head pushed onto `#segments` and an empty range pushed
+ * onto `#literals`, and `#length` still 0. A byte cap cannot see that. Measured
+ * before this existed: a hostile server flooding `{0}\r\n` during the pre-auth
+ * CAPABILITY drove rss to 464 MB and then a fatal V8 out-of-memory in about a
+ * second and a half, with the 96 MB cap never firing once. An OOM is not
+ * catchable, so this has to be a cap and not a rescue.
+ *
+ * 100,000 pieces is four orders of magnitude past any real response — a FETCH
+ * uses a handful of literals — and costs about 4 MB of heap if a server ever
+ * gets near it.
+ */
+const MAX_RESPONSE_PARTS = 100_000;
+
+/**
+ * The fourth guard rail, and the one that lives a layer above the other three.
+ *
+ * The assembler's caps only ever describe *one* response: every path that
+ * emits a complete response resets `#segments`, `#literals` and `#length` to
+ * empty. So a server that sends nothing but well-formed, complete untagged
+ * lines never trips either of them — it hands them off, one at a time, to
+ * `#current.untagged`, which had no cap at all. That array only empties when
+ * the tagged completion arrives, and a hostile server simply never sends one.
+ *
+ * This is the same reported harm as the `{0}` flood and needs the same absence
+ * of credentials: measured against the real client with the real socket, a
+ * server answering the pre-auth CAPABILITY with `* OK <1 KB>\r\n` forever took
+ * rss from 231 MB to 491 MB in 1.6 s and then a fatal V8 out-of-memory, with
+ * both assembler caps quiet throughout because no single response was ever
+ * large or ever had many pieces. `#onData` re-arms the idle timer on every
+ * chunk, so the 30 s deadline never helps here either.
+ *
+ * Counted two ways for the same reason the assembler counts two ways — a
+ * response costs far more heap than its own text. Measured retained cost of a
+ * parsed untagged response: 372 bytes for a 5-character one, 503 for 65
+ * characters, 1,451 for 1,005. Bytes alone would let sixteen million six-byte
+ * responses through before noticing.
+ *
+ * 50,000 responses is two orders of magnitude past the largest real command —
+ * `fetch()` chunks at 100 UIDs, so a FETCH yields ~100, and `LIST "" "*"` one
+ * per mailbox — and the byte ceiling is the same 96 MB the assembler already
+ * allows a single response, so "one command may buffer 96 MB" holds however
+ * the server chooses to slice it.
+ */
+const MAX_UNTAGGED_RESPONSES = 50_000;
+
 const SPECIAL_USE_FLAGS = new Set(['\\sent', '\\drafts', '\\trash', '\\junk', '\\archive', '\\all', '\\flagged', '\\important']);
 
 /* ================================================================== *
@@ -77,6 +128,11 @@ class ResponseAssembler {
     const out = [];
 
     for (;;) {
+      // Inside the loop, not after it. One 64 KB chunk holds ten thousand
+      // `{0}\r\n` markers, and a check that waits for the loop to drain has
+      // already let every one of them onto the heap.
+      this.#guard();
+
       if (this.#pendingLiteral > 0) {
         if (this.#buf.length < this.#pendingLiteral) break;
         const payload = this.#buf.subarray(0, this.#pendingLiteral);
@@ -134,10 +190,23 @@ class ResponseAssembler {
       this.#scan = 0;
     }
 
+    return out;
+  }
+
+  /**
+   * Everything the assembler is holding for a response that has not been
+   * emitted yet, measured two ways. Every path through the loop that grows
+   * state ends in `continue`, so running this at the top of each iteration
+   * means no growth goes unmeasured, and the very first iteration covers the
+   * chunk that was just concatenated on.
+   */
+  #guard() {
     if (this.#length + this.#buf.length > MAX_RESPONSE_BYTES) {
       throw new Error('server response exceeded the maximum size Zelos will buffer');
     }
-    return out;
+    if (this.#segments.length + this.#literals.length > MAX_RESPONSE_PARTS) {
+      throw new Error('server response exceeded the number of pieces Zelos will buffer');
+    }
   }
 }
 
@@ -373,6 +442,10 @@ function walkStructure(node, prefix, insideMessage, out) {
     size,
     disposition: disposition.kind,
     filename: disposition.filename || params.get('name') || null,
+    // body-fld-id, RFC 3501 §7.4.2. Worth carrying only because it is the one
+    // reliable mark of a part the message draws itself: an HTML body that says
+    // <img src="cid:logo@x"> needs a sibling whose Content-ID is <logo@x>.
+    contentId: tokenText(items[3]) || null,
   });
 
   if (isMessage) walkStructure(items[8], part, true, out);
@@ -410,8 +483,45 @@ function chooseTextPart(parts) {
   );
 }
 
-function hasAttachmentParts(parts) {
-  return parts.some((p) => p.disposition === 'attachment' || Boolean(p.filename) || p.type === 'application');
+/**
+ * A detached signature is machinery, not a document. Every S/MIME or PGP/MIME
+ * mail carries one, under one of these three subtypes, and nobody has ever
+ * wanted to be told their signed mail "has an attachment".
+ */
+const SIGNATURE_SUBTYPES = new Set(['pkcs7-signature', 'x-pkcs7-signature', 'pgp-signature']);
+
+/**
+ * Does this message carry something a person would call an attachment?
+ *
+ * The question is narrower than "is there a non-text part", and the old answer
+ * — attachment disposition OR any filename OR any `application/*` — got it
+ * wrong twice in the same direction. `application/*` alone fired on the
+ * `smime.p7s` and `signature.asc` parts that ride along with every signed
+ * corporate mail, which have no disposition and no name at all; the bare
+ * filename test fired on the logo in a `multipart/related` newsletter, because
+ * inline images routinely carry a NAME param. Both produced the model-facing
+ * mark `[unread, has attachment]` on mail with nothing attached to it.
+ *
+ * So: honour what the message says about itself. RFC 2183 defines `inline` as
+ * "display this as part of the message", which is the opposite of an
+ * attachment, and RFC 2392 gives a referenced part a Content-ID. Neither counts.
+ * A named part that claims neither does.
+ *
+ * The trade is deliberate: an unnamed `application/pdf` with no disposition —
+ * which some scanners and fax gateways still emit — now reads as no
+ * attachment. That is a false negative on an advisory flag nothing ranks or
+ * filters on, bought in exchange for the false positive that was firing on
+ * essentially every signed message in the mailbox.
+ */
+function hasAttachmentParts(parts, chosen) {
+  return parts.some((p) => {
+    if (p === chosen) return false; // the part we render as the body
+    if (SIGNATURE_SUBTYPES.has(p.subtype)) return false;
+    if (p.disposition === 'attachment') return true;
+    if (p.disposition === 'inline') return false;
+    if (p.contentId) return false; // a cid: target the body already draws
+    return Boolean(p.filename);
+  });
 }
 
 /* ================================================================== *
@@ -463,6 +573,22 @@ export class ImapClient {
   #onSocketData = null;
   #onSocketError = null;
   #onSocketClose = null;
+  #signal = null;
+  #cancelled = false;
+
+  /**
+   * The caller's cancellation, made real.
+   *
+   * An arrow field rather than a method so the reference is stable: the same
+   * function has to reach `removeEventListener`, and one `AbortSignal` outlives
+   * every client that borrows it — a sweep holds a single controller across
+   * four mailboxes of three accounts, so a listener left behind on each is a
+   * leak that grows for the length of the run.
+   */
+  #cancel = () => {
+    this.#cancelled = true;
+    this.#fail(this.#error('cancelled'));
+  };
 
   /**
    * `requireTls` is the answer to a silent failure mode. With `secure: false`
@@ -475,8 +601,16 @@ export class ImapClient {
    * `true` refuses to authenticate over anything but a real TLS socket, `false`
    * permits cleartext, and `null` (or nothing at all, which is what every
    * existing config says) means "required unless the host is loopback".
+   *
+   * `signal` is the other half of Ctrl-C. The idle timer is a deadline for
+   * SILENCE and nothing else — `#onData` re-arms it on every chunk — so a
+   * server that keeps talking without ever completing the command is unbounded
+   * in time, and even a silent one costs the full `timeoutMs`. Neither is a
+   * cancellation: the user has already said stop. An abort fails the command in
+   * flight and destroys the socket, which is what makes the stop visible in the
+   * same second it was asked for.
    */
-  constructor({ host, port, secure = true, user, pass, requireTls = null, timeoutMs = 30000, logger } = {}) {
+  constructor({ host, port, secure = true, user, pass, requireTls = null, timeoutMs = 30000, logger, signal } = {}) {
     if (!host || typeof host !== 'string') throw new Error('ImapClient: host is required');
     this.host = host;
     this.secure = secure !== false;
@@ -490,12 +624,30 @@ export class ImapClient {
     this.mailbox = null;
     const base = logger || defaultLog;
     this.log = typeof base.child === 'function' ? base.child('[imap]') : base;
+    if (signal) {
+      // An already-aborted signal never dispatches, so it is read rather than
+      // listened for. Handing one in means "do not start", and the difference
+      // matters: no socket is opened at all.
+      if (signal.aborted) this.#cancelled = true;
+      else {
+        this.#signal = signal;
+        signal.addEventListener('abort', this.#cancel, { once: true });
+      }
+    }
+  }
+
+  /** Stop listening to a signal that outlives us. Idempotent. */
+  #releaseSignal() {
+    if (!this.#signal) return;
+    this.#signal.removeEventListener('abort', this.#cancel);
+    this.#signal = null;
   }
 
   /* ---------------- lifecycle ---------------- */
 
   async connect() {
     if (this.#socket) return;
+    if (this.#cancelled) throw this.#error('cancelled');
     if (this.#dead) throw this.#error('client already closed');
 
     const greeting = new Promise((resolve, reject) => {
@@ -769,6 +921,7 @@ export class ImapClient {
 
   async close() {
     this.#dead = true;
+    this.#releaseSignal();
     const socket = this.#detach();
     this.#socket = null;
     if (socket) {
@@ -796,11 +949,17 @@ export class ImapClient {
    */
   #exec(command, { onContinuation = null } = {}) {
     return new Promise((resolve, reject) => {
+      // Ahead of the `#dead` check, because cancelling sets both and "cancelled"
+      // is the answer the caller can act on — "not connected" reads like a bug.
+      if (this.#cancelled) {
+        reject(this.#error('cancelled'));
+        return;
+      }
       if (this.#dead || !this.#socket) {
         reject(this.#error('not connected'));
         return;
       }
-      this.#queue.push({ command, onContinuation, resolve, reject, untagged: [], tag: null, timer: null });
+      this.#queue.push({ command, onContinuation, resolve, reject, untagged: [], untaggedBytes: 0, tag: null, timer: null });
       this.#pump();
     });
   }
@@ -837,6 +996,10 @@ export class ImapClient {
       return;
     }
     for (const raw of responses) {
+      // One chunk can carry thousands of complete responses, and the guard in
+      // #onResponse kills the connection from inside this loop. Without this
+      // the rest of the chunk would keep being handed to a dead client.
+      if (this.#dead) return;
       try {
         this.#onResponse(raw);
       } catch (err) {
@@ -883,7 +1046,7 @@ export class ImapClient {
         greeting.resolve();
         return;
       }
-      if (this.#current) this.#current.untagged.push(response);
+      if (this.#current) this.#keepUntagged(this.#current, response);
       return;
     }
 
@@ -912,10 +1075,33 @@ export class ImapClient {
     this.#pump();
   }
 
+  /**
+   * Hold an untagged response for the command in flight — the only place in
+   * the client where memory grows across responses rather than within one.
+   *
+   * See MAX_UNTAGGED_RESPONSES. The cap has to refuse rather than truncate:
+   * silently dropping responses would hand `select()` the wrong EXISTS or
+   * `fetch()` a short list of messages, which is a worse outcome than a
+   * connection that says why it stopped.
+   */
+  #keepUntagged(job, response) {
+    if (job.untagged.length + 1 > MAX_UNTAGGED_RESPONSES) {
+      this.#fail(this.#error('server sent more untagged responses to one command than Zelos will buffer'));
+      return;
+    }
+    job.untaggedBytes += response.text.length;
+    if (job.untaggedBytes > MAX_RESPONSE_BYTES) {
+      this.#fail(this.#error('untagged responses to one command exceeded the maximum size Zelos will buffer'));
+      return;
+    }
+    job.untagged.push(response);
+  }
+
   /** A fatal condition: every waiting caller learns which host went wrong. */
   #fail(err) {
     if (this.#dead) return;
     this.#dead = true;
+    this.#releaseSignal();
     const socket = this.#detach();
     this.#socket = null;
     socket?.destroy();
@@ -1024,25 +1210,110 @@ function sanitizeCommand(command) {
 const WITHHELD = '<password withheld>';
 
 /**
+ * A bare substring shorter than this is not searched for.
+ *
+ * A blind scan has no notion of a word, so a two-character password turns every
+ * accidental occurrence in the server's own sentence into `<password withheld>`
+ * — and the pattern of holes it leaves behind spells the password out for
+ * anyone reading the wreckage. Below the floor the credential is still struck
+ * in the shapes it actually travels in (quoted, base64), which is where a
+ * server that echoes it puts it; only the blind scan is skipped.
+ */
+const MIN_BARE_REDACTION = 4;
+
+/**
  * Strike our own password out of text that came back from the server.
  *
- * Three spellings, because that is how many ways this password left the process:
- * the literal bytes (a quoted LOGIN argument), its standalone base64, and the
- * SASL PLAIN payload `base64(NUL user NUL pass)`. A server that echoes any of
- * them is handing the credential back, and everything downstream — an API
- * response, `runs.stats_json` on disk, a log line — would keep it.
+ * Up to five spellings, because that is how many ways this password can come
+ * back. `quoted()` does not put the password on the wire verbatim: it
+ * backslash-escapes `"` and `\` first, so `pa"ss\word` leaves as
+ * `"pa\"ss\\word"` and a server quoting the LOGIN line it rejected hands back a
+ * string that `includes(pass)` says nothing about. That escaped form — with and
+ * without its quotes — is listed here alongside the verbatim bytes, the
+ * standalone base64, and the SASL PLAIN payload `base64(NUL user NUL pass)`.
+ *
+ * Two traps, both of which this used to walk into, and both of which are only
+ * visible end to end through `testConnection` against a server that echoes the
+ * line it rejected:
+ *
+ *  1. The list is not five distinct strings. A password with no `"` and no `\`
+ *     escapes to itself, so `pass === escaped` and the same needle appeared
+ *     twice — hence the `Set`.
+ *  2. Substituting one form at a time re-scans text that has already been
+ *     redacted, and `<password withheld>` is not inert: it contains "pass",
+ *     "word", "password" and "withheld". Measured through the real
+ *     `testConnection`, the password `pass` came back as
+ *     `<<<password withheld>word withheld>word withheld>` and `word` as
+ *     `<pass<pass<password withheld> withheld> withheld>`. Nothing leaked —
+ *     each pass ate the marker, not the secret — but the diagnosis the user
+ *     needs was shredded by the very code meant to preserve it.
+ *
+ * So: one left-to-right pass over the original text, longest form first at any
+ * given offset, and the cursor jumps past what was struck. Output is never an
+ * input, which is what makes the result independent of the order of the list.
+ *
+ * A server that echoes any of these forms is handing the credential back, and
+ * everything downstream — the Settings "Test connection" response body,
+ * `runs.stats_json` on disk, /api/state, a log line — would keep it.
  */
 function withoutCredentials(message, user, pass) {
-  let text = String(message);
+  const text = String(message);
   if (!pass) return text;
-  const plain = Buffer.concat([
+  const escaped = String(pass).replace(/([\\"])/g, '\\$1');
+  const sasl = Buffer.concat([
     Buffer.from([0]), Buffer.from(String(user ?? ''), 'utf8'),
     Buffer.from([0]), Buffer.from(pass, 'utf8'),
   ]).toString('base64');
-  for (const form of [pass, Buffer.from(pass, 'utf8').toString('base64'), plain]) {
-    if (form) text = text.split(form).join(WITHHELD);
+  const forms = [...new Set([
+    `"${escaped}"`,
+    Buffer.from(pass, 'utf8').toString('base64'),
+    sasl,
+    ...[pass, escaped].filter((form) => form.length >= MIN_BARE_REDACTION),
+  ])]
+    .filter(Boolean)
+    // Longest first, so a tie at the same offset — the bare password sitting
+    // one character inside its own quoted spelling — is resolved in favour of
+    // striking the whole quoted argument rather than leaving its quotes behind.
+    .sort((a, b) => b.length - a.length);
+
+  /* One left-to-right pass, with each form's next occurrence remembered.
+     The obvious loop — re-running `indexOf(form, cursor)` for every form on
+     every hit — is quadratic, and a hostile server chooses both the length and
+     the number of hits: a `NO` reply repeating an 8-character password measured
+     7 ms at 18 KB, 29 ms at 72 KB and 431 ms at 288 KB, which is 15x the time
+     for 4x the input, against a MAX_RESPONSE_BYTES ceiling of 96 MB. Because a
+     form's next index only ever moves forward, caching it and re-searching only
+     the form that was just consumed makes the whole scan linear in the text
+     once per form. `null` means "no further occurrence" and is never searched
+     again. */
+  const next = forms.map((form) => {
+    const idx = text.indexOf(form);
+    return idx < 0 ? null : idx;
+  });
+
+  let out = '';
+  let cursor = 0;
+  for (;;) {
+    let at = -1;
+    let which = -1;
+    for (let i = 0; i < forms.length; i++) {
+      const idx = next[i];
+      if (idx === null) continue;
+      if (at < 0 || idx < at) { at = idx; which = i; }
+    }
+    if (at < 0) break;
+    out += text.slice(cursor, at) + WITHHELD;
+    cursor = at + forms[which].length;
+    // Every form now sitting at or before the cursor is stale — including the
+    // one just struck, and any shorter form that overlapped it.
+    for (let i = 0; i < forms.length; i++) {
+      if (next[i] !== null && next[i] < cursor) {
+        const idx = text.indexOf(forms[i], cursor);
+        next[i] = idx < 0 ? null : idx;
+      }
+    }
   }
-  return text;
+  return out + text.slice(cursor);
 }
 
 /**
@@ -1088,6 +1359,12 @@ function specialUseOf(name, flags) {
  * messages (headers + structure), the second pulls exactly one body part per
  * message, chosen from the structure. Fetching whole messages to throw away the
  * attachments is how a mail sync turns into a download.
+ *
+ * `signal` is handed to the client rather than checked between the steps below.
+ * A poll between steps cancels nothing that matters: the expensive part of this
+ * function is a single `fetch()` of a hundred bodies, and that is exactly where
+ * a Ctrl-C lands. The client fails the command in flight and destroys the
+ * socket, so this function's rejection is what the caller waits for.
  */
 export async function fetchRecent({
   host,
@@ -1102,9 +1379,10 @@ export async function fetchRecent({
   onProgress,
   timeoutMs,
   logger,
+  signal,
 } = {}) {
   const progress = typeof onProgress === 'function' ? onProgress : () => {};
-  const client = new ImapClient({ host, port, secure, user, pass, requireTls, timeoutMs, logger });
+  const client = new ImapClient({ host, port, secure, user, pass, requireTls, timeoutMs, logger, signal });
 
   try {
     progress({ phase: 'connect', message: `Connecting to ${host}`, done: 0, total: 0 });
@@ -1206,7 +1484,7 @@ function buildRecord(row, mailbox) {
     date: parseDate(first('date')) || parseDate(row.internalDate),
     snippet: '',
     text: '',
-    hasAttachments: hasAttachmentParts(parts),
+    hasAttachments: hasAttachmentParts(parts, chosen),
     flags: row.flags,
     folder: mailbox,
     bodyPart: chosen ? chosen.part : 'TEXT',

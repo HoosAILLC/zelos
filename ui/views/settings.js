@@ -19,6 +19,7 @@ import { plural } from '../lib/format.js';
 import { aiAccessPanel } from './ai-access.js';
 
 const PANELS = [
+  { id: 'you', label: 'You' },
   { id: 'model', label: 'Model' },
   { id: 'mail', label: 'Mail' },
   { id: 'calendars', label: 'Calendars' },
@@ -132,6 +133,94 @@ function randomId(prefix) {
   const bytes = new Uint8Array(3);
   crypto.getRandomValues(bytes);
   return `${prefix}_${[...bytes].map((b) => b.toString(16).padStart(2, '0')).join('')}`;
+}
+
+/* ------------------------------------------------------------------- you */
+
+/**
+ * The best guess Zelos has for "you", taken from the first mailbox that is
+ * switched on.
+ *
+ * `identity.email` had a schema, a validator, and readers in the scorer and in
+ * the prompt — and nothing a user could reach ever set it. It stayed `''`, so
+ * `sameEmail(a, '')` was false for every message and the two branches at
+ * core/triage.mjs:434-435 (+6 for a message addressed To: you, −2 for one you
+ * were merely Cc'd on) never fired once. Reproduced at the item cap: a message
+ * written straight to the user was cut from the sweep prompt entirely while
+ * newer Cc-only rollups survived.
+ *
+ * So there are two writers, not one. The panel below is the explicit one; the
+ * mail form is the other, filling this in from the account being saved when
+ * nothing is set, because an install that has been running for months should
+ * not have to find a new tab to stop being wrong.
+ *
+ * Exported so it can be tested for what it is — a pure function over the
+ * config — rather than grepped for.
+ */
+export function defaultIdentityEmail(config) {
+  const accounts = Array.isArray(config?.mail) ? config.mail : [];
+  const first = accounts.find((a) => a && a.enabled !== false
+    && typeof a.user === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(a.user.trim()));
+  return first ? first.user.trim() : '';
+}
+
+function youPanel() {
+  const identity = state.config?.identity || {};
+  const status = statusLine();
+  const stored = String(identity.email || '').trim();
+  const guess = defaultIdentityEmail(state.config);
+
+  const nameInput = input({ value: identity.name || '', placeholder: 'Nemo Hale', autocomplete: 'off' });
+  const emailInput = input({
+    type: 'email',
+    value: stored || guess,
+    placeholder: 'you@example.com',
+    autocomplete: 'off',
+    spellcheck: 'false',
+  });
+
+  // Read at read time and never persisted: core/config.mjs resolves an empty
+  // timezone from this machine on every load, so a laptop that moves follows.
+  // Writing it back here would freeze the zone it was in the day it was typed.
+  const tzInput = input({ value: identity.timezone || '', readonly: true });
+
+  return el('div', { class: 'panel panel-you' }, [
+    el('p', { class: 'panel-lede', text: 'Two facts about you, used in two places and nowhere else. Neither leaves this machine except inside the request to the model endpoint you chose.' }),
+    field('Your name', nameInput, {
+      hint: 'Signs the drafts. Left blank, every prompt reads “name: (not set — do not invent one)” and drafts come back unsigned, with nothing on screen to say why.',
+    }),
+    field('Your email address', emailInput, {
+      hint: !stored && guess
+        ? `Zelos has not been told this yet, so the address of your first mailbox is filled in above. Press Save to use it. It is how a message written straight to you is ranked ahead of one you were only copied on — until it is set, that ranking does nothing at all.`
+        : 'How a message written straight to you is ranked ahead of one you were only copied on, and how Zelos tells your own replies from everyone else’s.',
+    }),
+    field('Timezone', tzInput, {
+      hint: 'Read from this machine every time Zelos starts, so it follows you rather than sticking where you were. Not editable here on purpose.',
+    }),
+    el('div', { class: 'row-inline' }, [
+      button('Save', {
+        class: 'btn solid',
+        onClick: async () => {
+          const email = emailInput.value.trim();
+          // Refused here rather than as a 400 from PUT /api/config: the server's
+          // rule is core/config.mjs:436 and this is the same rule, said where
+          // the person typing can see which field it is about.
+          if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+            status.bad(`“${email}” is not an email address. Leave it blank if you would rather not say.`);
+            return;
+          }
+          status.working('Saving…');
+          try {
+            await saveConfig({ identity: { name: nameInput.value.trim(), email } });
+            status.good('Saved. The next sweep uses it.');
+          } catch (err) {
+            status.bad(err.message);
+          }
+        },
+      }),
+    ]),
+    status.node,
+  ]);
 }
 
 /* --------------------------------------------------------------- the model */
@@ -355,6 +444,39 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
 
 /* ---------------------------------------------------------------- mail */
 
+/**
+ * The name this server gives its sent folder, from the SPECIAL-USE flag the
+ * IMAP client already reads.
+ *
+ * `core/sweep.mjs`'s `mailboxesFor()` appends `account.sentMailbox` to every
+ * fetch and the stored default is the bare word "Sent" — right for Fastmail and
+ * a plain Dovecot, wrong for Gmail (`[Gmail]/Sent Mail`), Microsoft 365
+ * (`Sent Items`) and iCloud (`Sent Messages`), which are three of the eight
+ * providers this app hardcodes and the three largest. Until this field existed
+ * the value had no writer anywhere in `ui/`, so those accounts reported
+ * `Mailbox doesn't exist: Sent` on every sweep, forever, while the run itself
+ * stayed `ok: true` and the board simply never learned what the user had
+ * already answered.
+ *
+ * `listMailboxes()` has computed `specialUse: 'sent'` from the server's own
+ * `\Sent` flag since the client was written (core/sources/imap.mjs:1176), and
+ * `testConnection` has returned it, and nothing outside a test had ever read
+ * it. This is that reader: press "Test the connection" and the right name
+ * arrives without anyone having to know their provider's spelling.
+ *
+ * What is typed wins over the flag — but only if the server actually has it.
+ * A name that is not on the server is not a preference, it is a typo, and
+ * silently keeping it is how this defect looked like nothing at all.
+ */
+export function sentMailboxFromTest(mailboxes, current = '') {
+  const list = Array.isArray(mailboxes) ? mailboxes : [];
+  const names = new Set(list.map((m) => (typeof m === 'string' ? m : m?.name)).filter(Boolean));
+  const flagged = list.find((m) => m && typeof m === 'object' && m.specialUse === 'sent')?.name || '';
+  const chosen = String(current ?? '').trim();
+  if (chosen && names.has(chosen)) return chosen;
+  return flagged || chosen;
+}
+
 function mailForm(account, { onSaved, onCancel }) {
   const draft = { ...account };
   const status = statusLine();
@@ -390,6 +512,9 @@ function mailForm(account, { onSaved, onCancel }) {
   mailboxInput.addEventListener('input', () => {
     draft.mailboxes = mailboxInput.value.split(',').map((s) => s.trim()).filter(Boolean);
   });
+
+  const sentInput = input({ value: draft.sentMailbox ?? 'Sent', placeholder: 'Sent' });
+  sentInput.addEventListener('input', () => { draft.sentMailbox = sentInput.value.trim(); });
 
   const lookbackInput = input({ type: 'number', value: String(draft.lookbackDays), min: '1', max: '365' });
   lookbackInput.addEventListener('input', () => { draft.lookbackDays = Number(lookbackInput.value) || 14; });
@@ -432,6 +557,9 @@ function mailForm(account, { onSaved, onCancel }) {
       field('Mailboxes', mailboxInput, { hint: 'Comma separated.' }),
       field('Look back (days)', lookbackInput),
     ]),
+    field('Sent folder', sentInput, {
+      hint: 'Read as well as the mailboxes above, because “you promised” is mined from what you wrote — without it that half of the board cannot exist. Gmail calls it “[Gmail]/Sent Mail”, Microsoft 365 “Sent Items”, iCloud “Sent Messages”. Press “Test the connection” and Zelos fills in whatever this server flags as its own. Leave it blank to read nothing outbound.',
+    }),
     field('Most messages per sweep', maxInput),
     el('div', { class: 'row-inline' }, [
       button('Save account', {
@@ -445,8 +573,23 @@ function mailForm(account, { onSaved, onCancel }) {
           try {
             await persistPassword();
             const others = (state.config.mail || []).filter((m) => m.id !== draft.id);
-            await saveConfig({ mail: [...others, { ...draft, secure, requireTls: requireTls() }] });
-            status.good('Saved.');
+            const patch = {
+              mail: [...others, { ...draft, secure, requireTls: requireTls(), sentMailbox: sentInput.value.trim() }],
+            };
+            // The second writer for identity.email — see defaultIdentityEmail
+            // above. An install that predates the You panel has `''` there, and
+            // `sameEmail(a, '')` is false for every message, so the scorer's
+            // To:/Cc: branches are dead and the sweep does not know which
+            // replies are the user's own. This is the moment the address is
+            // both known and confirmed by hand, so it is the moment to adopt
+            // it — announced rather than silent, and only when nothing is set.
+            const known = String(state.config?.identity?.email ?? '').trim();
+            const adopted = !known && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(draft.user) ? draft.user : '';
+            if (adopted) patch.identity = { email: adopted };
+            await saveConfig(patch);
+            status.good(adopted
+              ? `Saved. Zelos will also treat ${adopted} as your own address — change it under Settings → You.`
+              : 'Saved.');
             onSaved();
           } catch (err) {
             status.bad(err.message);
@@ -471,8 +614,19 @@ function mailForm(account, { onSaved, onCancel }) {
               keyRef: draft.keyRef,
               requireTls: requireTls(),
             });
-            if (result.ok) status.good(`Connected. ${plural((result.mailboxes || []).length, 'mailbox', 'mailboxes')} visible.`);
-            else status.bad(result.error || 'The server refused the connection.');
+            if (result.ok) {
+              const seen = `Connected. ${plural((result.mailboxes || []).length, 'mailbox', 'mailboxes')} visible.`;
+              // The reader for the SPECIAL-USE flag: it has been on the wire and
+              // in this response object all along with nowhere to land.
+              const suggested = sentMailboxFromTest(result.mailboxes, sentInput.value);
+              if (suggested && suggested !== sentInput.value.trim()) {
+                sentInput.value = suggested;
+                draft.sentMailbox = suggested;
+                status.good(`${seen} This server calls its sent folder “${suggested}” — filled in below. Save the account to keep it.`);
+              } else {
+                status.good(seen);
+              }
+            } else status.bad(result.error || 'The server refused the connection.');
           } catch (err) {
             status.bad(err.message);
           }
@@ -960,22 +1114,73 @@ function appearancePanel() {
 
 /* ----------------------------------------------------------------- render */
 
+/**
+ * A tab that announces "tab, selected" while pointing at nothing is worse than
+ * a plain button, and that is what this strip was: `role="tablist"`,
+ * `role="tab"` and `aria-selected` were all set, while the panel had no
+ * `role="tabpanel"`, no `aria-labelledby`, and the tabs had no `id` and no
+ * `aria-controls`. A screen-reader user was told there were eight tabs and
+ * given no way to find out what any of them controlled.
+ *
+ * Finished here rather than dropped, because ui/app.js's `refocusSelectedTab()`
+ * now finds the pressed tab again after the sub-route rebuild by selecting on
+ * `[role="tab"][aria-selected="true"]` — the roles are load-bearing.
+ *
+ * Two things the plain APG pattern has to be adapted for:
+ *
+ *  - Only ONE panel is ever in the document; changing tabs re-renders the view.
+ *    So `aria-controls` is set on the selected tab only. Pointing the other
+ *    seven at ids that do not exist is a dangling reference, which several
+ *    screen readers report as an empty relationship rather than as no
+ *    relationship — worse than the omission it would be fixing.
+ *  - The ids are fixed strings, not `nextId()` counters. They have to survive
+ *    every rebuild, and a counter that ticks on each render would leave
+ *    `aria-labelledby` pointing at the id the tab had one paint ago.
+ */
+const tabId = (id) => `settings-tab-${id}`;
+const panelId = (id) => `settings-panel-${id}`;
+
 export function renderSettings(ctx) {
   const panel = ctx.sub || 'model';
   const rerender = ctx.rerender;
 
+  // Arrow keys move between tabs, the way a tablist is expected to. Activation
+  // follows selection because a panel here costs one render, and the roving
+  // tabindex below means this only ever fires on the selected tab.
+  const onTabKey = (event) => {
+    const here = PANELS.findIndex((p) => p.id === panel);
+    let next = -1;
+    if (event.key === 'ArrowRight' || event.key === 'ArrowDown') next = (here + 1) % PANELS.length;
+    else if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') next = (here - 1 + PANELS.length) % PANELS.length;
+    else if (event.key === 'Home') next = 0;
+    else if (event.key === 'End') next = PANELS.length - 1;
+    if (next < 0 || here < 0) return;
+    event.preventDefault();
+    ctx.navigate(`#/settings/${PANELS[next].id}`);
+  };
+
   const tabs = el('div', { class: 'subtabs', role: 'tablist', 'aria-label': 'Settings sections' },
-    PANELS.map((p) => el('button', {
-      type: 'button',
-      class: 'subtab',
-      role: 'tab',
-      'aria-selected': p.id === panel ? 'true' : 'false',
-      onclick: () => ctx.navigate(`#/settings/${p.id}`),
-      text: p.label,
-    })));
+    PANELS.map((p) => {
+      const selected = p.id === panel;
+      return el('button', {
+        type: 'button',
+        class: 'subtab',
+        id: tabId(p.id),
+        role: 'tab',
+        'aria-selected': selected ? 'true' : 'false',
+        // Only the live panel exists to be controlled; see above.
+        'aria-controls': selected ? panelId(p.id) : null,
+        // Roving tabindex: one stop for the whole strip, arrows inside it.
+        tabindex: selected ? '0' : '-1',
+        onclick: () => ctx.navigate(`#/settings/${p.id}`),
+        onkeydown: onTabKey,
+        text: p.label,
+      });
+    }));
 
   let body;
-  if (panel === 'mail') body = mailPanel({ rerender });
+  if (panel === 'you') body = youPanel();
+  else if (panel === 'mail') body = mailPanel({ rerender });
   else if (panel === 'calendars') body = calendarPanel({ rerender });
   else if (panel === 'sweep') body = sweepPanel();
   else if (panel === 'privacy') body = privacyPanel();
@@ -983,6 +1188,15 @@ export function renderSettings(ctx) {
   else if (panel === 'data') body = dataPanel();
   else if (panel === 'about') body = aboutPanel();
   else body = modelPanel({});
+
+  // The other half of the relationship the tabs now name. `tabindex="-1"` is
+  // not for keyboard order — every panel here has focusable content of its own —
+  // it is so the panel can be given focus programmatically without becoming a
+  // ninth tab stop.
+  body.setAttribute('id', panelId(panel));
+  body.setAttribute('role', 'tabpanel');
+  body.setAttribute('aria-labelledby', tabId(panel));
+  body.setAttribute('tabindex', '-1');
 
   const errors = state.configErrors || [];
 

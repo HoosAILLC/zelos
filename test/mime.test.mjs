@@ -119,6 +119,33 @@ test('decodeCharset decodes the charsets mail actually uses', () => {
   assert.equal(decodeCharset(Buffer.from([0x4a, 0x6f, 0x73, 0xe9]), '"LATIN1"'), 'José');
 });
 
+test('decodeCharset uses the cp1252 table for every label that resolves to it', () => {
+  // The table exists because Node 22.16, 22.19 and 24.0.0 hand back the raw
+  // bytes for 0x80-0x9F, and all three are inside the supported engines range.
+  // It used to fire only for the literal string "windows-1252", but the WHATWG
+  // set makes all of these one encoding — "iso-8859-1" most of all, which is
+  // what Outlook stamps on a body full of cp1252 smart quotes, and which the
+  // alias table was rewriting *away* from the fix.
+  const smartQuotes = Buffer.from([0x93, 0x68, 0x69, 0x94]);
+  for (const label of [
+    'windows-1252', 'cp1252', 'x-cp1252', 'iso-8859-1', 'latin1', 'latin-1',
+    'iso8859-1', 'iso_8859-1', 'l1', 'us-ascii', 'ascii', ' "ISO-8859-1" ',
+  ]) {
+    assert.equal(decodeCharset(smartQuotes, label), '“hi”', `label ${label}`);
+    // That line only fails on the three Node builds that decode 0x80-0x9F
+    // wrongly, and none of them is the one running this. 0x81 is a position
+    // cp1252 leaves undefined: our table returns U+FFFD there and every
+    // runtime decoder — right or wrong about the rest of the range — returns
+    // U+0081. So this is the assertion that fails on *any* Node the moment a
+    // label stops being routed through the table.
+    assert.equal(decodeCharset(Buffer.from([0x81]), label), '�', `${label}: undefined byte`);
+  }
+  // Subjects take the same path, one encoded word at a time.
+  assert.equal(decodeWords('=?iso-8859-1?Q?=93hi=94?='), '“hi”');
+  // Labels that are their own encoding are untouched by any of this.
+  assert.equal(decodeCharset(Buffer.from([0x93, 0xfa, 0x96, 0x7b]), 'shift_jis'), '日本');
+});
+
 test('decodeCharset falls back to lossy utf-8 for an unknown label', () => {
   const utf8 = Buffer.from('naïve', 'utf8');
   assert.equal(decodeCharset(utf8, 'x-nonesuch'), 'naïve');
@@ -247,6 +274,71 @@ test('htmlToText never returns markup, even for malformed input', () => {
 
 test('htmlToText decodes numeric entities and leaves unknown ones alone', () => {
   assert.equal(htmlToText('<p>&#8364;40 &#x2014; &notarealentity;</p>'), '€40 — &notarealentity;');
+});
+
+test('htmlToText keeps a ">" inside an attribute value out of the text', () => {
+  // Every one of these was reproduced against the regex version, which ended a
+  // tag at the first ">" wherever it sat: the remainder of the tag came out as
+  // "plain text", which then became the snippet, the FTS row, the body handed
+  // to the model and the MCP payload.
+  assert.equal(htmlToText('<p>Sale ends Friday. <img alt="Shop Now >" src=x></p>'), 'Sale ends Friday.');
+  assert.equal(htmlToText('<td title="Save > 50%">Deals</td>'), 'Deals');
+  assert.equal(htmlToText('<table><tr><td style="a:b>c">cell</td></tr></table>'), 'cell');
+  assert.equal(htmlToText('<img onerror="if(a>b)steal()">body'), 'body');
+  // ...and the same bug in the other direction: it deleted text a person wrote.
+  assert.equal(htmlToText('<a title="x>y<z">text</a>'), 'text');
+  // A quote only opens an attribute value straight after "=", so a stray one
+  // cannot swallow the paragraph after it.
+  assert.equal(htmlToText('<img src=x y">kept'), 'kept');
+  // Prose the sender never meant as markup stays prose.
+  assert.equal(htmlToText('<p>1 < 2 and 3 > 4</p>'), '1 < 2 and 3 > 4');
+});
+
+test('htmlToText is linear in the length of hostile input, and capped', () => {
+  // The regex version was quadratic four separate ways, and nothing between
+  // the IMAP socket and this call bounds a body part below 64 MB. Measured on
+  // Node 26.3.0 at 256 KB, before the rewrite: '<!--' repeated 6.8 s, '<head>'
+  // repeated 863 ms, a bare '<' repeated 20.2 s, '<p' repeated 21.1 s — against
+  // 5 ms for benign HTML the same size. Every shape below is a megabyte and
+  // none takes more than 9 ms now. A budget is the only assertion that catches
+  // this coming back: the answers were always right, it was the clock that was
+  // wrong.
+  const shapes = [
+    ['unterminated comments', '<!--'.repeat(256 * 1024)],
+    ['unterminated scripts', '<script>'.repeat(128 * 1024)],
+    ['bare angle brackets', '<'.repeat(1024 * 1024)],
+    ['tags that never close', '<p'.repeat(512 * 1024)],
+    ['an attribute value that never closes', `<a href="${'x'.repeat(1024 * 1024)}`],
+    ['raw-text tags that never close', '<head>'.repeat(175 * 1024)],
+    ['nested raw-text tags that never close', '<noscript>'.repeat(105 * 1024)],
+    ['benign HTML', '<p>hello world &amp; friends</p>'.repeat(32 * 1024)],
+  ];
+  for (const [name, html] of shapes) {
+    assert.ok(html.length >= 1024 * 1024, `${name}: the input must be a megabyte to be worth timing`);
+    const started = Date.now();
+    htmlToText(html);
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed < 1000, `${name}: took ${elapsed}ms for ${html.length} characters`);
+  }
+
+  // And a cap, because everything downstream of the scan allocates a copy.
+  const huge = htmlToText(`<p>start</p>${'text and more text. '.repeat(200 * 1024)}`);
+  assert.ok(huge.startsWith('start'), 'the top of the message survives');
+  assert.ok(huge.length < 1024 * 1024, `capped, got ${huge.length} characters`);
+});
+
+test('htmlToText drops an unterminated script or style, and keeps prose', () => {
+  // script and style hold code, never something a person typed, so an
+  // unterminated one takes the rest of the part with it.
+  assert.equal(htmlToText('<p>before<script>var a = 1;'), 'before');
+  assert.equal(htmlToText('<p>before<style>p{color:'), 'before');
+  // A noscript with no closer is a different bet: what follows may be the whole
+  // message, so only the tag goes.
+  assert.equal(htmlToText('<p>before<noscript>you need js'), 'before you need js');
+  // Nothing but markup still means nothing.
+  assert.equal(htmlToText('<script>only()</script>'), '');
+  assert.equal(htmlToText('<p></p>'), '');
+  assert.equal(htmlToText(''), '');
 });
 
 /* ------------------------------------------------------------------ *

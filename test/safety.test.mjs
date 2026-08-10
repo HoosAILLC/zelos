@@ -569,6 +569,51 @@ test('validateSweep: drafts with placeholders are rejected as not ready', () => 
   assert.equal(res.errors.filter((e) => /placeholder/.test(e.message)).length, 4);
 });
 
+/**
+ * The gate had two bounds and both of them were bypasses.
+ *
+ * `PLACEHOLDER_RE` was `/\[[^\]\n]{1,80}\]|\{\{[^}\n]{0,80}\}\}/`, tested in one
+ * place, with no second guard anywhere including the UI. Measured: a bracket of
+ * 80 characters was rejected and one of 81 was kept — and the realistic vector
+ * is not an exotic input, it is the model talking to the reader mid-paragraph,
+ * which runs long by nature. Separately, `:600` screens the body with
+ * `collapse:false` while `:599` collapses the subject first, so a bracket
+ * opened on one line and closed on the next was caught in a subject and
+ * invisible in a body. Both drafts were stored `pending` and rendered under
+ * "Ready to send", against docs/SECURITY.md's flat "never contain
+ * [placeholders]".
+ *
+ * Nothing auto-sends, so the cost is embarrassment after a human copies out a
+ * draft they were told to read — which is exactly the promise this gate is.
+ */
+test('validateSweep: a long or multi-line bracket is still a placeholder', () => {
+  const draft = (body, extra = {}) => ({ to: 'dana@example.com', subject: 'Re: forecast', body, ...extra });
+  const aside = '[Confirm the delivery date with the supplier before sending - I could not find it in the thread]';
+  assert.ok(aside.length > 80, 'the vector has to be past the old ceiling to prove anything');
+
+  const res = validateSweep({
+    items: [
+      item({ key: 'long', bucket: 'waiting', draft: draft(`Hi Dana,\n\nThe forecast is attached. ${aside}\n\nNemo`) }),
+      item({ key: 'wrapped', bucket: 'waiting', draft: draft('Hi Dana,\n\nI will send it by [insert the date\nonce Ops confirm].\n\nNemo') }),
+      // The words the prompt has always banned and nothing rejected.
+      item({ key: 'todo', bucket: 'waiting', draft: draft('Hi Dana,\n\nTODO: check the figure before this goes.\n\nNemo') }),
+      item({ key: 'tbd', bucket: 'promised', draft: draft('Hi Dana,\n\nThe workshop is on the 14th, room TBD.\n\nNemo') }),
+      item({ key: 'insert-here', bucket: 'waiting', draft: draft('Hi Dana,\n\nPlease insert the signed figure here before replying.\n\nNemo') }),
+      // The control. Ordinary prose with brackets nowhere near it survives, and
+      // a rejection that swallowed this would be worse than the defect.
+      item({ key: 'fine', bucket: 'waiting', draft: draft('Hi Dana,\n\nSending the forecast today; the Q3 number is final.\n\nNemo') }),
+      item({ key: 'fine-punct', bucket: 'waiting', draft: draft('Hi Dana,\n\nThe totals (net of VAT) are attached — 20% up on Q2.\n\nNemo') }),
+    ],
+  });
+  const by = Object.fromEntries(res.value.items.map((i) => [i.key, i.draft]));
+  for (const key of ['long', 'wrapped', 'todo', 'tbd', 'insert-here']) {
+    assert.equal(by[key], null, `draft "${key}" reached the board as ready to send`);
+  }
+  assert.ok(by.fine, 'a clean draft was thrown away');
+  assert.ok(by['fine-punct'], 'ordinary punctuation is not a placeholder');
+  assert.equal(res.value.items.length, 7, 'a rejected draft still never costs you the item');
+});
+
 test('validateSweep: a draft outside waiting/promised is kept but reported', () => {
   const res = validateSweep({
     items: [item({
@@ -625,6 +670,51 @@ test('validateSweep: keys are normalised, derived when missing, and deduplicated
     items: [item({ key: '', headline: 'Derived one', personEmail: 'sam@example.com' })],
   });
   assert.equal(again.value.items[0].key, keys[1]);
+});
+
+/**
+ * ...and that is the whole of its stability, which is the defect.
+ *
+ * The fallback hashes the headline, and core/triage.mjs asks for headlines
+ * carrying a moving day count in one paragraph while banning exactly that input
+ * from keys in another. Reproduced against a real database: Day 1 marked done,
+ * Day 2 reworded, `getItemByKey` missed, `inserted: true`, `state: 'open'` —
+ * finished work back on the board.
+ *
+ * What is fixed here is the silence, not the instability. The old error read
+ * "missing or unusable key; derived one instead" and named nothing, so the run
+ * that minted the key was the one place the connection could still be made and
+ * it did not make it. Anchoring on a sourceRef instead was tried and taken back
+ * out: those ids are stable but not unique per obligation — one email routinely
+ * yields two items citing the same `msg:` id — and `validateSweep` DROPS a
+ * duplicate key, so that trade turns a visible duplicate into an item that
+ * silently never arrives. The test below pins both halves of that reasoning.
+ */
+test('validateSweep: a derived key is named in the errors, and two items from one message both survive', () => {
+  const res = validateSweep({
+    items: [
+      item({ key: '', headline: 'Reply to Dana about the forecast - 3 days left', sourceRefs: ['msg:abc123'] }),
+      item({ key: '', headline: 'Send Dana the March invoice', sourceRefs: ['msg:abc123'] }),
+    ],
+  });
+
+  assert.equal(res.value.items.length, 2,
+    'two obligations from one email collapsed into one — the item that vanished is the cost of a "more stable" key');
+  const [first, second] = res.value.items;
+  assert.notEqual(first.key, second.key);
+
+  const reported = res.errors.filter((e) => /key/.test(e.path));
+  assert.equal(reported.length, 2);
+  for (const item_ of res.value.items) {
+    assert.ok(item_.key.startsWith('auto-'));
+    assert.ok(
+      reported.some((e) => e.message.includes(`"${item_.key}"`)),
+      `the errors never name ${item_.key}, so a board that grew a duplicate cannot be traced to the run that minted it`,
+    );
+  }
+  // And the message says what it is derived FROM, because that is what tells a
+  // reader why it will not hold.
+  assert.ok(reported.every((e) => /headline/.test(e.message)), reported.map((e) => e.message).join(' | '));
 });
 
 test('validateSweep: first must name a surviving item', () => {

@@ -9,7 +9,7 @@
 import { el, button, meander, section } from '../lib/dom.js';
 import { itemHero, itemRow, emptyState } from '../lib/items.js';
 import { byUrgency, sweepSummary, plural } from '../lib/format.js';
-import { state, startSweep, itemsInBucket, snoozedItems } from '../lib/store.js';
+import { state, startSweep, itemsInBucket, snoozedItems, boardNotes } from '../lib/store.js';
 import { humanDelta, instant } from '../lib/time.js';
 
 const MAX_NOW_ROWS = 4;
@@ -58,16 +58,52 @@ function emptyForContext(navigate) {
   });
 }
 
-/** The failed-sweep banner. Persistent, specific, and it names the source. */
-function failureBanner() {
+/**
+ * Which of the two sweep failures the board is living with — 'whole', 'partial'
+ * or neither.
+ *
+ * A run that lost ONE source comes back `ok: true`. A revoked app password, a
+ * 404'd `.ics`, a Sent folder that is not called Sent: the sweep shrugs, writes
+ * `stats.sourcesFailed`, and the board just gets quieter — while this view said
+ * "Nothing needs you." and named the failure nowhere. `sourcesFailed` and
+ * `sources[]` are written by every sweep and, until this function existed, were
+ * read by nothing in the app; the CLI printed the list, the screen people
+ * actually look at did not.
+ *
+ * `sources[]` is the better signal because it carries the reason, but a run
+ * that died before the count was taken has one and not the other, so both are
+ * consulted and the larger wins.
+ */
+function sweepTrouble() {
+  const last = state.board.runs?.last;
+  if (state.sweep.error || (last && last.ok === false)) return 'whole';
+  const named = (last?.stats?.sources || []).filter((s) => s && s.ok === false).length;
+  const counted = Number(last?.stats?.sourcesFailed) || 0;
+  return Math.max(named, counted) > 0 ? 'partial' : null;
+}
+
+/**
+ * The failed-sweep banner. Persistent, specific, and it names the source.
+ *
+ * Two failures, two tones, two sentences. "The last sweep failed" over a run
+ * that read four sources out of five is a lie in the alarming direction, and it
+ * would send the reader looking for a broken app instead of a dead password.
+ */
+function failureBanner(trouble) {
   const last = state.board.runs?.last;
   const live = state.sweep.error;
-  if (!live && !(last && last.ok === false)) return null;
-  const message = live || last.error || 'The last sweep failed.';
   const failedSources = (last?.stats?.sources || []).filter((s) => s && s.ok === false);
+  const counted = Math.max(failedSources.length, Number(last?.stats?.sourcesFailed) || 0);
+  const whole = trouble === 'whole';
+  const message = whole
+    ? (live || last?.error || 'The last sweep failed.')
+    : `${plural(counted, 'source')} could not be read. Everything else on the board is from this sweep — whatever those hold is not.`;
 
-  return el('div', { class: 'banner banner-bad', role: 'status' }, [
-    el('h3', { class: 'banner-title', text: 'The last sweep failed' }),
+  return el('div', { class: `banner ${whole ? 'banner-bad' : 'banner-warn'}`, role: 'status' }, [
+    el('h3', {
+      class: 'banner-title',
+      text: whole ? 'The last sweep failed' : 'The last sweep could not read everything',
+    }),
     el('p', { class: 'banner-detail', text: message }),
     failedSources.length
       ? el('ul', { class: 'banner-list' }, failedSources.map((s) =>
@@ -88,23 +124,43 @@ export function renderNow(ctx) {
     || nowItems[0]
     || null;
   const rest = nowItems.filter((i) => i.id !== hero?.id).slice(0, MAX_NOW_ROWS);
-  const notes = (state.board.notes || []).filter((n) => typeof n === 'string' && n.trim());
+  // Through the store, not off state.board directly: the rail's "Worth
+  // knowing" row counts the same list, and the two filtering it separately is
+  // how they came to print different numbers side by side.
+  const notes = boardNotes();
   const noteItems = itemsInBucket('note');
 
   const body = el('div', { class: 'view view-now' });
-  const banner = failureBanner();
+  const trouble = sweepTrouble();
+  const banner = trouble ? failureBanner(trouble) : null;
   if (banner) body.appendChild(banner);
 
   if (!hero) {
     // When the banner is up it has already said what failed and offered the
     // retry. Repeating both in the empty state — same fact, two boxes, two
     // buttons — reads like the app panicking, so under a banner the empty
-    // state is just the plain shell.
+    // state is just the plain shell. After a PARTIAL failure the sweep did
+    // finish, so "the board fills in when a sweep finishes" would be the
+    // reassurance this whole banner exists to withdraw.
+    //
+    // The title has to carry that too, not only the detail. Branching the
+    // detail alone still left "Nothing on the board yet." as the largest text
+    // on an empty screen, and "yet" is the whole reassurance: it says the board
+    // is between sweeps and will fill in. After a partial failure the board is
+    // as full as it is ever going to get from this run, and the part nobody has
+    // seen is the part that could not be read. Two titles, because they are two
+    // different states of the world.
     body.appendChild(banner
-      ? emptyState({
-        title: 'Nothing on the board yet.',
-        detail: 'The board fills in when a sweep finishes.',
-      })
+      ? emptyState(trouble === 'partial'
+        ? {
+          title: 'Nothing on the board — and not everything was read',
+          detail: 'Nothing Zelos could read needs you. The sources named above went unread, '
+            + 'and whatever they hold is not on this board.',
+        }
+        : {
+          title: 'Nothing on the board yet.',
+          detail: 'The board fills in when a sweep finishes.',
+        })
       : emptyForContext(navigate));
   } else {
     body.appendChild(itemHero(hero, { tz }));
