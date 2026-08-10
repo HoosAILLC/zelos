@@ -470,7 +470,14 @@ describe('the command line', () => {
 
   test('neither --help nor --version creates a Zelos home', async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zelos-noop-'));
+    try {
     fs.rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  } catch (err) {
+    /* A temp directory that Windows still holds a handle on is litter, not a
+       test result. The OS clears it; failing the whole run over it reports a
+       defect that does not exist and hides the ones that do. */
+    if (err?.code !== 'EPERM' && err?.code !== 'EBUSY' && err?.code !== 'ENOTEMPTY') throw err;
+  }
     await run(process.execPath, ['zelos.mjs', '--help'], { env: { ZELOS_HOME: home } });
     await run(process.execPath, ['zelos.mjs', '--version'], { env: { ZELOS_HOME: home } });
     assert.equal(fs.existsSync(home), false, 'printing help should not touch the disk');
@@ -533,7 +540,14 @@ describe('a first launch with nothing configured', () => {
       child.kill('SIGKILL');
       await Promise.race([gone, new Promise((r) => setTimeout(r, 5_000))]);
     }
+    try {
     fs.rmSync(path.dirname(home), { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
+  } catch (err) {
+    /* A temp directory that Windows still holds a handle on is litter, not a
+       test result. The OS clears it; failing the whole run over it reports a
+       defect that does not exist and hides the ones that do. */
+    if (err?.code !== 'EPERM' && err?.code !== 'EBUSY' && err?.code !== 'ENOTEMPTY') throw err;
+  }
   });
 
   test('the launch URL carries a fresh 32-byte session token', () => {

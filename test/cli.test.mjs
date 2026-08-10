@@ -43,7 +43,14 @@ after(() => {
      after the process that read it has exited, which turns the tidy-up into an
      EBUSY and fails the run over nothing. On macOS and Linux the first attempt
      always succeeds, so the retries cost nothing there. */
-  fs.rmSync(SCRATCH, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  try {
+    fs.rmSync(SCRATCH, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  } catch (err) {
+    /* A temp directory that Windows still holds a handle on is litter, not a
+       test result. The OS clears it; failing the whole run over it reports a
+       defect that does not exist and hides the ones that do. */
+    if (err?.code !== 'EPERM' && err?.code !== 'EBUSY' && err?.code !== 'ENOTEMPTY') throw err;
+  }
 });
 
 /* ------------------------------------------------------------------ *

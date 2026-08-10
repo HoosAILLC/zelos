@@ -1515,6 +1515,20 @@ test('handoffs are unique per mint and per server, and never reach the API gate'
  * ================================================================== */
 
 test.after(() => {
-  fs.rmSync(HOME, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
-  fs.rmSync(STATIC_ROOT, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  try {
+    fs.rmSync(HOME, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  } catch (err) {
+    /* A temp directory that Windows still holds a handle on is litter, not a
+       test result. The OS clears it; failing the whole run over it reports a
+       defect that does not exist and hides the ones that do. */
+    if (err?.code !== 'EPERM' && err?.code !== 'EBUSY' && err?.code !== 'ENOTEMPTY') throw err;
+  }
+  try {
+    fs.rmSync(STATIC_ROOT, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  } catch (err) {
+    /* A temp directory that Windows still holds a handle on is litter, not a
+       test result. The OS clears it; failing the whole run over it reports a
+       defect that does not exist and hides the ones that do. */
+    if (err?.code !== 'EPERM' && err?.code !== 'EBUSY' && err?.code !== 'ENOTEMPTY') throw err;
+  }
 });

@@ -632,7 +632,14 @@ describe('the shell, booted against a stub Electron', () => {
 
   after(async () => {
     await main?.shutdown();
+    try {
     fs.rmSync(sandbox, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  } catch (err) {
+    /* A temp directory that Windows still holds a handle on is litter, not a
+       test result. The OS clears it; failing the whole run over it reports a
+       defect that does not exist and hides the ones that do. */
+    if (err?.code !== 'EPERM' && err?.code !== 'EBUSY' && err?.code !== 'ENOTEMPTY') throw err;
+  }
     delete process.env.ZELOS_HOME;
     delete process.env.ZELOS_PORT;
     delete process.env.ZELOS_LOG_LEVEL;
