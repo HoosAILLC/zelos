@@ -13,6 +13,9 @@ jobs:
   test:
     name: ${{ matrix.os }} · node ${{ matrix.node }}
     runs-on: ${{ matrix.os }}
+    # A hung job is worse than a failing one: it burns minutes and reports
+    # nothing. The suite takes well under a minute anywhere it is healthy.
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -32,6 +35,12 @@ jobs:
 
       # Node's test runner has no glob of its own, so the files are listed.
       # Shell globbing does the expansion, which is why this is bash on every OS.
+      #
+      # --test-timeout matters more than it looks: without it a test that blocks
+      # on a socket the platform will not refuse simply hangs, and the job
+      # reports nothing at all until the runner is killed. With it, the hang
+      # becomes a named failing test, which is the difference between a bug you
+      # can fix and twenty minutes of silence.
       - name: Run the suite
         shell: bash
-        run: node --test test/*.test.mjs
+        run: node --test --test-timeout=60000 test/*.test.mjs

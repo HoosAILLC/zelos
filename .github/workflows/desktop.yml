@@ -16,6 +16,9 @@ jobs:
   build:
     name: ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
+    # Electron packaging is slow but not unbounded; a hang here costs real
+    # minutes on a Windows runner.
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -43,7 +46,7 @@ jobs:
       # failing tree is worse than no installer.
       - name: Run the suite
         shell: bash
-        run: node --test test/*.test.mjs
+        run: node --test --test-timeout=60000 test/*.test.mjs
 
       - name: Build
         working-directory: desktop
