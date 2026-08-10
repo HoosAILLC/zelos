@@ -523,9 +523,17 @@ describe('a first launch with nothing configured', () => {
     }
   });
 
-  after(() => {
-    child?.kill('SIGKILL');
-    fs.rmSync(path.dirname(home), { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  /* Killing a process is asynchronous, and on Windows the files it had open
+     stay locked until it is actually reaped — so removing the directory in the
+     same tick raced the exit and failed with EPERM, which took the whole file
+     down with it. Wait for the exit that was just asked for, then clean up. */
+  after(async () => {
+    if (child && child.exitCode === null && child.signalCode === null) {
+      const gone = new Promise((resolve) => child.once('exit', resolve));
+      child.kill('SIGKILL');
+      await Promise.race([gone, new Promise((r) => setTimeout(r, 5_000))]);
+    }
+    fs.rmSync(path.dirname(home), { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
   });
 
   test('the launch URL carries a fresh 32-byte session token', () => {
