@@ -48,6 +48,13 @@ jobs:
       #
       # --test-timeout turns a test that blocks forever into a named failing
       # test instead of a job that sits silent until the runner is killed.
+      #
+      # Three minutes, not one. The AI-access scope matrix stands a server up
+      # for every combination of scopes and hunts a planted string through each
+      # one, which takes about ninety seconds on the slowest Windows runner and
+      # a few on a Mac. This flag exists to catch a HANG, not to enforce a
+      # performance budget, and 60s was an arbitrary number that turned the
+      # slowest honest test in the suite into a red build.
       - name: Run the suite
         shell: bash
-        run: node --test --test-timeout=60000 test/*.test.mjs
+        run: node --test --test-timeout=180000 test/*.test.mjs

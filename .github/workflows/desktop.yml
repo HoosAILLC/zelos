@@ -46,7 +46,7 @@ jobs:
       # failing tree is worse than no installer.
       - name: Run the suite
         shell: bash
-        run: node --test --test-timeout=60000 test/*.test.mjs
+        run: node --test --test-timeout=180000 test/*.test.mjs
 
       - name: Build
         working-directory: desktop
