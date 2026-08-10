@@ -200,10 +200,18 @@ included in a log.
 Pick the provider in Settings, paste the key, choose a model from the list
 Zelos fetches, and press **Test**. A green result means the whole path works.
 
-**Cost.** Zelos asks the model once per sweep — by default that is at most
-once every 30 minutes, and only when something has actually changed. It sends
-your recent messages, not your whole mailbox. On a normal inbox with a
-mid-priced model this is cents a day, not dollars. If you want it cheaper, turn
+**Cost.** A sweep asks the model once — by default at most once every 30
+minutes, and only when something has actually changed. It sends your recent
+messages, not your whole mailbox.
+
+That is not the only thing that spends money, and the other one is you: **every
+question on the Ask page is its own model call**, streamed, with the matching
+mail and events as context. So is each press of **Test** in Settings → Model.
+Neither is on a schedule — they happen when you ask — but a long session on the
+Ask page can outspend a day of sweeps.
+
+On a normal inbox with a mid-priced model the sweeps are cents a day, not
+dollars. If you want it cheaper, turn
 **Send message bodies** off in Settings → Privacy: Zelos will then send only
 headers and short snippets. That is a genuine change in what leaves your
 machine, and the board gets noticeably less sharp — the app says so honestly
@@ -273,7 +281,10 @@ setting and not a rule.
 
 **How much it reads.** By default, the last 14 days of `INBOX`, up to 400
 messages. Both are settings. Reading your sent mail as well is what lets Zelos
-tell "they owe me" from "I owe them", so it's worth turning on.
+tell "they owe me" from "I owe them", so it's worth turning on: **Settings →
+Mail → Sent folder**, prefilled from whatever your server flags with IMAP
+`SPECIAL-USE` when you press **Test**, and editable if it guessed wrong (Gmail
+calls it `[Gmail]/Sent Mail`, some servers `Sent Items`).
 
 ---
 
@@ -297,6 +308,17 @@ Three kinds, in order of how common they are:
 the server address and your username; the password goes in the same way a mail
 password does. For iCloud, use an app-specific password here too.
 
+> **If Zelos says a host asked for a password and it is not the host you
+> typed**, that is the pin working, not a bug — and the fix is one paste.
+> Zelos will not send your calendar password to a host it was merely *pointed
+> at* by another host's answer, and iCloud in particular partitions accounts
+> across per-user servers (`p43-caldav.icloud.com` and the like), so discovery
+> from the generic address routinely lands on one. Put the address Zelos names
+> in the error straight into the calendar URL, and it will authenticate to the
+> host you typed. The error message says this too; it is here because
+> `caldav.icloud.com` does not work for every account and it used to look like
+> a wrong password.
+
 **A file on this computer** — point Zelos at an `.ics` file and it will read
 it. Useful for exports and for calendars that only publish downloads.
 
@@ -319,12 +341,19 @@ and is the only place it is stated.
 | --- | --- |
 | `zelos.db` | The database: your messages, calendar events, the board, drafts, notes and the run history. This is the whole app's memory. |
 | `config.json` | Your settings — servers, addresses, preferences. **Never any password or key.** Only short names like `"mail.m_9f3a1c"` that point at the keychain. |
-| `logs/` | What Zelos did, for troubleshooting. Passwords and keys are stripped out before anything is written, by key name and by shape. |
+| `logs/` | Created on every launch, but **only the desktop app writes to it**, and the file it writes is `desktop.log`. Run Zelos from a terminal and the log is the terminal. Passwords and keys are stripped before anything is written, by key name and by shape. |
 | `cache/` | Scratch space. Safe to delete at any time. |
-| `secrets.enc`, `.seed` | Only present if your system has no keychain — see below. |
+| `window.json` | Desktop app only: window size and position. |
+| `secrets.enc`, `.seed` | Present when this home is on the encrypted-file backend — see below. `.seed` holds the key that decrypts `secrets.enc`, in the same folder. |
+| `secrets.backend.json` | Which secret store this home committed to, the first time it stored one. Zelos keeps using that store afterwards even if a keychain later appears, because moving would orphan the secrets already written. |
+| `.seed.unreadable-<ts>`, `secrets.enc.unreadable-<ts>` | Only after damage: a seed or store Zelos could not read is renamed aside as a matched pair sharing one timestamp, rather than overwritten. To recover, put the 64 hex characters back in `.seed`, rename the store back to `secrets.enc`, and the secrets read again. |
 
-**Your passwords and API keys are not in that folder** (unless you're on the
-fallback). They're in your operating system's keychain:
+**Your passwords and API keys are not in that folder** — **unless this home is
+on the encrypted-file fallback, in which case they are, and so is the key that
+opens them.** That case is not exotic: any machine without a working keychain
+lands there, and a home that fell back once stays there. Check which one you
+are on in **Settings → About**, with `zelos doctor`, or by looking for
+`secrets.enc` in the folder. When there is a keychain, they're in it: 
 
 - **macOS** — the login Keychain. Open *Keychain Access* and search for
   `com.zelos.app` to see them listed. You can delete them from there.
@@ -368,8 +397,11 @@ rm -rf ~/.zelos
 On Windows, delete the `.zelos` folder in your user folder, and the
 `Zelos` folder inside `%LOCALAPPDATA%`.
 
-That removes the database, the settings and the logs — but not the passwords,
-which are in the keychain, not in that folder. Remove those too:
+That removes the database, the settings and the logs. **Whether it also removes
+the passwords depends on which secret store this home was on** — if there was
+no keychain, `secrets.enc` and `.seed` were in that folder and are now gone
+with it, and you are done. If there was a keychain, the passwords are still in
+it. Remove those too:
 
 - **macOS** — open *Keychain Access*, search for `com.zelos.app`, and delete
   every entry it finds.
@@ -377,6 +409,10 @@ which are in the keychain, not in that folder. Remove those too:
   entries, or run `secret-tool clear service com.zelos.app account <name>`.
 - **Windows** — deleting the `Zelos` folder in `%LOCALAPPDATA%` is enough;
   that's where the encrypted blobs live.
+
+Doing it in that order costs you the ability to check: once `~/.zelos` is gone
+so is `secrets.backend.json`, which is the file that would have told you which
+case you were in. Look before you delete, or just do both.
 
 If Zelos is still running, you can do this the easy way instead: in Settings,
 each stored password and key has a **Forget** control beside it that removes it
@@ -395,41 +431,95 @@ convincing.
 ### 1. Look for the packages that aren't there
 
 Open `package.json`. There is no `dependencies` section and no
-`devDependencies` section, and there is no `node_modules` folder. Everything
-Zelos does — reading IMAP, parsing calendars, the database, the web server —
-is written against what Node itself ships with. Nobody else's code runs.
+`devDependencies` section, and there is no `node_modules` folder at the top
+level. Everything Zelos does — reading IMAP, parsing calendars, the database,
+the web server — is written against what Node itself ships with. Nobody else's
+code runs.
+
+**One exception, and it is a real one:** if you have built the desktop app,
+`desktop/node_modules` exists and is large. Electron and electron-builder are
+`devDependencies` of the shell, used to *build* a window; they are not imported
+by anything in `core/`, `ui/` or `zelos.mjs`, and none of them is in the
+published package. The claim is "the program that reads your mail has no
+dependencies", not "there is no npm anywhere on your disk" — and if you run
+Zelos from source or from npm, `desktop/` never gets installed at all.
 
 ### 2. Count the places it *could* phone home
 
-A program can only send data through code that opens a network connection.
-There are exactly two ways to do that in Node, so you can list every one of them
-in the whole program. In the `zelos` folder:
+A program can only send data through code that opens a network connection, and
+this one uses three primitives to do it: `fetch()`, `tls.connect` and
+`net.connect`. So you can list every one of them in the whole program. In the
+`zelos` folder:
 
 ```
 grep -rn "fetch(\|tls.connect\|net.connect" core/ zelos.mjs
 ```
 
-Ignore the lines that are comments, and the ones in `core/sources/imap.mjs`
-that say `client.fetch(` or `async fetch(` — those are Zelos's own IMAP
-object, which happens to have a method by that name, not a network call. What's
-left is **seven lines**, and this is all of them:
+That returns **19 lines** today. Ten of them are not network calls, and you can
+throw them out by two rules:
 
-| Where | What it connects to |
-| --- | --- |
-| `core/sources/imap.mjs` (3 lines) | your mail server — the address you typed in Settings |
-| `core/sources/caldav.mjs` | your CalDAV calendar — the address you typed |
-| `core/sweep.mjs` | your `.ics` calendar link — the address you typed |
-| `core/llm.mjs` | the model — the address you chose |
-| `core/server.mjs` | the calendar address you typed, when you press **Test** |
+- **Comments.** Seven of the nineteen are prose inside `/* */` or `//` blocks
+  that happen to mention `fetch(`.
+- **Zelos's own IMAP object.** Three lines in `core/sources/imap.mjs` say
+  `async fetch(` or `client.fetch(`. That is Zelos's IMAP client having a
+  method named after the IMAP `FETCH` command. It talks on a socket that is
+  already open; it does not open one.
+
+**Nine lines survive that, and one of them is an English sentence.**
+`core/doctor.mjs:567` is an error message ending "check this machine's internet
+connection" — it matches because `.` is a wildcard in `grep`'s pattern
+language, so `net.connect` finds "**net**␣**connect**ion" inside the word
+*internet*. Worth knowing as a rule: **this grep over-matches prose, and never
+under-matches code.** A false positive you can read is the right way round.
+
+So: **eight real outbound calls**, and this is all of them.
+
+| Where | Lines | What it connects to |
+| --- | --- | --- |
+| `core/sources/imap.mjs` | 719, 720, 770 | your mail server — the address you typed in Settings |
+| `core/sources/caldav.mjs` | 322 | your CalDAV calendar — the address you typed |
+| `core/sweep.mjs` | 237 | your `.ics` calendar link — the address you typed |
+| `core/llm.mjs` | 801 | the model — the address you chose |
+| `core/server.mjs` | 1277 | the calendar address you typed, when you press **Test** |
+| `core/doctor.mjs` | 62 | the one `fetch` `zelos doctor` uses, to try your model endpoint and your calendar address — both from your settings |
 
 Every one of them goes to an address that came from your own settings. There is
-no eighth. Then check for the usual suspects:
+no ninth.
+
+**And "three primitives" is itself a claim you should check**, since a grep for
+three names proves nothing if a fourth is in use. The other ways Node can reach
+the network are `http.request`/`https.request`, `node:http2`, `node:dgram` and
+running another program that does it for you. Grep for those too:
+
+```
+grep -rn "http\.request\|https\.request\|node:dgram\|node:http2\|child_process" core/ zelos.mjs
+```
+
+Two lines, both `import { spawn } from 'node:child_process'` — `core/secrets.mjs`,
+which runs your keychain helper, and `zelos.mjs`, which opens your browser.
+Neither is a network call, and neither takes an address from anything but this
+machine.
+
+If you want the survivors of the first grep without reading past the comments
+yourself:
+
+```
+grep -rn "fetch(\|tls.connect\|net.connect" core/ zelos.mjs \
+  | grep -v "^\S*: *\*\|^\S*: *//" | grep -v "client\.fetch(\|async fetch("
+```
+
+Then check for the usual suspects:
 
 ```
 grep -rni "analytics\|telemetry\|sentry\|posthog\|mixpanel\|gtag\|amplitude" core/ ui/ zelos.mjs
 ```
 
-Nothing comes back.
+**Three lines come back, and all three are the same joke as the one above.**
+Two are `core/sources/mime.mjs`'s `findClosingTag` — `-i` makes `gtag` match
+"findClosin**gTag**". The third is `ui/views/settings.js`, the Privacy panel's
+own sentence saying there is no telemetry. There is no analytics code, no
+reporting endpoint and no third-party script; the matches are a function name
+and a denial.
 
 ### 3. Watch the connections yourself
 
@@ -504,15 +594,29 @@ sweep just refreshes what's on screen. Both happen on the schedule. A local
 model on a laptop can take a minute or two, and that's the model thinking, not
 Zelos stalling — the progress line tells you which phase it's in.
 
-**Something else.** `~/.zelos/logs/zelos.log` records what happened, with
-credentials stripped. It's plain text, one line per event.
+**Something else.** Where the record is depends on how you launched Zelos, and
+**there is no `zelos.log`** — the name this page used to print does not exist
+and never has.
+
+- **From a terminal** (`node zelos.mjs`, `zelos`, `zelos sweep`, `zelos
+  doctor`): the log is that terminal. Nothing is written to disk, so an empty
+  `~/.zelos/logs/` is correct rather than a fault. Redirect it if you want to
+  keep it: `zelos sweep 2> sweep.log`. Note that `ZELOS_LOG_LEVEL=debug` buys
+  you **nothing** here — `debug` lines are written to the log *file* and
+  deliberately not to the terminal, and the CLI has no file, so they go
+  nowhere. Debug logging is a desktop-app facility only.
+- **The desktop app**, which has no terminal to write to: `~/.zelos/logs/desktop.log`,
+  one JSON object per line. **Board → Show logs** opens the folder.
+
+Credentials are stripped either way — by key name and by value shape, in
+`core/log.mjs`, on every line before it goes anywhere.
 
 ---
 
 ## Where things are, if you want to look
 
 ```
-zelos.mjs          the launcher — flags, banner, the browser
+zelos.mjs          the launcher — subcommands, flags, banner, the browser
 core/
   server.mjs         the local web server and its security model
   db.mjs             the database and every query
@@ -522,11 +626,24 @@ core/
   safety.mjs         treating mail as hostile
   triage.mjs         what gets asked, and how the answer is checked
   sweep.mjs          the loop: fetch, think, update, schedule
-  sources/           imap.mjs, mime.mjs, ics.mjs, caldav.mjs
+  mcp.mjs            the tools an AI client can call, and their audit log
+  ai-access.mjs      AI tokens, scopes, and the gate in front of them
+  doctor.mjs         every check `zelos doctor` runs
+  sample-data.mjs    the demo board, and the manifest that removes it exactly
+  home-lock.mjs      one Zelos per data folder, and a warning when there are two
+  log.mjs, time.mjs  redacted logging; zone-aware clock arithmetic
+  sources/           imap.mjs, mime.mjs, ics.mjs, caldav.mjs, oauth.mjs
 ui/                  the page you look at — plain HTML, CSS and JavaScript
-test/                the tests; run them with `node --test`
+desktop/             the Electron shell — a window and a tray, nothing more
+test/                the tests; run them with `node --test "test/*.test.mjs"`
 docs/                SPEC.md (what it must do), SECURITY.md (what it defends)
 ```
+
+Two notes on that list. `core/sources/oauth.mjs` is **not wired to anything** —
+989 lines with no importer outside its own test, excluded from the published
+package; [OAUTH.md](OAUTH.md) says exactly what is missing. And `desktop/` is
+the only directory with a `node_modules`: Electron and electron-builder, both
+`devDependencies` of the shell, neither reaching the core.
 
 Every file is meant to be read. If a comment explains *what* the code does
 rather than *why*, that's a bug in the comment.
