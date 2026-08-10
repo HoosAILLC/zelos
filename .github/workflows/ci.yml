@@ -20,8 +20,11 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        # 22.13 is the real floor: node:sqlite stops needing a flag there.
-        node: ['22.13', '24', 'latest']
+        # The floor is 22.16, not 22.13: node:sqlite stops needing a flag at
+        # 22.13 but is built WITHOUT FTS5 until 22.16, and Zelos's index needs
+        # it. 23 is excluded on purpose — the whole line lacks FTS5, and this
+        # matrix is what found that.
+        node: ['22.16', '22', '24', 'latest']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -36,11 +39,12 @@ jobs:
       # Node's test runner has no glob of its own, so the files are listed.
       # Shell globbing does the expansion, which is why this is bash on every OS.
       #
-      # --test-timeout matters more than it looks: without it a test that blocks
-      # on a socket the platform will not refuse simply hangs, and the job
-      # reports nothing at all until the runner is killed. With it, the hang
-      # becomes a named failing test, which is the difference between a bug you
-      # can fix and twenty minutes of silence.
+      # --test-timeout turns a test that blocks forever into a named failing
+      # test instead of a silent job. --test-force-exit covers the other half,
+      # which is what actually bit here: every test can PASS and the runner
+      # still hang, because one socket or server the suite opened is keeping
+      # the event loop alive. That is a leak worth knowing about, but it is not
+      # a reason for CI to sit for ten minutes and then report nothing.
       - name: Run the suite
         shell: bash
-        run: node --test --test-timeout=60000 test/*.test.mjs
+        run: node --test --test-timeout=60000 --test-force-exit test/*.test.mjs

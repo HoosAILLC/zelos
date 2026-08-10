@@ -103,10 +103,13 @@ describe('package.json is ready to publish as zelos-app', () => {
     assert.equal(pkg.name, 'zelos-app');
     assert.equal(pkg.type, 'module');
     assert.equal(pkg.bin.zelos, './zelos.mjs');
-    // 22.13, not 22.5: `node:sqlite` needed --experimental-sqlite until then,
-    // and core/db.mjs imports it at module load, so an earlier runtime does not
-    // fail on some feature nobody uses — it fails on the first line.
-    assert.equal(pkg.engines.node, '>=22.13.0');
+    /* Not a floor — a range with a hole in it, and the hole is real. Zelos
+       needs SQLite's FTS5 for its index, and the bundled build only has it from
+       22.16 in the 22 line, NOT anywhere in the 23 line, and again from 24.
+       Measured against real runtimes, not read off a changelog: 22.15 and
+       23.11.1 fail, 22.16 and 24.0.0 pass. Declaring ">=22.13" told people on
+       a genuine LTS release that Zelos would work for them, and it does not. */
+    assert.equal(pkg.engines.node, '>=22.16.0 <23 || >=24');
     assert.match(pkg.version, /^\d+\.\d+\.\d+/);
   });
 
@@ -333,7 +336,7 @@ const byId = (report, id) => report.checks.find((c) => c.id === id);
 
 describe('doctor', () => {
   test('compareVersions orders releases numerically, not alphabetically', () => {
-    assert.equal(compareVersions('22.5.0', MIN_NODE), 0);
+    assert.equal(compareVersions('22.16.0', MIN_NODE), 0);
     assert.equal(compareVersions('9.0.0', '22.5.0'), -1); // "9" > "2" as text
     assert.equal(compareVersions('26.3.0', '22.5.0'), 1);
     assert.equal(compareVersions('22.4.9', '22.5.0'), -1);

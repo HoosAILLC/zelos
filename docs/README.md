@@ -45,10 +45,16 @@ the end shows you how, in about five minutes, without being a programmer.
 ## What you need
 
 - **A computer** running macOS, Windows or Linux.
-- **Node.js 22.5 or newer.** Node 26 is what Zelos is built and tested
-  against. Download it from [nodejs.org](https://nodejs.org) and take the
-  default options. To check what you have, open Terminal (macOS/Linux) or
-  PowerShell (Windows) and run:
+- **Node.js 22.16 or newer — or 24 or newer.** Not simply "22 or newer", and
+  the exception is worth a sentence because it will otherwise waste an hour of
+  your life: Zelos stores everything in the SQLite that comes built into Node,
+  and uses its full-text search extension for the index. That extension is
+  missing from Node's build until **22.16**, and missing from the **whole of
+  the Node 23 line**, whatever the bigger number suggests. On any of those,
+  Zelos refuses to start and says so rather than failing halfway through.
+  Node 26 is what it is developed and tested against. Download it from
+  [nodejs.org](https://nodejs.org) and take the default options. To check what
+  you have, open Terminal (macOS/Linux) or PowerShell (Windows) and run:
 
   ```
   node --version
@@ -109,6 +115,14 @@ Two consequences worth knowing:
   load the page but nothing will work. Copy the new one from the terminal.
 - **Don't paste that URL into a chat window or a bug report.** Treat it like a
   password, because it is one. Restarting Zelos invalidates it.
+
+When Zelos opens your browser for you, it does *not* use that link. Handing a
+URL to the browser means handing it to `open` (or `xdg-open`, or `cmd start`)
+as a command-line argument — and on a shared machine, command lines are
+readable by every other process running as you. So the browser gets a one-shot
+ticket instead: a random id that is good for ten seconds, is spent the first
+time it is used, and is worth nothing afterwards. The link in the terminal is
+still there for you to copy by hand.
 
 ### Options
 
@@ -246,6 +260,16 @@ password is unaffected.
 
 Zelos guesses the server from your email address, so usually you type your
 address and password and press **Test**.
+
+**About encryption, since one row above turns it off.** Every account has a
+*Require encryption* setting, and left alone it does the right thing: anything
+that is not on your own machine has to end up encrypted before your password is
+sent, so a server that will not do it is refused rather than fallen back from.
+That matters because the fallback is silent — a network able to strip the
+upgrade offer would otherwise be handed your password in plain text. The one
+account that legitimately runs unencrypted is Proton Bridge, because it lives
+on `127.0.0.1` and the traffic never leaves your machine; that is why it is a
+setting and not a rule.
 
 **How much it reads.** By default, the last 14 days of `INBOX`, up to 400
 messages. Both are settings. Reading your sent mail as well is what lets Zelos

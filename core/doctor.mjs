@@ -35,11 +35,16 @@ import { testConnection as testCalDavConnection } from './sources/caldav.mjs';
 import { parseICS } from './sources/ics.mjs';
 import { safeUrl } from './safety.mjs';
 
-/** The floor is node:sqlite, which landed in 22.5.0. Below that nothing runs. */
-export const MIN_NODE = '22.5.0';
-
-/** Below this major, node:sqlite is still behind an experimental flag. */
-const STABLE_SQLITE_MAJOR = 24;
+/**
+ * The floor is not the version that added `node:sqlite` — it is the version
+ * whose bundled SQLite has the FTS5 extension Zelos indexes with. Measured
+ * against real runtimes rather than read off a changelog: 22.15 and 23.11 have
+ * no FTS5, 22.16 and 24.0 do. So the 23 line is excluded entirely, which no
+ * single "minimum version" can express.
+ */
+export const MIN_NODE = '22.16.0';
+/** The whole of this major lacks FTS5, however new its number looks. */
+const EXCLUDED_MAJOR = 23;
 
 /** pass = fine · warn = worth knowing · fail = broken · skip = nothing to check */
 export const STATUSES = Object.freeze(['pass', 'warn', 'fail', 'skip']);
@@ -98,16 +103,16 @@ function checkNode(version = process.versions.node) {
   if (compareVersions(version, MIN_NODE) < 0) {
     return check(
       'node', label, 'fail',
-      `This is Node ${version}. Zelos needs ${MIN_NODE} or newer — that is the release that added the built-in SQLite it keeps everything in.`,
+      `This is Node ${version}. Zelos needs ${MIN_NODE} or newer — that is the release whose built-in SQLite carries the FTS5 extension its search index is built on.`,
       'Install the current Node from nodejs.org (take the defaults), close this terminal, open a new one, and run zelos again.',
     );
   }
   const major = Number.parseInt(String(version).split('.')[0], 10) || 0;
-  if (major < STABLE_SQLITE_MAJOR) {
+  if (major === EXCLUDED_MAJOR) {
     return check(
-      'node', label, 'warn',
-      `Node ${version} works, but its SQLite module is still experimental.`,
-      'If Zelos fails to open its database, start it with: node --experimental-sqlite zelos.mjs. Upgrading to the current Node removes the flag entirely.',
+      'node', label, 'fail',
+      `This is Node ${version}. The whole Node 23 line was built without SQLite's FTS5 extension, which Zelos uses for its search index — so it cannot open its database at all, however new the version number looks.`,
+      'Install Node 24 or newer from nodejs.org, close this terminal, open a new one, and run zelos again.',
     );
   }
   return check('node', label, 'pass', `Node ${version}`);

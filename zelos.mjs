@@ -654,7 +654,11 @@ if (invokedDirectly) {
       setTimeout(() => process.exit(process.exitCode), 250).unref();
     },
     (err) => {
-      process.stderr.write(`zelos: ${err?.stack || err}\n`);
+      // A runtime that cannot run Zelos is a fact about the machine, not a
+      // crash: it gets the sentence and nothing else. A stack trace here would
+      // bury the one line that says what to install.
+      if (err?.code === 'ZELOS_NO_FTS5') process.stderr.write(`\n  ${err.message}\n\n`);
+      else process.stderr.write(`zelos: ${err?.stack || err}\n`);
       process.exit(1);
     },
   );

@@ -270,7 +270,20 @@ function filesUnder(...roots) {
 }
 
 const SCANNED = filesUnder('core', 'ui', 'test', 'zelos.mjs');
-const BUILTINS = new Set(builtinModules.flatMap((m) => [m, `node:${m}`]));
+/**
+ * Every module Node considers built in — plus the ones it does not list.
+ *
+ * `builtinModules` omits anything still marked experimental, and on the older
+ * runtimes Zelos supports that includes `node:sqlite` and `node:test` — the
+ * two most load-bearing imports in the project. The zero-dependency guard read
+ * that omission as "these are third-party packages" and failed on exactly the
+ * versions it was most important to check. They are builtins on every runtime
+ * this project runs on, so they are named here rather than discovered.
+ */
+const ALWAYS_BUILTIN = ['sqlite', 'test', 'test/reporters'];
+const BUILTINS = new Set(
+  [...builtinModules, ...ALWAYS_BUILTIN].flatMap((m) => [m, `node:${m}`]),
+);
 
 describe('every import in core/, ui/ and test/', () => {
   test('the scan actually found the imports (a broken scanner must not pass)', () => {

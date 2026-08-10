@@ -153,10 +153,25 @@ async function startMockImap({ capability = 'IMAP4rev1' } = {}) {
  * work, that half of the test is skipped rather than faked.
  */
 async function nonLoopbackAliasReaches(port) {
+  // Windows does not route it, and the probe itself is not free there: a
+  // connect to 0.0.0.0 can sit without ever refusing, which turns a skipped
+  // test into a hung CI job. So the answer is known in advance rather than
+  // measured, and no socket is opened at all.
+  if (process.platform === 'win32') return false;
   return new Promise((resolve) => {
     const socket = net.connect({ host: '0.0.0.0', port });
-    const done = (ok) => { socket.destroy(); resolve(ok); };
+    let settled = false;
+    const done = (ok) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(ok);
+    };
+    // Belt as well as braces: setTimeout covers an idle socket, the timer
+    // covers a connect that never resolves either way.
     socket.setTimeout(2_000, () => done(false));
+    const bail = setTimeout(() => done(false), 3_000);
+    bail.unref();
     socket.on('connect', () => done(true));
     socket.on('error', () => done(false));
   });

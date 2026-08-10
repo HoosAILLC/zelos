@@ -95,11 +95,14 @@ faulty.
 
 ### What you need
 
-**Node.js 22.5 or newer** — that is the version that added the built-in SQLite
-Zelos keeps everything in. **Node 26 is what it is developed and tested
-against**, and it is what you want; on Node 22 and 23 the SQLite module is still
-experimental and may need `node --experimental-sqlite zelos.mjs`. Get Node
-from [nodejs.org](https://nodejs.org) and take the defaults.
+**Node.js 22.16 or newer, or 24 or newer** — and the gap in the middle is real,
+not a typo. Zelos keeps everything in the SQLite built into Node, and its index
+needs that SQLite's full-text search extension. Node's build did not include it
+until **22.16**, and does not include it anywhere in the **Node 23** line. On a
+runtime without it Zelos will not start, and says which versions do work rather
+than failing partway through a migration. **Node 26 is what it is developed and
+tested against**, and it is what you want. Get Node from
+[nodejs.org](https://nodejs.org) and take the defaults.
 
 To check what you have, open Terminal (macOS/Linux) or PowerShell (Windows):
 

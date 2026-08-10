@@ -64,6 +64,34 @@ function tightenDbFiles(dbPath) {
   }
 }
 
+/**
+ * Whether this runtime's bundled SQLite has FTS5 compiled in.
+ *
+ * It is not a given, and the pattern is not a simple "new enough" line. The
+ * extension arrived in the 22 line at **22.16.0**, is absent from the whole 23
+ * line, and is present again from 24. A runtime without it fails deep inside
+ * the first migration with `no such module: fts5`, which reads like a corrupt
+ * install rather than what it is — so this is checked once, early, and
+ * answered in a sentence a person can act on.
+ */
+export function hasFts5(db) {
+  try {
+    db.exec('CREATE VIRTUAL TABLE IF NOT EXISTS zelos_fts5_probe USING fts5(probe)');
+    db.exec('DROP TABLE IF EXISTS zelos_fts5_probe');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export class UnsupportedRuntimeError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'UnsupportedRuntimeError';
+    this.code = 'ZELOS_NO_FTS5';
+  }
+}
+
 export function open(dbPath = paths().db) {
   if (dbPath !== ':memory:') {
     const dir = path.dirname(path.resolve(dbPath));
@@ -75,6 +103,17 @@ export function open(dbPath = paths().db) {
   db.exec('PRAGMA busy_timeout = 5000');
   // After the WAL pragma: that is what creates the sidecars.
   if (dbPath !== ':memory:') tightenDbFiles(dbPath);
+
+  if (!hasFts5(db)) {
+    try { db.close(); } catch { /* it is going away regardless */ }
+    throw new UnsupportedRuntimeError(
+      `This copy of Node (${process.version}) was built without SQLite's FTS5 extension, `
+      + 'which Zelos uses for its search index — so it cannot open the database at all.\n\n'
+      + 'Node 22.16 or newer, or Node 24 or newer, has it. The whole Node 23 line does not, '
+      + 'whatever its version number suggests.\n\n'
+      + 'Install a newer Node and run Zelos again; nothing in your Zelos home has been changed.',
+    );
+  }
   return db;
 }
 

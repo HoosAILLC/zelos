@@ -29,8 +29,11 @@ About 23,000 lines, and a test suite that is a substantial fraction of it.
 node zelos.mjs
 ```
 
-Node 22.13 or newer (that is where `node:sqlite` stops needing a flag). It opens in your browser
-at `127.0.0.1` and stays there. Nothing to install, no account, no server.
+Node **22.16+ or 24+**. Not "22 or newer": Zelos's index needs SQLite's FTS5 extension, and Node's
+bundled SQLite is built without it before 22.16 and throughout the whole Node 23 line. On a runtime
+that lacks it, Zelos refuses to start and names the versions that work.
+
+It opens in your browser at `127.0.0.1` and stays there. Nothing to install, no account, no server.
 
 ```bash
 zelos              # run it — this is the one you want

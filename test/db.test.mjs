@@ -21,6 +21,7 @@ const {
   startRun, finishRun, getRun, lastRun, listRuns,
   getKV, setKV, deleteKV,
   indexDoc, removeDoc, search, reindex, ftsQuery, resolveRef,
+  hasFts5,
 } = db_;
 
 let seq = 0;
@@ -615,4 +616,47 @@ test('resolveRef() maps a source ref back to its row', () => {
   assert.equal(resolveRef(db, `cap:${cap.id}`).text, 'Call the bank');
   assert.equal(resolveRef(db, 'msg:does-not-exist'), null);
   assert.equal(resolveRef(db, 'nonsense'), null);
+});
+
+/* ------------------------------------------------------------------ *
+ * The runtime Zelos will actually run on
+ * ------------------------------------------------------------------ */
+
+test('a runtime without FTS5 is refused with an instruction, not a stack trace', () => {
+  /* REGRESSION, and it took a cross-platform CI matrix to find: `node:sqlite`
+     stops needing a flag at 22.13, but the bundled SQLite is built WITHOUT the
+     FTS5 extension until 22.16 — and the entire Node 23 line lacks it too.
+     Measured, not read off a changelog: 22.15 and 23.11.1 fail, 22.16 and
+     24.0.0 pass. On such a runtime Zelos used to die inside its first
+     migration with "no such module: fts5", which reads like a corrupt install.
+
+     The probe is exercised here against a database object that answers the way
+     an old runtime does, because the test cannot install a second Node. */
+  assert.equal(typeof hasFts5, 'function');
+
+  const withoutFts5 = {
+    exec(sql) {
+      if (/USING\s+fts5/i.test(sql)) throw new Error('no such module: fts5');
+    },
+  };
+  assert.equal(hasFts5(withoutFts5), false, 'a runtime that refuses fts5 must be detected');
+
+  // And the real one, whatever this machine is running, must have it — if it
+  // did not, every other test in this file would already be failing.
+  const real = open(':memory:');
+  assert.equal(hasFts5(real), true);
+  close(real);
+});
+
+test('the FTS5 refusal names what to install, and does not leave a database behind', () => {
+  const err = new db_.UnsupportedRuntimeError('x');
+  assert.equal(err.code, 'ZELOS_NO_FTS5', 'the launcher branches on this code to skip the stack trace');
+
+  // The message is the whole remedy, so it has to carry both halves of the
+  // range — a floor alone would send a Node 23 user to a version that is older
+  // than the one they already have and still does not work.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zelos-fts5-'));
+  const probe = open(path.join(home, 'probe.db'));
+  close(probe);
+  fs.rmSync(home, { recursive: true, force: true });
 });

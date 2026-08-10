@@ -99,6 +99,37 @@ const CHARSET_ALIASES = new Map([
 ]);
 
 /** Bytes -> string. Unknown charsets fall back to lossy utf-8 rather than failing. */
+/**
+ * windows-1252, decoded here rather than by the runtime.
+ *
+ * It is the single most common non-UTF-8 charset in real mail, and whether
+ * Node decodes it correctly turns out to depend on which Node you have: v22.16,
+ * v22.19 and v24.0.0 all hand back the raw bytes for the 0x80–0x9F range, so a
+ * curly quote arrives as U+0093 instead of U+201C and the subject line reads as
+ * mojibake; v22.23 and v26 get it right. That is not a difference anyone
+ * downloading this should have to know about, and the table is sixteen lines.
+ *
+ * Only 0x80–0x9F needs saying: below it cp1252 is ASCII, above it Latin-1,
+ * and both of those map to the same code point as the byte itself. The five
+ * holes are the positions cp1252 leaves undefined, which become U+FFFD.
+ */
+const CP1252_HIGH = [
+  0x20ac, 0xfffd, 0x201a, 0x0192, 0x201e, 0x2026, 0x2020, 0x2021,
+  0x02c6, 0x2030, 0x0160, 0x2039, 0x0152, 0xfffd, 0x017d, 0xfffd,
+  0xfffd, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022, 0x2013, 0x2014,
+  0x02dc, 0x2122, 0x0161, 0x203a, 0x0153, 0xfffd, 0x017e, 0x0178,
+];
+
+function decodeCp1252(buf) {
+  let out = '';
+  for (const byte of buf) {
+    out += byte >= 0x80 && byte <= 0x9f
+      ? String.fromCharCode(CP1252_HIGH[byte - 0x80])
+      : String.fromCharCode(byte);
+  }
+  return out;
+}
+
 export function decodeCharset(input, charset) {
   const buf = toBuffer(input);
   const raw = String(charset ?? '')
@@ -107,6 +138,7 @@ export function decodeCharset(input, charset) {
     .replace(/^["']|["']$/g, '')
     .replace(/\*.*$/, ''); // RFC 2231 language suffix: "utf-8*en"
   const label = CHARSET_ALIASES.get(raw) ?? (raw || 'utf-8');
+  if (label === 'windows-1252') return decodeCp1252(buf);
   try {
     return new TextDecoder(label).decode(buf);
   } catch {
