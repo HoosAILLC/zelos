@@ -307,7 +307,13 @@ it. Useful for exports and for calendars that only publish downloads.
 Everything is in one folder: **`~/.zelos`** — that's
 `/Users/you/.zelos` on macOS, `/home/you/.zelos` on Linux,
 `C:\Users\you\.zelos` on Windows. (Use `--home` to put it somewhere else.)
-The folder is created readable by you and nobody else.
+
+On macOS and Linux that folder is created readable by you and nobody else. **On
+Windows it is not, and the difference is worth one sentence:** Windows has no
+POSIX file modes, so what guards the folder there is the NTFS ACL your user
+profile already carries, which also lets Administrators read it.
+[SECURITY.md § 5](SECURITY.md#5-what-leaves-your-machine) states that exactly,
+and is the only place it is stated.
 
 | File | What's in it |
 | --- | --- |

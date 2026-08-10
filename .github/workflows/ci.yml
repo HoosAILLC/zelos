@@ -55,6 +55,14 @@ jobs:
       # a few on a Mac. This flag exists to catch a HANG, not to enforce a
       # performance budget, and 60s was an arbitrary number that turned the
       # slowest honest test in the suite into a red build.
+      # The Windows legs are the only place the DPAPI backend is ever exercised
+      # for real. test/secrets.test.mjs gates that one test on `win32` AND `CI`,
+      # so a developer's own credential store is never written to; GitHub sets
+      # CI=true for every step of every job, including through `shell: bash` on
+      # Windows, so no `env:` entry is needed here and none should be added —
+      # setting CI by hand elsewhere is exactly what that gate is guarding
+      # against. If Windows ever stops detecting DPAPI and silently falls back
+      # to the encrypted file, that test is what turns it red.
       - name: Run the suite
         shell: bash
         run: node --test --test-timeout=180000 test/*.test.mjs

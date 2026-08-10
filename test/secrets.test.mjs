@@ -296,3 +296,137 @@ test('the index file records refs and nothing else', async (t) => {
     await deleteSecret(ref).catch(() => {});
   }
 });
+
+/* ---------------------------------------- the live Windows DPAPI backend */
+
+/**
+ * Why this one test is allowed to let detection run.
+ *
+ * docs/SECURITY.md tells a Windows user that their keys are held by DPAPI at
+ * CurrentUser scope. Until this test, nothing proved it. `describeCommand` is
+ * checked above, but that only asserts the *shape* of an argv; the store and
+ * read path in `secrets.mjs` runs solely when `detect()` actually returns
+ * 'windows-dpapi'.
+ *
+ * The two "native backend" tests above do let detection run — but both of them
+ * return quietly when it lands on 'encrypted-file', so a green Windows leg is
+ * equally consistent with DPAPI working and with Windows never having reached
+ * DPAPI at all. That is the gap: a documented security property whose evidence
+ * cannot distinguish "it works" from "it was skipped".
+ *
+ * So this test asserts the detected backend rather than tolerating it, and then
+ * puts a real secret through PowerShell. Letting detection run is the deliberate
+ * exception to the force-the-file-backend rule that test/repo.test.mjs enforces,
+ * and it is only safe because of the gate below: `win32` AND `CI` together mean
+ * a throwaway GitHub runner whose profile is destroyed with the job. A
+ * developer's own Windows box has neither, so their DPAPI store is never written
+ * to. If you are tempted to relax this gate, the thing you would be relaxing is
+ * "Zelos's test suite does not write into your credential store".
+ */
+const DPAPI_LIVE_ONLY = process.platform === 'win32' && process.env.CI
+  ? false
+  : 'the live DPAPI round-trip runs only on Windows CI, because letting the backend '
+    + `auto-detect writes into the running account's real DPAPI store (platform=${process.platform}, `
+    + `CI=${process.env.CI ? 'set' : 'unset'})`;
+
+/**
+ * A ref no real installation could ever produce. Zelos's own refs are
+ * "model.default" and "mail.m_<hex>"; nothing generates this shape, so a blob
+ * left behind by a crashed run is identifiable as litter at a glance, and a
+ * cleanup that misfires cannot take a real secret with it.
+ */
+const DPAPI_REF = `zelos-ci-throwaway.dpapi-live.${crypto.randomBytes(6).toString('hex')}`;
+
+/**
+ * Everything a naive implementation gets wrong, in one string: both kinds of
+ * quote, the two characters PowerShell expands inside a double-quoted string
+ * (`$` and a backtick), a backslash, an embedded newline, Latin-1 accents, a
+ * character that exists in no single-byte code page, and several kilobytes of
+ * tail so the value could not have fitted in a command line even if someone
+ * tried to put it there.
+ *
+ * It deliberately does NOT end in a newline. The value reaches PowerShell on
+ * stdin newline-terminated, so the script has to strip that terminator, and it
+ * does so with `-replace '\r?\n$',''` — which in .NET removes the whole trailing
+ * run of line breaks, not just the one Zelos added. A value that genuinely ends
+ * in a newline therefore cannot survive this backend. That is a defect in the
+ * backend rather than in this test, and asserting it here would be writing the
+ * bug down as correct behaviour.
+ */
+const DPAPI_VALUE = [
+  'sk-ant-api03-"double" and \'single\' quotes',
+  'a $variable, a `backtick`, a \\backslash\\ and a 100% percent',
+  'accents: ü é ñ, and a check mark outside every single-byte page: ✓',
+  `long tail: ${'zelos-'.repeat(600)}end`,
+].join('\n');
+
+/**
+ * Node's own diff truncates a multi-kilobyte string, and the failure this test
+ * is most likely to catch is an encoding one — where the strings look identical
+ * in a terminal and differ by a code point. So report the first divergence by
+ * number, with a little context either side.
+ */
+function firstDifference(expected, actual) {
+  if (typeof actual !== 'string') return `got ${typeof actual} (${JSON.stringify(actual)}) instead of a string`;
+  const codes = (s, at) => [...s.slice(Math.max(0, at - 8), at + 8)]
+    .map((ch) => `${JSON.stringify(ch)}=U+${ch.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')}`)
+    .join(' ');
+  for (let i = 0; i < Math.max(expected.length, actual.length); i += 1) {
+    if (expected[i] === actual[i]) continue;
+    return `first difference at index ${i} of ${expected.length}\n`
+      + `  expected: ${codes(expected, i)}\n`
+      + `  actual:   ${codes(actual, i)}`;
+  }
+  return `lengths differ: expected ${expected.length}, got ${actual.length}`;
+}
+
+test('Windows CI: DPAPI is the detected backend and really round-trips a secret', { skip: DPAPI_LIVE_ONLY }, async (t) => {
+  useHome('dpapi-live');
+  unforce();
+
+  // Registered before anything is written, so it still runs when an assertion
+  // below throws. A DPAPI blob lives in %LOCALAPPDATA%, outside the temp home
+  // that test.after removes, so nothing else would ever clear it.
+  t.after(async () => { await deleteSecret(DPAPI_REF).catch(() => {}); });
+
+  const b = await backend();
+  assert.equal(b.name, 'windows-dpapi',
+    `Windows detection chose ${b.name}. If powershell.exe cannot be probed on this machine, Zelos silently `
+    + 'stores keys in the encrypted file while docs/SECURITY.md and the note in the UI both tell the user '
+    + 'their operating system is holding them. That mismatch is the defect, not this assertion.');
+  assert.match(b.note, /DPAPI/);
+
+  // The module's own idea of where the blob goes, rather than a second copy of
+  // that path logic here — a test that guessed the path could pass against a
+  // backend that had written somewhere else entirely.
+  const blob = describeCommand({ name: 'windows-dpapi', action: 'set', ref: DPAPI_REF }).env.ZELOS_SECRET_FILE;
+
+  await setSecret(DPAPI_REF, DPAPI_VALUE);
+
+  assert.ok(fs.existsSync(blob), `setSecret reported success but wrote no blob at ${blob}`);
+  // WriteAllText emits no BOM on .NET Framework, but strip one anyway: a BOM
+  // would fail the hex check below for a reason that has nothing to do with
+  // whether the secret survived.
+  const onDisk = fs.readFileSync(blob, 'utf8').replace(/^\uFEFF/, '').trim();
+  assert.match(onDisk, /^[0-9A-Fa-f]+$/, 'ConvertFrom-SecureString should leave a hex DPAPI blob, nothing else');
+  for (const fragment of ['sk-ant-api03', 'backslash', 'check mark']) {
+    assert.ok(!onDisk.includes(fragment), `the DPAPI blob contains plaintext (${fragment}) — it was not encrypted`);
+  }
+
+  const got = await getSecret(DPAPI_REF);
+  assert.equal(got, DPAPI_VALUE,
+    `DPAPI did not hand back what it was given.\n${firstDifference(DPAPI_VALUE, got)}\n`
+    + 'The usual cause is console encoding: the value crosses stdin and stdout as bytes, and PowerShell '
+    + 'decodes them with the console code page rather than UTF-8 unless the script sets both '
+    + '[Console]::InputEncoding and [Console]::OutputEncoding to UTF8.');
+
+  const refs = await listRefs();
+  assert.ok(refs.includes(DPAPI_REF), 'a stored ref must appear in listRefs');
+  for (const r of refs) assert.notEqual(r, DPAPI_VALUE, 'listRefs returns refs, never values');
+
+  assert.deepEqual(await deleteSecret(DPAPI_REF), { ok: true, deleted: true });
+  assert.equal(fs.existsSync(blob), false, 'delete must remove the DPAPI blob, not just forget the ref');
+  assert.equal(await getSecret(DPAPI_REF), null, 'a deleted secret must read back as absent');
+  assert.ok(!(await listRefs()).includes(DPAPI_REF), 'a deleted ref must leave the index');
+  assert.deepEqual(await deleteSecret(DPAPI_REF), { ok: true, deleted: false }, 'deleting twice is not an error');
+});

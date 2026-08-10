@@ -20,8 +20,9 @@ permanently, and it is the same code as everything else here.
 
 ## Path 1 — `npx zelos-app`
 
-You need **Node.js 22.5 or newer** (see the next section for why, and how to
-check). Then:
+You need **Node.js 22.16 or newer, or 24 or newer** — and not the Node 23 line,
+which is a real exclusion rather than a typo (the next section says why, and how
+to check what you have). Then:
 
 ```
 npx zelos-app
@@ -181,34 +182,56 @@ Press `Ctrl-C` in the terminal to stop it.
 - No second copy of anything. The shell runs the Zelos core **inside its own
   process** — it does not launch a background Node.
 
+### Where a build comes from
+
+There is no download page in this repository, and no release binary committed to
+it. Builds come from one of two places.
+
+**A GitHub Actions run.** `.github/workflows/desktop.yml` builds the installers
+on a real Windows runner and a real macOS runner, either when a `v*` tag is
+pushed or when somebody starts the workflow by hand. It runs the whole test
+suite *before* it packages anything and fails the job rather than shipping an
+installer built from a failing tree. What comes out is attached to that run as
+an artifact:
+
+```
+Zelos-1.0.0-arm64.dmg          Apple Silicon
+Zelos-1.0.0-x64.dmg            Intel Macs
+Zelos-1.0.0-setup-x64.exe      Windows, 64-bit — ordinary PCs
+Zelos-1.0.0-setup-arm64.exe    Windows on ARM
+```
+
+Windows also gets a third installer from the same run, carrying both
+architectures in one larger file; take it if you are not sure which machine you
+are on. (That is why the workflow collects `*setup*.exe` rather than two fixed
+names.)
+
+A run artifact is not a public download link. GitHub hands artifacts only to
+signed-in users, and deletes them once the repository's retention window is up —
+90 days unless someone has changed it. If that does not suit you, build it
+yourself; it is the same code and the same configuration the runner uses.
+
 ### Building it yourself
 
-There are no published binaries to download from anywhere in this repository.
-You build it, or you take Path 1 or Path 2. Building needs one `npm install`,
-and it is the only one in the project:
+Building needs one `npm install`, and it is the only one in the project:
 
 ```
 cd desktop
 npm install          # downloads Electron (~120 MB) and electron-builder
 npm start            # run it now, unpackaged, to see if you like it
 npm run dist:mac     # build the macOS .dmg files  (must be run on a Mac)
-npm run dist:win     # build the Windows installer (run it on Windows)
+npm run dist:win     # build the Windows installers (run it on Windows)
 ```
 
-Finished installers land in `desktop/dist/`:
+Finished installers land in `desktop/dist/`, named as above.
 
-```
-Zelos-1.0.0-arm64.dmg          Apple Silicon
-Zelos-1.0.0-x64.dmg            Intel Macs
-Zelos-1.0.0-setup-x64.exe      Windows
-Zelos-1.0.0-setup-arm64.exe    Windows on ARM
-```
-
-Two honest limits on cross-building:
+Two honest limits on cross-building, and they are the reason the workflow above
+exists at all:
 
 - **A macOS `.dmg` can only be built on a Mac.** It needs Apple's own tools.
-- **Building the Windows installer from a Mac or Linux needs Wine**, and it
-  frequently does not work. Build it on Windows.
+- **Building the Windows installers from a Mac or Linux needs Wine**, and it
+  frequently does not work. Build them on Windows, or let the Windows runner do
+  it.
 
 `npm install` here installs Electron and electron-builder as *development*
 dependencies of the shell only. Nothing from npm ends up in the Zelos core,
@@ -278,28 +301,73 @@ that was modified after it was signed, which invalidates the signature.
 
 ## Installing on Windows — and what you will actually see
 
-Same story, different wording. The installer is unsigned, so it has no
-reputation with Microsoft.
+**These builds are not code-signed.** A code-signing certificate is a bill that
+arrives every year, and this project does not pay it, so the installer reaches
+you with no publisher name attached and no reputation with Microsoft. Windows
+will say so, in a dialog designed to stop you, and it is right to. This is not a
+bug to work around quietly; it is the trade, and you should know exactly what
+you are agreeing to before you click past a security warning. The reason it is
+reasonable to click past *this* one is that you can read the source and build
+the installer yourself.
 
-1. **The browser may block the download.** Edge says *"…setup.exe was blocked
-   because it could harm your device"*; Chrome says *"…isn't commonly
-   downloaded"*. Open the downloads list, click the **…** next to the file, and
-   choose **Keep** (then **Keep anyway** on the follow-up).
-2. **Running it trips SmartScreen.** A blue full-window dialog:
+1. **Take the installer that matches your machine.**
+   `Zelos-1.0.0-setup-x64.exe` for an ordinary PC, `-arm64` for Windows on ARM,
+   or the combined installer if you are not sure. The wrong one either runs
+   slowly under emulation or does not run at all.
+2. **Your browser may refuse to keep the file.** Edge says *"…setup.exe was
+   blocked because it could harm your device"*; Chrome says *"…isn't commonly
+   downloaded"*. Open the downloads list, click the **…** beside the file, and
+   choose **Keep** — then **Keep anyway** on the confirmation that follows.
+3. **Run it, and Windows stops it.** A blue full-window dialog:
 
    > **Windows protected your PC**
    > Microsoft Defender SmartScreen prevented an unrecognized app from starting.
    > Running this app might put your PC at risk.
    > `Don't run`
 
-   Click **More info** — it will show *Publisher: Unknown publisher* — then
-   **Run anyway**.
-3. The installer is per-user, so Windows does not ask for an administrator
-   password. It installs to
-   `C:\Users\<you>\AppData\Local\Programs\Zelos` and offers a Start menu and
-   desktop shortcut.
+   **The button you need is not on screen yet.** The only other thing on that
+   dialog is a small **More info** link under the message text. Click it. It
+   expands to show the file name and *Publisher: Unknown publisher*, and a
+   **Run anyway** button appears next to **Don't run**. Click **Run anyway**.
 
-To uninstall: **Settings → Apps → Installed apps → Zelos → Uninstall**.
+   That is SmartScreen's entire objection: it has not seen this file before and
+   nobody it recognises vouches for it. Signing would replace *Unknown
+   publisher* with a name. It would not make the app safer — it would make it
+   more expensive to hand out.
+4. **The installer does not need an administrator.** It installs per-user, so
+   Windows does not ask for an admin password, and it goes to
+   `C:\Users\<you>\AppData\Local\Programs\Zelos`. You can change that path
+   during setup. It offers a Start menu entry and a desktop shortcut, and
+   launches Zelos when it finishes.
+
+The warning is about the *downloaded file*, so it is the installer that trips
+it. Starting Zelos afterwards from the Start menu should not raise it again.
+
+**If you would rather deal with it before running anything**, Windows keeps a
+"this came from the internet" marker on the file, exactly as macOS does, and you
+can clear it first: right-click the `.exe` → **Properties** → tick **Unblock**
+at the bottom of the **General** tab → **OK**. In PowerShell that is:
+
+```
+Unblock-File .\Zelos-1.0.0-setup-x64.exe
+```
+
+That marker is a real safety mechanism — clear it only from something you built
+yourself or fetched deliberately, and never because a web page told you to.
+
+To uninstall: **Settings → Apps → Installed apps → Zelos → Uninstall**. It
+leaves `C:\Users\<you>\.zelos` alone, on purpose — see **Where your things
+live** below.
+
+### One thing that is genuinely weaker on Windows
+
+Zelos asks for `0700` on its home folder and `0600` on every file it writes
+there. On Windows those calls do almost nothing — there are no POSIX modes to
+set — so the protection around your mail cache is the NTFS ACL your user profile
+already carries, which also lets Administrators read it.
+[SECURITY.md § 5](SECURITY.md#5-what-leaves-your-machine) states that properly
+and is the one place it is kept up to date; if you are on a machine you do not
+solely administer, read it before you connect a mail account.
 
 ---
 
@@ -345,6 +413,16 @@ directly.
   their job. You are choosing to trust a build; the reason that is a reasonable
   choice here is that you can read the source and, if you want, produce the
   build yourself.
+- **Windows is built and tested, but nobody has lived with it.** The suite runs
+  on Windows as well as macOS and Linux, on four Node versions each, on every
+  push to `main` and every pull request — and the installers are packaged on a
+  Windows runner that has to go green first. That says the code runs there and
+  the package builds. It does not say the experience is good: no person has
+  installed Zelos on Windows and used it for a week. The tray behaviour, the
+  shortcuts and the dialog wording above are what the tests, the build
+  configuration and Windows itself say they are, not something anyone has sat
+  and watched. If something is wrong on that side, it will not already have been
+  noticed — which is a reason to report it, not a reason to assume it is you.
 - **The app is shipped unpacked, on purpose.** Most Electron apps bundle their
   code into an opaque `app.asar` archive. Zelos does not: `asar` is off in the
   build configuration. Open `/Applications/Zelos.app/Contents/Resources/`
@@ -374,6 +452,8 @@ directly.
 - **Architecture matters on both platforms.** Take the `arm64` build for Apple
   Silicon and Windows on ARM, and the `x64` build for Intel Macs and ordinary
   PCs. The wrong one either runs slowly under emulation or does not run at all.
+  Windows is the one place you can dodge the question, by taking the combined
+  installer instead; it is larger because it contains both.
 
 ---
 
