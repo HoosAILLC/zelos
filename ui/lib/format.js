@@ -6,7 +6,10 @@
  * and "you owe them", which is the same fact in a sentence you do not decode.
  */
 
-import { dayKey, daysBetweenKeys, formatTime, formatDay, humanDelta, instant, minutesIntoDay } from './time.js';
+import {
+  dayKey, daysBetweenKeys, dueInstant, formatTime, formatDay, humanDelta, instant,
+  localTimezone, minutesIntoDay, toZonedISO, wallClock,
+} from './time.js';
 
 export const BUCKETS = ['now', 'today', 'soon', 'waiting', 'promised', 'note', 'money'];
 
@@ -53,20 +56,36 @@ export function carriedFor(item, todayKeyStr) {
   return `carried ${days} days`;
 }
 
-/** "due in 2h" / "due Tue, Aug 11" / "" — one line, never both forms at once. */
-export function dueLabel(item, now = Date.now()) {
+/**
+ * "due in 2h" / "due today" / "due Tue, Aug 11" / "" — one line, never both
+ * forms at once.
+ *
+ * A deadline written as a bare date is a DAY, and both branches below treat it
+ * as one. Counting hours to it ("due in 9h") states a precision the promise
+ * never had, and — before dueInstant existed — counted them from UTC midnight,
+ * so an item due today read "due 16h ago" all day long in any western zone.
+ */
+export function dueLabel(item, now = Date.now(), tz = localTimezone()) {
   if (!item?.due_at) return '';
-  const at = instant(item.due_at);
+  const at = dueInstant(item.due_at, tz);
   if (at === null) return '';
+  if (wallClock(item.due_at)?.dateOnly) {
+    const days = daysBetweenKeys(dayKey(toZonedISO(now, tz)), dayKey(item.due_at));
+    if (days === 0) return 'due today';
+    if (days === 1) return 'due tomorrow';
+    if (days === -1) return 'due yesterday';
+    return `due ${formatDay(item.due_at)}`;
+  }
   const withinADay = Math.abs(at - now) < 36 * 3_600_000;
   if (withinADay) return `due ${humanDelta(item.due_at, now)}`;
   const time = formatTime(item.due_at);
   return `due ${formatDay(item.due_at)}${time ? ` · ${time}` : ''}`;
 }
 
-export function isOverdue(item, now = Date.now()) {
+/** Late — which, for a bare date, means its day is over. See dueInstant. */
+export function isOverdue(item, now = Date.now(), tz = localTimezone()) {
   if (!item?.due_at) return false;
-  const at = instant(item.due_at);
+  const at = dueInstant(item.due_at, tz);
   return at !== null && at < now;
 }
 
@@ -205,4 +224,37 @@ export function sweepSummary(run) {
 
 export function plural(n, one, many = `${one}s`) {
   return `${n} ${n === 1 ? one : many}`;
+}
+
+/** "1.2k" / "3.4M" — a size, not an accountancy. Under a thousand is exact. */
+export function compactCount(n) {
+  const v = Math.max(0, Math.round(Number(n) || 0));
+  if (v < 1_000) return String(v);
+  if (v < 1_000_000) return `${(v / 1_000).toFixed(v < 10_000 ? 1 : 0)}k`;
+  return `${(v / 1_000_000).toFixed(v < 10_000_000 ? 1 : 0)}M`;
+}
+
+/**
+ * The day's token spend, worded — or '' when there is nothing honest to say.
+ *
+ * Two silences are deliberate. There is no dollar figure: Zelos knows how many
+ * tokens went to the model and has no idea what anyone is paying for them, and
+ * a made-up price in the chrome would be the most quietly damaging number on
+ * the screen. And an absent counter renders NOTHING rather than "0 tokens in" —
+ * a database written before the counter existed, or a machine that has not
+ * swept yet, has no spend to report, which is not the same as a spend of zero.
+ *
+ * The payload is read tolerantly because the sweep engine owns its shape:
+ * either `{in, out}` or the run's own `{tokensIn, tokensOut}` reads correctly.
+ * A counter that names the day it covers is dropped once that day is over,
+ * since a rolling total is only "today's" while today is still today.
+ */
+export function tokenLine(tokens, todayKeyStr = null) {
+  if (!tokens || typeof tokens !== 'object') return '';
+  const day = typeof tokens.day === 'string' ? tokens.day : null;
+  if (day && todayKeyStr && day !== todayKeyStr) return '';
+  const into = Number(tokens.in ?? tokens.tokensIn ?? 0) || 0;
+  const outOf = Number(tokens.out ?? tokens.tokensOut ?? 0) || 0;
+  if (into <= 0 && outOf <= 0) return '';
+  return `${compactCount(into)} tokens in · ${compactCount(outOf)} out`;
 }

@@ -353,8 +353,18 @@ directly.
 - **No auto-update, at all.** The app never contacts a server to ask whether it
   is old. Check back here yourself when you want a newer version, and install it
   the same way.
-- **One copy at a time.** Starting Zelos while it is already running just
-  brings the existing window forward — two copies would fight over one database.
+- **One copy at a time, and it tells you rather than stopping you.** Launching
+  the app while the app is already running brings the existing window forward.
+  The other pairing — a `zelos` running in a terminal and the app in the tray,
+  both pointed at the same home — is caught differently: both write a
+  `zelos.lock` in the data directory, and the second one to arrive *warns* you,
+  naming what it thinks is already running and where its board is. It does not
+  refuse. That check reads a file to guess whether another process is alive,
+  and a guess is occasionally wrong; a wrong guess that could stop you opening
+  your own app would be a worse bug than the overlap it prevents. If you know
+  nothing else is running, the warning tells you which file to delete. What the
+  overlap actually costs, if you do run two: the same mail fetched twice and
+  the same model calls paid for twice.
 - **The desktop board is not reachable from your browser.** The shell keeps the
   session token to itself and never prints it. If you want the board in your own
   browser, use Path 1 or Path 2, where the launcher prints the URL for you.

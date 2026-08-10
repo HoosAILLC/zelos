@@ -47,6 +47,41 @@ const IMAP_HINTS = [
   { host: '127.0.0.1', label: 'Proton Bridge', note: 'Proton Bridge listens on 127.0.0.1:1143 without TLS.' },
 ];
 
+/**
+ * The password question, in words rather than in a boolean.
+ *
+ * core/config.mjs stores `requireTls` three ways on purpose: `null` means
+ * "decide from the address" — required everywhere except a server on this
+ * machine — while `true` and `false` are standing instructions that outlive the
+ * address they were given for. A checkbox has two states and would have to
+ * flatten "decide" into one of them, which is the sort of small lie that turns
+ * into a password sent in the clear to a host nobody meant to excuse. So it is
+ * three named choices, and the safe one is what an account gets by default.
+ *
+ * The labels say what the choice costs, not what protocol it selects. Nobody
+ * configuring their mail should have to know what STARTTLS is to understand
+ * that the third option lets a stranger on the café wifi read their password.
+ */
+export const TLS_CHOICES = [
+  { value: 'auto', label: 'Decide from the address (recommended)' },
+  { value: 'require', label: 'Never send my password unencrypted' },
+  { value: 'allow', label: 'Let this one server take it unencrypted' },
+];
+
+/** The stored value for a chosen option. Anything unrecognised is the safe one. */
+export function requireTlsFor(choice) {
+  if (choice === 'require') return true;
+  if (choice === 'allow') return false;
+  return null;
+}
+
+/** The option to show for a stored value. Only a real boolean moves it off "auto". */
+export function tlsChoiceFor(requireTls) {
+  if (requireTls === true) return 'require';
+  if (requireTls === false) return 'allow';
+  return 'auto';
+}
+
 /* ------------------------------------------------------------ form helpers */
 
 export function field(labelText, control, { hint = null, id = null } = {}) {
@@ -364,6 +399,13 @@ function mailForm(account, { onSaved, onCancel }) {
 
   let secure = draft.secure !== false;
 
+  const tlsSelect = select(TLS_CHOICES, { value: tlsChoiceFor(draft.requireTls) });
+  // Read off the control at the moment it is needed rather than mirrored into a
+  // variable on change: saving and testing must never be able to disagree about
+  // what is on screen, and this is the one setting where disagreeing means the
+  // password goes out under rules the user was never shown.
+  const requireTls = () => requireTlsFor(tlsSelect.value);
+
   async function persistPassword() {
     if (!passInput.value) return;
     await api.setSecret(draft.keyRef, passInput.value);
@@ -379,6 +421,9 @@ function mailForm(account, { onSaved, onCancel }) {
       field('Port', portInput),
       checkbox('TLS on connect (port 993)', { checked: secure, onChange: (v) => { secure = v; } }),
     ]),
+    field('Sending your password', tlsSelect, {
+      hint: 'Zelos will not send your password until the connection is encrypted. Left to decide, it insists on that everywhere except a server running on this machine — which is where Proton Bridge and its kind live, and the only reason an unencrypted connection is still offered at all. Allow one anywhere else and anyone sharing your network, or sitting anywhere between you and your mail server, can read the password and the mail.',
+    }),
     field('Username', userInput),
     field('Password', passInput, {
       hint: 'Goes straight to your OS keychain. It is never written to config.json, never passed on a command line, and never logged.',
@@ -400,7 +445,7 @@ function mailForm(account, { onSaved, onCancel }) {
           try {
             await persistPassword();
             const others = (state.config.mail || []).filter((m) => m.id !== draft.id);
-            await saveConfig({ mail: [...others, { ...draft, secure }] });
+            await saveConfig({ mail: [...others, { ...draft, secure, requireTls: requireTls() }] });
             status.good('Saved.');
             onSaved();
           } catch (err) {
@@ -414,12 +459,17 @@ function mailForm(account, { onSaved, onCancel }) {
           status.working(`Connecting to ${draft.host}…`);
           try {
             await persistPassword();
+            // `requireTls` goes with it, or this is not a test of this account.
+            // Without it the button connected under looser rules than the sweep
+            // will, so the one moment a user is told "this works" was the moment
+            // least like the 07:00 run — and the only one they are awake for.
             const result = await api.testMail({
               host: draft.host,
               port: draft.port,
               secure,
               user: draft.user,
               keyRef: draft.keyRef,
+              requireTls: requireTls(),
             });
             if (result.ok) status.good(`Connected. ${plural((result.mailboxes || []).length, 'mailbox', 'mailboxes')} visible.`);
             else status.bad(result.error || 'The server refused the connection.');
@@ -494,6 +544,10 @@ export function mailPanel({ compact = false, onDone = null, rerender } = {}) {
         host: '',
         port: 993,
         secure: true,
+        // Null, not false: a new account has not excused anything yet, and the
+        // blank this form opens on has to be the same blank core/config.mjs
+        // would have written.
+        requireTls: null,
         user: '',
         keyRef: `mail.${id}`,
         mailboxes: ['INBOX'],

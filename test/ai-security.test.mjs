@@ -61,6 +61,7 @@ const ai = await import('../core/ai-access.mjs');
 const { loadConfig, saveConfig, paths } = await import('../core/config.mjs');
 const { createServer, listen } = await import('../core/server.mjs');
 const { createLogger, redact } = await import('../core/log.mjs');
+const { setSecret, deleteSecret } = await import('../core/secrets.mjs');
 
 const OPEN_DBS = [];
 const OPEN_SERVERS = [];
@@ -196,6 +197,9 @@ describe('scope escape: with mail.bodies off, nothing gets a body out', () => {
     { offset: -5, limit: 50 }, { skip: -1 },
     { bucket: 'now' }, { state: 'open' }, { state: 'dismissed' },
     { query: 'canarymessagebody' },
+    // The owner's own note, by a word that exists nowhere else. Under the
+    // widened search this came back in full to anything holding the board.
+    { query: 'canarycapturetext' },
     { query: 'retainage wire' },
     { query: 'invoice', kinds: ['message'] },
     { query: 'invoice', kinds: ['message', 'item', 'event', 'capture'] },
@@ -236,8 +240,13 @@ describe('scope escape: with mail.bodies off, nothing gets a body out', () => {
           }
           if (!on.includes('board')) {
             assert.equal(wire.includes(C.itemWhy), false, `${name} leaked board text without the board scope`);
-            assert.equal(wire.includes(C.captureText), false, `${name} leaked a capture without the board scope`);
           }
+          // A capture is the owner's own note and no scope in the closed set
+          // owns one, so this holds for every combination rather than only for
+          // the ones without the board. It did not: `board` used to own
+          // captures, and a board grant handed the raw notes over verbatim.
+          assert.equal(wire.includes(C.captureText), false,
+            `${name} leaked a capture (scopes: ${on.join('+') || 'none'}, args: ${JSON.stringify(base)})`);
         }
       }
     }
@@ -278,12 +287,16 @@ describe('a disabled scope is absent and refused, both', () => {
     assert.deepEqual(listed.sort(), mcp.TOOLS.map((t) => t.name).sort());
 
     for (const tool of mcp.TOOLS) {
+      // A tool is gone only when EVERY scope that grants it is off. All but
+      // zelos_search have exactly one; taking the list from the registry means
+      // a tool that gains a second grant cannot quietly stop being checked.
+      const granting = tool.scopes?.length ? tool.scopes : [tool.scope];
       for (const s of mcp.SCOPES) scopes[s] = true;
-      scopes[tool.scope] = false;
-      if (tool.scope === 'mail.metadata') scopes['mail.bodies'] = false; // it implies metadata
+      for (const s of granting) scopes[s] = false;
+      if (granting.includes('mail.metadata')) scopes['mail.bodies'] = false; // it implies metadata
 
       const now = (await mcp.handle(rpc('tools/list'), live)).result.tools.map((t) => t.name);
-      assert.equal(now.includes(tool.name), false, `${tool.name} is still listed with ${tool.scope} off`);
+      assert.equal(now.includes(tool.name), false, `${tool.name} is still listed with ${granting.join(', ')} off`);
 
       const res = await mcp.handle(callRpc(tool.name), live);
       assert.equal(res.error.code, mcp.ERROR_CODES.SCOPE_DENIED,
@@ -601,6 +614,149 @@ describe('auth: the two credentials are not interchangeable', () => {
       await zombie.text();
       assert.equal(zombie.status, 401);
     } finally { process.env.ZELOS_HOME = previous; }
+  });
+});
+
+/* ================================================================== *
+ * 3b. The other three writers of ai.tokens
+ *
+ * `touchToken` was hardened against a stale token list; its siblings were not.
+ * Each of them takes a config snapshot, does something slow, and then saves —
+ * and a save replaces the whole `ai.tokens` array, so whatever the snapshot
+ * said about the tokens it was not touching becomes the truth on disk.
+ *
+ * The slow part is the secret store. On macOS every read or write is a spawn of
+ * /usr/bin/security; on the encrypted-file backend these tests run against, it
+ * costs nothing at all, and a race with a zero-width window cannot be observed.
+ * So the store is passed in, and it holds the door open on purpose.
+ * ================================================================== */
+
+describe('a config snapshot cannot undo what happened while it was held', () => {
+  /** A store whose write parks until the test lets it through. */
+  function heldStore() {
+    let release;
+    const held = new Promise((resolve) => { release = resolve; });
+    return {
+      release,
+      store: {
+        setSecret: async (ref, value) => { await held; return setSecret(ref, value); },
+        deleteSecret: async (ref) => { await held; return deleteSecret(ref); },
+      },
+    };
+  }
+
+  /** A home of this test's own, with AI access on and no tokens yet. */
+  function fresh(name) {
+    const home = path.join(SANDBOX, `home-${name}-${crypto.randomBytes(4).toString('hex')}`);
+    const previous = process.env.ZELOS_HOME;
+    process.env.ZELOS_HOME = home;
+    saveConfig({ ai: { enabled: true, scopes: scopeMap(['board']), tokens: [], maxRows: 50 } });
+    return { home, restore: () => { process.env.ZELOS_HOME = previous; } };
+  }
+
+  const idsOnDisk = () => loadConfig().ai.tokens.map((t) => t.id).sort();
+
+  test('REGRESSION: a revoke that lands inside a mint stays revoked', async () => {
+    // mintToken awaited the secret store holding the token list it started
+    // with, then wrote that list back. A revocation in the window was undone:
+    // the record reappeared in config.json and the panel listed a token the
+    // user had thrown away.
+    const r = fresh('mint-race');
+    try {
+      const keep = await ai.mintToken({ label: 'Keep', config: loadConfig() });
+      const doomed = await ai.mintToken({ label: 'Doomed', config: loadConfig() });
+      const stale = loadConfig(); // both tokens, taken before the revocation
+
+      const held = heldStore();
+      const minting = ai.mintToken({ label: 'Late', config: stale, store: held.store });
+      await ai.revokeToken(doomed.token.id, { config: stale });
+      assert.deepEqual(idsOnDisk(), [keep.token.id], 'the revoke itself has to have landed first');
+
+      held.release();
+      const late = await minting;
+
+      assert.deepEqual(idsOnDisk(), [keep.token.id, late.token.id].sort(),
+        'the mint wrote its pre-revocation token list back over the revocation');
+      assert.deepEqual(ai.listTokens(loadConfig()).map((t) => t.id).sort(), [keep.token.id, late.token.id].sort(),
+        'the panel lists a token the user revoked');
+      assert.equal((await ai.verifyToken(doomed.value, { config: loadConfig() })).ok, false);
+      assert.equal((await ai.verifyToken(late.value, { config: loadConfig() })).ok, true,
+        'the token the mint returned has to actually work');
+    } finally { r.restore(); }
+  });
+
+  test('REGRESSION: a mint that lands inside a revoke is not erased by it', async () => {
+    // The same hole from the other side. revokeToken filtered one id out of its
+    // snapshot's array and saved the array, so a token minted while the delete
+    // ran vanished from config.json — while its secret stayed in the store,
+    // which is an orphan nobody can see well enough to clean up.
+    const r = fresh('revoke-race');
+    try {
+      const keep = await ai.mintToken({ label: 'Keep', config: loadConfig() });
+      const doomed = await ai.mintToken({ label: 'Doomed', config: loadConfig() });
+      const stale = loadConfig();
+
+      const held = heldStore();
+      const revoking = ai.revokeToken(doomed.token.id, { config: stale, store: held.store });
+      const late = await ai.mintToken({ label: 'Late', config: stale });
+      held.release();
+      assert.equal((await revoking).revoked, true);
+
+      assert.deepEqual(idsOnDisk(), [keep.token.id, late.token.id].sort(),
+        'the revoke wrote its snapshot back and deleted a token minted beside it');
+      assert.equal((await ai.verifyToken(late.value, { config: loadConfig() })).ok, true);
+      assert.equal((await ai.verifyToken(doomed.value, { config: loadConfig() })).ok, false);
+    } finally { r.restore(); }
+  });
+
+  test('REGRESSION: flicking the master switch does not restore a revoked token', async () => {
+    // The HTTP layer holds one config snapshot for the life of the process and
+    // handed it to setAiSettings, which wrote the whole `ai` block — token list
+    // included — every time somebody touched a checkbox in Settings.
+    const r = fresh('settings-stale');
+    try {
+      const keep = await ai.mintToken({ label: 'Keep', config: loadConfig() });
+      const doomed = await ai.mintToken({ label: 'Doomed', config: loadConfig() });
+      const stale = loadConfig();
+
+      await ai.revokeToken(doomed.token.id, { config: stale });
+      ai.setAiSettings({ enabled: true, scopes: { board: true } }, { config: stale });
+
+      assert.deepEqual(idsOnDisk(), [keep.token.id],
+        'setAiSettings restored a revoked token from a stale snapshot');
+      assert.equal(loadConfig().ai.enabled, true, 'the switch it was asked to write did not land');
+      assert.equal(ai.aiConfig(loadConfig()).scopes.board, true);
+    } finally { r.restore(); }
+  });
+
+  test('REGRESSION: a scope another writer set is not reverted by a stale snapshot', async () => {
+    const r = fresh('settings-scopes');
+    try {
+      const stale = loadConfig(); // board on, calendar off
+      ai.setAiSettings({ scopes: { calendar: true } });
+      assert.equal(ai.aiConfig(loadConfig()).scopes.calendar, true);
+
+      // A second window, still holding the old snapshot, turns something else on.
+      ai.setAiSettings({ scopes: { people: true } }, { config: stale });
+
+      const scopes = ai.aiConfig(loadConfig()).scopes;
+      assert.equal(scopes.calendar, true, 'the stale snapshot switched a scope back off');
+      assert.equal(scopes.people, true);
+      assert.equal(scopes['mail.bodies'], false, 'nothing may turn bodies on as a side effect');
+    } finally { r.restore(); }
+  });
+
+  test('a revoke for a token minted after the snapshot still revokes it', async () => {
+    const r = fresh('revoke-unseen');
+    try {
+      const stale = loadConfig(); // no tokens at all
+      const late = await ai.mintToken({ label: 'Late', config: loadConfig() });
+
+      const result = await ai.revokeToken(late.token.id, { config: stale });
+      assert.equal(result.revoked, true, 'a snapshot that predates the token must not veto its revocation');
+      assert.deepEqual(idsOnDisk(), []);
+      assert.equal((await ai.verifyToken(late.value, { config: loadConfig() })).ok, false);
+    } finally { r.restore(); }
   });
 });
 
@@ -1127,4 +1283,484 @@ test('REGRESSION: closing the oracle does not break ordinary subject search', as
   );
   assert.ok((JSON.stringify(res).match(/"ref"/g) || []).length >= 1,
     'a subject word must still be findable with only mail.metadata');
+});
+
+/* ================================================================== *
+ * REGRESSION 8 — the widened search handed the board somebody's diary
+ *
+ * `zelos_search` was widened so that any scope owning a searchable kind could
+ * reach the tool, on the reasoning that the per-kind filter inside it already
+ * confined the answer. The filter did not confine it: `capture` was mapped to
+ * the `board` scope, so a client granted nothing but the board could search the
+ * notes the owner had typed into Zelos themselves — captures no board item had
+ * ever referenced — and get them back in full.
+ *
+ * That is the worst shape a bug in this feature can take. It is not a body
+ * escaping a mail toggle, which is at least a thing the person was thinking
+ * about when they read the Settings panel; it is data reaching a client the
+ * person never granted it to at all, under a scope whose own summary says
+ * "the triaged items: headline, why it matters, which bucket, when it is due".
+ *
+ * Two properties are pinned below. Each kind comes back only to the scope that
+ * owns it, and a capture — owned by nothing — comes back to no one. The second
+ * test is the audit half: the row a person reads in the panel has to name the
+ * scope that ACTUALLY authorised the call, and every row used to carry the
+ * tool's nominal `mail.metadata` however it had been reached.
+ * ================================================================== */
+
+/** One canary word per kind, each in exactly one row, all four indexed. */
+function oneOfEachKind() {
+  const db = freshDb();
+  const capture = dbm.insertCapture(db, `${C.captureText} the thing I did not want to forget`);
+  const msgId = dbm.upsertMessage(db, {
+    sourceId: 'm_work',
+    uid: 8801,
+    messageId: '<kinds@example.test>',
+    threadKey: 'thread-kinds',
+    folder: 'INBOX',
+    direction: 'in',
+    from: { name: 'Ada Vance', email: 'ada@example.test' },
+    to: [],
+    subject: 'ZQXMESSAGEONLY quarterly numbers',
+    date: '2026-08-05T09:12:00-04:00',
+    snippet: 'nothing notable',
+    text: 'nothing notable',
+  }).id;
+  dbm.upsertEvent(db, {
+    calendarId: 'c_work',
+    uid: 'evt-kinds',
+    title: 'ZQXEVENTONLY pre-con',
+    description: 'nothing notable',
+    startsAt: '2026-08-11T14:00:00-04:00',
+    endsAt: '2026-08-11T15:00:00-04:00',
+  });
+  const itemId = dbm.upsertItem(db, {
+    key: 'kinds-item',
+    kind: 'money',
+    bucket: 'now',
+    headline: 'ZQXITEMONLY chase the invoice',
+    why: 'nothing notable',
+    sourceRefs: [`cap:${capture.id}`, `msg:${msgId}`],
+  }, { runId: 'run_1' }).id;
+  // Items reach the index through the sweep's reindex, not through the upsert.
+  dbm.reindex(db);
+  return { db, itemId, msgId, captureId: capture.id };
+}
+
+test('REGRESSION: each scope searches its own kind, and nobody searches a capture', async () => {
+  const { db, itemId } = oneOfEachKind();
+  const WORDS = Object.freeze({
+    item: 'ZQXITEMONLY',
+    event: 'ZQXEVENTONLY',
+    message: 'ZQXMESSAGEONLY',
+    capture: C.captureText,
+  });
+
+  // The index really holds all four, so the assertions below are not passing
+  // by looking at an empty database.
+  for (const word of Object.values(WORDS)) {
+    assert.ok(dbm.search(db, word.toLowerCase(), { limit: 5 }).length >= 1, `${word} is not indexed`);
+  }
+
+  for (const [scope, owned] of [['board', 'item'], ['calendar', 'event'], ['mail.metadata', 'message']]) {
+    const ctx = { db, config: cfg([scope]) };
+    for (const [kind, word] of Object.entries(WORDS)) {
+      const res = await mcp.handle(callRpc('zelos_search', { query: word }), ctx);
+      const found = res.result.structuredContent;
+      if (kind === owned) {
+        assert.equal(found.results.length, 1, `${scope} lost its own ${kind}`);
+        assert.equal(found.results[0].kind, kind);
+      } else {
+        assert.deepEqual(found.results, [], `${scope} returned a ${kind}`);
+      }
+      assert.equal(found.kinds.includes('capture'), false, `${scope} searched captures`);
+      assert.equal(JSON.stringify(res).includes('did not want to forget'), false,
+        `${scope} leaked the text of a private note`);
+    }
+  }
+
+  // The other door onto a capture: an item that cites the note it came from.
+  const item = await mcp.handle(callRpc('zelos_item', { id: itemId }), { db, config: cfg(mcp.SCOPES) });
+  const wire = JSON.stringify(item);
+  assert.equal(wire.includes(C.captureText), false, 'zelos_item handed over the note behind the item');
+  assert.equal(wire.includes('did not want to forget'), false);
+});
+
+test('REGRESSION: the access log names the scope that authorised the call, not the tool default', async () => {
+  const r = await rig({ scopes: ['board'], seed: oneOfEachKind() });
+  try {
+    const res = await r.mcpCall(callRpc('zelos_search', { query: 'ZQXITEMONLY' }));
+    assert.equal(res.status, 200);
+    assert.equal(res.json.result.structuredContent.results.length, 1, 'a board client can still search its board');
+
+    const [row] = mcp.listAccessLog(r.db, { limit: 1 });
+    assert.equal(row.tool, 'zelos_search');
+    assert.equal(row.scope, 'board',
+      'a board-only token searching the board was logged as a mail read');
+    assert.equal(row.ok, true);
+
+    // The refusal half: a tool this token cannot reach names the scopes that
+    // would have granted it, so the panel's row is still an honest answer to
+    // "what did my AI try to read?".
+    await r.mcpCall(callRpc('zelos_people', {}));
+    const [denied] = mcp.listAccessLog(r.db, { limit: 1 });
+    assert.equal(denied.ok, false);
+    assert.equal(denied.scope, 'people');
+  } finally { r.restoreHome(); }
+});
+
+/* ================================================================== *
+ * REGRESSION 9 — one column restriction, applied to every kind at once
+ *
+ * The oracle above was closed by confining the MATCH to the `title` column
+ * whenever `mail.bodies` was off. One restriction, one MATCH, every kind — and
+ * the FTS `body` column does not mean the same thing twice. A message's holds
+ * its snippet and its text; an EVENT's holds the description, which the calendar
+ * scope promises in its own summary it does not hand over.
+ *
+ * So turning on a mail scope lifted the restriction on the calendar. Nothing
+ * came back that named the description — `eventView` has no such field — but a
+ * hit is an answer: ask for a word, get an event, and you have confirmed the
+ * word is in somebody's calendar. A grant over mail must not change what a
+ * caller can find in a diary, and the restriction is now per kind.
+ *
+ * The matrix below plants one word in each hiding place the index has and then
+ * asks, for every combination of the four scopes that own something searchable,
+ * exactly which of them can be found. It is the whole promise in one table.
+ * ================================================================== */
+
+/** One word per hiding place. A hit names the field that answered. */
+const PLANTED = Object.freeze({
+  capture: 'ZQXPLANTEDCAPTURE',
+  subject: 'ZQXPLANTEDSUBJECT',
+  messageBody: 'ZQXPLANTEDMESSAGEBODY',
+  eventTitle: 'ZQXPLANTEDEVENTTITLE',
+  eventDescription: 'ZQXPLANTEDEVENTDESCRIPTION',
+  itemHeadline: 'ZQXPLANTEDITEMHEADLINE',
+  itemWhy: 'ZQXPLANTEDITEMWHY',
+});
+
+function plantedDb() {
+  const db = freshDb();
+  const capture = dbm.insertCapture(db, `${PLANTED.capture} — what the doctor said`);
+
+  const msgId = dbm.upsertMessage(db, {
+    sourceId: 'm_work',
+    uid: 9901,
+    messageId: '<planted@example.test>',
+    threadKey: 'thread-planted',
+    folder: 'INBOX',
+    direction: 'in',
+    from: { name: 'Ada Vance', email: 'ada@example.test' },
+    to: [{ name: 'Nemo Hale', email: 'nemo@example.com' }],
+    subject: `${PLANTED.subject} quarterly numbers`,
+    date: '2026-08-05T09:12:00-04:00',
+    snippet: 'nothing notable in the snippet',
+    text: `nothing notable in the snippet.\n\n${PLANTED.messageBody} and nothing else.`,
+  }).id;
+
+  const eventId = dbm.upsertEvent(db, {
+    calendarId: 'c_work',
+    uid: 'evt-planted',
+    title: `${PLANTED.eventTitle} pre-con`,
+    description: `${PLANTED.eventDescription} — walk the slab schedule`,
+    location: 'Site trailer',
+    startsAt: '2026-08-11T14:00:00-04:00',
+    endsAt: '2026-08-11T15:00:00-04:00',
+    organizer: { name: 'Alder', email: 'pm@aldervance.example' },
+    attendees: [{ name: 'Nemo Hale', email: 'nemo@example.com', rsvp: 'ACCEPTED' }],
+    status: 'CONFIRMED',
+  }).id;
+
+  const itemId = dbm.upsertItem(db, {
+    key: 'planted-item',
+    kind: 'money',
+    bucket: 'now',
+    headline: `${PLANTED.itemHeadline} chase the invoice`,
+    why: `${PLANTED.itemWhy}: Marcus asked twice.`,
+    person: 'Marcus Reyes',
+    personEmail: 'marcus@riverstone.example',
+    severity: 3,
+    // Every door onto the item: the mail it came from, the meeting it belongs
+    // to, and the note the owner typed — which no scope owns.
+    sourceRefs: [`msg:${msgId}`, `evt:${eventId}`, `cap:${capture.id}`],
+  }, { runId: 'run_1' }).id;
+
+  dbm.upsertDraft(db, {
+    itemId,
+    to: 'marcus@riverstone.example',
+    subject: 'Re: Invoice',
+    body: `Marcus — ${C.draftBody}, remittance to follow.`,
+  });
+
+  // Items reach the index through the sweep's reindex, not through the upsert.
+  dbm.reindex(db);
+  return { db, msgId, itemId, eventId, captureId: capture.id };
+}
+
+/**
+ * Which kind each planted word may legitimately come back as, given the scopes
+ * on. This is the specification, written once:
+ *
+ *  - a capture belongs to no scope, so it is never reachable;
+ *  - a subject follows mail.metadata, a message body follows mail.bodies;
+ *  - an event title follows the calendar, and an event DESCRIPTION follows
+ *    nothing at all — the calendar's own summary excludes it, and no mail scope
+ *    may stand in for a scope that does not exist;
+ *  - a headline and a `why` both follow the board, which grants both in the row
+ *    it hands over, and neither may move when a mail scope is turned on.
+ */
+function reachableWith(on) {
+  const mail = on.includes('mail.metadata') || on.includes('mail.bodies');
+  return {
+    capture: null,
+    subject: mail ? 'message' : null,
+    messageBody: on.includes('mail.bodies') ? 'message' : null,
+    eventTitle: on.includes('calendar') ? 'event' : null,
+    eventDescription: null,
+    itemHeadline: on.includes('board') ? 'item' : null,
+    itemWhy: on.includes('board') ? 'item' : null,
+  };
+}
+
+describe('the scope matrix: what each grant can reach, column by column', () => {
+  test('the index really holds all seven, so the matrix is not reading an empty database', () => {
+    const { db } = plantedDb();
+    for (const word of Object.values(PLANTED)) {
+      assert.ok(dbm.search(db, word.toLowerCase(), { limit: 5 }).length >= 1,
+        `${word} is not in the index — the matrix below would pass on nothing`);
+    }
+  });
+
+  test('REGRESSION: every scope combination reaches exactly its own kinds and its own columns', async () => {
+    const { db } = plantedDb();
+    const AXIS = ['board', 'calendar', 'mail.metadata', 'mail.bodies'];
+    let checks = 0;
+
+    for (let mask = 0; mask < (1 << AXIS.length); mask += 1) {
+      const on = AXIS.filter((_, i) => mask & (1 << i));
+      const ctx = { db, config: cfg(on) };
+      const expected = reachableWith(on);
+      const label = on.join('+') || 'nothing';
+
+      for (const [where, word] of Object.entries(PLANTED)) {
+        const res = await mcp.handle(callRpc('zelos_search', { query: word }), ctx);
+        checks += 1;
+
+        if (!on.length) {
+          // No scope owns a searchable kind, so the tool is not reachable at all.
+          assert.equal(res.error.code, mcp.ERROR_CODES.SCOPE_DENIED, 'search answered with nothing granted');
+          continue;
+        }
+
+        const found = res.result.structuredContent.results;
+        if (expected[where]) {
+          assert.deepEqual(found.map((r) => r.kind), [expected[where]],
+            `${word} should be findable as a ${expected[where]} with ${label}`);
+        } else {
+          assert.deepEqual(found, [],
+            `${word} was findable with ${label} — that column belongs to a scope this caller does not hold`);
+        }
+      }
+    }
+    assert.equal(checks, 16 * Object.keys(PLANTED).length, 'the matrix did not cover what it claims');
+  });
+
+  test('REGRESSION: a mail grant does not widen the calendar', async () => {
+    const { db } = plantedDb();
+    // The description IS indexed, in the events row's body column, and an
+    // unrestricted search finds it — which is what made this a real hole.
+    assert.ok(dbm.search(db, PLANTED.eventDescription.toLowerCase(), { limit: 5 })
+      .some((h) => h.kind === 'event'), 'the description is not indexed; this test would prove nothing');
+
+    for (const on of [['calendar'], ['calendar', 'mail.metadata'], ['calendar', 'mail.bodies'], mcp.SCOPES]) {
+      const ctx = { db, config: cfg(on) };
+      const res = await mcp.handle(callRpc('zelos_search', { query: PLANTED.eventDescription }), ctx);
+      assert.deepEqual(res.result.structuredContent.results, [],
+        `an event description was findable with ${on.join('+')} — mail must not open a calendar column`);
+
+      // …and the calendar still works for what it does grant.
+      const title = await mcp.handle(callRpc('zelos_search', { query: PLANTED.eventTitle }), ctx);
+      assert.equal(title.result.structuredContent.results.length, 1, `the event title stopped being findable with ${on.join('+')}`);
+    }
+  });
+
+  test('REGRESSION: what the board can find does not move when a mail scope is turned on', async () => {
+    const { db } = plantedDb();
+    for (const on of [['board'], ['board', 'mail.metadata'], ['board', 'mail.bodies']]) {
+      for (const word of [PLANTED.itemHeadline, PLANTED.itemWhy]) {
+        const res = await mcp.handle(callRpc('zelos_search', { query: word }), { db, config: cfg(on) });
+        const found = res.result.structuredContent.results;
+        assert.equal(found.length, 1, `${word} was not findable with ${on.join('+')}`);
+        assert.equal(found[0].kind, 'item');
+      }
+    }
+  });
+
+  test('a message body is findable only with the scope that hands it over', async () => {
+    const { db } = plantedDb();
+    const off = await mcp.handle(callRpc('zelos_search', { query: PLANTED.messageBody }), { db, config: cfg(['mail.metadata']) });
+    assert.deepEqual(off.result.structuredContent.results, []);
+
+    const on = await mcp.handle(callRpc('zelos_search', { query: PLANTED.messageBody }), { db, config: cfg(['mail.bodies']) });
+    assert.equal(on.result.structuredContent.results.length, 1, 'the bodies scope must still find a body');
+    assert.ok(JSON.stringify(on).includes(PLANTED.messageBody), 'and hand the text over, which is what it is for');
+  });
+});
+
+/* ================================================================== *
+ * REGRESSION 10 — the audit row named the tool, not the answer
+ *
+ * The log is the only window a person has onto what a connected client read. It
+ * was repaired for `zelos_search` and left alone everywhere else, so it lied in
+ * two directions at once.
+ *
+ * `zelos_item` returns the mail an item was derived from, bodies included, and
+ * the draft written for it. It reported nothing about what it spent, so every
+ * row fell back to its nominal grant and said `board` — a whole message logged
+ * as a board read. And `mail.bodies` owns no kind, so it could not appear in a
+ * row at all: a thread read that returned every message end to end was recorded
+ * exactly like the same read with bodies off.
+ * ================================================================== */
+
+describe('the access log names every scope the answer spent', () => {
+  const newest = (db) => mcp.listAccessLog(db, { limit: 1 })[0];
+
+  test('REGRESSION: an item that comes back carrying mail is not logged as a board read', async () => {
+    const { db, itemId } = plantedDb();
+
+    const res = await mcp.handle(callRpc('zelos_item', { id: itemId }), { db, config: cfg(mcp.SCOPES) });
+    const payload = res.result.structuredContent;
+    assert.deepEqual(payload.sources.map((s) => s.kind), ['message', 'event'],
+      'the fixture must actually hand over mail and a meeting, or the row below proves nothing');
+    assert.ok(JSON.stringify(res).includes(C.draftBody), 'and the draft, which is its own scope');
+
+    const row = newest(db);
+    assert.equal(row.tool, 'zelos_item');
+    assert.equal(row.scope, 'board+mail.metadata+mail.bodies+calendar+drafts',
+      'the row named the tool it was, not the scopes its answer spent');
+    assert.equal(row.detail, 'message bodies included');
+  });
+
+  test('the same tool spends less when it returns less', async () => {
+    const { db, itemId } = plantedDb();
+
+    await mcp.handle(callRpc('zelos_item', { id: itemId }), { db, config: cfg(['board']) });
+    assert.equal(newest(db).scope, 'board', 'an item alone is a board read, and only that');
+    assert.equal(newest(db).detail, null);
+
+    await mcp.handle(callRpc('zelos_item', { id: itemId }), { db, config: cfg(['board', 'mail.metadata']) });
+    assert.equal(newest(db).scope, 'board+mail.metadata', 'subjects are not bodies');
+    assert.equal(newest(db).detail, null, 'and nothing may claim a body went out when none did');
+
+    await mcp.handle(callRpc('zelos_item', { id: itemId }), { db, config: cfg(['board', 'mail.bodies']) });
+    assert.equal(newest(db).scope, 'board+mail.metadata+mail.bodies');
+    assert.equal(newest(db).detail, 'message bodies included');
+  });
+
+  test('REGRESSION: a body read is distinguishable from a metadata read', async () => {
+    const { db } = plantedDb();
+
+    await mcp.handle(callRpc('zelos_thread', { thread: 'thread-planted' }), { db, config: cfg(['mail.metadata']) });
+    const metadata = newest(db);
+    assert.equal(metadata.scope, 'mail.metadata');
+
+    await mcp.handle(callRpc('zelos_thread', { thread: 'thread-planted' }), { db, config: cfg(['mail.bodies']) });
+    const bodies = newest(db);
+    assert.equal(bodies.scope, 'mail.metadata+mail.bodies',
+      'a thread that came back in full was logged the same as one that came back as headers');
+    assert.notEqual(bodies.scope, metadata.scope, 'the two reads must not be indistinguishable in the log');
+  });
+
+  test('every tool says what it spent, and none of them says more', async () => {
+    const { db, itemId } = plantedDb();
+    const ctx = { db, config: cfg(mcp.SCOPES) };
+
+    /* Tool, arguments, and the scopes the answer actually spends. A search over
+       every kind spends every scope that owns one — plus the bodies scope, but
+       only when a message with a body was in the answer. */
+    const EXPECTED = [
+      ['zelos_board', {}, 'board'],
+      ['zelos_item', { id: itemId }, 'board+mail.metadata+mail.bodies+calendar+drafts'],
+      ['zelos_calendar', { from: '2026-08-01', to: '2026-09-01' }, 'calendar'],
+      ['zelos_search', { query: PLANTED.subject }, 'mail.metadata+mail.bodies+calendar+board'],
+      ['zelos_search', { query: PLANTED.eventTitle }, 'mail.metadata+calendar+board'],
+      ['zelos_search', { query: PLANTED.subject, kinds: ['message'] }, 'mail.metadata+mail.bodies'],
+      ['zelos_thread', { thread: 'thread-planted' }, 'mail.metadata+mail.bodies'],
+      // A draft's `to` and `subject` are the correspondent's, not the draft's:
+      // Zelos writes replies, so both are mail metadata arriving by another
+      // door. With the mail scope on they go out, and the row says so.
+      ['zelos_drafts', {}, 'drafts+mail.metadata'],
+      ['zelos_people', {}, 'people'],
+    ];
+
+    for (const [name, args, scope] of EXPECTED) {
+      const res = await mcp.handle(callRpc(name, args), ctx);
+      assert.ok(res.result, `${name} did not answer`);
+      const row = newest(db);
+      assert.equal(row.tool, name);
+      assert.equal(row.scope, scope, `${name} logged ${row.scope}`);
+
+      /* The invariant behind the whole table, and the one worth keeping if the
+         rows above ever change: a body left this machine if and only if the row
+         says so. Both directions — a read that under-reports is the defect, and
+         one that over-reports would teach the owner to ignore the column. */
+      const leaked = JSON.stringify(res).includes(PLANTED.messageBody);
+      assert.equal(row.scope.includes('mail.bodies'), leaked,
+        `${name} returned ${leaked ? 'a body and did not log it' : 'no body and logged one'}`);
+      assert.equal(row.detail, leaked ? 'message bodies included' : null);
+    }
+  });
+
+  test('a drafts-only client is not told who you write to, or about what', async () => {
+    /* REGRESSION. The `drafts` grant is "let it read the replies Zelos wrote".
+       It is not "let it read my correspondence" — but a draft carries the
+       recipient it is addressed to and the subject it is replying under, both
+       lifted mechanically off a message. A client holding drafts and nothing
+       else could therefore learn who someone corresponds with, and about what,
+       having been granted neither, and the audit row said only "drafts". */
+    const { db } = plantedDb();
+    const res = await mcp.handle(callRpc('zelos_drafts', {}), { db, config: cfg(['drafts']) });
+    const drafts = res.result.structuredContent.drafts;
+    assert.ok(drafts.length, 'the precondition: there is a draft to read');
+
+    for (const d of drafts) {
+      assert.equal(d.to, null, 'a correspondent address is mail metadata');
+      assert.equal(d.subject, null, 'so is the subject it replies under');
+      // Withheld has to be legible as withheld, or a client reads the nulls as
+      // "this draft has no recipient" and tells its user something false.
+      assert.deepEqual(d.withheld, ['to', 'subject']);
+      assert.ok(d.body, 'the text Zelos actually wrote is the point of the tool');
+    }
+    // And nothing about the correspondent may reach the wire by another route.
+    const wire = JSON.stringify(res);
+    assert.equal(wire.includes(PLANTED.subject), false, 'the source subject escaped');
+    assert.equal(newest(db).scope, 'drafts', 'and the row claims no more than it spent');
+
+    // With the mail scope on, the same call hands them over — and says so.
+    const withMail = await mcp.handle(callRpc('zelos_drafts', {}),
+      { db, config: cfg(['drafts', 'mail.metadata']) });
+    const opened = withMail.result.structuredContent.drafts;
+    assert.ok(opened.some((d) => d.to), 'the mail scope is what opens the recipient');
+    assert.equal(opened.every((d) => d.withheld === undefined), true);
+    assert.equal(newest(db).scope, 'drafts+mail.metadata');
+  });
+
+  test('with the bodies scope off, no row anywhere names it', async () => {
+    const { db, itemId } = plantedDb();
+    const ctx = { db, config: cfg(['board', 'calendar', 'mail.metadata', 'drafts', 'people']) };
+    for (const [name, args] of [
+      ['zelos_board', {}],
+      ['zelos_item', { id: itemId }],
+      ['zelos_calendar', { from: '2026-08-01', to: '2026-09-01' }],
+      ['zelos_search', { query: PLANTED.subject }],
+      ['zelos_thread', { thread: 'thread-planted' }],
+      ['zelos_drafts', {}],
+      ['zelos_people', {}],
+    ]) {
+      await mcp.handle(callRpc(name, args), ctx);
+      assert.equal(newest(db).scope.includes('mail.bodies'), false, `${name} claimed a scope that is off`);
+      assert.equal(newest(db).detail, null, `${name} claimed bodies went out with the scope off`);
+    }
+  });
 });

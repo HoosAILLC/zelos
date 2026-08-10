@@ -14,7 +14,7 @@ const {
   open, close, migrate,
   getItemByKey, itemRowId, setItemState, listBoard, bucketCounts,
   listMessages, listEvents, insertCapture, listCaptures,
-  getRun, getKV, startRun, finishRun,
+  getRun, getKV, setKV, startRun, finishRun,
 } = await import('../core/db.mjs');
 const { SWEEP_KV } = await import('../core/triage.mjs');
 const { seedSampleData } = await import('../core/sample-data.mjs');
@@ -50,6 +50,116 @@ async function closedPort() {
   const { port } = server.address();
   await new Promise((r) => server.close(r));
   return port;
+}
+
+/* ------------------------------------------------------------------ *
+ * A mock IMAP server
+ *
+ * The sweep's own mail reader is a default, not an injection: `deps.fetchMail`
+ * replaces it, so every other test in this file never opens an IMAP socket at
+ * all — and that is exactly why the option the reader forwards to the client
+ * could go missing without a single test noticing. These tests take the default
+ * path on purpose, against a real socket on 127.0.0.1 speaking real IMAP.
+ * ------------------------------------------------------------------ */
+
+const HEADER_SECTION = 'HEADER.FIELDS (FROM TO CC SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES LIST-ID)';
+const PLAIN_TEXT_STRUCTURE = '("TEXT" "PLAIN" ("CHARSET" "UTF-8") NIL NIL "7BIT" 120 4 NIL NIL NIL NIL)';
+const MOCK_HEADERS = [
+  'From: Priya Raman <priya@raman.example>',
+  'To: Nemo Hale <nemo@example.com>',
+  'Subject: Dates for the walkthrough',
+  'Date: Fri, 07 Aug 2026 09:15:00 +0000',
+  'Message-ID: <mock-1@raman.example>',
+  '',
+  '',
+].join('\r\n');
+
+/**
+ * One mailbox, one message, and every line the client sent. `capability` is the
+ * lever the TLS tests pull: a list without STARTTLS in it is precisely what a
+ * machine in the middle would send, and is indistinguishable — from the client's
+ * side — from a server that simply cannot do TLS.
+ */
+async function startMockImap({ capability = 'IMAP4rev1' } = {}) {
+  const received = [];
+  const sockets = new Set();
+
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.setNoDelay(true);
+    socket.on('error', () => {});
+    socket.on('close', () => sockets.delete(socket));
+    socket.write('* OK Zelos sweep mock ready\r\n');
+
+    let buffer = '';
+    socket.on('data', (chunk) => {
+      buffer += chunk.toString('latin1');
+      let idx;
+      while ((idx = buffer.indexOf('\r\n')) >= 0) {
+        const line = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+        received.push(line);
+
+        const parts = line.split(' ');
+        const tag = parts[0] || '';
+        const verb = (parts[1] || '').toUpperCase() === 'UID'
+          ? `UID ${(parts[2] || '').toUpperCase()}`
+          : (parts[1] || '').toUpperCase();
+        const send = (text) => socket.write(text);
+
+        if (verb === 'CAPABILITY') {
+          send(`* CAPABILITY ${capability}\r\n${tag} OK CAPABILITY completed\r\n`);
+        } else if (verb === 'LOGIN') {
+          send(`${tag} OK LOGIN completed\r\n`);
+        } else if (verb === 'SELECT' || verb === 'EXAMINE') {
+          send('* 1 EXISTS\r\n* OK [UIDVALIDITY 1] UIDs valid\r\n'
+            + `${tag} OK [READ-ONLY] EXAMINE completed\r\n`);
+        } else if (verb === 'UID SEARCH') {
+          send(`* SEARCH 101\r\n${tag} OK UID SEARCH completed\r\n`);
+        } else if (verb === 'UID FETCH') {
+          if (line.includes('BODYSTRUCTURE')) {
+            send(`* 1 FETCH (UID 101 FLAGS (\\Seen) INTERNALDATE "07-Aug-2026 09:15:00 +0000" `
+              + `BODYSTRUCTURE ${PLAIN_TEXT_STRUCTURE} BODY[${HEADER_SECTION}] {${MOCK_HEADERS.length}}\r\n`
+              + `${MOCK_HEADERS})\r\n${tag} OK UID FETCH completed\r\n`);
+          } else {
+            const payload = 'Either the 28th or the 30th works.\r\n';
+            send(`* 1 FETCH (UID 101 BODY[1] {${payload.length}}\r\n${payload})\r\n`
+              + `${tag} OK UID FETCH completed\r\n`);
+          }
+        } else if (verb === 'LOGOUT') {
+          send(`* BYE\r\n${tag} OK LOGOUT completed\r\n`);
+        } else {
+          send(`${tag} BAD unexpected command in mock\r\n`);
+        }
+      }
+    });
+  });
+
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  servers.push(server);
+  return {
+    port: server.address().port,
+    received,
+    sawCredentials: () => received.some((l) => /LOGIN|AUTHENTICATE/i.test(l)),
+    destroy: () => { for (const s of sockets) s.destroy(); },
+  };
+}
+
+/**
+ * Whether this machine routes 0.0.0.0 to a listener bound on loopback. macOS and
+ * Linux do; Windows refuses the connect outright. It is the only address that is
+ * reachable in a test and is *not* loopback as far as core/sources/imap.mjs is
+ * concerned, which is what a non-loopback case needs — so where it does not
+ * work, that half of the test is skipped rather than faked.
+ */
+async function nonLoopbackAliasReaches(port) {
+  return new Promise((resolve) => {
+    const socket = net.connect({ host: '0.0.0.0', port });
+    const done = (ok) => { socket.destroy(); resolve(ok); };
+    socket.setTimeout(2_000, () => done(false));
+    socket.on('connect', () => done(true));
+    socket.on('error', () => done(false));
+  });
 }
 
 function icsDocument(startMs) {
@@ -268,6 +378,319 @@ test('the four-item now bar holds end to end, through a real model reply', async
   assert.equal(getItemByKey(db, 'urgent-5').bucket, 'now');
 });
 
+/** Four legal `now` items under one prefix — one whole reply's worth. */
+function fourNow(prefix, severity) {
+  return [0, 1, 2, 3].map((i) => item({
+    key: `${prefix}-${i}`,
+    bucket: 'now',
+    headline: `Deal with the ${prefix} thing number ${i}`,
+    severity,
+  }));
+}
+
+test('the four-item now bar holds on the persisted board, not only per model reply', async () => {
+  const db = fresh();
+  // Two runs, disjoint keys, each reply perfectly legal on its own. safety.mjs
+  // clamps a reply; nothing used to clamp the board, so this left eight open
+  // `now` items and made the loudest thing the product says untrue.
+  const model = fakeModel((call) => board(call === 1 ? fourNow('older', 1) : fourNow('newer', 3)));
+  const config = baseConfig({ mail: [mailAccount()] });
+  const deps = { getSecret: SECRETS, complete: model, fetchMail: async () => [fetched()] };
+
+  const first = await runSweep({ db, config, mode: 'full', deps });
+  assert.equal(first.stats.now, 4, 'four on their own are within the bar');
+  assert.equal(bucketCounts(db).now, 4);
+
+  const second = await runSweep({ db, config, mode: 'full', deps });
+
+  assert.equal(second.ok, true, second.error);
+  const counts = bucketCounts(db);
+  assert.equal(counts.now, 4, 'the board holds four whatever the replies each did');
+  assert.equal(counts.today, 4, 'the overflow was demoted');
+  assert.equal(second.stats.now, 4, 'and the run reports the board, not the reply');
+
+  const open = listBoard(db, { states: ['open'] });
+  assert.equal(open.length, 8, 'nothing was deleted to make the number work');
+  assert.deepEqual(
+    open.filter((row) => row.bucket === 'now').map((row) => row.payload.key).sort(),
+    ['newer-0', 'newer-1', 'newer-2', 'newer-3'],
+    'the four that keep the bucket are the four the board itself ranks first',
+  );
+  for (const key of ['older-0', 'older-1', 'older-2', 'older-3']) {
+    const row = getItemByKey(db, key);
+    assert.equal(row.bucket, 'today', `${key} should have been demoted`);
+    assert.equal(row.state, 'open', 'demotion changes the bucket and nothing else');
+  }
+});
+
+test('the board-level now bar demotes open items only, never a decision the user made', async () => {
+  const db = fresh();
+  const model = fakeModel((call) => board(call === 1 ? fourNow('older', 1) : fourNow('newer', 3)));
+  const config = baseConfig({ mail: [mailAccount()] });
+  const deps = { getSecret: SECRETS, complete: model, fetchMail: async () => [fetched()] };
+
+  await runSweep({ db, config, mode: 'full', deps });
+  setItemState(db, itemRowId('older-0'), 'snoozed');
+  setItemState(db, itemRowId('older-1'), 'done');
+
+  await runSweep({ db, config, mode: 'full', deps });
+
+  assert.equal(bucketCounts(db, { states: ['open'] }).now, 4);
+  const snoozed = getItemByKey(db, 'older-0');
+  assert.equal(snoozed.state, 'snoozed');
+  assert.equal(snoozed.bucket, 'now', 'a snoozed item is not competing for the bar, so it is left alone');
+  const finished = getItemByKey(db, 'older-1');
+  assert.equal(finished.state, 'done');
+  assert.equal(finished.bucket, 'now', 'and neither is a finished one');
+  assert.equal(getItemByKey(db, 'older-2').bucket, 'today', 'the open ones are what give way');
+  assert.equal(getItemByKey(db, 'older-3').bucket, 'today');
+});
+
+test('a light run holds the bar too, without asking the model anything', async () => {
+  const db = fresh();
+  const model = fakeModel((call) => board(call === 1 ? fourNow('older', 1) : fourNow('newer', 3)));
+  const config = baseConfig({ mail: [mailAccount()] });
+  const deps = { getSecret: SECRETS, complete: model, fetchMail: async () => [fetched()] };
+
+  await runSweep({ db, config, mode: 'full', deps });
+  await runSweep({ db, config, mode: 'full', deps });
+  // Put the board back over the bar behind the sweep's back, the way the user
+  // reopening two demoted items does.
+  setItemState(db, itemRowId('older-0'), 'open');
+  setItemState(db, itemRowId('older-1'), 'open');
+  db.prepare("UPDATE items SET bucket = 'now' WHERE id IN (?, ?)")
+    .run(itemRowId('older-0'), itemRowId('older-1'));
+  assert.equal(bucketCounts(db).now, 6);
+
+  const light = await runSweep({ db, config, mode: 'light', deps });
+
+  assert.equal(model.calls.length, 2, 'the light run cost nothing');
+  assert.equal(light.counts.now, 4);
+  assert.equal(bucketCounts(db).now, 4);
+  assert.equal(listBoard(db, { states: ['open'] }).length, 8, 'still nothing deleted');
+});
+
+test('a finished item\'s key is named to the next run as already handled', async () => {
+  const db = fresh();
+  const model = fakeModel(board([item()]));
+  const config = baseConfig({ mail: [mailAccount()] });
+  const deps = { getSecret: SECRETS, complete: model, fetchMail: async () => [fetched()] };
+
+  await runSweep({ db, config, mode: 'full', deps });
+  setItemState(db, itemRowId('thread-a'), 'done');
+  await runSweep({ db, config, mode: 'full', deps });
+
+  const firstPrompt = model.calls[0].messages[0].content;
+  const secondPrompt = model.calls[1].messages[0].content;
+  assert.ok(!firstPrompt.includes('ALREADY HANDLED'),
+    'nothing is claimed to be handled on the run that had nothing to handle');
+  assert.match(secondPrompt, /ALREADY HANDLED — DO NOT RAISE THESE AGAIN/);
+  assert.match(secondPrompt, /key=thread-a · done/);
+  assert.ok(secondPrompt.includes('Answer Priya Raman on the Jul 28 dates'),
+    'the headline travels with the key, so the same obligation is recognisable in other words');
+});
+
+/**
+ * REGRESSION. The WHERE read the stored timestamps as instants — through
+ * datetime(), because they carry the user's offset — and the ORDER BY then read
+ * the very same column as characters. The rows that survived the LIMIT were
+ * therefore chosen by how the offset happened to sort, so the most recent thing
+ * the user finished could be the one row dropped, and the model would raise it
+ * again.
+ */
+test('the most recently closed item survives the limit whatever offset it was closed in', async () => {
+  const db = fresh();
+  const RESOLVED_LIMIT = 40;
+  const keys = [...Array(RESOLVED_LIMIT).keys()].map((i) => `resolved-early-${i}`);
+  const LATE = 'resolved-late';
+
+  const first = fakeModel(board([...keys, LATE].map((key) => item({ key, headline: `Finish ${key}` }))));
+  const config = baseConfig({ mail: [mailAccount()] });
+  const fetchMail = async () => [fetched()];
+  await runSweep({ db, config, mode: 'full', deps: { getSecret: SECRETS, complete: first, fetchMail } });
+
+  /** The same instant, written the way a user in that zone would see it. */
+  const zoned = (ms, offsetHours) => {
+    const sign = offsetHours < 0 ? '-' : '+';
+    const wall = new Date(ms + offsetHours * 3_600_000).toISOString().slice(0, 19);
+    return `${wall}${sign}${String(Math.abs(offsetHours)).padStart(2, '0')}:00`;
+  };
+  // Forty closed five days ago in UTC+12, and one closed six hours *later* in
+  // UTC-12. As instants the late one is the newest; as text it is the oldest of
+  // the lot, so string ordering drops exactly the row that matters most.
+  const baseMs = Date.now() - 5 * 86_400_000;
+  for (const key of keys) setItemState(db, itemRowId(key), 'done', { now: zoned(baseMs, 12) });
+  setItemState(db, itemRowId(LATE), 'done', { now: zoned(baseMs + 6 * 3_600_000, -12) });
+
+  const second = fakeModel(board([]));
+  await runSweep({ db, config, mode: 'full', deps: { getSecret: SECRETS, complete: second, fetchMail } });
+
+  const prompt = second.calls[0].messages[0].content;
+  assert.match(prompt, /ALREADY HANDLED/);
+  assert.ok(prompt.includes(`key=${LATE}`),
+    'the newest decision the user made was dropped by the limit');
+});
+
+test('a model that is told what was handled does not resurrect it under a new key', async () => {
+  const db = fresh();
+  const WORK = 'Answer Priya Raman on the Jul 28 dates';
+  // A stand-in for a model that follows its instructions: the mail that produced
+  // this obligation is still in front of it every run, so it writes the item up
+  // again — under a fresh key, because a finished key is not on the prior board —
+  // unless the prompt tells it the work is closed. No code can undo a re-key
+  // after the fact, which is exactly why the prompt has to carry the closed keys.
+  const model = fakeModel((call, opts) => {
+    const shown = opts.messages[0].content;
+    const toldItIsHandled = shown.includes('ALREADY HANDLED') && /key=thread-a\b/.test(shown);
+    if (call === 1) return board([item({ key: 'thread-a', headline: WORK })]);
+    return board(toldItIsHandled ? [] : [item({ key: 'thread-a-again', headline: WORK })]);
+  });
+  const config = baseConfig({ mail: [mailAccount()] });
+  const deps = { getSecret: SECRETS, complete: model, fetchMail: async () => [fetched()] };
+
+  await runSweep({ db, config, mode: 'full', deps });
+  setItemState(db, itemRowId('thread-a'), 'done');
+  const second = await runSweep({ db, config, mode: 'full', deps });
+
+  assert.equal(second.ok, true, second.error);
+  assert.equal(getItemByKey(db, 'thread-a').state, 'done', 'the decision stands');
+  assert.equal(getItemByKey(db, 'thread-a-again'), null, 'and was not re-minted under another key');
+  assert.deepEqual(
+    listBoard(db, { states: ['open'] }).filter((row) => row.headline === WORK),
+    [],
+    'the board holds no live copy of work the user finished',
+  );
+  assert.equal(
+    listBoard(db, { states: ['done'] }).filter((row) => row.headline === WORK).length,
+    1,
+    'exactly one copy exists, and it is the one they closed',
+  );
+});
+
+test('a successful run records what it spent where the UI can read it', async () => {
+  const db = fresh();
+  const model = fakeModel(board([item()]));
+  const config = baseConfig({ mail: [mailAccount()] });
+  const deps = { getSecret: SECRETS, complete: model, fetchMail: async () => [fetched()] };
+
+  await runSweep({ db, config, mode: 'full', deps });
+  const afterOne = JSON.parse(getKV(db, SWEEP_KV.tokens));
+  assert.match(afterOne.day, /^\d{4}-\d{2}-\d{2}$/);
+  assert.equal(afterOne.tokensIn, 1234);
+  assert.equal(afterOne.tokensOut, 567);
+  assert.equal(afterOne.runs, 1);
+  assert.equal(afterOne.modelRuns, 1);
+  assert.deepEqual(afterOne.lifetime, { tokensIn: 1234, tokensOut: 567, runs: 1, modelRuns: 1 });
+  assert.ok(afterOne.at, 'the totals say when they were last touched');
+
+  await runSweep({ db, config, mode: 'full', deps });
+  const afterTwo = JSON.parse(getKV(db, SWEEP_KV.tokens));
+  assert.equal(afterTwo.tokensIn, 2468, 'the day accumulates');
+  assert.equal(afterTwo.tokensOut, 1134);
+  assert.equal(afterTwo.runs, 2);
+  assert.equal(afterTwo.lifetime.tokensIn, 2468);
+
+  await runSweep({ db, config, mode: 'light', deps });
+  const afterLight = JSON.parse(getKV(db, SWEEP_KV.tokens));
+  assert.equal(afterLight.tokensIn, 2468, 'a light run spends nothing and adds nothing');
+  assert.equal(afterLight.runs, 3);
+  assert.equal(afterLight.modelRuns, 2, 'and does not count as a run that thought');
+});
+
+/**
+ * REGRESSION. The spend was recorded only `if (ok)`, which erased exactly the
+ * spend a person is most likely to be surprised by: the model answered, the
+ * provider billed for it, and the run then failed because the answer was not a
+ * board. The counter showed nothing, and the bill showed the tokens.
+ */
+test('a run that failed still records what the model was paid for', async () => {
+  const db = fresh();
+  const config = baseConfig({ mail: [mailAccount()] });
+  const fetchMail = async () => [fetched()];
+
+  await runSweep({
+    db, config, mode: 'full',
+    deps: { getSecret: SECRETS, complete: fakeModel(board([item()])), fetchMail },
+  });
+
+  const failed = await runSweep({
+    db, config, mode: 'full',
+    deps: { getSecret: SECRETS, complete: fakeModel('I am terribly sorry, I cannot help with that.'), fetchMail },
+  });
+  assert.equal(failed.ok, false);
+
+  const after = JSON.parse(getKV(db, SWEEP_KV.tokens));
+  assert.equal(after.tokensIn, 2468, 'the tokens the failed reply cost are in the total');
+  assert.equal(after.tokensOut, 1134);
+  assert.equal(after.lifetime.tokensIn, 2468);
+  // The counts answer a different question from the spend, and a run that
+  // produced no board is not a sweep that happened.
+  assert.equal(after.runs, 1, 'a failed run is not counted as a sweep');
+  assert.equal(after.modelRuns, 1);
+});
+
+/**
+ * REGRESSION. recordTokens caught a *read* it could not parse and then wrote
+ * outside that guard, from an unguarded call in finish() — so a kv table that
+ * refused a write turned a finished sweep, board and all, into a failed one over
+ * a number in the corner of the screen.
+ */
+test('a token counter that cannot be written does not cost the user the board', async () => {
+  const db = fresh();
+  // Everything the run does works, except the one statement that stores the
+  // counter. Nothing else in the sweep touches this key.
+  const brittle = new Proxy(db, {
+    get(target, prop, receiver) {
+      const value = Reflect.get(target, prop, receiver);
+      if (prop !== 'prepare') return typeof value === 'function' ? value.bind(target) : value;
+      return (sql) => {
+        const stmt = target.prepare(sql);
+        if (!sql.includes('INSERT INTO kv')) return stmt;
+        return {
+          run: (...args) => {
+            if (args[0] === SWEEP_KV.tokens) throw new Error('database or disk is full');
+            return stmt.run(...args);
+          },
+          get: (...args) => stmt.get(...args),
+          all: (...args) => stmt.all(...args),
+        };
+      };
+    },
+  });
+
+  const result = await runSweep({
+    db: brittle,
+    config: baseConfig({ mail: [mailAccount()] }),
+    mode: 'full',
+    deps: { getSecret: SECRETS, complete: fakeModel(board([item()])), fetchMail: async () => [fetched()] },
+  });
+
+  assert.equal(result.ok, true, result.error);
+  assert.equal(result.stats.items, 1);
+  assert.ok(getItemByKey(db, 'thread-a'), 'the board the user waited for is on disk');
+  assert.equal(getKV(db, SWEEP_KV.tokens), null, 'and only the number was lost');
+});
+
+test('the token totals start again on a new day rather than growing forever', async () => {
+  const db = fresh();
+  const model = fakeModel(board([item()]));
+  const config = baseConfig({ mail: [mailAccount()] });
+  const deps = { getSecret: SECRETS, complete: model, fetchMail: async () => [fetched()] };
+
+  await runSweep({ db, config, mode: 'full', deps });
+  const yesterday = { ...JSON.parse(getKV(db, SWEEP_KV.tokens)), day: '2000-01-01' };
+  setKV(db, SWEEP_KV.tokens, JSON.stringify(yesterday));
+
+  await runSweep({ db, config, mode: 'full', deps });
+  const today = JSON.parse(getKV(db, SWEEP_KV.tokens));
+
+  assert.equal(today.tokensIn, 1234, 'today counts only today');
+  assert.equal(today.runs, 1);
+  assert.notEqual(today.day, '2000-01-01');
+  assert.equal(today.lifetime.tokensIn, 2468, 'while the lifetime total keeps everything');
+  assert.equal(today.lifetime.runs, 2);
+});
+
 test('what the user decided survives the next run', async () => {
   const db = fresh();
   const model = fakeModel(board([item(), item({ key: 'k2', bucket: 'today', headline: 'Draw the retainage figure' })]));
@@ -333,6 +756,115 @@ test('an account with no stored password is reported, not crashed on', async () 
   assert.equal(source.ok, false);
   assert.match(source.error, /No password stored for Work/);
   assert.equal(result.stats.messages, 0);
+});
+
+/* ================================================================== *
+ * The TLS requirement, on the path the sweep actually takes
+ *
+ * REGRESSION. core/config.mjs stored `requireTls`, core/sources/imap.mjs
+ * enforced it, and the reader in between never passed it on — so the one setting
+ * a user has for "do not send my password in the clear to this host" reached
+ * nothing that runs at 07:00. The account is the whole subject of these tests:
+ * they take the default mail reader, not `deps.fetchMail`.
+ * ================================================================== */
+
+test('an account that requires TLS gets no credentials from a server that will not do it', async () => {
+  const db = fresh();
+  const imap = await startMockImap({ capability: 'IMAP4rev1' });
+  const account = mailAccount({
+    host: '127.0.0.1', port: imap.port, secure: false, sentMailbox: '', requireTls: true,
+  });
+
+  const result = await runSweep({
+    db,
+    config: baseConfig({ mail: [account] }),
+    mode: 'light',
+    deps: { getSecret: SECRETS },
+  });
+
+  const source = result.stats.sources.find((s) => s.kind === 'mail');
+  assert.equal(source.ok, false, 'the account asked for TLS and the server offered none');
+  assert.match(source.error, /still in the clear/);
+  assert.equal(result.stats.messages, 0);
+  assert.ok(!imap.sawCredentials(),
+    `credentials went out over a cleartext socket: ${imap.received.join(' | ')}`);
+  assert.ok(!imap.received.some((line) => line.includes('a-password')));
+  imap.destroy();
+});
+
+test('a loopback bridge with nothing set still reads its mail in the clear', async () => {
+  const db = fresh();
+  const imap = await startMockImap({ capability: 'IMAP4rev1' });
+  // No requireTls at all, which is every account saved before the setting
+  // existed. 127.0.0.1 is where Proton Bridge lives and is the documented reason
+  // plaintext is still allowed there — refusing this would be the fix breaking
+  // the setup it was written to protect.
+  const account = mailAccount({ host: '127.0.0.1', port: imap.port, secure: false, sentMailbox: '' });
+
+  const result = await runSweep({
+    db,
+    config: baseConfig({ mail: [account] }),
+    mode: 'light',
+    deps: { getSecret: SECRETS },
+  });
+
+  const source = result.stats.sources.find((s) => s.kind === 'mail');
+  assert.equal(source.ok, true, source.error);
+  assert.equal(result.stats.messages, 1);
+  assert.equal(listMessages(db)[0].subject, 'Dates for the walkthrough');
+  assert.ok(imap.sawCredentials(), 'the bridge case has to keep working');
+  imap.destroy();
+});
+
+test('an explicit permission to use cleartext is honoured off loopback too', async () => {
+  const imap = await startMockImap({ capability: 'IMAP4rev1' });
+  if (!await nonLoopbackAliasReaches(imap.port)) {
+    // Windows will not connect to 0.0.0.0, and there is no other address a test
+    // can reach that this code calls non-loopback. Skipped rather than pretended.
+    imap.destroy();
+    return;
+  }
+
+  const db = fresh();
+  const account = mailAccount({
+    host: '0.0.0.0', port: imap.port, secure: false, sentMailbox: '', requireTls: false,
+  });
+
+  const result = await runSweep({
+    db,
+    config: baseConfig({ mail: [account] }),
+    mode: 'light',
+    deps: { getSecret: SECRETS },
+  });
+
+  const source = result.stats.sources.find((s) => s.kind === 'mail');
+  assert.equal(source.ok, true, `an explicit false must outrank the host default: ${source.error}`);
+  assert.equal(result.stats.messages, 1);
+  imap.destroy();
+});
+
+test('off loopback, an account that says nothing is still protected', async () => {
+  const imap = await startMockImap({ capability: 'IMAP4rev1' });
+  if (!await nonLoopbackAliasReaches(imap.port)) {
+    imap.destroy();
+    return;
+  }
+
+  const db = fresh();
+  const account = mailAccount({ host: '0.0.0.0', port: imap.port, secure: false, sentMailbox: '' });
+
+  const result = await runSweep({
+    db,
+    config: baseConfig({ mail: [account] }),
+    mode: 'light',
+    deps: { getSecret: SECRETS },
+  });
+
+  const source = result.stats.sources.find((s) => s.kind === 'mail');
+  assert.equal(source.ok, false);
+  assert.match(source.error, /still in the clear/);
+  assert.ok(!imap.sawCredentials());
+  imap.destroy();
 });
 
 test('a light run reads the sources and calls no model at all', async () => {

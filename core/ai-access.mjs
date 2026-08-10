@@ -55,6 +55,19 @@ export { recordAccess, listAccessLog } from './mcp.mjs';
 const MAX_TOKENS = 20;
 const MAX_LABEL_CHARS = 60;
 
+/**
+ * The secret store, as a seam.
+ *
+ * The race every writer below has to survive is defined by what happens
+ * *during* the store's latency, and that latency is real: on macOS a write is a
+ * spawn of /usr/bin/security, tens to hundreds of milliseconds with a whole
+ * event loop running underneath it. On the encrypted-file backend the same call
+ * costs nothing, so a test that only ever sees that backend cannot get inside
+ * the window at all. Passing the store in lets one hold a mint open across a
+ * revocation and watch which list reaches the disk.
+ */
+const STORE = { setSecret, deleteSecret };
+
 /* ------------------------------------------------------------------ *
  * Reading the config block
  * ------------------------------------------------------------------ */
@@ -88,6 +101,21 @@ export function aiConfig(config = null) {
         lastUsedAt: t.lastUsedAt || null,
       })),
   };
+}
+
+/**
+ * The `ai` block as it is ON DISK, right now.
+ *
+ * Every writer in this file calls this immediately before its save, for the
+ * reason spelled out at length on `touchToken`: `saveConfig` replaces the whole
+ * `ai.tokens` array, so a caller that took its snapshot a moment ago — before an
+ * await, before an HTTP round trip, before another window's revocation — writes
+ * that snapshot's list over everything that happened in between. The caller's
+ * snapshot is the right source for what the caller *asked for*. It is never the
+ * right source for the parts it is not changing.
+ */
+function liveAi() {
+  return aiConfig(loadConfig());
 }
 
 /** True only when the master switch is on. Nothing else may stand in for it. */
@@ -185,11 +213,17 @@ function assertLabel(label) {
  * Returns `{value, token, config}` and this is the **only** moment `value`
  * exists outside the secret store. Nothing persists it, nothing logs it, and
  * there is no route or function anywhere that can produce it again.
+ *
+ * The list the new record is appended to is re-read from disk after the store
+ * write, not carried across it. A mint takes as long as the secret store does,
+ * and a revocation that lands inside that window used to be undone by the save
+ * at the end of it: the revoked record came back into config.json, and the
+ * panel then listed a token the user had already thrown away. Appending to the
+ * live list keeps both truths — the revocation and the new token.
  */
-export async function mintToken({ label, config = loadConfig(), now = nowISO() } = {}) {
+export async function mintToken({ label, config = loadConfig(), now = nowISO(), store = STORE } = {}) {
   const clean = assertLabel(label);
-  const existing = aiConfig(config).tokens;
-  if (existing.length >= MAX_TOKENS) {
+  if (aiConfig(config).tokens.length >= MAX_TOKENS) {
     throw new Error(`there are already ${MAX_TOKENS} tokens — revoke one before minting another`);
   }
 
@@ -199,14 +233,20 @@ export async function mintToken({ label, config = loadConfig(), now = nowISO() }
 
   // The secret lands first. If this throws, config is untouched and there is no
   // token record pointing at a value that was never stored.
-  await setSecret(ref, value);
+  await store.setSecret(ref, value);
 
   const token = { id, label: clean, ref, createdAt: now, lastUsedAt: null };
   let saved;
   try {
-    saved = saveConfig({ ai: { ...aiConfig(config), tokens: [...existing, token] } });
+    const current = liveAi();
+    // Checked again against the live list: two mints running side by side each
+    // saw room, and the cap is a promise about what is on disk.
+    if (current.tokens.length >= MAX_TOKENS) {
+      throw new Error(`there are already ${MAX_TOKENS} tokens — revoke one before minting another`);
+    }
+    saved = saveConfig({ ai: { ...current, tokens: [...current.tokens, token] } });
   } catch (err) {
-    await deleteSecret(ref).catch(() => {});
+    await store.deleteSecret(ref).catch(() => {});
     throw err;
   }
 
@@ -218,14 +258,20 @@ export async function mintToken({ label, config = loadConfig(), now = nowISO() }
  * Revoke a token: gone from the secret store, gone from config. Either half
  * alone would be enough to stop it working, and both are done anyway — a
  * credential nobody can use is still a credential sitting on the disk.
+ *
+ * The removal is applied to the list as it is on disk after the store call, not
+ * to the caller's snapshot. Taking one id out of a stale array and saving the
+ * array is how a revocation silently deleted a token minted while it ran: that
+ * record vanished from config.json while its secret stayed in the store, which
+ * is an orphan nobody can see to clean up.
  */
-export async function revokeToken(id, { config = loadConfig() } = {}) {
-  const current = aiConfig(config);
-  const token = current.tokens.find((t) => t.id === id);
+export async function revokeToken(id, { config = loadConfig(), store = STORE } = {}) {
+  const token = aiConfig(config).tokens.find((t) => t.id === id)
+    ?? liveAi().tokens.find((t) => t.id === id);
   if (!token) return { ok: true, revoked: false, config };
 
   try {
-    await deleteSecret(token.ref);
+    await store.deleteSecret(token.ref);
   } catch (err) {
     // Config is still updated below: a token the app refuses to accept is
     // revoked as far as every caller is concerned, and leaving it listed would
@@ -233,6 +279,7 @@ export async function revokeToken(id, { config = loadConfig() } = {}) {
     log.warn('ai: could not remove a revoked token from the secret store', { id, error: err.message });
   }
 
+  const current = liveAi();
   const saved = saveConfig({ ai: { ...current, tokens: current.tokens.filter((t) => t.id !== id) } });
   log.info('ai: revoked an access token', { id, label: token.label });
   return { ok: true, revoked: true, config: saved };
@@ -304,10 +351,12 @@ export async function verifyToken(presented, { config = loadConfig() } = {}) {
  * record straight back into config.json — the panel then listed a token the
  * user had revoked, and had `deleteSecret` failed (which `revokeToken`
  * tolerates, and only warns about) the credential would have worked again.
- * A token revoked mid-request stays revoked.
+ * A token revoked mid-request stays revoked. `mintToken`, `revokeToken` and
+ * `setAiSettings` do the same thing for the same reason; `liveAi` is the shared
+ * name for it.
  */
 export function touchToken(id, { config = loadConfig(), now = nowISO() } = {}) {
-  const current = aiConfig(loadConfig());
+  const current = liveAi();
   const record = current.tokens.find((t) => t.id === id);
   if (!record) return config;
   if (record.lastUsedAt === now) return config;
@@ -323,9 +372,18 @@ export function touchToken(id, { config = loadConfig(), now = nowISO() } = {}) {
  * Write the master switch and the scope toggles. Both are validated against the
  * closed set — an unknown scope key is refused rather than stored, because a
  * key nothing reads is a switch that looks like it does something and does not.
+ *
+ * Everything this call is not changing comes off the disk. A caller's config
+ * snapshot no longer has a say: the HTTP layer holds one for the life of the
+ * process and used to hand it here, which meant a flick of the master switch
+ * wrote that snapshot's whole `ai` block back — putting a revoked token record,
+ * or a scope another window had just switched off, straight into config.json.
+ * `enabled` and `scopes` are the only things a caller gets to state. The old
+ * second argument is still accepted and ignored, so existing callers are
+ * unaffected.
  */
-export function setAiSettings({ enabled, scopes } = {}, { config = loadConfig() } = {}) {
-  const current = aiConfig(config);
+export function setAiSettings({ enabled, scopes } = {}) {
+  const current = liveAi();
   const next = { ...current };
 
   if (enabled !== undefined) {

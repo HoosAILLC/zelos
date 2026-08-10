@@ -251,6 +251,18 @@ entire reason this file is allowed to be a blocklist.
 Three outbound destinations exist. All three are ones you typed in yourself.
 
 1. **Your IMAP host**, on the port you configured, over TLS.
+
+   The account setting that governs this is `requireTls`, and it is worth
+   stating exactly, because the failure it prevents is silent. Left unset, it
+   decides from the host: anything that is not loopback must end up encrypted
+   before a password is sent, so a `STARTTLS` that the server does not offer —
+   including one an attacker on the path has *stripped* from the capability
+   list — aborts the connection instead of falling back to cleartext. Set to
+   `false` it is a standing permission to use cleartext for that account, which
+   exists for a local bridge (Proton Mail Bridge and friends) where the traffic
+   never leaves the machine. Set to `true` it is enforced everywhere, loopback
+   included. Zelos refuses *before* `LOGIN`, so a stripped connection costs you
+   a sweep and never a password.
 2. **Your calendar URL** — an `.ics` feed or a CalDAV server.
 3. **Your model endpoint** — the `model.baseUrl` you chose. If you point that
    at Ollama, LM Studio, llama.cpp, vLLM or LocalAI on `127.0.0.1`, then
@@ -324,6 +336,21 @@ protection:
   A `Host` carrying userinfo (`evil.example@127.0.0.1`) is rejected too: it
   reads one way to a person and parses to loopback.
 - No CORS headers are emitted, ever — at any status, including on a preflight.
+- `GET /h/<id>` is the browser handoff, and it is the one route outside `/api/*`
+  that hands out anything. It exists because opening a browser means handing a
+  URL to `open`/`xdg-open`/`cmd start` as a **command-line argument**, and a
+  command line is readable by every other process running as you — so the
+  session token itself must never be in it. Instead the launcher mints a
+  single-use id, opens `/h/<id>`, and that route trades it exactly once for the
+  real token and redirects to the board. The id is 32 random bytes, compared
+  against live entries with `timingSafeEqual` and no early exit, expires after
+  ten seconds, is spent before the token is written (so a race cannot spend it
+  twice), and is capped at eight live at a time. Used, expired and never-minted
+  all answer with the identical 404, so nothing can be told apart by probing.
+  It sits behind the same `Host` and `Origin` checks as everything else.
+  The token does land in the address bar for the instant before the page strips
+  it with `history.replaceState` — the same exposure the printed launch URL has
+  always had, and the reason the token is per-launch.
 - Static file serving resolves the path and asserts the *real* path is inside
   `ui/`, so `..`, `%2e%2e`, `%252e%252e`, overlong UTF-8, backslashes and
   symlinks pointing out of the root all fail. The same parsed pathname drives

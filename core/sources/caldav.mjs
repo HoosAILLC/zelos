@@ -20,9 +20,18 @@
  * expanded. Server responses are untrusted input like everything else — the
  * calendar text this module returns is data for the ICS parser, never anything
  * that gets executed or fetched.
+ *
+ * A sweep no longer pays for the whole walk. What the discovery hops found is
+ * remembered between runs and the ctag decides whether a calendar has to be
+ * read at all — see "Remembering the layout", below.
  */
 
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import { Buffer } from 'node:buffer';
+
+import { paths, writeFileAtomic } from '../config.mjs';
 import { log } from '../log.mjs';
 
 const dav = log.child('[caldav]');
@@ -426,18 +435,21 @@ const BODY_COLLECTIONS = `<?xml version="1.0" encoding="utf-8"?>
   <cs:getctag/><ic:calendar-color/>
 </d:prop></d:propfind>`;
 
-/** CalDAV wants basic-format UTC: 20260811T140000Z. */
-function davTime(value, fallbackMs) {
-  const at = value === undefined || value === null || value === ''
-    ? new Date(fallbackMs)
-    : value instanceof Date
-      ? value
-      : typeof value === 'number'
-        ? new Date(value)
-        : new Date(String(value));
+/** An ISO string, a Date or epoch milliseconds, read as milliseconds. */
+function msOf(value, fallbackMs) {
+  if (value === undefined || value === null || value === '') return fallbackMs;
+  const at = value instanceof Date ? value : typeof value === 'number' ? new Date(value) : new Date(String(value));
   const ms = at.getTime();
-  const safe = Number.isNaN(ms) ? new Date(fallbackMs) : at;
-  return `${safe.toISOString().slice(0, 19).replace(/[-:]/g, '')}Z`;
+  return Number.isNaN(ms) ? fallbackMs : ms;
+}
+
+const DAY_MS = 86_400_000;
+const floorDay = (ms) => Math.floor(ms / DAY_MS) * DAY_MS;
+const ceilDay = (ms) => Math.ceil(ms / DAY_MS) * DAY_MS;
+
+/** CalDAV wants basic-format UTC: 20260811T140000Z. */
+function davStamp(ms) {
+  return `${new Date(ms).toISOString().slice(0, 19).replace(/[-:]/g, '')}Z`;
 }
 
 function calendarQueryBody(start, end) {
@@ -595,14 +607,211 @@ function normalizeUrl(url) {
 }
 
 /* ------------------------------------------------------------------ *
+ * Remembering the layout
+ * ------------------------------------------------------------------ */
+
+/**
+ * Every sweep used to buy the same three answers again.
+ *
+ * `fetchRange` ran the full walk — principal, then calendar-home-set, then the
+ * Depth:1 collection listing — before it could ask a single calendar for a
+ * single event, against a layout that had not moved since the account was
+ * configured. On a five-minute sweep that is three remote round trips an hour
+ * apiece to relearn something already known, and it was the largest fixed cost
+ * in a calendar sweep.
+ *
+ * So the *layout* is remembered: the principal, the home set, and the URL whose
+ * listing actually produced calendars. The listing itself is deliberately not
+ * remembered. That one PROPFIND still runs on every sweep, because its response
+ * is where each collection's ctag lives, and a cached ctag would be a cache
+ * that answers "nothing changed" forever. Three requests become one, and the
+ * fresh ctag then decides whether the REPORT behind it has to happen at all.
+ *
+ * The principal and the home set are kept for the day the listing root stops
+ * answering. They are the rungs above it, and a provider that moves a
+ * collection has almost always left them where they were, so `targetsFor` walks
+ * back up them one at a time before it gives up and re-runs the walk from the
+ * URL the user typed. Remembering them and then not consulting them would be a
+ * cache of two strings that cost a write and bought nothing.
+ *
+ * The record is keyed by a hash of the normalised URL and the username, so
+ * changing either in Settings keys a different record and is its own
+ * invalidation; `invalidate()` covers the edits that change neither. **No
+ * password goes into the key and none is written to the file** — what is stored
+ * is server layout, in the Zelos home at 0600, and nothing else.
+ *
+ * The origin pin is untouched by any of this. `authOrigin` is derived from the
+ * URL the user configured on every call, so a remembered href that points
+ * somewhere else is still requested anonymously, exactly as a freshly
+ * discovered one would be.
+ *
+ * Every read and write here is best effort. A cache that cannot be opened,
+ * parsed or written falls back to the full walk rather than failing a sweep.
+ */
+
+const CACHE_SCHEMA = 1;
+/**
+ * How long a remembered layout stands before the full walk runs again. It can
+ * be generous: the listing is re-read every sweep anyway, and a listing that
+ * fails or comes back empty drops the record on the spot. What this bounds is
+ * the rarer case — a provider that moves the principal or the home set under an
+ * account whose collection URLs still answer.
+ */
+const LAYOUT_TTL_MS = 6 * 60 * 60 * 1000;
+
+/** Parsed records, so repeat sweeps in one process do not re-read the file. */
+const layouts = new Map();
+
+function accountKey(base, user) {
+  return crypto.createHash('sha256')
+    .update([CACHE_SCHEMA, base, user ?? ''].join('\n'), 'utf8')
+    .digest('hex')
+    .slice(0, 32);
+}
+
+function layoutFile(key) {
+  return path.join(paths().cacheDir, 'caldav', `${key}.json`);
+}
+
+const stillFresh = (record) => Date.now() - record.at < LAYOUT_TTL_MS;
+
+function readLayout(key) {
+  const memo = layouts.get(key);
+  if (memo) return stillFresh(memo) ? memo : null;
+
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(layoutFile(key), 'utf8'));
+  } catch {
+    return null;
+  }
+  if (!parsed || parsed.schema !== CACHE_SCHEMA || typeof parsed.listRoot !== 'string') return null;
+
+  const record = {
+    listRoot: parsed.listRoot,
+    principal: typeof parsed.principal === 'string' ? parsed.principal : null,
+    homeSet: typeof parsed.homeSet === 'string' ? parsed.homeSet : null,
+    at: Number(parsed.at) || 0,
+  };
+  if (!stillFresh(record)) return null;
+  layouts.set(key, record);
+  return record;
+}
+
+function writeLayout(key, record) {
+  layouts.set(key, record);
+  try {
+    const file = layoutFile(key);
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    writeFileAtomic(file, `${JSON.stringify({ schema: CACHE_SCHEMA, ...record })}\n`, 0o600);
+  } catch (err) {
+    dav.debug(`could not remember the calendar layout: ${err.message}`);
+  }
+}
+
+/**
+ * The documents each calendar last returned, kept in this process and nowhere
+ * else.
+ *
+ * A ctag that has not moved means the collection has not changed, so the REPORT
+ * behind it can be skipped — but only if the answer it would have given is
+ * still to hand, which is why the answer is kept. It is kept in memory on
+ * purpose: this is the text of somebody's calendar, and the database is where
+ * calendar contents belong. A long-lived sweep gets the whole benefit of it; a
+ * one-shot CLI run pays for one REPORT per calendar, which is what it was
+ * always going to pay.
+ *
+ * The budget is a memory ceiling, not a policy: entries are dropped oldest
+ * first once the total passes it, so a person with a great many calendars costs
+ * bounded memory rather than however much their provider felt like sending.
+ */
+const documents = new Map();
+const MAX_REMEMBERED_BYTES = 32 * 1024 * 1024;
+let rememberedBytes = 0;
+
+const slotFor = (key, href) => `${key} ${href}`;
+
+function drop(slot) {
+  const entry = documents.get(slot);
+  if (!entry) return;
+  rememberedBytes -= entry.bytes;
+  documents.delete(slot);
+}
+
+function recall(key, href) {
+  return documents.get(slotFor(key, href)) || null;
+}
+
+function remember(key, href, { ctag, start, end, docs }) {
+  const slot = slotFor(key, href);
+  drop(slot);
+  const bytes = docs.reduce((sum, doc) => sum + doc.length, 0);
+  if (bytes > MAX_REMEMBERED_BYTES) return;
+  documents.set(slot, { ctag, start, end, docs, bytes });
+  rememberedBytes += bytes;
+  // Map iteration is insertion order, so the first key is the oldest entry.
+  for (const oldest of documents.keys()) {
+    if (rememberedBytes <= MAX_REMEMBERED_BYTES) break;
+    if (oldest !== slot) drop(oldest);
+  }
+}
+
+/** Drop one account's record, on disk and in memory, documents included. */
+function forgetLayout(key) {
+  layouts.delete(key);
+  for (const slot of [...documents.keys()]) {
+    if (slot.startsWith(`${key} `)) drop(slot);
+  }
+  try {
+    fs.rmSync(layoutFile(key), { force: true });
+  } catch (err) {
+    dav.debug(`could not drop a remembered calendar layout: ${err.message}`);
+  }
+}
+
+/**
+ * Forget what is remembered about one account — or, with no argument, about
+ * every account.
+ *
+ * Settings calls this whenever a calendar is written or removed. A URL or a
+ * username that changed keys a different record and would have been rediscovered
+ * anyway; this is for the edits that change neither and still mean the old
+ * answer should not be trusted — a password corrected, a collection added on the
+ * server, an account deleted outright.
+ */
+export function invalidate({ url = null, user = null } = {}) {
+  if (url === null || url === undefined) {
+    layouts.clear();
+    documents.clear();
+    rememberedBytes = 0;
+    try {
+      fs.rmSync(path.join(paths().cacheDir, 'caldav'), { recursive: true, force: true });
+    } catch (err) {
+      dav.debug(`could not clear the calendar layout cache: ${err.message}`);
+    }
+    return;
+  }
+  let base;
+  try {
+    base = normalizeUrl(url);
+  } catch {
+    return; // a URL that cannot be normalised was never a cache key
+  }
+  forgetLayout(accountKey(base, user));
+}
+
+/* ------------------------------------------------------------------ *
  * Public API
  * ------------------------------------------------------------------ */
 
 /**
  * Walk current-user-principal -> calendar-home-set -> calendar collections.
- * -> {principal, homeSet, calendars:[{href, name, color, ctag, components}]}
+ * -> {principal, homeSet, listRoot, calendars:[{href, name, color, ctag, components}]}
  * Throws CalDavError (with .status and .host) when the server cannot be
  * reached or rejects the credentials.
+ *
+ * `listRoot` is the URL whose Depth:1 listing produced the calendars — the one
+ * hop worth repeating on its own later, and null when nothing produced any.
  */
 export async function discover({ url, user, pass, timeoutMs = DEFAULT_TIMEOUT_MS, signal } = {}) {
   const base = normalizeUrl(url);
@@ -656,7 +865,9 @@ export async function discover({ url, user, pass, timeoutMs = DEFAULT_TIMEOUT_MS
       const res = await request('PROPFIND', root, { ...opts, body: BODY_COLLECTIONS, depth: 1 });
       listed = true;
       const calendars = calendarsFrom(parseXml(res.text), res.url);
-      if (calendars.length) return { principal, homeSet, calendars };
+      // `res.url`, not `root`: a redirect means the collections live at the
+      // address the server pointed at, and that is the hop worth remembering.
+      if (calendars.length) return { principal, homeSet, listRoot: res.url, calendars };
     } catch (err) {
       listError = err;
       if (err instanceof CalDavError && (err.status === 401 || err.status === 403)) throw err;
@@ -669,7 +880,97 @@ export async function discover({ url, user, pass, timeoutMs = DEFAULT_TIMEOUT_MS
   if (!listed) {
     throw listError || probeError || new CalDavError(`No DAV collections at ${hostOf(base)}`, { host: hostOf(base) });
   }
-  return { principal, homeSet, calendars: [] };
+  return { principal, homeSet, listRoot: null, calendars: [] };
+}
+
+/**
+ * One Depth:1 listing. -> {listRoot, calendars} when it produced any, else null.
+ *
+ * A 401 or 403 is rethrown rather than reported as "no calendars here": that is
+ * an answer about credentials, not about layout, and it belongs to the caller
+ * exactly as it would from a fresh walk. Anything else is this URL being wrong,
+ * which is a thing the next candidate might fix.
+ */
+async function listCalendarsAt(root, opts) {
+  try {
+    const res = await request('PROPFIND', root, { ...opts, body: BODY_COLLECTIONS, depth: 1 });
+    const calendars = calendarsFrom(parseXml(res.text), res.url);
+    if (calendars.length) return { listRoot: res.url, calendars };
+    dav.debug(`the remembered listing at ${hostOf(root)} holds no calendars any more`);
+  } catch (err) {
+    if (err instanceof CalDavError && (err.status === 401 || err.status === 403)) throw err;
+    dav.debug(`the remembered listing at ${hostOf(root)} failed: ${err.message}`);
+  }
+  return null;
+}
+
+/**
+ * The calendars to query this sweep, from the cheapest source that can still be
+ * trusted.
+ *
+ * The remembered listing root is one PROPFIND and covers the ordinary case. The
+ * two hops above it are remembered as well, and they are what makes a *moved*
+ * collection cheap rather than a full rediscovery: a provider that renames a
+ * calendar collection usually leaves the home set where it was, and one that
+ * moves the home set usually leaves the principal where it was. So a failed
+ * listing walks back up the record one rung at a time — list the home set, then
+ * re-ask the principal for its home set and list that — and only falls all the
+ * way through to `discover` when the remembered layout is wrong from the top.
+ * Each rung that works rewrites the record with the root that answered, so the
+ * next sweep is back to one request.
+ *
+ * Nothing here is patched around. A rung that produces calendars is trusted; a
+ * record that produces none anywhere is dropped rather than kept, so an account
+ * whose provider moved everything heals itself on the next sweep.
+ */
+async function targetsFor(base, key, opts) {
+  const known = readLayout(key);
+  if (known) {
+    const tried = new Set();
+    for (const root of [known.listRoot, known.homeSet]) {
+      if (!root || tried.has(root)) continue;
+      tried.add(root);
+      const found = await listCalendarsAt(root, opts);
+      if (!found) continue;
+      if (found.listRoot !== known.listRoot) {
+        writeLayout(key, { ...known, listRoot: found.listRoot, at: Date.now() });
+      }
+      return found.calendars;
+    }
+
+    if (known.principal) {
+      // The principal is the one URL a server almost never moves, so asking it
+      // where the calendars live now is two requests where the walk is four.
+      let homeSet = null;
+      try {
+        const res = await request('PROPFIND', known.principal, { ...opts, body: BODY_HOME_SET, depth: 0 });
+        homeSet = hrefUnder(parseXml(res.text), res.url, 'calendar-home-set');
+      } catch (err) {
+        if (err instanceof CalDavError && (err.status === 401 || err.status === 403)) throw err;
+        dav.debug(`the remembered principal at ${hostOf(known.principal)} failed: ${err.message}`);
+      }
+      if (homeSet && !tried.has(homeSet)) {
+        const found = await listCalendarsAt(homeSet, opts);
+        if (found) {
+          writeLayout(key, { ...known, homeSet, listRoot: found.listRoot, at: Date.now() });
+          return found.calendars;
+        }
+      }
+    }
+
+    forgetLayout(key);
+  }
+
+  const found = await discover({ url: base, ...opts });
+  if (found.listRoot) {
+    writeLayout(key, {
+      listRoot: found.listRoot,
+      principal: found.principal,
+      homeSet: found.homeSet,
+      at: Date.now(),
+    });
+  }
+  return found.calendars;
 }
 
 /**
@@ -678,22 +979,42 @@ export async function discover({ url, user, pass, timeoutMs = DEFAULT_TIMEOUT_MS
  *
  * `from`/`to` accept an ISO string, a Date or epoch milliseconds. Omitted, they
  * default to the last 30 and the next 180 days.
+ *
+ * The window is snapped outward to whole UTC days before it is used. A sweep's
+ * window slides by however long it was since the last one, which would make
+ * every request — and so every cache entry — unique, and the ctag check below
+ * pointless. Snapping widens the query by less than a day at each end, it is
+ * applied to the REPORT as well as to what is remembered so the two can never
+ * disagree, and the ICS parser downstream filters to the caller's real window
+ * regardless.
  */
 export async function fetchRange({ url, user, pass, from, to, timeoutMs = DEFAULT_TIMEOUT_MS, signal } = {}) {
-  const opts = { user, pass, timeoutMs, signal, authOrigin: originOf(normalizeUrl(url)) };
+  const base = normalizeUrl(url);
+  const opts = { user, pass, timeoutMs, signal, authOrigin: originOf(base) };
   const now = Date.now();
-  const start = davTime(from, now - 30 * 86_400_000);
-  const end = davTime(to, now + 180 * 86_400_000);
-  const body = calendarQueryBody(start, end);
+  const start = floorDay(msOf(from, now - 30 * DAY_MS));
+  const end = ceilDay(msOf(to, now + 180 * DAY_MS));
+  const body = calendarQueryBody(davStamp(start), davStamp(end));
 
-  const { calendars: targets } = await discover({ url, ...opts });
+  const key = accountKey(base, user);
+  const targets = await targetsFor(base, key, opts);
   if (!targets.length) {
-    dav.warn(`no calendar collections found at ${hostOf(normalizeUrl(url))}`);
+    dav.warn(`no calendar collections found at ${hostOf(base)}`);
     return [];
   }
 
   const out = [];
   for (const calendar of targets) {
+    // The ctag is the server's own answer to "has anything in this collection
+    // changed?". When it has not moved and the window is the same one, the
+    // REPORT would return what we already hold, so it is not sent.
+    const held = recall(key, calendar.href);
+    if (calendar.ctag && held && held.ctag === calendar.ctag && held.start === start && held.end === end) {
+      dav.debug(`${calendar.name} is unchanged; skipping its calendar-query`);
+      out.push(...held.docs);
+      continue;
+    }
+
     let res;
     try {
       res = await request('REPORT', calendar.href, { ...opts, body, depth: 1 });
@@ -702,16 +1023,21 @@ export async function fetchRange({ url, user, pass, from, to, timeoutMs = DEFAUL
       dav.warn(`calendar-query failed for ${calendar.name}: ${err.message}`);
       continue;
     }
+    const docs = [];
     const doc = parseXml(res.text);
     for (const response of findAll(doc, 'response')) {
       for (const prop of okProps(response)) {
         for (const child of prop.children) {
           if (child.local !== 'calendar-data') continue;
           const text = textOf(child).trim();
-          if (text.includes('BEGIN:VCALENDAR')) out.push(text);
+          if (text.includes('BEGIN:VCALENDAR')) docs.push(text);
         }
       }
     }
+    // Only a server that advertises a ctag can be skipped later: without one
+    // there is no way to know the collection has not moved on.
+    if (calendar.ctag) remember(key, calendar.href, { ctag: calendar.ctag, start, end, docs });
+    out.push(...docs);
   }
   return out;
 }

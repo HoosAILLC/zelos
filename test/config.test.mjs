@@ -268,3 +268,41 @@ test('newId() and isValidRef()', () => {
   assert.ok(!isValidRef(''));
   assert.ok(!isValidRef('a'.repeat(65)));
 });
+
+/**
+ * REGRESSION. A mail account with `secure: false` upgraded to TLS only if the
+ * server said it could, so a capability list with STARTTLS stripped out of it
+ * got the password in the clear and nobody was told. `requireTls` is the
+ * standing instruction about that, and it has to survive a config written
+ * before it existed — which is every config there is.
+ */
+test('requireTls defaults to "decide from the host" and is never pinned on the way in', () => {
+  freshHome('require-tls');
+  assert.equal(MAIL_ACCOUNT_DEFAULTS.requireTls, null);
+
+  const saved = saveConfig({ mail: [{ host: 'imap.example.com', user: 'nemo@example.com' }] });
+  assert.equal(saved.mail[0].requireTls, null,
+    'an account written before the option existed must not be frozen to a boolean');
+  assert.equal(validateConfig(saved).ok, true, JSON.stringify(validateConfig(saved).errors));
+
+  // The account is later pointed at a local bridge and told to allow cleartext.
+  const off = saveConfig({ mail: [{ ...saved.mail[0], host: '127.0.0.1', port: 1143, secure: false, requireTls: false }] });
+  assert.equal(off.mail[0].requireTls, false, 'an explicit permission has to round-trip through a save');
+  assert.equal(validateConfig(off).ok, true);
+
+  const on = saveConfig({ mail: [{ ...off.mail[0], requireTls: true }] });
+  assert.equal(on.mail[0].requireTls, true);
+  assert.equal(validateConfig(on).ok, true);
+});
+
+test('requireTls accepts only true, false and null', () => {
+  freshHome('require-tls-validate');
+  const base = saveConfig({ mail: [{ host: 'imap.example.com', user: 'nemo@example.com' }] });
+  for (const junk of ['yes', 'false', 0, 1, {}, []]) {
+    const cfg = structuredClone(base);
+    cfg.mail[0].requireTls = junk;
+    const result = validateConfig(cfg);
+    assert.equal(result.ok, false, JSON.stringify(junk));
+    assert.ok(result.errors.some((e) => e.path === 'mail[0].requireTls'), JSON.stringify(junk));
+  }
+});

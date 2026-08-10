@@ -49,11 +49,27 @@ export function clampToDisplays(bounds, workAreas = []) {
     return { width, height };
   }
 
+  /**
+   * The display the window is mostly on, not the first one it happens to touch.
+   * A window left straddling two monitors overlaps both work areas, and taking
+   * the first match meant the answer depended on the order the OS enumerated
+   * displays in: a window 80% on the second monitor was clamped back onto the
+   * first and appeared to teleport. Largest overlapping area wins; the minimum
+   * still decides whether a display counts as overlapping at all, so a sliver
+   * of a window on a second screen cannot claim it.
+   */
   const rect = { x, y, width, height };
-  const home = workAreas.find((area) => {
+  let home = null;
+  let covered = 0;
+  for (const area of workAreas) {
     const o = overlap(rect, area);
-    return o.width >= MIN_VISIBLE.width && o.height >= MIN_VISIBLE.height;
-  });
+    if (o.width < MIN_VISIBLE.width || o.height < MIN_VISIBLE.height) continue;
+    const onThisOne = o.width * o.height;
+    if (onThisOne > covered) {
+      covered = onThisOne;
+      home = area;
+    }
+  }
   if (!home) return { width, height };
 
   const w = Math.min(width, home.width);

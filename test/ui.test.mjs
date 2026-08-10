@@ -479,10 +479,20 @@ function stubBrowserGlobals() {
   if (!globalThis.document) {
     globalThis.document = {
       documentElement: { style: { setProperty() {} } },
+      // The board's heartbeat reads this and stops while nobody is looking, so
+      // the stub has to have an opinion about it.
+      visibilityState: 'visible',
       addEventListener() {},
+      removeEventListener() {},
       createElement() { throw new Error('these tests must not build DOM'); },
     };
   }
+}
+
+/** Let a chain of already-resolved promises settle, without a real timer. */
+async function settle() {
+  await new Promise((r) => setImmediate(r));
+  await new Promise((r) => setImmediate(r));
 }
 
 test('itemsInBucket keeps snoozed rows off the panes; snoozedItems carries them', async () => {
@@ -643,9 +653,23 @@ test('view navigation resets the scroll; same-view re-renders leave it alone', (
   assert.match(onRoute[0], /window\.scrollTo\(0, 0\)/);
   assert.match(onRoute[0], /before !== route\.view/,
     'the reset must be gated on the view actually changing');
-  // The navigation handler is the only place allowed to move the scroll: a
-  // deferred board refresh yanking the page to the top is its own bug.
-  assert.equal(app.split('scrollTo').length - 1, 1);
+
+  // Two call sites, and exactly two: onRoute above, and the skeleton handover
+  // in render() — leaving onboarding for the board is a navigation in
+  // everything but the hash, and onRoute cannot see it because the view name is
+  // 'now' on both sides. Anything beyond those two is a repaint moving the
+  // page under a reader, which is its own bug: a deferred board refresh that
+  // yanks the scroll to the top is exactly the thing this guard is here for.
+  assert.equal(app.split('scrollTo').length - 1, 2);
+  const handover = /if \(layout !== 'chrome'\) \{[\s\S]*?\n  \}/m.exec(app);
+  assert.ok(handover, 'the skeleton handover branch is missing');
+  assert.match(handover[0], /window\.scrollTo\(0, 0\)/,
+    'the second call site must be the skeleton handover, not a repaint');
+  for (const fn of ['paintChrome', 'flushQueuedRender', 'paintSweepLine']) {
+    const body = new RegExp(`function ${fn}\\([^)]*\\)[\\s\\S]*?\\n\\}`, 'm').exec(app);
+    assert.ok(body, `${fn} is missing`);
+    assert.ok(!body[0].includes('scrollTo'), `${fn} must not move the scroll`);
+  }
 });
 
 test('exactly one document-level keydown listener, and it closes the note panel', () => {
@@ -678,6 +702,314 @@ test('the clash flag cannot escape its month cell', () => {
   assert.match(row[1], /min-width:\s*0/);
 });
 
+/* ------------------------------------------- 6. the overnight window, and
+                                                   the things nobody could hear */
+
+/**
+ * A bare "due 2026-08-12" is a DAY, not an instant, and `instant()` reads it as
+ * UTC midnight because it is the ordering rule. Used as a deadline that made an
+ * item turn overdue-red at 8pm the evening before in New York, and read "due
+ * 16h ago" for the whole of the day it was actually due. dueInstant() is the
+ * deadline reading; instant() is left exactly as the parity suite pins it.
+ */
+test('dueInstant puts a bare deadline at the end of its own day, in the right zone', () => {
+  const tz = 'America/New_York';
+  assert.equal(ui.dueInstant('2026-08-12', tz), Date.parse('2026-08-12T23:59:59.999-04:00'));
+  // ...and the same date in January lands on the winter offset, not the summer one.
+  assert.equal(ui.dueInstant('2026-01-12', tz), Date.parse('2026-01-12T23:59:59.999-05:00'));
+  // A due date that names a time is that time, untouched.
+  assert.equal(ui.dueInstant('2026-08-12T09:00:00-04:00', tz), Date.parse('2026-08-12T09:00:00-04:00'));
+  assert.equal(ui.dueInstant('nonsense', tz), null);
+  // The ordering rule is deliberately unchanged.
+  assert.equal(ui.instant('2026-08-12'), Date.parse('2026-08-12T00:00:00Z'));
+});
+
+test('a bare due date is not overdue during its own day, west of Greenwich', () => {
+  const tz = 'America/New_York';
+  const item = { due_at: '2026-08-12' };
+  // 8:30pm on the 11th — half an hour past the UTC midnight the old reading
+  // used, which is where an item due tomorrow started rendering overdue-red.
+  assert.equal(fmt.isOverdue(item, Date.parse('2026-08-12T00:30:00Z'), tz), false);
+  assert.equal(fmt.isOverdue(item, Date.parse('2026-08-12T13:00:00Z'), tz), false); // 9am, its own day
+  assert.equal(fmt.isOverdue(item, Date.parse('2026-08-13T03:00:00Z'), tz), false); // 11pm, still its day
+  // Half past midnight: the day it was promised for is over, and now it is late.
+  assert.equal(fmt.isOverdue(item, Date.parse('2026-08-13T04:30:00Z'), tz), true);
+});
+
+test('a bare due date reads as a day, not as hours since UTC midnight', () => {
+  const tz = 'America/New_York';
+  const due = { due_at: '2026-08-12' };
+  assert.equal(fmt.dueLabel(due, Date.parse('2026-08-12T13:00:00Z'), tz), 'due today');
+  assert.equal(fmt.dueLabel(due, Date.parse('2026-08-11T22:00:00Z'), tz), 'due tomorrow');
+  assert.equal(fmt.dueLabel(due, Date.parse('2026-08-13T13:00:00Z'), tz), 'due yesterday');
+  assert.equal(fmt.dueLabel({ due_at: '2026-08-20' }, Date.parse('2026-08-12T13:00:00Z'), tz), 'due Thu, Aug 20');
+  // A deadline that names a time still counts down to it.
+  assert.equal(
+    fmt.dueLabel({ due_at: '2026-08-11T14:00:00Z' }, Date.parse('2026-08-11T12:00:00Z'), tz),
+    'due in 2h',
+  );
+});
+
+test('the day cost is stated in tokens, or not at all', () => {
+  assert.equal(fmt.tokenLine({ in: 12_400, out: 1_120 }), '12k tokens in · 1.1k out');
+  // The sweep engine's own field names read the same.
+  assert.equal(fmt.tokenLine({ tokensIn: 900, tokensOut: 40 }), '900 tokens in · 40 out');
+  // Absence is not zero: an older database, or a machine that has never swept,
+  // has nothing to report and must render nothing rather than "0 tokens in".
+  assert.equal(fmt.tokenLine(null), '');
+  assert.equal(fmt.tokenLine(undefined), '');
+  assert.equal(fmt.tokenLine({}), '');
+  assert.equal(fmt.tokenLine({ in: 0, out: 0 }), '');
+  // A rolling total is only today's while today is still today.
+  assert.equal(fmt.tokenLine({ day: '2026-08-11', in: 500, out: 20 }, '2026-08-12'), '');
+  assert.equal(fmt.tokenLine({ day: '2026-08-12', in: 500, out: 20 }, '2026-08-12'), '500 tokens in · 20 out');
+  // Zelos does not know what anyone pays per token and must never imply it does.
+  assert.ok(!/[$€£]/.test(fmt.tokenLine({ in: 12_400, out: 1_120 })));
+  assert.equal(fmt.compactCount(999), '999');
+  assert.equal(fmt.compactCount(1_050), '1.1k');
+  assert.equal(fmt.compactCount(2_400_000), '2.4M');
+});
+
+test('a window left open past midnight keeps its date, its now-line and its day', async () => {
+  stubBrowserGlobals();
+  const store = await import(path.join(UI, 'lib/store.js'));
+  store.state.board = {
+    ...store.state.board,
+    now: '2026-08-11T23:30:00-04:00',
+    events: [
+      { id: 'tonight', starts_at: '2026-08-11T21:00:00-04:00' },
+      { id: 'tomorrow', starts_at: '2026-08-12T09:00:00-04:00' },
+    ],
+  };
+  store.state.boardAt = Date.now() - 3 * 3_600_000;
+
+  // The old nowMark answered {key: null} the moment the clock passed midnight:
+  // blank header date, no now-line, no events, and the calendar's "Today"
+  // button anchored to yesterday until someone reloaded the page.
+  const nm = store.nowMark();
+  assert.equal(nm.key, '2026-08-12');
+  assert.ok(Math.abs(nm.minutes - 150) < 2, `2:30am, not ${nm.minutes}`);
+  assert.deepEqual(store.eventsToday().map((e) => e.id), ['tomorrow']);
+});
+
+test('an untouched window refetches the board on a timer, and stops while hidden', async (t) => {
+  stubBrowserGlobals();
+  const store = await import(path.join(UI, 'lib/store.js'));
+  t.mock.timers.enable({ apis: ['setInterval'] });
+
+  let fetched = 0;
+  const board = {
+    items: [], counts: {}, events: [], drafts: [], runs: { last: null },
+    notes: [], first: null, now: '2026-08-12T02:30:00-04:00',
+  };
+  globalThis.fetch = async (reqPath) => {
+    if (reqPath === '/api/state') fetched += 1;
+    return { ok: true, status: 200, text: async () => JSON.stringify(board) };
+  };
+  t.after(() => {
+    delete globalThis.fetch;
+    globalThis.document.visibilityState = 'visible';
+  });
+
+  store.state.phase = 'ready';
+  const stop = store.watchBoard({ intervalMs: 60_000 });
+  t.after(stop);
+
+  t.mock.timers.tick(60_000);
+  await settle();
+  assert.equal(fetched, 1, 'nothing was refetching the board at all');
+
+  globalThis.document.visibilityState = 'hidden';
+  t.mock.timers.tick(60_000);
+  await settle();
+  assert.equal(fetched, 1, 'a tab nobody is looking at must not poll');
+
+  globalThis.document.visibilityState = 'visible';
+  t.mock.timers.tick(60_000);
+  await settle();
+  assert.equal(fetched, 2, 'the heartbeat resumes when the tab comes back');
+  assert.equal(store.state.board.now, '2026-08-12T02:30:00-04:00');
+});
+
+test('the heartbeat refetches through the store, so it defers like any board change', () => {
+  const store = fs.readFileSync(path.join(UI, 'lib/store.js'), 'utf8');
+  const watch = /export function watchBoard\([\s\S]*?\n\}/m.exec(store);
+  assert.ok(watch, 'watchBoard is missing');
+  assert.match(watch[0], /setInterval/);
+  assert.match(watch[0], /visibilityState === 'hidden'/, 'a hidden tab must not poll');
+  assert.match(watch[0], /visibilitychange/, 'and it must catch up when the tab returns');
+  // loadBoard + emit is the same path a finished sweep takes, which is what
+  // puts this refresh under the shell's deferred-render rule: a refetch landing
+  // while a draft is being typed queues until that field blurs.
+  assert.match(watch[0], /await loadBoard\(\)/);
+  assert.match(watch[0], /\n\s*emit\(\);/);
+  assert.ok(!/notify\(/.test(watch[0]), 'a background refetch must not toast its failures');
+
+  const app = fs.readFileSync(path.join(UI, 'app.js'), 'utf8');
+  assert.match(app, /watchBoard\(\)/, 'the shell never starts the heartbeat');
+});
+
+/**
+ * A live region announces MUTATIONS made while it is in the document. Both of
+ * the app's regions were built with their text already set and then swapped in
+ * whole — so sweep progress, sweep failure and every single toast were silent.
+ * ui/views/ai-access.js documents the same trap and works around it the same way.
+ */
+test('the sweep line and the toast can actually be heard', () => {
+  const app = fs.readFileSync(path.join(UI, 'app.js'), 'utf8');
+
+  const build = /function buildSweepLine\(\)[\s\S]*?\n\}/m.exec(app);
+  assert.ok(build, 'buildSweepLine is missing');
+  assert.match(build[0], /'aria-live': 'polite'/);
+  assert.ok(!/text:/.test(build[0]), 'a live region born with its text set announces nothing');
+
+  const paint = /function paintSweepLine\(parts\)[\s\S]*?\n\}/m.exec(app);
+  assert.ok(paint, 'paintSweepLine is missing');
+  assert.match(paint[0], /announce\(parts\.textNode/);
+
+  const announce = /function announce\(node, text\)[\s\S]*?\n\}/m.exec(app);
+  assert.ok(announce, 'announce is missing');
+  assert.match(announce[0], /requestAnimationFrame/, 'the text must land after insertion');
+
+  // Replacing the region is the same silence in another coat, so the repaint
+  // path must update the one that is already there.
+  const paintChrome = /function paintChrome\(\)[\s\S]*?\n\}/m.exec(app);
+  assert.ok(paintChrome, 'paintChrome is missing');
+  assert.ok(!paintChrome[0].includes('buildSweepLine('), 'paintChrome mints a fresh live region');
+  assert.match(paintChrome[0], /paintSweepLine\(chrome\.sweep\)/);
+
+  const toast = /function toastBar\(\)[\s\S]*?\n\}/m.exec(app);
+  assert.ok(toast, 'toastBar is missing');
+  assert.ok(!/text: state\.toast\.message/.test(toast[0]), 'the toast bakes its message in');
+  assert.match(paintChrome[0], /announce\(built\.text, state\.toast\.message\)/);
+});
+
+test('the page declares the one theme it actually has', () => {
+  const html = fs.readFileSync(path.join(UI, 'index.html'), 'utf8');
+  // "light dark" on an app with a single black theme makes a light-mode OS draw
+  // its scrollbars, form controls and caret pale against pure black.
+  assert.match(html, /<meta name="color-scheme" content="dark">/);
+  assert.ok(!/content="light dark"/.test(html));
+});
+
+test('the search route is registered, and its view module answers to it', async () => {
+  const app = fs.readFileSync(path.join(UI, 'app.js'), 'utf8');
+  assert.match(app, /import \{ renderSearch \} from '\.\/views\/search\.js';/);
+  assert.match(app, /\{ id: 'search', label: 'Search', render: renderSearch, countKey: null \}/);
+  // No count badge: every other number in the rail is work that is waiting, and
+  // "how many things could you find" is not that.
+  assert.ok(!/id: 'search'[^}]*countKey: '/.test(app));
+
+  assert.ok(fs.existsSync(path.join(UI, 'views/search.js')), 'ui/views/search.js is missing');
+  stubBrowserGlobals();
+  const mod = await import(path.join(UI, 'views/search.js'));
+  assert.equal(typeof mod.renderSearch, 'function', 'search.js must export renderSearch');
+});
+
+/* ------------------------------------- 7. the view helpers worth pinning */
+
+/**
+ * The search and calendar views keep their arithmetic in exported pure
+ * functions precisely so it can be checked here, without a layout engine. Both
+ * modules are imported rather than read as text: these are behaviours, not
+ * mechanisms, and a source guard would only pin the spelling.
+ */
+test('a search hit knows where — and whether — it can be opened', async () => {
+  stubBrowserGlobals();
+  const search = await import(path.join(UI, 'views/search.js'));
+
+  assert.deepEqual(search.refParts('msg:abc'), { prefix: 'msg', id: 'abc' });
+  // Message ids are not guaranteed to be colon-free; only the first one splits.
+  assert.deepEqual(search.refParts('msg:a:b'), { prefix: 'msg', id: 'a:b' });
+  assert.equal(search.refParts('msg:'), null);
+  assert.equal(search.refParts('other:1'), null);
+  assert.equal(search.refParts(null), null);
+
+  assert.equal(search.hashForBucket('waiting'), '#/owed');
+  assert.equal(search.hashForBucket('money'), '#/today');
+  assert.equal(search.hashForBucket('nonsense'), '#/now');
+
+  const items = [
+    { id: 'i1', bucket: 'waiting', sourceRefs: ['msg:m1'] },
+    { id: 'i2', bucket: 'now', sourceRefs: [] },
+  ];
+  const events = [{ id: 'e1', starts_at: '2026-08-11T14:00:00-04:00' }];
+
+  // The hash carries the day, so opening a March event lands on March rather
+  // than on whatever range the calendar was last left showing.
+  assert.deepEqual(search.destinationFor('evt:e1', { items, events }), {
+    where: 'calendar', hash: '#/calendar/2026-08-11', event: events[0], day: '2026-08-11',
+  });
+  assert.equal(search.destinationFor('item:i1', { items, events }).hash, '#/owed');
+  // A message is not a page in this app, but the item a sweep raised from it is.
+  const raised = search.destinationFor('msg:m1', { items, events });
+  assert.equal(raised.item.id, 'i1');
+  assert.equal(raised.raised, true);
+  // A hit nothing on the board cites offers no way in, which is honest: an
+  // item that has been done is not on a page any more.
+  assert.equal(search.destinationFor('msg:gone', { items, events }), null);
+  assert.equal(search.destinationFor('evt:gone', { items, events }), null);
+  assert.equal(search.destinationFor('item:gone', { items, events }), null);
+});
+
+test('the results summary counts in the words the app uses, board first', async () => {
+  stubBrowserGlobals();
+  const search = await import(path.join(UI, 'views/search.js'));
+  assert.equal(
+    search.summariseKinds([
+      { kind: 'message' }, { kind: 'item' }, { kind: 'message' }, { kind: 'event' },
+    ]),
+    'board 1 · mail 2 · calendar 1',
+  );
+  assert.equal(search.summariseKinds([]), '');
+  assert.equal(search.summariseKinds(null), '');
+  // The database's own vocabulary must not reach the screen.
+  assert.equal(search.kindLabel('capture'), 'note');
+  assert.equal(search.kindLabel('message'), 'mail');
+  assert.equal(search.kindLabel(''), 'result');
+});
+
+test('the calendar opens where the day is, not at midnight', async () => {
+  stubBrowserGlobals();
+  const cal = await import(path.join(UI, 'views/calendar.js'));
+
+  // Now wins, with two hours of context above it.
+  assert.equal(cal.openingScrollMinutes({ nowMinutes: 14 * 60, firstEventMinutes: 9 * 60 }), 12 * 60);
+  // Early enough and it clamps rather than going negative.
+  assert.equal(cal.openingScrollMinutes({ nowMinutes: 30 }), 0);
+  // A range with no today aims at its first timed event instead.
+  assert.equal(cal.openingScrollMinutes({ firstEventMinutes: 10 * 60 }), 10 * 60 - 45);
+  // And with neither, the working day.
+  assert.equal(cal.openingScrollMinutes({}), 7 * 60);
+
+  // All-day spans start at minute zero and live in their own strip; counting
+  // them would aim every range at midnight.
+  assert.equal(cal.earliestStartMinutes([
+    { start: 0, allDay: true }, { start: 600 }, { start: 540 },
+  ]), 540);
+  assert.equal(cal.earliestStartMinutes([{ start: 0, allDay: true }]), null);
+  assert.equal(cal.earliestStartMinutes([]), null);
+
+  // A re-render in the same place keeps the scroll the reader chose; arriving,
+  // or moving to another range, does not.
+  const sig = cal.rangeSignature('week', ['2026-08-09', '2026-08-15']);
+  assert.equal(sig, cal.rangeSignature('week', ['2026-08-09', '2026-08-10', '2026-08-15']));
+  assert.equal(cal.shouldOpenAtTarget({ signature: sig, lastSignature: sig, wasOnScreen: true }), false);
+  assert.equal(cal.shouldOpenAtTarget({ signature: sig, lastSignature: sig, wasOnScreen: false }), true);
+  assert.equal(cal.shouldOpenAtTarget({ signature: sig, lastSignature: 'week|x|y', wasOnScreen: true }), true);
+});
+
+test('the tab bar does not keep a second copy of how many views there are', () => {
+  const css = fs.readFileSync(path.join(UI, 'app.css'), 'utf8');
+  const bar = /^\.tabbar \{([^}]*)\}/m.exec(css);
+  assert.ok(bar, '.tabbar rule is missing');
+  // A literal column count here is VIEWS.length written down twice; adding the
+  // seventh view wrapped the extra tab onto a row below the bar.
+  assert.ok(!/grid-template-columns:\s*repeat\(\d/.test(bar[1]), 'the tab count is hardcoded in CSS');
+  assert.match(bar[1], /grid-auto-flow: column/);
+  assert.match(bar[1], /grid-auto-columns: minmax\(0, 1fr\)/);
+});
+
 test('no rule still branches on a theme attribute that is never set', () => {
   const css = fs.readFileSync(path.join(UI, 'app.css'), 'utf8');
   const html = fs.readFileSync(path.join(UI, 'index.html'), 'utf8');
@@ -685,4 +1017,440 @@ test('no rule still branches on a theme attribute that is never set', () => {
   // like it is handling a case and is not.
   assert.ok(!/\[data-theme[~^|*$]?=/.test(css), 'app.css still branches on data-theme');
   assert.ok(!/data-theme=/.test(html), 'index.html still carries a data-theme attribute');
+});
+
+/* ------------------------------------------- 8. the fixes that were not wired,
+                                                  and the failures nobody saw */
+
+/**
+ * A zone parameter nothing passes is not a fix.
+ *
+ * `dueLabel` and `isOverdue` both take a zone and both default it to the
+ * BROWSER's, and every row on the board called them without one — so a bare
+ * "due 2026-08-12" was judged against the laptop's zone while the carried-for
+ * badge on the same line was judged in the configured one. The two readings are
+ * a whole day apart for anyone away from home. `dueBit` is the single place the
+ * zone is threaded, and the two assertions below are the two halves that matter:
+ * that it actually consults the zone, and that no call site has been left behind.
+ */
+test('a deadline is read in the configured zone, wherever the browser thinks it is', async () => {
+  stubBrowserGlobals();
+  const items = await import(path.join(UI, 'lib/items.js'));
+  const item = { due_at: '2026-08-12' };
+  // 1pm UTC on the 12th. In New York that is 9am of the day it is due; in
+  // Kiritimati it is 3am of the day AFTER. Two zones, two honest answers, and
+  // neither of them depends on where this test is being run.
+  const now = Date.parse('2026-08-12T13:00:00Z');
+
+  const inNewYork = items.dueBit(item, { tz: 'America/New_York', now });
+  assert.deepEqual(inNewYork, { text: 'due today', hot: false });
+
+  const inKiritimati = items.dueBit(item, { tz: 'Pacific/Kiritimati', now });
+  assert.deepEqual(inKiritimati, { text: 'due yesterday', hot: true });
+
+  assert.equal(items.dueBit({ due_at: null }, { tz: 'America/New_York', now }), null);
+});
+
+test('every production call of dueLabel/isOverdue is handed a zone', () => {
+  // The fix lived in format.js and was reachable only from the tests. This walks
+  // the shipped modules and fails on a call site that left the zone to chance —
+  // which is what metaLine() and itemHero() were both doing.
+  const files = [];
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.name.endsWith('.js')) files.push(full);
+    }
+  };
+  walk(UI);
+
+  let callSites = 0;
+  for (const file of files) {
+    // format.js declares them; a declaration is not a call.
+    if (file.endsWith(path.join('lib', 'format.js'))) continue;
+    const src = fs.readFileSync(file, 'utf8');
+    for (const m of src.matchAll(/\b(dueLabel|isOverdue)\s*\(([^)]*)\)/g)) {
+      callSites += 1;
+      assert.match(m[2], /\bzone\b|\btz\b/,
+        `${path.relative(UI, file)} calls ${m[1]}(${m[2]}) without a zone`);
+    }
+  }
+  assert.ok(callSites > 0, 'the call sites moved; this guard is now pinning nothing');
+});
+
+/**
+ * The memo is exact, not approximate: both Intl lookups inside dueInstant are
+ * taken at instants derived from the zone and the day-key alone, so the same
+ * pair can never produce a different answer. What it buys is the cost — the
+ * lookups are something like a hundred times the string parse they replaced, and
+ * a board row asks for the same deadline twice, once for its words and once for
+ * whether it is late.
+ */
+test('a deadline costs its zone lookup once per zone and day, not once per row', (t) => {
+  const real = Intl.DateTimeFormat;
+  let built = 0;
+  // A subclass rather than a wrapper: `new Intl.DateTimeFormat(...)` must keep
+  // returning something with formatToParts on it.
+  class Counting extends real {
+    constructor(...args) {
+      built += 1;
+      super(...args);
+    }
+  }
+  Intl.DateTimeFormat = Counting;
+  t.after(() => { Intl.DateTimeFormat = real; });
+
+  const tz = 'America/New_York';
+  // A key this process has certainly not seen, so the memo starts cold.
+  const first = ui.dueInstant('2031-08-12', tz);
+  assert.ok(built > 0, 'the first reading must actually consult the zone');
+  const beforeRepeat = built;
+
+  for (let i = 0; i < 20; i += 1) {
+    assert.equal(ui.dueInstant('2031-08-12', tz), first);
+  }
+  assert.equal(built, beforeRepeat, 'the same zone and day were looked up again');
+
+  // A different day, and a different zone on the same day, are both still real
+  // work — the memo must not be answering from the wrong entry.
+  assert.equal(ui.dueInstant('2031-01-12', tz), Date.parse('2031-01-12T23:59:59.999-05:00'));
+  assert.equal(ui.dueInstant('2031-08-12', 'Europe/London'), Date.parse('2031-08-12T23:59:59.999+01:00'));
+  assert.equal(first, Date.parse('2031-08-12T23:59:59.999-04:00'));
+});
+
+/**
+ * The heartbeat swallowed every error, which left the app permanently and
+ * invisibly stale in the exact scenario it was added for: the window open
+ * overnight, whose hours-old board looks precisely like a current one.
+ */
+test('a run of failed heartbeats says so, and one blip does not', async (t) => {
+  stubBrowserGlobals();
+  const store = await import(path.join(UI, 'lib/store.js'));
+  t.mock.timers.enable({ apis: ['setInterval'] });
+
+  const board = {
+    items: [], counts: {}, events: [], drafts: [], runs: { last: null },
+    notes: [], first: null, now: '2026-08-12T02:30:00-04:00',
+  };
+  let answering = false;
+  globalThis.fetch = async () => (answering
+    ? { ok: true, status: 200, text: async () => JSON.stringify(board) }
+    : { ok: false, status: 503, text: async () => '{"error":"the server is not there"}' });
+  t.after(() => {
+    delete globalThis.fetch;
+    store.state.fatal = null;
+    store.state.phase = 'ready';
+  });
+
+  store.state.phase = 'ready';
+  store.state.fatal = null;
+  const stop = store.watchBoard({ intervalMs: 60_000 });
+  t.after(stop);
+
+  t.mock.timers.tick(60_000);
+  await settle();
+  assert.equal(store.state.fatal, null, 'one missed refetch is a wifi hiccup, not news');
+  t.mock.timers.tick(60_000);
+  await settle();
+  assert.equal(store.state.fatal, null, 'two is still not a story');
+
+  t.mock.timers.tick(60_000);
+  await settle();
+  assert.equal(store.state.fatal?.title, 'Zelos is not answering',
+    'a heartbeat that keeps failing must stop pretending the board is current');
+  assert.equal(store.state.phase, 'down');
+
+  // ...and it comes back down by itself when the server does.
+  answering = true;
+  t.mock.timers.tick(60_000);
+  await settle();
+  assert.equal(store.state.fatal, null, 'a server that came back must clear its own screen');
+  assert.equal(store.state.phase, 'ready');
+});
+
+test('the heartbeat states its failure in the same words the boot path uses', () => {
+  const store = fs.readFileSync(path.join(UI, 'lib/store.js'), 'utf8');
+  const watch = /export function watchBoard\([\s\S]*?\n\}/m.exec(store);
+  assert.ok(watch, 'watchBoard is missing');
+  // One screen, one wording. Two copies of "Zelos is not answering" is two
+  // sentences that will drift.
+  assert.match(watch[0], /fatalFor\(err\)/);
+  assert.equal(store.split("title: 'Zelos is not answering'").length - 1, 1);
+  const refresh = /export async function refresh\([\s\S]*?\n\}/m.exec(store);
+  assert.ok(refresh, 'refresh is missing');
+  assert.match(refresh[0], /fatalFor\(err\)/);
+});
+
+/**
+ * `nowMark()` rolls its key past midnight rather than giving up, and the
+ * now-line is a child of whichever column was today when the grid was built. So
+ * at 00:03 the line was being repositioned three minutes down YESTERDAY's
+ * column — a confident claim about the wrong day.
+ */
+test('past midnight the now-line changes column, or leaves', async (t) => {
+  stubBrowserGlobals();
+  const store = await import(path.join(UI, 'lib/store.js'));
+  const cal = await import(path.join(UI, 'views/calendar.js'));
+
+  // A grid small enough to reason about: the handful of node behaviours
+  // tickNowLine actually uses, and nothing else.
+  const node = (day) => {
+    const self = {
+      dataset: day ? { day } : {},
+      children: [],
+      parentNode: null,
+      classes: new Set(day ? [] : []),
+      style: {},
+      classList: {
+        add(c) { self.classes.add(c); },
+        remove(c) { self.classes.delete(c); },
+      },
+      appendChild(child) {
+        child.parentNode?.children.splice(child.parentNode.children.indexOf(child), 1);
+        child.parentNode = self;
+        self.children.push(child);
+        return child;
+      },
+      remove() {
+        const kids = self.parentNode?.children;
+        if (kids) kids.splice(kids.indexOf(self), 1);
+        self.parentNode = null;
+      },
+    };
+    return self;
+  };
+
+  const grid = (dayKeys) => {
+    const cols = dayKeys.map((d) => node(d));
+    const line = node(null);
+    cols[0].appendChild(line);
+    cols[0].classList.add('is-today');
+    const realDoc = globalThis.document;
+    globalThis.document = {
+      ...realDoc,
+      querySelector: (sel) => (sel === '.cal-days .now-line' && line.parentNode ? line : null),
+      querySelectorAll: (sel) => (sel === '.cal-days .cal-col' ? cols : []),
+    };
+    t.after(() => { globalThis.document = realDoc; });
+    return { cols, line };
+  };
+
+  // The board was fetched at 23:30 and nobody has touched the window since; it
+  // is now three hours later, which is 02:30 of the NEXT day.
+  store.state.board = { ...store.state.board, now: '2026-08-11T23:30:00-04:00' };
+  store.state.boardAt = Date.now() - 3 * 3_600_000;
+  assert.equal(store.nowMark().key, '2026-08-12', 'the premise of this test has moved');
+
+  const week = grid(['2026-08-11', '2026-08-12']);
+  cal.tickNowLine();
+  assert.equal(week.line.parentNode, week.cols[1],
+    'the now-line stayed in yesterday and moved itself down inside it');
+  assert.ok(week.cols[1].classes.has('is-today'));
+  assert.ok(!week.cols[0].classes.has('is-today'), 'the grid is claiming two todays');
+  assert.match(week.line.style.top, /^calc\(15\d(\.\d+)? \* var\(--min-h\)\)$/);
+
+  // A grid the new day is not on has no honest place to draw "now".
+  const stale = grid(['2026-08-11']);
+  cal.tickNowLine();
+  assert.equal(stale.line.parentNode, null, 'a line for a day not on screen must go');
+});
+
+/**
+ * `paint()` runs on every board render, and the board now has a heartbeat — so
+ * rewriting the status region unconditionally announces stale search results to
+ * a screen reader on a timer, forever.
+ */
+test('the search status announces a change, not a repaint', () => {
+  const search = fs.readFileSync(path.join(UI, 'views/search.js'), 'utf8');
+  const paint = /function paint\(\)[\s\S]*?\n\}/m.exec(search);
+  assert.ok(paint, 'paint is missing');
+  assert.ok(!/statusNode\.textContent\s*=/.test(paint[0]),
+    'paint writes the live region on every render');
+  assert.match(paint[0], /announce\(statusNode/);
+
+  const announce = /function announce\(node, text\)[\s\S]*?\n\}/m.exec(search);
+  assert.ok(announce, 'announce is missing');
+  assert.match(announce[0], /if \(announced === value\) return/, 'the guard must be on the text');
+  assert.match(announce[0], /requestAnimationFrame/, 'the text must land after insertion');
+});
+
+/**
+ * 'Check a token' reverted to the just-minted token on every repaint, so the
+ * second press of Test checked something other than what was on screen.
+ */
+test('what was typed into the token test survives a repaint', () => {
+  const src = fs.readFileSync(path.join(UI, 'views/ai-access.js'), 'utf8');
+  const block = /function testBlock\(v\)[\s\S]*?\n  \}/m.exec(src);
+  assert.ok(block, 'testBlock is missing');
+  assert.ok(!/^\s*if \(revealed\) tokenInput\.value = revealed\.value;$/m.test(block[0]),
+    'the field is still overwritten with the minted token on every repaint');
+  assert.match(block[0], /if \(tokenDraft !== null\) tokenInput\.value = tokenDraft;/);
+  assert.match(block[0], /addEventListener\('input'[\s\S]*?tokenDraft = tokenInput\.value/);
+  // Module scope, not closure scope: the panel is rebuilt wholesale, so a draft
+  // kept inside the builder would not survive the thing it exists to survive.
+  assert.match(src, /^let tokenDraft = null;$/m);
+  // Minting is the one write that is allowed to replace it.
+  const mint = /async function mint\(label\)[\s\S]*?\n  \}/m.exec(src);
+  assert.ok(mint, 'mint is missing');
+  assert.match(mint[0], /tokenDraft = null;/);
+});
+
+/* ------------------------------------- 9. the setting that existed everywhere
+                                            except where anyone could reach it */
+
+/**
+ * `requireTls` was stored by core/config.mjs, enforced by core/sources/imap.mjs
+ * and forwarded by the sweep, the doctor and the mail-test route — and `grep -rn
+ * requireTls ui/` matched nothing. A security setting nobody can see is not a
+ * setting, and the account editor had no way to say "this bridge on my own
+ * machine is deliberate" short of hand-editing config.json.
+ *
+ * The mapping is checked as behaviour because it is the whole of the risk: get
+ * it backwards, or coerce a stray string, and Zelos quietly stops requiring
+ * encryption for a real mail server on the public internet.
+ */
+test('the TLS choice maps to the three values config stores, and junk lands on the safe one', async () => {
+  stubBrowserGlobals();
+  const settings = await import(path.join(UI, 'views/settings.js'));
+  const config = await import(path.join(ROOT, 'core/config.mjs'));
+
+  assert.deepEqual(settings.TLS_CHOICES.map((c) => c.value), ['auto', 'require', 'allow']);
+  for (const choice of settings.TLS_CHOICES) {
+    assert.ok(choice.label.length > 0, choice.value);
+    // The copy is about the password, not about the protocol. A user deciding
+    // this should not have to know what STARTTLS is.
+    assert.ok(!/STARTTLS|TLS handshake|cleartext/i.test(choice.label), choice.label);
+  }
+
+  assert.equal(settings.requireTlsFor('auto'), null);
+  assert.equal(settings.requireTlsFor('require'), true);
+  assert.equal(settings.requireTlsFor('allow'), false);
+  // A select can only hand back its own values, but the direction of the
+  // failure matters: anything unrecognised must resolve to "decide from the
+  // host", never to permission.
+  for (const junk of ['', 'false', 'true', null, undefined, 0, 'Allow']) {
+    assert.equal(settings.requireTlsFor(junk), null, JSON.stringify(junk));
+  }
+
+  assert.equal(settings.tlsChoiceFor(true), 'require');
+  assert.equal(settings.tlsChoiceFor(false), 'allow');
+  // What every account saved before this setting existed says, and what a new
+  // one gets: the default the config module itself ships.
+  assert.equal(config.MAIL_ACCOUNT_DEFAULTS.requireTls, null);
+  assert.equal(settings.tlsChoiceFor(null), 'auto');
+  assert.equal(settings.tlsChoiceFor(undefined), 'auto');
+  // A truthy string is not a boolean, and must not read as permission either.
+  for (const junk of ['false', 'true', 0, 1, 'no']) {
+    assert.equal(settings.tlsChoiceFor(junk), 'auto', JSON.stringify(junk));
+  }
+});
+
+/**
+ * The editor and the test button are pinned at the source because building the
+ * form needs a layout engine, and the failure is in the wiring rather than in
+ * any function: "Test the connection" composed its body by hand and left
+ * `requireTls` out of it, so the one moment a user is told "this works" was the
+ * moment least like the sweep that runs at 07:00.
+ */
+test('the mail editor can set requireTls, and the test connects under the same rule', () => {
+  const src = fs.readFileSync(path.join(UI, 'views/settings.js'), 'utf8');
+  const form = /function mailForm\(account, \{ onSaved, onCancel \}\)[\s\S]*?\n\}/m.exec(src);
+  assert.ok(form, 'mailForm is missing');
+
+  // A control, actually placed in the returned form — not merely built.
+  assert.match(form[0], /select\(TLS_CHOICES, \{ value: tlsChoiceFor\(draft\.requireTls\) \}\)/,
+    'the editor must offer the three stored values');
+  assert.match(form[0], /field\('Sending your password', tlsSelect/,
+    'the control must be in the form, with a label about the password');
+
+  // Both paths out of this form carry it, and both read the same control.
+  const probe = /api\.testMail\(\{[\s\S]*?\}\)/m.exec(form[0]);
+  assert.ok(probe, 'the testMail call is missing');
+  assert.match(probe[0], /requireTls: requireTls\(\)/,
+    'the connection test omits requireTls and so tests different rules than the sweep');
+  const save = /saveConfig\(\{ mail: \[[\s\S]*?\] \}\)/m.exec(form[0]);
+  assert.ok(save, 'the save call is missing');
+  assert.match(save[0], /requireTls: requireTls\(\)/, 'the save drops what the editor chose');
+
+  // The blank a new account opens on is the config module's blank. A literal
+  // `false` here would excuse cleartext for a host nobody has named yet.
+  const blank = /editor\.replaceChildren\(mailForm\(\{[\s\S]*?\}, \{/m.exec(src);
+  assert.ok(blank, 'the new-account literal is missing');
+  assert.match(blank[0], /requireTls: null/, 'a new account must start on "decide from the address"');
+});
+
+/**
+ * The removal half of the midnight fix. `tickNowLine` dropped the line when the
+ * new day was off screen and left `is-today` on the column that was today when
+ * the grid was built — so a day grid showing the 12th, ticked at 00:03 on the
+ * 13th, went on tinting the 12th and labelling it today.
+ */
+test('a now-line that leaves takes the today marker with it', async (t) => {
+  stubBrowserGlobals();
+  const store = await import(path.join(UI, 'lib/store.js'));
+  const cal = await import(path.join(UI, 'views/calendar.js'));
+
+  const node = (day) => {
+    const self = {
+      dataset: day ? { day } : {},
+      children: [],
+      parentNode: null,
+      classes: new Set(),
+      style: {},
+      classList: {
+        add(c) { self.classes.add(c); },
+        remove(c) { self.classes.delete(c); },
+      },
+      appendChild(child) {
+        child.parentNode?.children.splice(child.parentNode.children.indexOf(child), 1);
+        child.parentNode = self;
+        self.children.push(child);
+        return child;
+      },
+      remove() {
+        const kids = self.parentNode?.children;
+        if (kids) kids.splice(kids.indexOf(self), 1);
+        self.parentNode = null;
+      },
+    };
+    return self;
+  };
+
+  const grid = (dayKeys) => {
+    const cols = dayKeys.map((d) => node(d));
+    const line = node(null);
+    cols[0].appendChild(line);
+    cols[0].classList.add('is-today');
+    const realDoc = globalThis.document;
+    globalThis.document = {
+      ...realDoc,
+      querySelector: (sel) => (sel === '.cal-days .now-line' && line.parentNode ? line : null),
+      querySelectorAll: (sel) => (sel === '.cal-days .cal-col' ? cols : []),
+    };
+    t.after(() => { globalThis.document = realDoc; });
+    return { cols, line };
+  };
+
+  // A day grid built on the 12th, still open at three minutes past midnight.
+  store.state.board = { ...store.state.board, now: '2026-08-12T23:30:00-04:00' };
+  store.state.boardAt = Date.now() - 33 * 60_000;
+  const mark = store.nowMark();
+  assert.equal(mark.key, '2026-08-13', 'the premise of this test has moved');
+  assert.ok(Math.abs(mark.minutes - 3) < 2, `00:03, not ${mark.minutes}`);
+
+  const day = grid(['2026-08-12']);
+  cal.tickNowLine();
+  assert.equal(day.line.parentNode, null, 'the line has no honest place on this grid');
+  assert.ok(!day.cols[0].classes.has('is-today'),
+    'the 12th is still being drawn as today, on the 13th');
+
+  // The other way out: no reading of "now" at all. The marker goes with it,
+  // because it was only ever a claim about a clock this grid can no longer read.
+  const orphan = grid(['2026-08-12', '2026-08-13']);
+  store.state.board = { ...store.state.board, now: null };
+  assert.equal(store.nowMark().key, null, 'the premise of this test has moved');
+  cal.tickNowLine();
+  assert.equal(orphan.line.parentNode, null);
+  assert.ok(!orphan.cols.some((c) => c.classes.has('is-today')), 'a today marker outlived its clock');
 });

@@ -28,6 +28,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 /* The environment has to be settled before the modules that read it are
    evaluated, which static imports would not allow. */
@@ -141,6 +144,8 @@ async function mcpCall(ctx, request, { bearer = null, headers = {}, method = 'PO
 }
 
 const RPC = { jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} };
+
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /* ================================================================== *
  * The module on its own
@@ -654,16 +659,18 @@ test('a real call updates lastUsedAt and lands in the access log', async (t) => 
   assert.equal(JSON.stringify(after.json.access).includes(value), false);
 
   // A scope that is off is refused — and the refusal is logged too, because
-  // "what did my AI try to read?" is part of the same question.
+  // "what did my AI try to read?" is part of the same question. `zelos_people`
+  // and not `zelos_search`: search is reachable from any scope that owns a
+  // searchable kind, and the calendar is one, so it would not be refused here.
   const denied = await mcpCall(ctx, {
-    jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'zelos_search', arguments: { query: 'x' } },
+    jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'zelos_people', arguments: {} },
   }, { bearer: value });
   assert.equal(denied.status, 200);
-  assert.ok(denied.json.error, 'mail.metadata is off, so this must not answer');
+  assert.ok(denied.json.error, 'people is off, so this must not answer');
   const withDenial = await api(ctx, 'GET', '/api/ai');
   assert.equal(withDenial.json.access.length, 2);
   assert.equal(withDenial.json.access[0].ok, false);
-  assert.equal(withDenial.json.access[0].scope, 'mail.metadata');
+  assert.equal(withDenial.json.access[0].scope, 'people');
 
   // A ping is a keep-alive, not a read.
   await mcpCall(ctx, { jsonrpc: '2.0', id: 3, method: 'ping' }, { bearer: value });
@@ -676,6 +683,185 @@ test('a real call updates lastUsedAt and lands in the access log', async (t) => 
   const refused = await api(ctx, 'GET', '/api/ai');
   assert.equal(refused.json.access.length, 2);
   assert.equal(refused.json.tokens[0].lastUsedAt, after.json.tokens[0].lastUsedAt);
+});
+
+test('a burst of calls stamps lastUsedAt once a minute, not once a second', async (t) => {
+  await resetAi();
+  const ctx = await startServer(t, { real: true });
+  await api(ctx, 'PUT', '/api/ai', { body: { enabled: true, scopes: { calendar: true } } });
+  const made = await api(ctx, 'POST', '/api/ai/tokens', { body: { label: 'Chatty client' } });
+  const value = made.json.value;
+
+  // Every successful call used to rewrite config.json — an atomic write with
+  // two fsyncs — to move a second-resolution timestamp. The old code skipped a
+  // rewrite only when the stamp it was about to write was the one already
+  // there, so a burst spread over three seconds bought three rewrites; a client
+  // polling all day bought one a second, forever.
+  //
+  // config.json's mtime is the measurement, because it is the I/O itself rather
+  // than a proxy for it: one distinct mtime is one rewrite.
+  const writes = new Set();
+  const started = Date.now();
+  for (let i = 0; i < 8; i += 1) {
+    const res = await mcpCall(ctx, RPC, { bearer: value });
+    assert.equal(res.status, 200, 'every call in the burst must still be answered');
+    writes.add(fs.statSync(paths().configFile).mtimeMs);
+    await delay(400);
+  }
+  assert.ok(Date.now() - started > 2_000, 'the burst has to span more than a second to prove anything');
+  assert.equal(writes.size, 1, `the burst rewrote config.json ${writes.size} times`);
+
+  // Throttled, not dropped: the first call still stamps, so a token that has
+  // just started working says so on the panel straight away.
+  const after = await api(ctx, 'GET', '/api/ai');
+  assert.ok(after.json.tokens[0].lastUsedAt, 'the first call in a burst still records that it worked');
+});
+
+test('the access log names the token the way its owner named it', async (t) => {
+  await resetAi();
+  const ctx = await startServer(t, { real: true });
+  await api(ctx, 'PUT', '/api/ai', { body: { enabled: true, scopes: { calendar: true } } });
+  const made = await api(ctx, 'POST', '/api/ai/tokens', { body: { label: 'Claude on the laptop' } });
+  const id = made.json.token.id;
+
+  const CALL = { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'zelos_calendar', arguments: {} } };
+  assert.equal((await mcpCall(ctx, CALL, { bearer: made.json.value })).status, 200);
+
+  const [row] = (await api(ctx, 'GET', '/api/ai')).json.access;
+  assert.equal(row.tokenId, id, 'the id is still there — it is what identifies a token for ever');
+  assert.equal(row.label, 'Claude on the laptop', 'and the panel gets the name the user chose');
+  assert.equal(row.tokenRevoked, false);
+
+  // A row outlives its token, and says so rather than going quietly anonymous:
+  // "a client you have since cut off read this" is the interesting case.
+  await api(ctx, 'DELETE', `/api/ai/tokens/${id}`);
+  const [orphan] = (await api(ctx, 'GET', '/api/ai')).json.access;
+  assert.equal(orphan.tokenId, id);
+  assert.equal(orphan.label, null);
+  assert.equal(orphan.tokenRevoked, true);
+});
+
+test('the access log comes back in windows, and asking for more is bounded', async (t) => {
+  await resetAi();
+  const ctx = await startServer(t, { real: true });
+  await api(ctx, 'PUT', '/api/ai', { body: { enabled: true, scopes: { calendar: true } } });
+  const made = await api(ctx, 'POST', '/api/ai/tokens', { body: { label: 'Busy' } });
+
+  const CALL = { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'zelos_calendar', arguments: {} } };
+  for (let i = 0; i < 60; i += 1) await mcpCall(ctx, CALL, { bearer: made.json.value });
+
+  const first = await api(ctx, 'GET', '/api/ai');
+  assert.equal(first.json.access.length, 50, 'the default window is fifty rows, not sixty and not six thousand');
+  assert.equal(first.json.accessMore, true, 'and the panel is told there are older ones behind it');
+
+  const wider = await api(ctx, 'GET', '/api/ai?log=200');
+  assert.equal(wider.json.access.length, 60);
+  assert.equal(wider.json.accessMore, false, 'sixty rows in a window of two hundred is the whole log');
+
+  // The window is the panel's to choose and the server's to bound.
+  const absurd = await api(ctx, 'GET', '/api/ai?log=999999');
+  assert.equal(absurd.json.accessLimit, absurd.json.accessMax);
+  assert.equal((await api(ctx, 'GET', '/api/ai?log=0')).json.accessLimit, 1);
+  assert.equal((await api(ctx, 'GET', '/api/ai?log=nonsense')).json.accessLimit, 50);
+});
+
+/* ================================================================== *
+ * POST /api/ai/test — what the client would see
+ * ================================================================== */
+
+test('the connection test shows exactly what a client would be handed', async (t) => {
+  await resetAi();
+  const ctx = await startServer(t, { real: true });
+  await api(ctx, 'PUT', '/api/ai', { body: { enabled: true, scopes: { calendar: true, board: true } } });
+  const made = await api(ctx, 'POST', '/api/ai/tokens', { body: { label: 'Claude Desktop' } });
+  const value = made.json.value;
+
+  const res = await api(ctx, 'POST', '/api/ai/test', { body: { token: value } });
+  assert.equal(res.status, 200);
+  assert.equal(res.json.ok, true);
+  assert.equal(res.json.token.label, 'Claude Desktop');
+  assert.equal(res.json.serverInfo.name, 'zelos');
+  assert.equal(res.json.protocolVersion, '2025-06-18');
+  assert.match(res.json.instructions, /read-only/i);
+
+  // It is a test, not a use: it reads nothing, so it logs nothing and it does
+  // not make a token that nobody is using look alive. Asserted before the
+  // comparison below, which is a genuine client call and does stamp it.
+  const state = await api(ctx, 'GET', '/api/ai');
+  assert.deepEqual(state.json.access, [], 'a handshake reads no data, so it leaves no access row');
+  assert.equal(state.json.tokens[0].lastUsedAt, null, 'testing a token is not the client using it');
+
+  // The same list, from the same tool layer, as the client itself gets.
+  const listed = await mcpCall(ctx, { jsonrpc: '2.0', id: 1, method: 'tools/list' }, { bearer: value });
+  assert.deepEqual(
+    res.json.tools.map((tool) => tool.name).sort(),
+    listed.json.result.tools.map((tool) => tool.name).sort(),
+    'the test must show the real tool list, not a description of it',
+  );
+
+  // And it never hands the pasted value back.
+  assert.equal(res.text.includes(value), false);
+});
+
+test('the connection test says which half of the setup is wrong', async (t) => {
+  await resetAi();
+  const ctx = await startServer(t, { real: true });
+  const made = await api(ctx, 'POST', '/api/ai/tokens', { body: { label: 'Not yet allowed' } });
+
+  // The switch is off, which is what a client would hit first.
+  const shut = await api(ctx, 'POST', '/api/ai/test', { body: { token: made.json.value } });
+  assert.equal(shut.json.ok, false);
+  assert.equal(shut.json.stage, 'switch');
+  assert.match(shut.json.detail, /403/);
+
+  // On, with every scope closed — the state where a client connects fine and
+  // can read nothing at all.
+  await api(ctx, 'PUT', '/api/ai', {
+    body: { enabled: true, scopes: { board: false, calendar: false } },
+  });
+
+  const junk = await api(ctx, 'POST', '/api/ai/test', { body: { token: 'not-a-token-at-all' } });
+  assert.equal(junk.json.ok, false);
+  assert.equal(junk.json.stage, 'token');
+  assert.match(junk.json.detail, /zlt_/);
+
+  const wrong = await api(ctx, 'POST', '/api/ai/test', {
+    body: { token: 'zlt_t_ffffff_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' },
+  });
+  assert.equal(wrong.json.ok, false);
+  assert.equal(wrong.json.stage, 'token');
+  assert.match(wrong.json.detail, /401/);
+
+  // A good token with nothing ticked: the handshake works and the client is
+  // handed an empty tool list, which is a state worth being able to see.
+  const empty = await api(ctx, 'POST', '/api/ai/test', { body: { token: made.json.value } });
+  assert.equal(empty.json.ok, true);
+  assert.deepEqual(empty.json.tools, []);
+  assert.match(empty.json.detail, /no scope is ticked/);
+
+  assert.equal((await api(ctx, 'POST', '/api/ai/test', { body: {} })).status, 400);
+});
+
+test('the connection test takes the session token and refuses an AI one', async (t) => {
+  await resetAi();
+  const ctx = await startServer(t, { real: true });
+  await api(ctx, 'PUT', '/api/ai', { body: { enabled: true, scopes: { board: true } } });
+  const made = await api(ctx, 'POST', '/api/ai/tokens', { body: { label: 'Curious client' } });
+
+  // Presenting the AI token as the session credential — a client trying to use
+  // its own token to walk further into the API than /api/mcp.
+  const asSession = await api(ctx, 'POST', '/api/ai/test', {
+    token: made.json.value,
+    body: { token: made.json.value },
+  });
+  assert.equal(asSession.status, 401, 'an AI token authorises nothing outside /api/mcp');
+
+  const asBearer = await fetch(`${ctx.base}/api/ai/test`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${made.json.value}` },
+    body: JSON.stringify({ token: made.json.value }),
+  });
+  assert.equal(asBearer.status, 401, 'and a bearer header is not the session token either');
 });
 
 test('the real MCP module is what /api/mcp mounts by default', async (t) => {
@@ -754,4 +940,33 @@ test('the whole feature leaves no trace when nobody turns it on', async (t) => {
   assert.equal(ai.aiEnabled(loadConfig()), false);
   assert.deepEqual((await api(ctx, 'GET', '/api/ai')).json.tokens, []);
   assert.equal((await listRefs()).some((r) => r.startsWith('ai.')), false);
+});
+
+/* ================================================================== *
+ * The panel's own source
+ *
+ * ui/views/ai-access.js cannot be imported here — it reaches for `window` the
+ * moment ui/lib/api.js is evaluated — so the few properties of it that a
+ * regression could silently take away are asserted against its text. Narrow on
+ * purpose: these are the claims, not the rendering.
+ * ================================================================== */
+
+const PANEL_SOURCE = fs.readFileSync(path.join(ROOT, 'ui', 'views', 'ai-access.js'), 'utf8');
+
+test('the panel builds its DOM rather than writing markup', () => {
+  assert.equal(/innerHTML|outerHTML|insertAdjacentHTML|document\.write/.test(PANEL_SOURCE), false,
+    'this panel prints a token and an access log — it may never assemble either as markup');
+});
+
+test('the minted token is substituted into the config block, not left as a placeholder', () => {
+  // The block is built with the value in it, and the placeholder survives only
+  // for the copy shown when there is no token to hand.
+  assert.match(PANEL_SOURCE, /function httpBlock\(client, token = ''\)/);
+  assert.match(PANEL_SOURCE, /Bearer \$\{token \|\| TOKEN_PLACEHOLDER\}/);
+  assert.match(PANEL_SOURCE, /httpBlock\(v\.client, revealed\.value\)/);
+});
+
+test('the panel asks the routes this file tests', () => {
+  assert.match(PANEL_SOURCE, /'\/api\/ai\/test'/);
+  assert.match(PANEL_SOURCE, /\/api\/ai\?log=/);
 });

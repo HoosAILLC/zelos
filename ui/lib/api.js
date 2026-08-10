@@ -145,7 +145,21 @@ export const api = {
   testCalendar: (calendar) => request('/api/calendar/test', { method: 'POST', body: calendar }),
   updateDraft: (id, patch) =>
     request(`/api/drafts/${encodeURIComponent(id)}`, { method: 'PUT', body: patch }),
-  search: (q) => request(`/api/search?q=${encodeURIComponent(q)}`),
+  /**
+   * The index, queried. The options are optional so the one-argument call
+   * `api.search(q)` still means exactly what it always did — same URL, same
+   * default of twenty rows decided by the server.
+   *
+   * The search view needs both of them. `limit` because a page with room for a
+   * list wants more than the twenty a source list wants, and `signal` because a
+   * query is superseded by the next keystroke: without a way to abandon the
+   * request in flight, a slow answer to `sur` can land after the answer to
+   * `survey` and overwrite it with the wrong results.
+   */
+  search: (q, { limit = null, signal = undefined } = {}) => {
+    const query = `q=${encodeURIComponent(q)}${limit === null ? '' : `&limit=${encodeURIComponent(limit)}`}`;
+    return request(`/api/search?${query}`, { signal });
+  },
 
   /* AI access (SPEC-v2 §1). All four answer with the same whole-state payload —
      switch, scopes, effective scopes, tokens, access log and client hints — so

@@ -43,6 +43,7 @@ import {
   getKV,
   setKV,
   getItem,
+  withTransaction,
 } from './db.mjs';
 import { buildSweepPrompt, mergeSweep, SWEEP_KV } from './triage.mjs';
 import { SAMPLE_SOURCE_ID, SAMPLE_CALENDAR_ID, SAMPLE_MARK } from './sample-data.mjs';
@@ -69,6 +70,28 @@ const CALENDAR_FORWARD_DAYS = 60;
 /** How much history the prompt draws on, independent of what a fetch returned. */
 const PROMPT_LOOKBACK_DAYS = 21;
 const PROMPT_MESSAGE_LIMIT = 600;
+
+/**
+ * How many items may sit in `now` on the persisted board.
+ *
+ * The same four core/safety.mjs allows in a single reply, and it is the same
+ * number for a reason: the promise the product makes is about the board the user
+ * opens, not about one exchange with a model.
+ */
+const NOW_BOARD_LIMIT = 4;
+
+/**
+ * How many finished items are named back to the model as already handled.
+ *
+ * The window they are drawn from is PROMPT_LOOKBACK_DAYS, the prompt's own mail
+ * lookback, and that is the whole justification for the number: the only way a
+ * closed item comes back is for the model to read the mail that produced it and
+ * write it up again, and no mail older than that window is in front of it. A
+ * resolution older than the oldest message in the prompt cannot be re-raised from
+ * that message, so paying context for it would buy nothing. Forty is a ceiling on
+ * a busy fortnight, not a target; the prompt's budget trims further if it has to.
+ */
+const RESOLVED_LIMIT = 40;
 
 const ICS_TIMEOUT_MS = 20_000;
 const ICS_MAX_BYTES = 8 * 1024 * 1024;
@@ -268,6 +291,13 @@ async function defaultFetchEvents({ calendar, pass, from, to, timezone, email, s
  * `fetchRecent` has no cancellation of its own, so `signal` is not forwarded;
  * the caller checks it between mailboxes instead, and an abandoned connection is
  * closed by `fetchRecent`'s own `finally`.
+ *
+ * `requireTls` is forwarded deliberately, and `?? null` rather than `|| null`,
+ * because the setting is three-valued: `false` is a standing permission to talk
+ * to this one host in the clear, and collapsing it into "not set" would put the
+ * requirement back on a Proton Bridge the user has already excused. An account
+ * saved before the field existed has no value at all, which is what `null`
+ * means — the client then decides from the host, as it always has.
  */
 function defaultFetchMail({ account, mailbox, pass, sinceDays, limit, onProgress }) {
   return fetchRecent({
@@ -276,6 +306,7 @@ function defaultFetchMail({ account, mailbox, pass, sinceDays, limit, onProgress
     secure: account.secure,
     user: account.user,
     pass,
+    requireTls: account.requireTls ?? null,
     mailbox,
     sinceDays,
     limit,
@@ -384,13 +415,27 @@ export async function runSweep({
   const abort = () => signal?.aborted === true;
   const finish = (ok, error, extra = {}) => {
     stats.ms = Date.now() - startedMs;
+    const endedAt = nowISO(tz);
     finishRun(db, runId, {
       ok,
       error,
       tokensIn: stats.tokensIn,
       tokensOut: stats.tokensOut,
       stats: { ...stats, sources },
-      now: nowISO(tz),
+      now: endedAt,
+    });
+    // Spend is recorded whether or not the run succeeded. A run that failed
+    // after the model answered — a reply that was cut off, or JSON that was not
+    // a board — was still billed for every token of it, and that is precisely
+    // the spend a user would be most surprised to find missing from the counter.
+    // What a failed run does not add to is the run counts: it spent money and it
+    // produced no board, and those are two different things to be honest about.
+    recordTokens(db, {
+      tokensIn: stats.tokensIn,
+      tokensOut: stats.tokensOut,
+      thought: stats.kind === 'full',
+      ok,
+      now: endedAt,
     });
     const result = { runId, ok, stats: { ...stats, sources }, ...extra };
     if (error) result.error = error;
@@ -558,6 +603,7 @@ export async function runSweep({
     events: promptInput.events,
     captures: promptInput.captures,
     priorItems: promptInput.priorItems,
+    resolvedItems: promptInput.resolvedItems,
     privacy: config.privacy ?? {},
   });
 
@@ -668,7 +714,10 @@ export async function runSweep({
 
   const derived = recomputeDerived(db, { now });
   stats.items = merged.stats.items;
-  stats.now = merged.stats.byBucket.now;
+  // The board's count, not the reply's: this run's four `now` items may have
+  // arrived on a board that was already holding four of somebody else's, and the
+  // number reported has to be the one the user will see.
+  stats.now = derived.counts.now;
 
   if (merged.errors.length) {
     slog.info(`board accepted with ${merged.errors.length} repair(s)`, {
@@ -688,12 +737,119 @@ export async function runSweep({
 
 /**
  * `runs.kind` is written once by db.startRun, and the light/full decision can
- * legitimately change after the fetch. This is the only write here that reaches
- * past a db.mjs helper, and it exists because the run's recorded kind must match
- * what the run actually did — shouldRunFull reads it back on the next sweep.
+ * legitimately change after the fetch. It reaches past a db.mjs helper because
+ * the run's recorded kind must match what the run actually did — shouldRunFull
+ * reads it back on the next sweep, and a light-labelled run that thought would
+ * make the next decision on a false premise.
  */
 function setRunKind(db, runId, kind) {
   db.prepare('UPDATE runs SET kind = ? WHERE id = ?').run(String(kind), String(runId));
+}
+
+/**
+ * The keys of things the user has already finished, most recently closed first.
+ *
+ * `listBoard` cannot express this: it ranks by bucket and severity, which is the
+ * reading order of live work and says nothing about when a decision was made, so
+ * on a board that has been running for months its limit would return the oldest
+ * closed items and hide exactly the recent ones that matter. `state_at` is when
+ * the user decided, and both sides of the comparison go through datetime() for
+ * the same reason listBoard's snooze wake does — the stored timestamps carry the
+ * user's offset while `since` is UTC, and comparing those as strings would be
+ * wrong by the difference.
+ *
+ * The ordering goes through datetime() for exactly the same reason, and this is
+ * not decoration: the filter and the sort choose the rows together, so a WHERE
+ * that reads instants feeding an ORDER BY that reads characters means the LIMIT
+ * keeps whichever rows happen to sort well as text. Two items closed a minute
+ * apart either side of a timezone change would come back in the wrong order, and
+ * the one that fell off the end would be the most recent decision the user made.
+ */
+const RECENTLY_RESOLVED_SQL = `
+SELECT id, bucket, headline, state, state_at, payload_json FROM items
+WHERE state IN ('done', 'dismissed') AND state_at IS NOT NULL
+  AND datetime(state_at) >= datetime(:since)
+ORDER BY datetime(state_at) DESC
+LIMIT :limit`;
+
+function recentlyResolved(db, now) {
+  const nowMs = instant(now) ?? Date.now();
+  const since = new Date(nowMs - PROMPT_LOOKBACK_DAYS * 86_400_000).toISOString();
+  const rows = db.prepare(RECENTLY_RESOLVED_SQL).all({ since, limit: RESOLVED_LIMIT });
+  const out = [];
+  for (const row of rows) {
+    let key = '';
+    try {
+      key = String(JSON.parse(row.payload_json || '{}')?.key ?? '');
+    } catch {
+      // A row whose payload will not parse has no key to reuse, so it has
+      // nothing to contribute here and is simply left out.
+      key = '';
+    }
+    if (!key) continue;
+    out.push({ key, headline: row.headline, state: row.state, resolvedAt: row.state_at });
+  }
+  return out;
+}
+
+/**
+ * Today's model spend, written where the UI can read it without walking the runs
+ * table. `runs` counts every successful sweep and `modelRuns` only the ones that
+ * actually thought, because a light run costs nothing and folding it into the
+ * same counter would quietly halve what a thinking run appears to cost.
+ *
+ * The token totals and the run counts answer different questions, so a failed
+ * run moves one and not the other: `ok: false` still adds whatever the model
+ * charged for the reply that could not be used, and adds nothing to the count of
+ * sweeps that happened, because no sweep did.
+ *
+ * The day rolls over on the user's own day key rather than on UTC — "today" has
+ * to mean the day they are having, or the number resets mid-evening.
+ *
+ * Nothing in here may fail a sweep. This is a display counter: both the read of
+ * the old totals and the write of the new ones are caught, because a `kv` table
+ * that will not take a write is a reason to lose a number, never a reason to
+ * throw away a board the user waited for.
+ */
+function recordTokens(db, { tokensIn = 0, tokensOut = 0, thought = false, ok = true, now = nowISO() } = {}) {
+  const today = dayKey(now) || '';
+  let stored = null;
+  try {
+    const raw = getKV(db, SWEEP_KV.tokens);
+    if (raw) stored = JSON.parse(raw);
+  } catch {
+    // Unreadable totals are a display detail, never a reason to fail a run that
+    // otherwise worked. Counting starts again from this sweep.
+    stored = null;
+  }
+  if (!stored || typeof stored !== 'object') stored = {};
+  const lifetime = stored.lifetime && typeof stored.lifetime === 'object' ? stored.lifetime : {};
+  const carried = stored.day === today ? stored : {};
+  const num = (v) => Number(v) || 0;
+
+  const ranAsSweep = ok ? 1 : 0;
+  const ranAsModelSweep = ok && thought ? 1 : 0;
+
+  const totals = {
+    day: today,
+    tokensIn: num(carried.tokensIn) + num(tokensIn),
+    tokensOut: num(carried.tokensOut) + num(tokensOut),
+    runs: num(carried.runs) + ranAsSweep,
+    modelRuns: num(carried.modelRuns) + ranAsModelSweep,
+    lifetime: {
+      tokensIn: num(lifetime.tokensIn) + num(tokensIn),
+      tokensOut: num(lifetime.tokensOut) + num(tokensOut),
+      runs: num(lifetime.runs) + ranAsSweep,
+      modelRuns: num(lifetime.modelRuns) + ranAsModelSweep,
+    },
+    at: now,
+  };
+  try {
+    setKV(db, SWEEP_KV.tokens, JSON.stringify(totals));
+  } catch (err) {
+    slog.warn('could not record the token counter', { error: errorText(err) });
+  }
+  return totals;
 }
 
 /** What the prompt gets to look at. Read from the database, not from this fetch,
@@ -727,16 +883,71 @@ function gatherPromptInput(db, config, now) {
     captures: listCaptures(db, { includeProcessed: false, limit: 50 })
       .filter((c) => !String(c.text || '').startsWith(SAMPLE_MARK)),
     priorItems: listBoard(db, { states: ['open', 'snoozed'], limit: 120 }),
+    // A finished item's key is otherwise never shown again, and a key the model
+    // cannot see is a key it cannot reuse: it rewords the same obligation, mints
+    // a fresh key, and work the user already did comes back as new. Naming them
+    // is a prompt-side fix — nothing about how state merges changes.
+    resolvedItems: recentlyResolved(db, now),
   };
 }
 
+const DEMOTE_ITEM_BUCKET = `
+UPDATE items SET bucket = :bucket, updated_at = :now
+WHERE id = :id AND state = 'open'`;
+
 /**
- * What a light run recomputes: the counts the rail shows, and whether the item
- * the board opens with is still one the user cares about. If they marked the
- * hero done, the next-best open item takes its place — no model call needed to
- * know that.
+ * Hold the four-item `now` bar on the board itself.
+ *
+ * core/safety.mjs clamps each model reply to four, which is only a guarantee
+ * about one exchange. Two runs whose replies use different keys each contribute
+ * their own four, nothing demotes what was already there, and the board the user
+ * opens carries eight — so the loudest promise the product makes was true of the
+ * model and false of the product. It is enforced here instead, on every run,
+ * light or full, because the number that matters is the one on the screen.
+ *
+ * The four that keep their place are the four the board's own reading order puts
+ * first: `listBoard` asked for one bucket, so severity, then what is due soonest,
+ * then longest-carried, exactly as the rail and the page already rank them. There
+ * is one ranking in this product and this is not a second opinion on it.
+ *
+ * Nothing is ever deleted and no state is touched. An item that loses its place
+ * moves to `today`, where it is still the user's work, still carried with its
+ * first_seen intact, and still theirs to finish. Only open rows are considered:
+ * a snoozed or finished item is a decision the user made, and demoting it would
+ * be this pass overruling them to make room for the model.
+ *
+ * Exported because a sweep is not the only thing that can add to `now`: reading
+ * the board wakes a snooze that has come due, and a fifth `now` item can arrive
+ * that way with no sweep anywhere near it. core/server.mjs holds the bar on that
+ * path with this same function, so there is one demotion rule and not two.
+ */
+export function capNowBucket(db, { now = nowISO() } = {}) {
+  const inNow = listBoard(db, { states: ['open'], buckets: ['now'], limit: 500, now });
+  if (inNow.length <= NOW_BOARD_LIMIT) return 0;
+
+  const overflow = inNow.slice(NOW_BOARD_LIMIT);
+  const stmt = db.prepare(DEMOTE_ITEM_BUCKET);
+  withTransaction(db, () => {
+    for (const item of overflow) stmt.run({ bucket: 'today', now, id: item.id });
+  });
+  slog.info(`board held ${inNow.length} now items; demoted ${overflow.length} to today`, {
+    demoted: overflow.map((i) => i.id),
+  });
+  return overflow.length;
+}
+
+/**
+ * What a light run recomputes: the four-item bar on the persisted board, the
+ * counts the rail shows, and whether the item the board opens with is still one
+ * the user cares about. If they marked the hero done, the next-best open item
+ * takes its place — no model call needed to know that.
+ *
+ * The demotion runs first, and has to: the counts must describe the board as it
+ * will be read, and the `first` pointer must not be handed a `now` item that is
+ * about to stop being one.
  */
 function recomputeDerived(db, { now = nowISO() } = {}) {
+  const demoted = capNowBucket(db, { now });
   const counts = bucketCounts(db, { states: ['open'] });
   const open = Object.values(counts).reduce((n, v) => n + v, 0);
 
@@ -747,7 +958,7 @@ function recomputeDerived(db, { now = nowISO() } = {}) {
     setKV(db, SWEEP_KV.first, board.length ? board[0].id : '');
   }
   setKV(db, SWEEP_KV.counts, JSON.stringify({ counts, open, at: now }));
-  return { counts, open };
+  return { counts, open, demoted };
 }
 
 /* ------------------------------------------------------------------ *

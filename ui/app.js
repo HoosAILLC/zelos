@@ -19,26 +19,31 @@
 
 import { el, button, meander, replace, focusQuietly } from './lib/dom.js';
 import {
-  state, subscribe, refresh, watchSweeps, startSweep, railCounts, timezone,
+  state, subscribe, refresh, watchSweeps, watchBoard, startSweep, railCounts, timezone,
   needsOnboarding, applyAccent, currentAccent, notify, nowMark,
 } from './lib/store.js';
 import { api, hasToken } from './lib/api.js';
-import { BUCKET_LABEL, sweepSummary } from './lib/format.js';
+import { BUCKET_LABEL, sweepSummary, tokenLine } from './lib/format.js';
 import { humanDelta, formatDay } from './lib/time.js';
 
 import { renderNow } from './views/now.js';
 import { renderToday } from './views/today.js';
 import { renderOwed } from './views/owed.js';
 import { renderCalendar, tickNowLine } from './views/calendar.js';
+import { renderSearch } from './views/search.js';
 import { renderAsk } from './views/ask.js';
 import { renderSettings } from './views/settings.js';
 import { renderOnboarding } from './views/onboarding.js';
 
+// Search carries no count. Every other number in the rail is a claim about work
+// that is waiting; "how many things could you find" is not one, and a badge
+// there would read as one.
 const VIEWS = [
   { id: 'now', label: 'Now', render: renderNow, countKey: 'now' },
   { id: 'today', label: 'Today', render: renderToday, countKey: 'today' },
   { id: 'owed', label: 'Owed', render: renderOwed, countKey: 'drafts' },
   { id: 'calendar', label: 'Calendar', render: renderCalendar, countKey: 'events' },
+  { id: 'search', label: 'Search', render: renderSearch, countKey: null },
   { id: 'ask', label: 'Ask', render: renderAsk, countKey: null },
   { id: 'settings', label: 'Settings', render: renderSettings, countKey: null },
 ];
@@ -77,7 +82,52 @@ function navigate(hash) {
 
 /* ------------------------------------------------------------------ chrome */
 
-function sweepLine() {
+/**
+ * Say something in a live region, in the one way that actually reaches a screen
+ * reader: as a MUTATION of a region that is already in the document.
+ *
+ * Text baked into a node before it is inserted is never announced, and neither
+ * is text carried in on a node that replaces the old one — which is exactly how
+ * the sweep line and every toast in this app came to be silent. Both were built
+ * complete and then swapped in. So the regions below are created empty, kept
+ * for the life of the page where they can be, and filled a frame later.
+ * ui/views/ai-access.js does the same thing for the same reason.
+ */
+const announced = new WeakMap();
+
+function announce(node, text) {
+  const value = text || '';
+  if (announced.get(node) === value) return;
+  announced.set(node, value);
+  requestAnimationFrame(() => {
+    // A newer announcement may have overtaken this one between frames.
+    if (announced.get(node) === value) node.textContent = value;
+  });
+}
+
+/**
+ * The sweep line: one node, built once, repainted in place. Its text is the
+ * live region above, so this line is where "Sweeping…", "Sweep finished" and a
+ * sweep's failure are spoken as well as shown.
+ */
+function buildSweepLine() {
+  const textNode = el('p', { class: 'sweepline-text mono', 'aria-live': 'polite' });
+  // The day's token spend sits OUTSIDE the live region: it is a fact to glance
+  // at, not an announcement, and reading it aloud on every sweep tick would
+  // bury the progress it sits beside.
+  const tokenNode = el('p', { class: 'sweepline-tokens mono' });
+  const fillNode = el('div', { class: 'sweepbar-fill', style: { width: '0%' } });
+  const barNode = el('div', { class: 'sweepbar' }, fillNode);
+  return {
+    node: el('div', { class: 'sweepline' }, [textNode, tokenNode, barNode]),
+    textNode,
+    tokenNode,
+    barNode,
+    fillNode,
+  };
+}
+
+function paintSweepLine(parts) {
   const s = state.sweep;
   const last = state.board.runs?.last;
 
@@ -91,16 +141,12 @@ function sweepLine() {
 
   const pct = s.running && s.total > 0 ? Math.min(100, Math.round((s.done / s.total) * 100)) : null;
 
-  return el('div', { class: `sweepline${s.running ? ' is-running' : ''}${s.error ? ' is-bad' : ''}` }, [
-    el('p', {
-      class: 'sweepline-text mono',
-      'aria-live': 'polite',
-      'aria-busy': s.running ? 'true' : 'false',
-      text,
-    }),
-    el('div', { class: `sweepbar${pct === null && s.running ? ' is-indeterminate' : ''}` },
-      el('div', { class: 'sweepbar-fill', style: { width: s.running ? `${pct ?? 100}%` : '0%' } })),
-  ]);
+  parts.node.className = `sweepline${s.running ? ' is-running' : ''}${s.error ? ' is-bad' : ''}`;
+  parts.textNode.setAttribute('aria-busy', s.running ? 'true' : 'false');
+  announce(parts.textNode, text);
+  parts.tokenNode.textContent = tokenLine(state.board.tokens, nowMark().key);
+  parts.barNode.className = `sweepbar${pct === null && s.running ? ' is-indeterminate' : ''}`;
+  parts.fillNode.style.width = s.running ? `${pct ?? 100}%` : '0%';
 }
 
 /** Quick capture. It is a note to yourself; the next sweep reads it. */
@@ -167,7 +213,7 @@ function buildChrome() {
     class: 'btn solid',
     onClick: () => startSweep('auto'),
   });
-  const sweepSlot = sweepLine();
+  const sweep = buildSweepLine();
   const topbarNode = el('header', { class: 'topbar' }, [
     el('div', { class: 'topbar-row' }, [
       el('a', { class: 'wordmark', href: '#/now' }, [
@@ -178,13 +224,13 @@ function buildChrome() {
       el('div', { class: 'topbar-actions' }, [capture.toggle, sweepBtn]),
     ]),
     capture.panel,
-    sweepSlot,
+    sweep.node,
   ]);
   return {
     topbarNode,
     dateNode,
     sweepBtn,
-    sweepSlot,
+    sweep,
     capture,
     railNode: rail(route.view),
     tabbarNode: tabbar(route.view),
@@ -248,11 +294,18 @@ function tabbar(current) {
   }));
 }
 
+/**
+ * The toast, as {node, text}. Its message node is left EMPTY here and filled by
+ * announce() once the toast is in the document — a role="status" element that
+ * arrives with its text already written is read by nobody, which meant every
+ * failed save and every Undo offer in this app was silent.
+ */
 function toastBar() {
   if (!state.toast) return null;
   const action = state.toast.action;
-  return el('div', { class: `toast toast-${state.toast.tone}`, role: 'status' }, [
-    el('p', { text: state.toast.message }),
+  const text = el('p');
+  const node = el('div', { class: `toast toast-${state.toast.tone}`, role: 'status' }, [
+    text,
     action ? button(action.label, {
       class: 'link',
       onClick: () => {
@@ -265,6 +318,7 @@ function toastBar() {
     }) : null,
     button('Dismiss', { class: 'link', onClick: () => notify(null) }),
   ]);
+  return { node, text };
 }
 
 /* ------------------------------------------------------------- whole screens */
@@ -458,11 +512,13 @@ function render({ force = false } = {}) {
 
 /**
  * Chrome repaints on every store event — but only around the capture panel,
- * never through it. The panel and its toggle are the same nodes for the life
- * of the page; the date and sweep button are text/attribute updates on nodes
- * that also persist; the sweep line, rail, tab bar and toast hold no input, so
- * they are rebuilt and swapped in place with replaceWith, which cannot touch
- * anything a person is typing into.
+ * never through it. The panel and its toggle are the same nodes for the life of
+ * the page; the date, the sweep button and the whole sweep line are text and
+ * attribute updates on nodes that also persist (the sweep line has to persist —
+ * its text is a live region, and a region that is replaced rather than mutated
+ * announces nothing); the rail, tab bar and toast hold no input, so they are
+ * rebuilt and swapped in place with replaceWith, which cannot touch anything a
+ * person is typing into.
  */
 function paintChrome() {
   if (!chromeWrap) return;
@@ -471,14 +527,15 @@ function paintChrome() {
     replace(chromeWrap, [chrome.topbarNode, chrome.railNode, chrome.tabbarNode, chrome.toastSlot]);
   }
 
+  // The date comes from the ROLLED key, not from the board's `now` string: a
+  // window open past midnight has a stale string and a correct key, and the
+  // header must say the day the reader is living in.
   const nm = nowMark();
-  chrome.dateNode.textContent = nm.key ? formatDay(state.board.now) : '';
+  chrome.dateNode.textContent = nm.key ? formatDay(nm.key) : '';
   chrome.sweepBtn.textContent = state.sweep.running ? 'Sweeping…' : 'Sweep now';
   chrome.sweepBtn.disabled = state.sweep.running;
 
-  const freshSweep = sweepLine();
-  chrome.sweepSlot.replaceWith(freshSweep);
-  chrome.sweepSlot = freshSweep;
+  paintSweepLine(chrome.sweep);
 
   const freshRail = rail(route.view);
   chrome.railNode.replaceWith(freshRail);
@@ -494,7 +551,9 @@ function paintChrome() {
   // a hovering cursor, mid-press.
   if (paintedToast !== state.toast) {
     paintedToast = state.toast;
-    replace(chrome.toastSlot, toastBar());
+    const built = toastBar();
+    replace(chrome.toastSlot, built && built.node);
+    if (built) announce(built.text, state.toast.message);
   }
   measureTopbar();
 }
@@ -577,4 +636,9 @@ setInterval(() => {
 
 refresh().then(() => {
   watchSweeps();
+  // ...and a slow heartbeat under it, so a window left open overnight wakes up
+  // on the right day instead of holding yesterday's board until someone
+  // reloads. It refetches through the store, so it defers around a half-typed
+  // draft exactly as a finished sweep does.
+  watchBoard();
 });

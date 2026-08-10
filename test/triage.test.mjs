@@ -272,6 +272,92 @@ test('prior board goes in with its keys, so identity can be reused', () => {
   assert.match(content, /carried 6d/);
 });
 
+/** A finished item, in the shape core/sweep.mjs reads off the items table. */
+function resolved(over = {}) {
+  return {
+    key: 'thread-raman-dates',
+    headline: 'Answer Priya Raman on the Jul 28 dates',
+    state: 'done',
+    resolvedAt: '2026-08-07T16:20:00-04:00',
+    ...over,
+  };
+}
+
+test('items the user closed are named with their keys, so a re-key is a knowing choice', () => {
+  const { messages, budget } = buildSweepPrompt({
+    identity: IDENTITY, now: NOW, privacy: PRIVACY,
+    resolvedItems: [resolved(), resolved({ key: 'invoice-4471-ferguson', headline: 'Pay the Ferguson invoice', state: 'dismissed' })],
+  });
+  const content = messages[0].content;
+
+  assert.equal(budget.available.resolved, 2);
+  assert.equal(budget.shown.resolved, 2);
+  assert.match(content, /ALREADY HANDLED — DO NOT RAISE THESE AGAIN/);
+  assert.match(content, /do\n {2}not re-mint the same obligation under different wording/);
+  assert.match(content, /key=thread-raman-dates · done .* — Answer Priya Raman on the Jul 28 dates/);
+  assert.match(content, /key=invoice-4471-ferguson · dismissed .* — Pay the Ferguson invoice/);
+  // Same treatment as every other block derived from mail: it is data the model
+  // reasons about, not a second set of instructions it may take from.
+  assert.match(content, /<<<ZELOS-UNTRUSTED [0-9a-f]{24} label="items the user already closed/);
+});
+
+test('a database row is accepted as readily as an unpacked one', () => {
+  const { messages } = buildSweepPrompt({
+    identity: IDENTITY, now: NOW, privacy: PRIVACY,
+    resolvedItems: [{
+      id: 'abc', bucket: 'waiting', headline: 'Chase Dana for the signed W-9',
+      state: 'done', state_at: '2026-08-06T09:00:00-04:00', payload: { key: 'w9-dana-signed' },
+    }],
+  });
+  assert.match(messages[0].content, /key=w9-dana-signed · done .* — Chase Dana for the signed W-9/);
+});
+
+test('nothing handled means no section at all, not an empty one', () => {
+  const { messages, budget } = buildSweepPrompt({ identity: IDENTITY, now: NOW, privacy: PRIVACY });
+  assert.equal(budget.available.resolved, 0);
+  assert.ok(!messages[0].content.includes('ALREADY HANDLED'),
+    'a first run has handled nothing and must not be told otherwise');
+});
+
+test('a key that is still live on the board is not also announced as handled', () => {
+  const prior = [{
+    id: 'abc', bucket: 'waiting', headline: 'Chase Dana for the signed W-9',
+    person: 'Dana', state: 'open', severity: 2, seen_runs: 4,
+    first_seen: '2026-08-02T09:00:00-04:00', due_at: '', payload: { key: 'w9-dana-signed' },
+  }];
+  const { messages, budget } = buildSweepPrompt({
+    identity: IDENTITY, now: NOW, privacy: PRIVACY,
+    priorItems: prior,
+    resolvedItems: [resolved({ key: 'w9-dana-signed', headline: 'Chase Dana for the signed W-9' })],
+  });
+  const content = messages[0].content;
+  assert.equal(budget.available.resolved, 0, 'the live copy wins; the closed one is dropped');
+  assert.equal((content.match(/key=w9-dana-signed/g) || []).length, 1,
+    'the model must not be told the same key is both open and finished');
+});
+
+test('the already-handled list is capped and costs the model no mail', () => {
+  const many = Array.from({ length: 30 }, (_, i) =>
+    message({ id: `mm${i}`, thread_key: `tt${i}`, sent_at: `2026-08-0${(i % 7) + 1}T09:0${i % 10}:00-04:00` }));
+  const handled = Array.from({ length: 200 }, (_, i) =>
+    resolved({ key: `handled-${i}`, headline: `Something the user finished, number ${i}` }));
+
+  const without = buildSweepPrompt({ identity: IDENTITY, now: NOW, messages: many, privacy: PRIVACY });
+  const withHandled = buildSweepPrompt({
+    identity: IDENTITY, now: NOW, messages: many, resolvedItems: handled, privacy: PRIVACY,
+  });
+
+  assert.equal(withHandled.budget.available.resolved, 200);
+  assert.ok(withHandled.budget.shown.resolved > 0, 'some of them travel');
+  assert.ok(withHandled.budget.shown.resolved <= 24,
+    `the section has a ceiling, got ${withHandled.budget.shown.resolved}`);
+  assert.equal(without.budget.shown.inbound, 30, 'the fixture fits comfortably to begin with');
+  assert.equal(withHandled.budget.shown.inbound, 30,
+    'and not one message was dropped to make room for the closed keys');
+  assert.match(withHandled.messages[0].content,
+    new RegExp(`Already handled: ${withHandled.budget.shown.resolved} of 200 shown`));
+});
+
 test('events carry the offset off the string, and the day is named', () => {
   const { messages } = buildSweepPrompt({
     identity: IDENTITY, now: NOW, privacy: PRIVACY,

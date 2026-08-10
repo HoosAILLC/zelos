@@ -407,17 +407,34 @@ async function checkMailAccount(account, deps, { timeoutMs }) {
     );
   }
 
+  // `requireTls` is forwarded so this connects under the same rule the sweep
+  // will. A diagnosis that signs in where the real run would refuse to is not a
+  // diagnosis, it is a second, more permissive client — and it would report an
+  // account as healthy on the morning its mail stops arriving.
   const result = await deps.testImap({
     host: account.host,
     port: account.port ?? 993,
     secure: account.secure !== false,
     user: account.user,
     pass,
+    requireTls: account.requireTls ?? null,
     timeoutMs,
   });
 
   if (!result?.ok) {
     const reason = result?.error || 'the connection failed';
+    // A refusal to send the password in the clear has to be recognised before
+    // the sign-in advice below, because its wording mentions the password and
+    // would otherwise be read as a rejected credential. Nothing was rejected:
+    // nothing was sent, on purpose, and the fix is a port rather than a
+    // different password.
+    if (/still in the clear/i.test(reason)) {
+      return check(
+        id, label, 'fail',
+        `${account.host}: ${reason}`,
+        `Zelos stopped before your password left this machine. Use the TLS port in Settings → Mail — ${guess.host ? `${guess.host}:${guess.port}` : 'usually 993'} — and if this host really is a local bridge that cannot do TLS, turn requireTls off for this account.`,
+      );
+    }
     const authish = /auth|login|credential|password|invalid|denied/i.test(reason);
     return check(
       id, label, 'fail',

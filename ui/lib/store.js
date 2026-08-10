@@ -14,7 +14,7 @@
  */
 
 import { api, openStream, ApiError } from './api.js';
-import { minutesIntoDay, dayKey, localTimezone } from './time.js';
+import { minutesIntoDay, dayKey, addDaysToKey, localTimezone } from './time.js';
 
 const ACCENT_KEY = 'zelos.accent';
 const ONBOARDED_KEY = 'zelos.onboarded';
@@ -29,6 +29,10 @@ const EMPTY_BOARD = Object.freeze({
   notes: [],
   first: null,
   now: null,
+  // The sweep engine's rolling token counter, when this database has one. It
+  // is null rather than a zeroed pair on purpose: "nothing has been spent" and
+  // "this build never counted" must not render as the same line.
+  tokens: null,
 });
 
 export const state = {
@@ -210,6 +214,26 @@ export async function saveConfig(patch) {
   return res;
 }
 
+/**
+ * The fatal screen for a failure to reach the server, in one place.
+ *
+ * The boot path and the heartbeat both need it and must word it identically: a
+ * window that goes dark at 3am should say what a window that never came up says,
+ * because it is the same fact about the same server.
+ */
+export function fatalFor(err) {
+  if (err instanceof ApiError && err.status === 401) {
+    return {
+      title: 'This tab has lost its key',
+      detail: 'Zelos mints a new session token every launch. Reopen the app from the terminal window that started it — the URL there carries the token.',
+    };
+  }
+  return {
+    title: 'Zelos is not answering',
+    detail: err?.message || 'The reason did not survive the trip.',
+  };
+}
+
 /** health + config + board, in parallel. The first one is what boots the app. */
 export async function refresh({ silent = false } = {}) {
   try {
@@ -217,17 +241,7 @@ export async function refresh({ silent = false } = {}) {
     state.phase = 'ready';
     state.fatal = null;
   } catch (err) {
-    if (err instanceof ApiError && err.status === 401) {
-      state.fatal = {
-        title: 'This tab has lost its key',
-        detail: 'Zelos mints a new session token every launch. Reopen the app from the terminal window that started it — the URL there carries the token.',
-      };
-    } else {
-      state.fatal = {
-        title: 'Zelos is not answering',
-        detail: err.message,
-      };
-    }
+    state.fatal = fatalFor(err);
     state.phase = 'down';
   }
   if (!silent) emit();
@@ -321,22 +335,120 @@ export function watchSweeps() {
   return () => { stopped = true; };
 }
 
+/**
+ * How often an untouched window refetches the board. Minutes, not seconds: this
+ * is a local HTTP call against a SQLite file, but the point of it is only to
+ * keep a window that has been open all night honest — the sweep stream is what
+ * delivers actual news.
+ */
+const BOARD_REFRESH_MS = 3 * 60_000;
+
+/**
+ * Keep the board from quietly rotting in a window nobody has touched.
+ *
+ * A sweep pushes its results down the stream, but a window that sat open past
+ * midnight was never told the day had changed, and one whose laptop slept woke
+ * up with an hours-old board and no reason to refetch it. Both are the same
+ * missing piece: a slow heartbeat.
+ *
+ * Two properties matter more than the interval itself.
+ *
+ * It goes out through `loadBoard` + `emit`, which is the SAME path a sweep's
+ * `done` event takes — so the shell's deferred-render rule applies to it
+ * unchanged, and a refresh that lands while someone is typing in a draft queues
+ * until that field blurs instead of rebuilding the form under their hands.
+ *
+ * And it is quiet about a single failure, but not about a run of them. One
+ * missed refetch is a laptop changing wifi, and a warning every three minutes
+ * while someone is on a train is worse than a board a few minutes old. Three in
+ * a row is a server that has gone away, and a heartbeat that swallowed that
+ * would leave the app permanently and invisibly stale in the exact scenario it
+ * was written for — the overnight window, whose board is hours old and looks
+ * exactly like a board that is current. So the run of failures raises the SAME
+ * fatal screen the boot path raises, once, and a refetch that succeeds takes it
+ * back down. No toast: a toast per tick is the noise this was avoiding.
+ */
+export function watchBoard({ intervalMs = BOARD_REFRESH_MS } = {}) {
+  let stopped = false;
+  const hidden = () => document.visibilityState === 'hidden';
+
+  // How many refetches in a row must fail before the window says so. Three
+  // ticks is the better part of ten minutes at the default interval, which is
+  // long past "the wifi hiccuped".
+  const MISSES_BEFORE_FATAL = 3;
+  let misses = 0;
+  // Whether the screen currently showing is one this heartbeat put up. Only
+  // that one may be taken down here — a fatal from the boot path or from a lost
+  // session key is somebody else's to clear.
+  let raised = false;
+
+  const tick = async () => {
+    // A hidden tab is a tab nobody is reading. Refetching it burns battery to
+    // paint pixels no one will see, and the visibility handler below catches
+    // up the moment it comes back.
+    if (stopped || hidden() || state.phase === 'boot') return;
+    try {
+      await loadBoard();
+      misses = 0;
+      if (raised) {
+        raised = false;
+        state.fatal = null;
+        state.phase = 'ready';
+      }
+      emit();
+    } catch (err) {
+      misses += 1;
+      if (misses < MISSES_BEFORE_FATAL || state.fatal) return;
+      state.fatal = fatalFor(err);
+      state.phase = 'down';
+      raised = true;
+      emit();
+    }
+  };
+
+  const timer = setInterval(tick, intervalMs);
+  const onVisible = () => { if (!hidden()) tick(); };
+  document.addEventListener('visibilitychange', onVisible);
+
+  return () => {
+    stopped = true;
+    clearInterval(timer);
+    document.removeEventListener?.('visibilitychange', onVisible);
+  };
+}
+
 /* ------------------------------------------------------------------- derived */
 
 export function timezone() {
   return state.config?.identity?.timezone || localTimezone();
 }
 
-/** The user's "now" as {key, minutes}, ticked forward by elapsed duration. */
+/**
+ * The user's "now" as {key, minutes}, ticked forward by elapsed duration.
+ *
+ * Midnight used to end this function: past 1440 minutes it answered {key:null},
+ * which is what a window left open overnight actually did to the app — the
+ * header date went blank, the now-line vanished, Today's events fell to zero
+ * and the calendar's "Today" button pointed at yesterday, all of it until
+ * someone reloaded. Nothing refetched the board on a timer, so "until someone
+ * reloaded" could be days.
+ *
+ * So the day is ROLLED instead of dropped: whole days elapsed are added to the
+ * key and the remainder is the minute of the new day. That is arithmetic on a
+ * duration and a date-key, neither of which needs a zone. The one thing it
+ * cannot see is a DST change inside the elapsed span, which leaves the line an
+ * hour out until watchBoard() refetches — minutes later, at worst.
+ */
 export function nowMark() {
   const iso = state.board.now;
   const base = minutesIntoDay(iso);
   if (base === null) return { key: null, minutes: null };
   const elapsed = Math.max(0, Date.now() - state.boardAt) / 60_000;
-  const minutes = base + elapsed;
-  // Past midnight the key is stale too; roll it rather than draw the line at 25:00.
-  if (minutes >= 1440) return { key: null, minutes: null };
-  return { key: dayKey(iso), minutes };
+  const total = base + elapsed;
+  const daysOver = Math.floor(total / 1440);
+  const key = daysOver ? addDaysToKey(dayKey(iso), daysOver) : dayKey(iso);
+  if (!key) return { key: null, minutes: null };
+  return { key, minutes: total - daysOver * 1440 };
 }
 
 /**

@@ -32,7 +32,9 @@
  */
 
 import { el, button, section, copyText, focusQuietly } from '../lib/dom.js';
-import { api, isMissingRoute } from '../lib/api.js';
+// `request` as well as `api`: two of the calls here take a query string or a
+// body that the shared endpoint list has no reason to know about.
+import { api, isMissingRoute, request } from '../lib/api.js';
 // Nothing is read from the store: `/api/ai` is the whole of this panel's truth,
 // including the install paths it prints, so there is no second copy to drift.
 // A cycle: settings.js imports this panel, this panel imports its form helpers.
@@ -110,10 +112,25 @@ let phase = 'boot';
 let loadError = '';
 /** A minted token, held only until the user says they have copied it. */
 let revealed = null;
+/**
+ * What the reader has typed into 'Check a token', kept across rebuilds.
+ *
+ * The panel is rebuilt wholesale by anything that bumps the settings view, and
+ * the field used to be re-seeded with the just-minted token every time — so
+ * someone who pasted a DIFFERENT token, pressed Test, and pressed it again was
+ * testing the minted one while the box in front of them appeared to say
+ * otherwise. Null means "untouched", which is not the same as an emptied field
+ * and must not be: an emptied field stays empty.
+ */
+let tokenDraft = null;
 /** `{kind:'bodies'|'revoke', id}` — an armed confirmation. */
 let pending = null;
 /** `{text, tone}` — painted into the live region once it is in the document. */
 let announcement = null;
+/** How many access-log rows have been asked for; 0 means the server's default. */
+let logWindow = 0;
+/** The last connection test's payload, so it survives a rebuild of the panel. */
+let probe = null;
 
 let uid = 0;
 const nextId = (prefix) => `${prefix}-ai-${(uid += 1)}`;
@@ -136,6 +153,8 @@ function view() {
     maxRows: Number.isFinite(rows) && rows > 0 ? rows : 50,
     tokens: Array.isArray(raw.tokens) ? raw.tokens.filter(isObject) : [],
     access: Array.isArray(raw.access) ? raw.access.filter(isObject) : [],
+    accessMore: raw.accessMore === true,
+    accessMax: Number.isFinite(Number(raw.accessMax)) ? Number(raw.accessMax) : 500,
     client: isObject(raw.client) ? raw.client : {},
     scopeInfo: info.filter(isObject).map((s) => {
       const copy = SCOPE_COPY[s.id] || {};
@@ -194,6 +213,9 @@ function exposureLine(v) {
 
 /* ---------------------------------------------------------- config blocks */
 
+/** What the HTTP block says where a token would go, when there is none to put. */
+const TOKEN_PLACEHOLDER = 'PASTE-THE-TOKEN-YOU-MINTED';
+
 /**
  * What goes in an AI client's own config file. The stdio form is what a desktop
  * client spawns; the HTTP form is for clients that would rather post. Both are
@@ -209,13 +231,21 @@ function stdioBlock(client) {
   return JSON.stringify({ mcpServers: { zelos: server } }, null, 2);
 }
 
-function httpBlock(client) {
+/**
+ * `token` is the value that was just minted, when there is one. Assembling the
+ * block by hand — copy this, then go back and paste that into the middle of it —
+ * is where a setup goes wrong, and it goes wrong silently: a client with a
+ * placeholder where its credential should be reports "unauthorized", which
+ * reads like the token is bad rather than absent. So the one moment the value
+ * exists, it is written into the block the person is about to copy.
+ */
+function httpBlock(client, token = '') {
   return JSON.stringify({
     mcpServers: {
       zelos: {
         type: 'http',
         url: client.httpUrl || `${window.location.origin}/api/mcp`,
-        headers: { Authorization: 'Bearer PASTE-THE-TOKEN-YOU-MINTED' },
+        headers: { Authorization: `Bearer ${token || TOKEN_PLACEHOLDER}` },
       },
     },
   }, null, 2);
@@ -358,15 +388,29 @@ function tokenRow(token, { armed, onArm, onCancel, onRevoke }) {
 
 /* --------------------------------------------------------------- log rows */
 
+/**
+ * Who made the call, in the words the person reading this chose.
+ *
+ * The log stores a token id, because that is what identifies a token for ever.
+ * `t_9f3a1c` is not an answer to "what did my AI read?", so the server resolves
+ * it back to the label, and a row whose token has since been revoked says so —
+ * "a client you have since cut off read this" is the most interesting line on
+ * the screen, and hiding it behind a blank would be the wrong instinct.
+ */
+function callerOf(entry) {
+  const label = typeof entry.label === 'string' && entry.label ? entry.label : '';
+  const client = typeof entry.client === 'string' ? entry.client : '';
+  if (entry.tokenRevoked === true) return `${label || client || 'a client'} · revoked since`;
+  return label || client;
+}
+
 function logRow(entry) {
   const refused = entry.ok === false;
   const rows = Number(entry.rows);
   const when = entry.at
     ? `${humanDelta(entry.at)}${formatTime(entry.at) ? ` · ${formatTime(entry.at)}` : ''}`
     : 'time not recorded';
-  const who = typeof entry.label === 'string' && entry.label
-    ? entry.label
-    : (typeof entry.client === 'string' ? entry.client : '');
+  const who = callerOf(entry);
 
   return el('div', { class: `ai-log-row${refused ? ' is-refused' : ''}` }, [
     el('code', { class: 'mono ai-log-tool', text: String(entry.tool || 'unknown tool') }),
@@ -395,6 +439,7 @@ export function aiAccessPanel() {
   const wrap = el('div', { class: 'panel panel-ai' });
   const live = el('p', { class: 'status', role: 'status', 'aria-live': 'polite' });
   const mintStatus = statusLine();
+  const testStatus = statusLine();
   let busy = false;
 
   /** Say something in the live region. Set before a request, painted after. */
@@ -459,7 +504,16 @@ export function aiAccessPanel() {
     }
   }
 
-  const load = () => run(() => api.ai());
+  /**
+   * `log` asks for a wider slice of the access log. It is a parameter on the
+   * ordinary read rather than a route of its own, because every route here
+   * answers with the whole state — a second endpoint returning half of it would
+   * be the one place the panel had to merge two truths.
+   */
+  const load = (log = logWindow) => {
+    logWindow = log;
+    return run(() => (log ? request(`/api/ai?log=${log}`) : api.ai()));
+  };
 
   function setEnabled(next) {
     const v = view();
@@ -504,6 +558,11 @@ export function aiAccessPanel() {
           return;
         }
         revealed = { label, value, id: res?.token?.id || '' };
+        // A freshly minted token is the one the reader is about to try, so it
+        // replaces whatever was in the test field — this is the one moment the
+        // panel is allowed to write over what they typed, because they just
+        // asked for a new token.
+        tokenDraft = null;
         mintStatus.clear();
         say('Token minted. Copy it now — this is the only time it is shown.');
       },
@@ -512,6 +571,7 @@ export function aiAccessPanel() {
 
   function revoke(token) {
     pending = null;
+    if (probe?.token?.id === token.id) probe = null;
     run(() => api.revokeAiToken(token.id), {
       onDone: (res) => {
         if (revealed && revealed.id && revealed.id === token.id) revealed = null;
@@ -520,6 +580,35 @@ export function aiAccessPanel() {
           : `${token.label || 'That token'} is revoked. Anything still using it is refused.`);
       },
     });
+  }
+
+  /**
+   * Run the handshake an MCP client runs, with a token the user pasted, and
+   * show what came back.
+   *
+   * Deliberately not routed through `run()`: that helper replaces the whole
+   * panel payload with whatever the server answered, and this route answers
+   * with a test result rather than with the state of the feature. Overwriting
+   * the panel's own truth with a probe result is how a screen ends up claiming
+   * a scope is on because a *test* said so.
+   */
+  async function testConnection(value) {
+    if (!value) {
+      testStatus.bad('Paste a token first — this checks a specific one, not the feature in general.');
+      return;
+    }
+    testStatus.working('Asking as a client would…');
+    try {
+      probe = await request('/api/ai/test', { method: 'POST', body: { token: value } });
+      testStatus.clear();
+      say(probe?.ok
+        ? 'The handshake worked. What is listed below is everything that client can reach.'
+        : 'That token would not connect. The reason is below.');
+    } catch (err) {
+      probe = null;
+      testStatus.bad(`The test itself could not run: ${err.message}`);
+    }
+    paint();
   }
 
   /* --------------------------------------------------------------- parts */
@@ -570,8 +659,20 @@ export function aiAccessPanel() {
     })));
   }
 
-  function revealBlock() {
+  /**
+   * The one screen where the token exists — so it is also the one screen that
+   * can hand over a config block with nothing left to fill in.
+   *
+   * Copying a value and then copying a block with a placeholder in it and then
+   * putting the first inside the second is three steps, and the failure when a
+   * step is missed reads as "unauthorized", which sounds like a bad token
+   * rather than a missing one. Both forms are offered because both are real:
+   * the stdio one carries no token at all, and saying that out loud is the
+   * whole reason it appears here beside one that does.
+   */
+  function revealBlock(v) {
     if (!revealed) return null;
+    const onCopied = (text, tone) => { mintStatus[tone === 'good' ? 'good' : 'bad'](text); };
     return el('div', { class: 'ai-reveal', role: 'group', 'aria-label': 'Your new token' }, [
       el('p', { class: 'ai-reveal-eyebrow', text: `Token for ${revealed.label}` }),
       el('p', { class: 'mono ai-reveal-value', text: revealed.value }),
@@ -591,9 +692,21 @@ export function aiAccessPanel() {
         }),
         button('I have copied it — hide it', {
           class: 'btn quiet',
-          onClick: () => { revealed = null; mintStatus.clear(); paint(); },
+          onClick: () => { revealed = null; probe = null; mintStatus.clear(); paint(); },
         }),
       ]),
+      codeCard(
+        'Ready to paste — any MCP client, over HTTP',
+        httpBlock(v.client, revealed.value),
+        'This block already holds the token above. It is the whole of what that client needs, and it is only complete while this is on screen.',
+        onCopied,
+      ),
+      codeCard(
+        'Ready to paste — a client that spawns Zelos itself',
+        stdioBlock(v.client),
+        'No token appears in this one, and that is correct: a client that spawns Zelos runs it as you, so the switch and the scopes above are the whole of what holds it back.',
+        onCopied,
+      ),
     ]);
   }
 
@@ -606,7 +719,7 @@ export function aiAccessPanel() {
 
     return el('div', { class: 'ai-tokens' }, [
       el('p', { class: 'field-hint', text: 'A client connecting over HTTP proves it is allowed by presenting a token. Mint one per client, so revoking one leaves the others working.' }),
-      revealBlock(),
+      revealBlock(v),
       el('div', { class: 'ai-mint' }, [
         field('Name this token', labelInput, { hint: 'Whatever tells you which client it is. You will be reading this list months from now.' }),
         el('div', { class: 'row-inline' }, button('Mint a token', { class: 'btn solid', onClick: submit })),
@@ -623,13 +736,110 @@ export function aiAccessPanel() {
     ]);
   }
 
+  /**
+   * The log, newest first, in windows rather than whole.
+   *
+   * A log that has been running for months is thousands of rows, and a panel
+   * that rendered all of them would spend its time laying out a year of pings
+   * nobody scrolls to. So the server sends a window — fifty by default — and
+   * says whether there are older rows behind it; asking for more asks for a
+   * wider window, up to a ceiling the server names rather than one written down
+   * here twice.
+   */
   function logBlock(v) {
+    const wider = Math.min(v.accessMax, Math.max(v.access.length * 4, 200));
     return el('div', { class: 'ai-log-wrap' }, [
-      el('p', { class: 'field-hint', text: 'One line for every call Zelos answered: the tool that was called, the scope it was spent against, and how many rows went back. It is written on this machine and goes nowhere.' }),
+      el('p', { class: 'field-hint', text: 'One line for every call Zelos answered: the tool that was called, the scope it was spent against, how many rows went back and which token asked. It is written on this machine and goes nowhere.' }),
       v.access.length
         ? el('div', { class: 'ai-log' }, v.access.map(logRow))
         : el('p', { class: 'quiet-note', text: 'Nothing has read anything yet.' }),
-      el('div', { class: 'row-inline' }, button('Refresh', { class: 'btn quiet', onClick: load })),
+      v.access.length
+        ? el('p', {
+          class: 'field-hint',
+          text: v.accessMore
+            ? `The ${plural(v.access.length, 'most recent call')}. There are older ones behind these.`
+            : `${capitalise(plural(v.access.length, 'call'))}, which is the whole log.`,
+        })
+        : null,
+      el('div', { class: 'row-inline' }, [
+        button('Refresh', { class: 'btn quiet', onClick: () => load() }),
+        v.accessMore
+          ? button(`Show older (up to ${wider})`, { class: 'btn quiet', onClick: () => load(wider) })
+          : null,
+        logWindow ? button('Show fewer', { class: 'btn quiet', onClick: () => load(0) }) : null,
+      ]),
+    ]);
+  }
+
+  /**
+   * "Does my setup actually work?" — answered here rather than in somebody
+   * else's client.
+   *
+   * It runs the two calls every MCP client makes on connect and prints what
+   * came back: the tool list that client would be handed, and the paragraph it
+   * would put in front of its model. That list is the honest picture of the
+   * grant — shorter than the scope list above whenever a scope is ticked but
+   * the switch is off, or a token has been revoked, and those are exactly the
+   * two states a person cannot otherwise see from this screen.
+   */
+  function testBlock(v) {
+    const tokenInput = input({
+      placeholder: 'zlt_t_… — paste the token your client is using',
+      maxlength: '400',
+      autocomplete: 'off',
+      spellcheck: 'false',
+    });
+    // What the reader typed wins over the minted token: they typed it after it
+    // was offered, and a repaint is not a reason to take it away from them.
+    if (tokenDraft !== null) tokenInput.value = tokenDraft;
+    else if (revealed) tokenInput.value = revealed.value;
+    const submit = () => testConnection(tokenInput.value.trim());
+    tokenInput.addEventListener('input', () => { tokenDraft = tokenInput.value; });
+    tokenInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); submit(); }
+    });
+
+    return el('div', { class: 'ai-connect' }, [
+      el('p', { class: 'field-hint', text: 'Zelos will present this token to its own MCP endpoint, run the handshake and the tool listing, and show you exactly what your client would be shown. It reads nothing, changes nothing, and does not count as the token being used.' }),
+      field('The token to try', tokenInput, { hint: v.tokens.length ? 'Whatever you pasted into the client. Zelos cannot read a token back, so this has to come from you.' : 'There is no token yet — mint one above first.' }),
+      el('div', { class: 'row-inline' }, button('Test connection', { class: 'btn', onClick: submit })),
+      testStatus.node,
+      probeBlock(),
+    ]);
+  }
+
+  function probeBlock() {
+    if (!isObject(probe)) return null;
+    if (probe.ok !== true) {
+      return el('div', { class: 'banner banner-warn', role: 'status' }, [
+        el('h3', { class: 'banner-title', text: probe.stage === 'switch' ? 'It would be refused at the switch' : 'It would be refused at the door' }),
+        el('p', { class: 'banner-detail', text: String(probe.detail || 'The server gave no reason.') }),
+      ]);
+    }
+
+    const tools = Array.isArray(probe.tools) ? probe.tools.filter(isObject) : [];
+    const info = isObject(probe.serverInfo) ? probe.serverInfo : {};
+    const named = [
+      probe.token?.label ? `connected as ${probe.token.label}` : null,
+      info.name ? `${info.name} ${info.version || ''}`.trim() : null,
+      probe.protocolVersion ? `protocol ${probe.protocolVersion}` : null,
+    ].filter(Boolean).join(' · ');
+
+    return el('div', { class: 'stack' }, [
+      el('p', { class: 'status is-good', text: String(probe.detail || 'The handshake worked.') }),
+      named ? el('p', { class: 'field-hint', text: named }) : null,
+      tools.length
+        ? el('p', { class: 'scope-tools' }, [
+          el('span', { class: 'scope-tools-label', text: plural(tools.length, 'tool') }),
+          ...tools.map((t) => el('code', { class: 'mono scope-tool', text: String(t.name || '') })),
+        ])
+        : el('p', { class: 'quiet-note', text: 'No tool at all: every scope is off, so that client connects and can read nothing.' }),
+      probe.instructions
+        ? el('div', { class: 'ai-code' }, [
+          el('div', { class: 'ai-code-head' }, el('span', { class: 'ai-code-title', text: 'What the AI is told Zelos is' })),
+          el('pre', { class: 'code' }, el('code', { text: String(probe.instructions) })),
+        ])
+        : null,
     ]);
   }
 
@@ -712,6 +922,7 @@ export function aiAccessPanel() {
         note: 'Each of these is its own decision. The sentence under a scope is the list of things that leave this machine when it is on — read it before you tick it.',
       }, scopeBlock(v)),
       section('Tokens', {}, tokenBlock(v)),
+      section('Check a token', {}, testBlock(v)),
       section('What your AI has read', {}, logBlock(v)),
       section('Connecting a client', {}, connectBlock(v)),
       section('What it cannot do', {}, [

@@ -192,21 +192,112 @@ function packageVersion() {
  * ------------------------------------------------------------------ */
 
 /**
- * The URL is ours — built from the port we bound and the token we minted. It
- * is never derived from mail, a calendar or model output, and it is passed as
- * an argument to a known binary, never through a shell.
+ * Opening the app without putting the session token on a command line.
+ *
+ * That token is the whole local API: anything holding it can read every message
+ * Zelos has. An argument vector is not private — on Linux `/proc/<pid>/cmdline`
+ * is world-readable, and everywhere else `ps` shows a co-resident process the
+ * full command line for as long as it runs. `open "…/?t=<token>"` handed the
+ * credential to exactly that. core/secrets.mjs already refuses to do this with
+ * passwords, feeding `security` and `secret-tool` on stdin instead; this is the
+ * same leak wearing a different hat, and it gets the same answer.
+ *
+ * What replaces it depends on what the platform can actually do, because the
+ * opener is not the only process involved — whatever it launches ends up with
+ * the URL too:
+ *
+ *  - **A handoff URL, when the server offers one.** A single-use nonce that the
+ *    server trades for the real token on first request and then forgets. It may
+ *    sit in an argument vector safely: by the time anyone reads it there, it has
+ *    already been spent. This is the only route that is both private and
+ *    automatic on every platform, so it wins whenever it is available.
+ *  - **macOS without one.** `osascript` reads its script from stdin, and
+ *    `open location` hands the URL to LaunchServices, which passes it to the
+ *    browser as an Apple Event rather than as an argument. Nothing anywhere gets
+ *    a command line with the token in it.
+ *  - **Windows without one.** `cmd` reads `start` from stdin, which keeps the
+ *    token out of the opener's own arguments. The browser it launches may still
+ *    receive the URL as an argument; this is strictly better, not perfect.
+ *  - **Everything else without one.** `xdg-open` takes a positional argument and
+ *    execs a browser with another, so there is no way to do this privately at
+ *    all. The browser is opened at the tokenless address and the user pastes the
+ *    URL the banner printed. Refusing to leak beats opening the right page.
+ *
+ * The URL is always ours, built from the port we bound and the token we minted,
+ * and it is checked against a tight character set before any of this — a value
+ * from anywhere else has no business being handed to `cmd`.
  */
-function openBrowser(url) {
-  const [command, args] =
-    process.platform === 'darwin' ? ['open', [url]]
-    : process.platform === 'win32' ? ['cmd', ['/c', 'start', '', url]]
-    : ['xdg-open', [url]];
+const LAUNCH_URL_RE = /^http:\/\/127\.0\.0\.1:\d{1,5}\/[A-Za-z0-9/?=._~-]*$/;
+
+/** The same address with the query — and therefore the token — taken off. */
+function withoutToken(url) {
+  const cut = url.indexOf('?');
+  return cut === -1 ? url : url.slice(0, cut);
+}
+
+/**
+ * Decide how to open the browser, without opening it. Returns `null` when there
+ * is nothing safe to run, and otherwise `{command, args, stdin, target,
+ * handsOverToken}` — `handsOverToken` being false when the user will have to
+ * paste the address themselves.
+ */
+export function browserLaunchPlan({ url, handoffUrl = null, platform = process.platform } = {}) {
+  const opener =
+    platform === 'darwin' ? 'open'
+    : platform === 'win32' ? 'cmd'
+    : 'xdg-open';
+
+  if (typeof handoffUrl === 'string' && LAUNCH_URL_RE.test(handoffUrl)) {
+    const args = platform === 'win32' ? ['/c', 'start', '', handoffUrl] : [handoffUrl];
+    return { command: opener, args, stdin: null, target: handoffUrl, handsOverToken: true };
+  }
+
+  if (typeof url !== 'string' || !LAUNCH_URL_RE.test(url)) return null;
+
+  if (platform === 'darwin') {
+    return {
+      command: 'osascript',
+      args: [],
+      stdin: `open location "${url}"\n`,
+      target: url,
+      handsOverToken: true,
+    };
+  }
+  if (platform === 'win32') {
+    return {
+      command: 'cmd',
+      args: [],
+      stdin: `start "" "${url}"\r\nexit\r\n`,
+      target: url,
+      handsOverToken: true,
+    };
+  }
+  const bare = withoutToken(url);
+  return { command: opener, args: [bare], stdin: null, target: bare, handsOverToken: false };
+}
+
+/**
+ * Run a plan. `spawn` is a seam so a test can see exactly what a child process
+ * would have been given; a plan with a `stdin` string is written and closed
+ * immediately, because the opener has nothing else to say.
+ */
+export function openBrowser(plan, { spawn: spawnFn = spawn } = {}) {
+  if (!plan) return false;
   try {
-    const child = spawn(command, args, { stdio: 'ignore', detached: true, windowsHide: true });
+    const child = spawnFn(plan.command, plan.args, {
+      stdio: [plan.stdin === null ? 'ignore' : 'pipe', 'ignore', 'ignore'],
+      detached: true,
+      windowsHide: true,
+    });
     child.on('error', () => {}); // no browser to open is not a failure to launch
+    if (plan.stdin !== null && child.stdin) {
+      child.stdin.on('error', () => {});
+      child.stdin.end(plan.stdin);
+    }
     child.unref();
+    return true;
   } catch {
-    /* likewise */
+    return false;
   }
 }
 
@@ -216,7 +307,7 @@ function openBrowser(url) {
 
 const RULE = '━'.repeat(58);
 
-function banner({ url, home, version, model, mailAccounts, calendars, auto }) {
+function banner({ url, home, version, model, mailAccounts, calendars, auto, pasteNeeded = false }) {
   const lines = [
     '',
     `  ZELOS ${version}`,
@@ -235,6 +326,15 @@ function banner({ url, home, version, model, mailAccounts, calendars, auto }) {
     '  Ctrl-C to stop.',
     '',
   ];
+  if (pasteNeeded) {
+    // The browser was opened at the address without the token, because on this
+    // platform handing it over would have meant putting it on a command line
+    // where any other process could read it. Copying it across is the price.
+    lines.splice(lines.length - 1, 0,
+      '  Your browser was opened without the token: on this platform passing it',
+      '  would have put it on a command line. Paste the address above.',
+      '');
+  }
   // Straight to stdout, not through the logger: the logger redacts anything
   // token-shaped, and this line is the one place the token has to be readable.
   process.stdout.write(`${lines.join('\n')}\n`);
@@ -420,6 +520,27 @@ export async function main(argv = process.argv.slice(2)) {
 
   const config = loadConfig();
   const where = paths();
+
+  /* Say something if this home already looks busy. The exclusion lives in the
+     desktop shell's runtime because that is where it was needed first, but it
+     is the CLI half that makes it mean anything: the pairing people actually
+     end up in is a `zelos` in a terminal and the app in the tray, both sweeping
+     one database on their own clocks — the same mail read twice and the same
+     model calls paid for twice.
+
+     It is a warning and never a refusal. The check reads a file on disk to
+     guess whether another process is alive, and a guess that is occasionally
+     wrong must not be able to stop somebody starting their own app. The lock
+     module is loaded defensively for the same reason: a source checkout with no
+     desktop shell beside it is a supported way to run Zelos. */
+  let homeLock = null;
+  try {
+    const { holdHome } = await import('./desktop/runtime.js');
+    homeLock = holdHome({ home: where.home, kind: 'cli', logger: log });
+  } catch {
+    /* No shell in this copy, or it would not load. Running is what matters. */
+  }
+
   const db = openDb(where.db);
   migrate(db);
 
@@ -445,7 +566,26 @@ export async function main(argv = process.argv.slice(2)) {
     }
   }
 
-  const { tokenUrl } = await listen(server, { port: flags.port ?? undefined });
+  const { url: origin, tokenUrl } = await listen(server, { port: flags.port ?? undefined });
+
+  // Now that a port exists, put it in the lock, so the next process to find
+  // this home busy can name the board rather than only a process number.
+  try { homeLock?.setPort(new URL(origin).port ? Number(new URL(origin).port) : null); } catch { /* a courtesy, not state */ }
+
+  /* The handoff is the only way to open a browser on every platform without the
+     session token touching a command line, and it is the server's to mint — it
+     is the half that has to remember the nonce and spend it. A server that does
+     not offer one is not an error: browserLaunchPlan falls back per platform. */
+  let handoffUrl = null;
+  if (flags.open && typeof server.zelos.mintHandoff === 'function') {
+    try {
+      const at = server.zelos.mintHandoff();
+      if (typeof at === 'string' && at) handoffUrl = new URL(at, origin).href;
+    } catch (err) {
+      log.warn('zelos: could not mint a browser handoff; opening without one', { error: err.message });
+    }
+  }
+  const plan = flags.open ? browserLaunchPlan({ url: tokenUrl, handoffUrl }) : null;
 
   const modelLine = config.model.model
     ? `${config.model.label || config.model.protocol} · ${config.model.model}${isLocalAddress(config.model.baseUrl) ? ' (on this machine)' : ''}`
@@ -461,9 +601,10 @@ export async function main(argv = process.argv.slice(2)) {
     mailAccounts: enabledMail ? `${enabledMail} account${enabledMail === 1 ? '' : 's'}` : 'none yet',
     calendars: enabledCals ? `${enabledCals} calendar${enabledCals === 1 ? '' : 's'}` : 'none yet',
     auto: scheduler ? `every ${config.sweep.intervalMinutes}m between ${config.sweep.activeHours[0]}:00 and ${config.sweep.activeHours[1]}:00` : 'manual',
+    pasteNeeded: Boolean(plan) && !plan.handsOverToken,
   });
 
-  if (flags.open) openBrowser(tokenUrl);
+  if (plan) openBrowser(plan);
 
   // Started after the banner so the URL is the first thing on screen.
   scheduler?.start();

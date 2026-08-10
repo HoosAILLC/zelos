@@ -418,6 +418,36 @@ function hasAttachmentParts(parts) {
  * 5. The client
  * ================================================================== */
 
+/**
+ * Loopback, in every spelling a person or a provider actually writes.
+ *
+ * This matters because loopback is the one address where a cleartext IMAP
+ * session is defensible: Proton Bridge and the other local proxies that
+ * decrypt on your behalf listen on 127.0.0.1 with no TLS on purpose, and that
+ * traffic never leaves the machine. `guessImapHost` returns exactly that for a
+ * proton.me address. Any other host is a network, and a network has people on
+ * it.
+ */
+export function isLoopbackHost(host) {
+  const h = String(host ?? '').trim().toLowerCase().replace(/^\[/, '').replace(/\]$/, '');
+  if (!h) return false;
+  if (h === 'localhost' || h.endsWith('.localhost')) return true;
+  if (h === '::1' || h === '0:0:0:0:0:0:0:1') return true;
+  const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/.exec(h);
+  const v4 = mapped ? mapped[1] : h;
+  if (!/^127(?:\.\d{1,3}){3}$/.test(v4)) return false;
+  return v4.split('.').every((octet) => Number(octet) <= 255);
+}
+
+/**
+ * Whether an account must prove the connection is encrypted before it hands
+ * over a password, when the config has not said either way. On by default
+ * everywhere except loopback — see `isLoopbackHost`.
+ */
+export function tlsRequiredByDefault(host) {
+  return !isLoopbackHost(host);
+}
+
 export class ImapClient {
   #socket = null;
   #assembler = new ResponseAssembler();
@@ -434,11 +464,26 @@ export class ImapClient {
   #onSocketError = null;
   #onSocketClose = null;
 
-  constructor({ host, port, secure = true, user, pass, timeoutMs = 30000, logger } = {}) {
+  /**
+   * `requireTls` is the answer to a silent failure mode. With `secure: false`
+   * the client offers to upgrade, but only if the server says it can — and a
+   * machine in the middle can simply delete STARTTLS from the capability list,
+   * at which point the client shrugs and sends the password in the clear. The
+   * user is told nothing, because from the client's side nothing went wrong.
+   *
+   * So the requirement is stated, not inferred from what the server offered:
+   * `true` refuses to authenticate over anything but a real TLS socket, `false`
+   * permits cleartext, and `null` (or nothing at all, which is what every
+   * existing config says) means "required unless the host is loopback".
+   */
+  constructor({ host, port, secure = true, user, pass, requireTls = null, timeoutMs = 30000, logger } = {}) {
     if (!host || typeof host !== 'string') throw new Error('ImapClient: host is required');
     this.host = host;
     this.secure = secure !== false;
     this.port = Number(port) || (this.secure ? 993 : 143);
+    this.requireTls = requireTls === null || requireTls === undefined
+      ? tlsRequiredByDefault(this.host)
+      : requireTls !== false;
     this.user = user == null ? '' : String(user);
     this.pass = pass == null ? '' : String(pass);
     this.timeoutMs = Number(timeoutMs) > 0 ? Number(timeoutMs) : 30000;
@@ -479,6 +524,30 @@ export class ImapClient {
       const caps = await this.capabilities();
       if (caps.has('STARTTLS')) await this.#startTls();
     }
+    // Checked here as well as in login() so the caller learns immediately, on
+    // the call that opened the socket, rather than one step later.
+    this.#assertEncrypted();
+  }
+
+  /**
+   * The gate. Not "did we try to upgrade" but "is this socket actually TLS" —
+   * `encrypted` is set by node:tls itself and is the only thing here a hostile
+   * server has no say over. A CAPABILITY reply is the server's word; a
+   * TLSSocket is a handshake that happened.
+   *
+   * Failing closes the connection, because a session that is not allowed to
+   * authenticate has nothing left to do on it.
+   */
+  #assertEncrypted() {
+    if (!this.requireTls) return;
+    if (this.#socket && this.#socket.encrypted === true) return;
+    const err = this.#error(
+      'this connection is still in the clear and the server never offered STARTTLS, '
+      + 'so your password was not sent. Connect with TLS (port 993 usually), or, if a '
+      + 'plaintext connection to this host is deliberate, set requireTls to false on the account.',
+    );
+    this.#fail(err);
+    throw err;
   }
 
   #openSocket(useTls) {
@@ -555,6 +624,9 @@ export class ImapClient {
 
   async login() {
     if (this.#authenticated) return;
+    // The real gate: every path to a password on the wire runs through here,
+    // including one on a client somebody built by hand rather than via connect().
+    this.#assertEncrypted();
     const caps = await this.capabilities();
     const asciiCredentials = isAsciiSafe(this.user) && isAsciiSafe(this.pass);
 
@@ -1023,6 +1095,7 @@ export async function fetchRecent({
   secure,
   user,
   pass,
+  requireTls = null,
   mailbox = 'INBOX',
   sinceDays = 14,
   limit = 400,
@@ -1031,7 +1104,7 @@ export async function fetchRecent({
   logger,
 } = {}) {
   const progress = typeof onProgress === 'function' ? onProgress : () => {};
-  const client = new ImapClient({ host, port, secure, user, pass, timeoutMs, logger });
+  const client = new ImapClient({ host, port, secure, user, pass, requireTls, timeoutMs, logger });
 
   try {
     progress({ phase: 'connect', message: `Connecting to ${host}`, done: 0, total: 0 });
@@ -1174,10 +1247,10 @@ function stripAngles(value) {
  * ================================================================== */
 
 /** Connect, authenticate, list. Never throws — the UI wants the reason, not a stack. */
-export async function testConnection({ host, port, secure, user, pass, timeoutMs, logger } = {}) {
+export async function testConnection({ host, port, secure, user, pass, requireTls = null, timeoutMs, logger } = {}) {
   let client;
   try {
-    client = new ImapClient({ host, port, secure, user, pass, timeoutMs, logger });
+    client = new ImapClient({ host, port, secure, user, pass, requireTls, timeoutMs, logger });
   } catch (err) {
     return { ok: false, capabilities: [], mailboxes: [], error: err.message };
   }

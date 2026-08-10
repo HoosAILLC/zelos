@@ -5,7 +5,11 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Zelos</title>
   <meta name="description" content="A local-first second brain. What needs you now, what you owe, what owes you, what is coming.">
-  <meta name="color-scheme" content="light dark">
+  <!-- There is exactly one theme here, and it is black. Claiming "light dark"
+       made the UA draw scrollbars, form controls and the caret in its light
+       style whenever the OS was in light mode — pale furniture on a pure black
+       page, which is the only part of the app the stylesheet cannot reach. -->
+  <meta name="color-scheme" content="dark">
   <link rel="icon" href="/assets/icon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/app.css">
   <script src="/boot.js"></script>

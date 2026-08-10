@@ -40,7 +40,24 @@ export function isValidRef(ref) {
   return typeof ref === 'string' && ref.length > 0 && ref.length <= 64 && REF_RE.test(ref);
 }
 
-/** Defaults for one mail account. Exported so the UI can build a blank one. */
+/**
+ * Defaults for one mail account. Exported so the UI can build a blank one.
+ *
+ * `requireTls` is deliberately three-valued. `secure: true` is implicit TLS on
+ * 993 and needs no help; `secure: false` starts in the clear and upgrades only
+ * if the server offers STARTTLS, which a machine in the middle can simply
+ * decline to advertise. `requireTls` is the standing instruction about that:
+ * `true` means never send the password over an unencrypted socket, `false`
+ * means the plaintext is deliberate, and `null` — which is what every config
+ * written before this existed says — means decide from the host, requiring it
+ * everywhere except loopback. Loopback is where Proton Bridge and its kind
+ * live, which is the whole reason plaintext is still an option.
+ *
+ * It is stored as null rather than resolved to a boolean on the way in on
+ * purpose: a resolved `false` would survive the user later pointing the same
+ * account at a real mail server, and go on permitting cleartext for a host
+ * nobody ever meant it for.
+ */
 export const MAIL_ACCOUNT_DEFAULTS = deepFreeze({
   id: '',
   enabled: true,
@@ -48,6 +65,7 @@ export const MAIL_ACCOUNT_DEFAULTS = deepFreeze({
   host: '',
   port: 993,
   secure: true,
+  requireTls: null,
   user: '',
   keyRef: '',
   mailboxes: ['INBOX'],
@@ -381,6 +399,7 @@ export function validateConfig(cfg) {
       if (a.enabled && (!isStr(a.user) || !a.user.trim())) errors.push({ path: `${at}.user`, message: 'is required for an enabled account' });
       if (!isInt(a.port, 1, 65535)) errors.push({ path: `${at}.port`, message: 'must be a port number' });
       if (!isBool(a.secure)) errors.push({ path: `${at}.secure`, message: 'must be a boolean' });
+      if (a.requireTls !== null && !isBool(a.requireTls)) errors.push({ path: `${at}.requireTls`, message: 'must be true, false, or null to decide from the host' });
       checkRef(errors, `${at}.keyRef`, a.keyRef, { allowNull: !a.enabled });
       if (!Array.isArray(a.mailboxes) || a.mailboxes.length === 0 || !a.mailboxes.every(isStr)) errors.push({ path: `${at}.mailboxes`, message: 'must be a non-empty array of mailbox names' });
       if (!isStr(a.sentMailbox)) errors.push({ path: `${at}.sentMailbox`, message: 'must be a string' });

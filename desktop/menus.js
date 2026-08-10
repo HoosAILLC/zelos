@@ -9,6 +9,15 @@
  * nothing in a text field, and the Owed view is mostly text fields.
  */
 
+/**
+ * Where `app.setLoginItemSettings` means anything. macOS and Windows both have
+ * a real login-items list Electron can write to; on Linux the call is a no-op,
+ * and a checkbox that silently does nothing is worse than no checkbox at all.
+ */
+export function supportsLoginItem(platform = process.platform) {
+  return platform === 'darwin' || platform === 'win32';
+}
+
 /** The board's views, in the order the UI lists them. Used for ⌘1…⌘6. */
 export const VIEWS = Object.freeze([
   { id: 'now', label: 'Now' },
@@ -59,6 +68,19 @@ export function buildAppMenuTemplate({ platform = process.platform, appName = 'Z
       { type: 'separator' },
       { label: 'Show data folder', click: () => actions.openDataFolder?.() },
       { label: 'Show logs', click: () => actions.openLogs?.() },
+      // The whole pitch is a Zelos that sweeps while you are doing something
+      // else, and today it only sweeps if you remember to launch it. Opt-in,
+      // never assumed: the checkbox reads the OS's own list rather than a
+      // setting of ours, so it cannot disagree with what the OS will do.
+      ...(supportsLoginItem(platform) ? [
+        { type: 'separator' },
+        {
+          label: 'Open Zelos at login',
+          type: 'checkbox',
+          checked: actions.openAtLogin?.() === true,
+          click: (item) => actions.setOpenAtLogin?.(item?.checked === true),
+        },
+      ] : []),
       ...(mac ? [] : [{ type: 'separator' }, { role: 'quit', label: 'Quit Zelos' }]),
     ],
   });
@@ -100,11 +122,14 @@ export function buildAppMenuTemplate({ platform = process.platform, appName = 'Z
     ],
   });
 
+  // `close` is on both branches. Without it a macOS build has no ⌘W at all —
+  // the shortcut every Mac user reaches for first, doing nothing, in an app
+  // whose window is *meant* to be closed and left running.
   template.push({
     label: 'Window',
     role: 'window',
     submenu: mac
-      ? [{ role: 'minimize' }, { role: 'zoom' }, { type: 'separator' }, { role: 'front' }]
+      ? [{ role: 'minimize' }, { role: 'zoom' }, { role: 'close' }, { type: 'separator' }, { role: 'front' }]
       : [{ role: 'minimize' }, { role: 'close' }],
   });
 

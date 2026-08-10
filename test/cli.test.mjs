@@ -35,7 +35,7 @@ process.env.ZELOS_HOME = path.join(SCRATCH, 'default-home');
 process.env.ZELOS_SECRETS_BACKEND = 'encrypted-file';
 
 const { diagnose, formatReport, compareVersions, MIN_NODE } = await import('../core/doctor.mjs');
-const { parseArgs, COMMANDS } = await import('../zelos.mjs');
+const { parseArgs, COMMANDS, browserLaunchPlan, openBrowser } = await import('../zelos.mjs');
 
 after(() => {
   fs.rmSync(SCRATCH, { recursive: true, force: true });
@@ -103,13 +103,20 @@ describe('package.json is ready to publish as zelos-app', () => {
     assert.equal(pkg.name, 'zelos-app');
     assert.equal(pkg.type, 'module');
     assert.equal(pkg.bin.zelos, './zelos.mjs');
-    assert.equal(pkg.engines.node, '>=22.5.0');
+    // 22.13, not 22.5: `node:sqlite` needed --experimental-sqlite until then,
+    // and core/db.mjs imports it at module load, so an earlier runtime does not
+    // fail on some feature nobody uses — it fails on the first line.
+    assert.equal(pkg.engines.node, '>=22.13.0');
     assert.match(pkg.version, /^\d+\.\d+\.\d+/);
   });
 
-  test('it points at the site, not at a placeholder', () => {
+  test('it points at the site and at the source, not at a placeholder', () => {
     assert.equal(pkg.homepage, 'https://zelos-app.netlify.app');
-    assert.match(String(pkg.repository?.url ?? ''), /zelos-app\.netlify\.app/);
+    // `repository` is where the code is, which is not where the product is.
+    // Pointing it at the site made `npm repo` open a marketing page and left
+    // "free and open source" with nowhere to go.
+    assert.match(String(pkg.repository?.url ?? ''), /github\.com\/[^/]+\/zelos(\.git)?$/);
+    assert.match(String(pkg.bugs?.url ?? ''), /github\.com\/[^/]+\/zelos\/issues$/);
   });
 
   test('no dependencies, of any kind', () => {
@@ -133,7 +140,11 @@ describe('package.json is ready to publish as zelos-app', () => {
   });
 
   test('the files allowlist names exactly what ships', () => {
-    assert.deepEqual(pkg.files, ['core/', 'ui/', 'assets/', 'docs/*.md', 'zelos.mjs', 'LICENSE']);
+    // README.md is listed even though npm would include it regardless: the
+    // allowlist is read by people as the definition of what ships, and a file
+    // that ships without appearing in it makes the list a half-truth.
+    assert.deepEqual(pkg.files,
+      ['core/', 'ui/', 'assets/', 'docs/*.md', 'zelos.mjs', 'README.md', 'LICENSE']);
   });
 });
 
@@ -196,6 +207,7 @@ describe('npm pack produces a tarball that runs', () => {
 
   test('nothing outside the allowlist sneaks in', () => {
     const allowed = (e) => e === 'package.json' || e === 'zelos.mjs' || e === 'LICENSE'
+      || e === 'README.md'
       || e.startsWith('core/') || e.startsWith('ui/') || e.startsWith('assets/')
       || /^docs\/[^/]+\.md$/.test(e);
     const strays = entries.filter((e) => !allowed(e));
@@ -503,6 +515,41 @@ describe('doctor', () => {
     assert.match(check.action, /app password/i);
   });
 
+  /**
+   * REGRESSION. `requireTls` reached core/sources/imap.mjs from nowhere: not
+   * from the sweep, not from the mail test, and not from here. A doctor that
+   * signs in where the real run would refuse is not a diagnosis — it is a second,
+   * more permissive client, reporting an account healthy on the morning its mail
+   * quietly stops arriving.
+   */
+  test('doctor connects under the account\'s own TLS rule, and says what to do when it refuses', async () => {
+    const seen = [];
+    const testImap = async (opts) => {
+      seen.push(opts);
+      return { ok: false, capabilities: [], mailboxes: [], error: 'IMAP 127.0.0.1:1143 — this connection is still in the clear and the server never offered STARTTLS, so your password was not sent.' };
+    };
+
+    process.env.ZELOS_HOME = freshHome({
+      mail: [
+        { id: 'm_strict', enabled: true, label: 'Bridge', host: '127.0.0.1', port: 1143, secure: false, user: 'a@example.com', keyRef: 'mail.m_strict', requireTls: true },
+        { id: 'm_quiet', enabled: true, label: 'Work', host: 'imap.fastmail.com', port: 993, secure: true, user: 'b@fastmail.com', keyRef: 'mail.m_quiet' },
+        { id: 'm_open', enabled: true, label: 'Local', host: '127.0.0.1', port: 1144, secure: false, user: 'c@example.com', keyRef: 'mail.m_open', requireTls: false },
+      ],
+    });
+    const report = await diagnose({ deps: { ...SILENT_DEPS, getSecret: async () => 'hunter2', testImap } });
+
+    assert.deepEqual(seen.map((o) => o.requireTls), [true, null, false],
+      'each account is tested under its own rule, and one that never said becomes null, not false');
+
+    // The refusal must not be dressed up as a rejected credential: nothing was
+    // rejected, because nothing was sent.
+    const strict = byId(report, 'mail.m_strict');
+    assert.equal(strict.status, 'fail');
+    assert.match(strict.action, /requireTls/);
+    assert.ok(!/App Password|app password/.test(strict.action),
+      'a refusal to use cleartext is not a password problem and must not be described as one');
+  });
+
   test('a mailbox the server does not have is a warning that lists the real ones', async () => {
     process.env.ZELOS_HOME = freshHome({
       mail: [{ id: 'm_3', enabled: true, label: 'Work', host: 'imap.fastmail.com', port: 993, secure: true, user: 'a@fastmail.com', keyRef: 'mail.m_3', mailboxes: ['INBOX', 'Projects'] }],
@@ -777,5 +824,159 @@ describe('the bare invocation is untouched', () => {
     } finally {
       child.kill('SIGKILL');
     }
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Opening the browser
+ * ------------------------------------------------------------------ */
+
+describe('the session token never reaches a command line', () => {
+  /**
+   * REGRESSION. The launch URL was handed to `open`/`xdg-open`/`cmd` as an
+   * argument, so for the length of the launch — and, on Linux, for the whole
+   * life of the browser — the session token sat in an argument vector any
+   * co-resident process could read. That token is the entire local API.
+   * core/secrets.mjs refuses to put a password in argv for exactly this reason;
+   * these tests hold the launcher to the same rule.
+   */
+  const TOKEN = 'f3a1c9'.repeat(10) + 'abcd';
+  const URL_WITH_TOKEN = `http://127.0.0.1:7777/?t=${TOKEN}`;
+  const PLATFORMS = ['darwin', 'win32', 'linux', 'freebsd'];
+
+  /** Just enough of a ChildProcess for openBrowser to drive. */
+  function fakeChild(seen) {
+    const stdin = { writes: [], on() {}, end(chunk) { if (chunk !== undefined) stdin.writes.push(String(chunk)); } };
+    seen.stdin = stdin;
+    return { on() {}, unref() {}, stdin };
+  }
+
+  test('no platform hands the token to a child process as an argument', () => {
+    for (const platform of PLATFORMS) {
+      const plan = browserLaunchPlan({ url: URL_WITH_TOKEN, platform });
+      assert.ok(plan, `${platform} produced no plan at all`);
+      const argv = [plan.command, ...plan.args].join(' ');
+      assert.ok(!argv.includes(TOKEN), `${platform} put the session token in argv: ${argv}`);
+      assert.ok(!plan.target.includes(TOKEN) || plan.stdin !== null,
+        `${platform} routed the tokened URL through something that is not stdin`);
+    }
+  });
+
+  test('macOS and Windows pass the URL on stdin, so it opens without pasting', () => {
+    for (const platform of ['darwin', 'win32']) {
+      const plan = browserLaunchPlan({ url: URL_WITH_TOKEN, platform });
+      assert.deepEqual(plan.args, [], `${platform} should need no arguments at all`);
+      assert.ok(plan.stdin.includes(URL_WITH_TOKEN), `${platform} did not send the URL on stdin`);
+      assert.equal(plan.handsOverToken, true);
+    }
+    assert.equal(browserLaunchPlan({ url: URL_WITH_TOKEN, platform: 'darwin' }).command, 'osascript');
+    assert.equal(browserLaunchPlan({ url: URL_WITH_TOKEN, platform: 'win32' }).command, 'cmd');
+  });
+
+  test('a platform with no private opener opens the tokenless address instead', () => {
+    // xdg-open takes a positional argument and execs a browser with another, so
+    // there is no private route at all: the user pastes what the banner printed.
+    for (const platform of ['linux', 'freebsd']) {
+      const plan = browserLaunchPlan({ url: URL_WITH_TOKEN, platform });
+      assert.equal(plan.command, 'xdg-open');
+      assert.deepEqual(plan.args, ['http://127.0.0.1:7777/']);
+      assert.equal(plan.stdin, null);
+      assert.equal(plan.handsOverToken, false, 'the user has to be told they must paste');
+    }
+  });
+
+  test('a one-time handoff is used everywhere, and carries no token', () => {
+    const handoffUrl = 'http://127.0.0.1:7777/h/9f3a1c7e5b2d4088';
+    for (const platform of PLATFORMS) {
+      const plan = browserLaunchPlan({ url: URL_WITH_TOKEN, handoffUrl, platform });
+      const everything = [plan.command, ...plan.args, plan.stdin ?? ''].join(' ');
+      assert.ok(!everything.includes(TOKEN), `${platform} leaked the token alongside the handoff`);
+      assert.ok(everything.includes(handoffUrl), `${platform} did not use the handoff`);
+      assert.equal(plan.handsOverToken, true);
+      assert.equal(plan.stdin, null, 'a spent nonce is safe in argv, so the plain opener is fine');
+    }
+  });
+
+  test('openBrowser spawns nothing that carries the token in argv', () => {
+    for (const platform of PLATFORMS) {
+      const seen = {};
+      const spawn = (command, args, options) => {
+        seen.command = command;
+        seen.args = args;
+        seen.options = options;
+        return fakeChild(seen);
+      };
+      assert.equal(openBrowser(browserLaunchPlan({ url: URL_WITH_TOKEN, platform }), { spawn }), true);
+      assert.ok(!JSON.stringify([seen.command, seen.args]).includes(TOKEN),
+        `${platform} spawned ${seen.command} ${JSON.stringify(seen.args)}`);
+      if (seen.stdin.writes.length) {
+        assert.ok(seen.stdin.writes.join('').includes(URL_WITH_TOKEN), `${platform} wrote nothing usable to stdin`);
+      }
+    }
+  });
+
+  /**
+   * REGRESSION, and the reason the one above was not enough. The launcher gated
+   * the whole handoff on `typeof server.zelos.mintHandoff === 'function'` and
+   * the server exposed no such function, so the branch was permanently false and
+   * every launch went on putting the token in argv. A test that supplies its own
+   * handoff URL cannot see that; this one asks the real server for one.
+   */
+  test('the server mints a handoff the launcher can actually open', async () => {
+    const { createServer, listen } = await import('../core/server.mjs');
+    const dbm = await import('../core/db.mjs');
+    const handle = dbm.open(':memory:');
+    dbm.migrate(handle);
+    const server = createServer({ db: handle });
+    const { url: origin, tokenUrl } = await listen(server, { port: 0 });
+
+    try {
+      assert.equal(typeof server.zelos.mintHandoff, 'function',
+        'the launcher checks for exactly this before it will open a browser privately');
+
+      // The two lines main() runs, verbatim.
+      const at = server.zelos.mintHandoff();
+      const handoffUrl = new URL(at, origin).href;
+
+      for (const platform of PLATFORMS) {
+        const plan = browserLaunchPlan({ url: tokenUrl, handoffUrl, platform });
+        const everything = [plan.command, ...plan.args, plan.stdin ?? ''].join(' ');
+        assert.ok(!everything.includes(server.sessionToken),
+          `${platform} still launches with the token: ${everything}`);
+        assert.ok(everything.includes(handoffUrl), `${platform} did not use the server's handoff`);
+        assert.equal(plan.handsOverToken, true, `${platform} would make the user paste`);
+      }
+
+      // And the address the launcher built is one this server answers: a handoff
+      // the browser cannot spend is the same dead branch with extra steps.
+      const res = await fetch(handoffUrl, { redirect: 'manual' });
+      assert.equal(res.status, 302);
+      assert.equal(res.headers.get('location'), `/?t=${server.sessionToken}`);
+    } finally {
+      server.closeAllConnections();
+      await new Promise((r) => server.close(r));
+      dbm.close(handle);
+    }
+  });
+
+  test('anything that is not one of our own launch URLs is not run at all', () => {
+    const bad = [
+      'http://evil.example/?t=x',
+      'https://127.0.0.1:7777/?t=x',
+      'http://127.0.0.1:7777/?t=a&calc=1',
+      'http://127.0.0.1:7777/" ; rm -rf ~',
+      'http://127.0.0.1:7777/?t=$(id)',
+      'file:///etc/passwd',
+      'not a url at all',
+      '',
+      null,
+      undefined,
+    ];
+    for (const url of bad) {
+      assert.equal(browserLaunchPlan({ url, platform: 'win32' }), null, JSON.stringify(url));
+      assert.equal(browserLaunchPlan({ url: URL_WITH_TOKEN, handoffUrl: url, platform: 'darwin' }).stdin !== null, true,
+        `a bad handoff (${JSON.stringify(url)}) must fall back, never be run`);
+    }
+    assert.equal(openBrowser(null, { spawn: () => { throw new Error('nothing should have been spawned'); } }), false);
   });
 });

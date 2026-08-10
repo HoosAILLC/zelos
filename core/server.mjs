@@ -22,6 +22,12 @@
  *      and symlinks all fail before anything is read.
  *   5. Bodies are capped, so a runaway POST cannot exhaust memory.
  *
+ * There is exactly one path that answers without the token, `GET /h/<id>`, and
+ * it exists to hand the token over: a single-use, seconds-long address the
+ * launcher opens a browser at so the token never has to travel on a command
+ * line. It is subject to every check above, and see HandoffPad for why spending
+ * one is not a way in for anything else.
+ *
  * And one rule that outranks all of them: **no route ever returns a secret.**
  * /api/secrets is write-only — there is no read route, by design, not by
  * omission — and every config response is passed through a filter that drops
@@ -64,7 +70,10 @@ import { sampleStatus, seedSampleData, clearSampleData } from './sample-data.mjs
 import { complete, stream, listModels, probeLocal, isLocalAddress, PRESETS } from './llm.mjs';
 import { safeUrl, screenContent, cap, wrapUntrusted, scrubForPrompt, SafetyError } from './safety.mjs';
 import { testConnection as testMailConnection } from './sources/imap.mjs';
-import { testConnection as testCalDavConnection } from './sources/caldav.mjs';
+import {
+  testConnection as testCalDavConnection,
+  invalidate as forgetCalDavLayouts,
+} from './sources/caldav.mjs';
 import { parseICS } from './sources/ics.mjs';
 import { nowISO, toZonedISO, localTimezone, instant, offsetFor, addDaysToKey, todayKey } from './time.mjs';
 import { log } from './log.mjs';
@@ -83,10 +92,30 @@ const MAX_QUESTION_CHARS = 2_000;
 const MAX_DRAFT_CHARS = 20_000;
 /** A JSON-RPC envelope is small; nothing legitimate on /api/mcp is not. */
 const MAX_MCP_BODY_BYTES = 256 * 1024;
-/** How many access-log rows GET /api/ai hands the Settings panel. */
+/** How many access-log rows GET /api/ai hands the Settings panel by default. */
 const AI_LOG_ROWS = 50;
+/** ...and the most it will hand over when the panel asks for older ones. */
+const AI_LOG_ROWS_MAX = 500;
+/**
+ * How often a token's `lastUsedAt` may actually be written.
+ *
+ * Stamping it is one atomic config rewrite with two fsyncs, and an AI client
+ * can fire several tool calls a second — so under sustained traffic the stamp
+ * was costing a rewrite per second, forever, to move a timestamp by a second.
+ * What the panel is answering with that field is "is this client still alive",
+ * which a minute answers as well as a second does.
+ */
+const AI_TOUCH_EVERY_MS = 60_000;
 /** A remote .ics can be large; it cannot be unbounded. */
 const MAX_ICS_BYTES = 8 * 1_048_576;
+/**
+ * The `now` bar, mirrored from core/sweep.mjs, which owns the demotion itself.
+ * It is duplicated rather than imported because it is read on every GET
+ * /api/state and importing it would drag the whole sweep engine — TLS, IMAP, the
+ * model adapter — into a process that may only be showing the setup screen. One
+ * number in two files is the price of that; the rule it guards lives in one.
+ */
+const NOW_BOARD_LIMIT = 4;
 const ASK_CONTEXT_HITS = 12;
 const ASK_CONTEXT_CHARS = 1_200;
 const HEARTBEAT_MS = 15_000;
@@ -168,6 +197,93 @@ function tokensMatch(a, b) {
   const ha = crypto.createHash('sha256').update(a, 'utf8').digest();
   const hb = crypto.createHash('sha256').update(b, 'utf8').digest();
   return crypto.timingSafeEqual(ha, hb);
+}
+
+/* ------------------------------------------------------------------ *
+ * The browser handoff
+ * ------------------------------------------------------------------ */
+
+/** Where a handoff is spent. Under `/h/` so it cannot collide with a UI file. */
+const HANDOFF_PREFIX = '/h/';
+/**
+ * How long a handoff lives. It exists to survive the gap between spawning an
+ * opener and that opener's browser making its first request, which is a second
+ * or two on a cold start and never a minute. Anything longer is a credential
+ * sitting in an argument vector with nothing spent to justify it.
+ */
+const HANDOFF_TTL_MS = 10_000;
+/**
+ * A ceiling on live handoffs, so nothing can grow this list without bound. Only
+ * the launcher mints, and it mints once — this is a rail, not a workload.
+ */
+const HANDOFF_MAX_LIVE = 8;
+
+/**
+ * One-time addresses that trade themselves for the session token.
+ *
+ * The problem this solves is spelled out in zelos.mjs: opening a browser at
+ * `…/?t=<token>` means putting the session token — which is the entire local
+ * API — on a command line, where `ps` and `/proc/<pid>/cmdline` hand it to any
+ * other process on the machine for as long as the opener runs. A handoff id may
+ * sit in an argument vector safely, because by the time anyone could read it
+ * there it has already been spent and means nothing.
+ *
+ * What makes that true is enforced here rather than promised:
+ *
+ *   - **Once.** The entry is removed before the token is written, so two
+ *     requests racing for the same id cannot both be answered. A browser that
+ *     preloads the address and then loads it again gets the token once and a
+ *     dead link the second time, which is the correct and slightly annoying
+ *     behaviour of a one-time credential.
+ *   - **Briefly.** Expiry is checked on every look, so an id that was never
+ *     spent stops working whether or not anything asks about it again.
+ *   - **Unguessably.** 32 bytes from the CSPRNG, compared in constant time
+ *     against every live entry with no early exit, so neither the value nor the
+ *     number of live handoffs is readable from how long a refusal took.
+ *
+ * It weakens nothing about the per-launch token model: a handoff yields that
+ * launch's session token and nothing else, it dies with the process along with
+ * the token itself, and it is reached through the same Host and Origin checks as
+ * every other path on this server.
+ */
+class HandoffPad {
+  #live = [];
+  #ttlMs;
+
+  constructor({ ttlMs = HANDOFF_TTL_MS } = {}) {
+    this.#ttlMs = Number(ttlMs) > 0 ? Number(ttlMs) : HANDOFF_TTL_MS;
+  }
+
+  /** A path, not a URL: the launcher knows the origin, this does not. */
+  mint({ now = Date.now() } = {}) {
+    this.#purge(now);
+    if (this.#live.length >= HANDOFF_MAX_LIVE) this.#live.shift();
+    const id = crypto.randomBytes(32).toString('hex');
+    this.#live.push({ id, expiresAt: now + this.#ttlMs });
+    return `${HANDOFF_PREFIX}${id}`;
+  }
+
+  /**
+   * Spend an id. True exactly once per minted handoff, and false for everything
+   * else — used, expired, never minted — with no way to tell those apart, since
+   * a caller that can tell them apart is a caller being told something.
+   */
+  spend(candidate, { now = Date.now() } = {}) {
+    this.#purge(now);
+    let hit = -1;
+    // No early exit: every live entry is compared even after a match, so the
+    // time this takes describes the pad and never the id.
+    for (let i = 0; i < this.#live.length; i += 1) {
+      if (tokensMatch(this.#live[i].id, candidate)) hit = i;
+    }
+    if (hit === -1) return false;
+    this.#live.splice(hit, 1);
+    return true;
+  }
+
+  #purge(now) {
+    this.#live = this.#live.filter((entry) => entry.expiresAt > now);
+  }
 }
 
 /* ------------------------------------------------------------------ *
@@ -683,6 +799,63 @@ function boardNarrative(db) {
   return { notes, first: first && getItem(db, first) ? first : null };
 }
 
+/**
+ * The day's model spend, as core/sweep.mjs recorded it — or nothing at all.
+ *
+ * Absent has to stay absent all the way to the screen. A machine that has never
+ * swept, and a database written before the counter existed, have no spend to
+ * report, and that is not the same fact as a spend of zero: ui/lib/format.js
+ * renders an absent counter as an empty string and a present one as a number, so
+ * inventing `{tokensIn: 0}` here would put "0 tokens in" under the board of
+ * someone who has not run a sweep yet. Unreadable JSON is treated the same way,
+ * for the same reason — the counter is chrome, and chrome does not get to make
+ * the board fail.
+ */
+function tokenCounter(db) {
+  const stored = getKV(db, 'sweep.tokens');
+  if (!stored) return null;
+  try {
+    const parsed = JSON.parse(stored);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    log.warn('server: kv sweep.tokens is not JSON; ignoring it');
+    return null;
+  }
+}
+
+/**
+ * The four-item `now` bar, held on the read path.
+ *
+ * core/sweep.mjs caps the bucket on every run, which covers every way a sweep
+ * can add to it. It does not cover the other way an item becomes `now`: reading
+ * the board wakes any snooze that has come due, so a fifth `now` item can arrive
+ * on a plain GET with no sweep involved, and between sweeps the loudest promise
+ * the product makes would simply be false.
+ *
+ * Doing it here is deliberate and it is bounded. A GET that wakes a snooze is
+ * already a write — that is how the wake works — so this is not new behaviour on
+ * a read, it is the rest of a write that was already happening. And it only ever
+ * runs when the board actually came back over the bar, which is rare: the common
+ * request pays one comparison, and the sweep engine (which pulls in TLS, IMAP
+ * and the model adapter) is not even loaded until a board is genuinely over.
+ *
+ * Returns true when something was demoted, so the caller can re-read the board
+ * it is about to send rather than describe one that no longer exists.
+ */
+async function holdNowBar(db, items, now) {
+  const over = items.filter((row) => row.state === 'open' && row.bucket === 'now').length;
+  if (over <= NOW_BOARD_LIMIT) return false;
+  try {
+    const { capNowBucket } = await import('./sweep.mjs');
+    return capNowBucket(db, { now }) > 0;
+  } catch (err) {
+    // A board with five `now` items is worse than the board the user asked for,
+    // but it is still their board. Log it and serve it.
+    log.warn('server: could not hold the now bar on a read', { error: err.message });
+    return false;
+  }
+}
+
 /* ------------------------------------------------------------------ *
  * Routes
  * ------------------------------------------------------------------ */
@@ -706,7 +879,7 @@ async function handleHealth(ctx) {
   });
 }
 
-function handleState(ctx) {
+async function handleState(ctx) {
   const { db } = ctx;
   const cfg = ctx.config();
   const tz = cfg.identity.timezone || localTimezone();
@@ -717,18 +890,29 @@ function handleState(ctx) {
   const nowZoned = nowISO(tz);
   const narrative = boardNarrative(db);
 
+  // listBoard before bucketCounts, deliberately: reading the board is what wakes
+  // due snoozes, and the counts must describe the board as returned. `now` in
+  // the configured zone so the wake comparison is offset-exact against the
+  // snoozed_until values this server wrote.
+  let items = listBoard(db, { states: ['open', 'snoozed'], limit: 500, now: nowZoned });
+  // ...and a wake is exactly how a fifth `now` item appears between sweeps, so
+  // the bar is held before anything is counted or sent.
+  if (await holdNowBar(db, items, nowZoned)) {
+    items = listBoard(db, { states: ['open', 'snoozed'], limit: 500, now: nowZoned });
+  }
+
+  const tokens = tokenCounter(db);
+
   sendJSON(ctx.res, 200, {
-    // listBoard before bucketCounts, deliberately: reading the board is what
-    // wakes due snoozes, and the counts must describe the board as returned.
-    // `now` in the configured zone so the wake comparison is offset-exact
-    // against the snoozed_until values this server wrote.
-    items: listBoard(db, { states: ['open', 'snoozed'], limit: 500, now: nowZoned }),
+    items,
     counts: bucketCounts(db, { states: ['open'] }),
     events: listEvents(db, { from, to, limit: 1000 }),
     drafts: listDrafts(db, { states: ['pending', 'edited'], limit: 200 }),
     runs: { last: lastRun(db) },
     notes: narrative.notes,
     first: narrative.first,
+    // Omitted entirely when there is none, never sent as a zero.
+    ...(tokens ? { tokens } : {}),
     now: nowZoned,
   });
 }
@@ -827,6 +1011,12 @@ async function handleConfigPut(ctx) {
   const patch = await readJSON(ctx.req);
   const saved = saveConfig(stripSecretShaped(patch));
   ctx.setConfig(saved);
+  // The CalDAV client remembers where it found each account's collections, so
+  // that a sweep costs one request instead of four. A calendar that has just
+  // been edited is exactly the case that record must not survive: the password
+  // may have been corrected, a collection may have been added on the server, or
+  // the whole account may be gone.
+  if (patch && Object.hasOwn(patch, 'calendars')) forgetCalDavLayouts();
   // Saved first, reported second: setup is progressive, and a half-filled form
   // that cannot be saved is a form the user cannot come back to. The errors
   // travel with the response so the UI can show exactly what is still missing.
@@ -916,6 +1106,22 @@ async function handleLocalProbe(ctx) {
   sendJSON(ctx.res, 200, await probeLocal({}));
 }
 
+/**
+ * `requireTls` as the config stores it: true, false, or null for "decide from
+ * the host". Absent means null, so a Settings panel that has never heard of the
+ * field tests an account exactly the way the sweep will read it.
+ *
+ * It is read strictly rather than coerced, because every other reading of a
+ * value here is a downgrade: the string 'false' out of a form field, or a 0,
+ * would switch encryption off for a host the user never excused.
+ */
+function requireTlsFrom(body) {
+  const value = body?.requireTls;
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'boolean') throw new HttpError(400, 'requireTls must be true, false, or null');
+  return value;
+}
+
 async function handleMailTest(ctx) {
   const body = await readJSON(ctx.req);
   const host = requireString(body, 'host', { max: 255 });
@@ -923,15 +1129,21 @@ async function handleMailTest(ctx) {
   const keyRef = requireString(body, 'keyRef', { max: 64 });
   const port = Number(body.port ?? 993);
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new HttpError(400, 'port must be a port number');
+  const requireTls = requireTlsFrom(body);
   const pass = await secretFor(keyRef);
   if (!pass) throw new HttpError(400, `no password is stored for ${keyRef} — save it first with POST /api/secrets`);
 
+  // The test has to connect under the same rule the sweep will, or it is not a
+  // test of this account: an account that will refuse to send its password in
+  // the clear at 07:00 must refuse here too, while the user is watching and can
+  // do something about it.
   const result = await testMailConnection({
     host,
     port,
     secure: body.secure !== false,
     user,
     pass,
+    requireTls,
     timeoutMs: 30_000,
   });
   sendJSON(ctx.res, 200, result);
@@ -1276,12 +1488,51 @@ function mcpClientHints(ctx) {
 }
 
 /**
- * One shape, returned by all four routes, so the panel never has to reconcile
+ * The access log, with each row's token id resolved to the label the user chose
+ * for it.
+ *
+ * The log stores an id because an id is what identifies a token forever; the
+ * panel has to show a name, because `t_9f3a1c` is not an answer to "what did my
+ * AI read?". A row whose token has since been revoked keeps its id and gets no
+ * label — and is marked as such, because "a client you have since cut off read
+ * this" is worth seeing rather than hiding behind a blank.
+ *
+ * `limit` is how many rows come back at all. It exists so the panel can ask for
+ * older ones without this route ever being unbounded: a log that has been
+ * running for months is thousands of rows, and sending them all on every render
+ * of the Settings screen would be a payload nobody reads.
+ */
+function accessRows(ctx, config, limit) {
+  const labels = new Map(listTokens(config).map((t) => [t.id, t.label]));
+  return listAccessLog(ctx.db, { limit }).map((row) => {
+    if (!row.tokenId) return row;
+    const label = labels.get(row.tokenId);
+    return { ...row, label: label ?? null, tokenRevoked: label === undefined };
+  });
+}
+
+/**
+ * A log window the panel asked for, clamped to something this route will send.
+ * An absent `log` is read before it is converted, because `Number(null)` is 0
+ * and a missing parameter must mean the default rather than "one row".
+ */
+function accessLimit(ctx) {
+  const raw = ctx.url?.searchParams?.get('log');
+  if (raw === null || raw === undefined || raw === '') return AI_LOG_ROWS;
+  const asked = Number(raw);
+  if (!Number.isFinite(asked)) return AI_LOG_ROWS;
+  return Math.min(AI_LOG_ROWS_MAX, Math.max(1, Math.floor(asked)));
+}
+
+/**
+ * One shape, returned by all five routes, so the panel never has to reconcile
  * two versions of the truth. It carries no token values — `listTokens` cannot
  * produce one — and no secret refs.
  */
 function aiStateResponse(ctx, status, config, extra = {}) {
   const ai = aiConfig(config);
+  const limit = accessLimit(ctx);
+  const access = accessRows(ctx, config, limit);
   sendJSON(ctx.res, status, {
     enabled: ai.enabled,
     scopes: ai.scopes,
@@ -1290,7 +1541,12 @@ function aiStateResponse(ctx, status, config, extra = {}) {
     tokens: listTokens(config),
     // The audit log core/mcp.mjs writes — the same rows whether the call came
     // in over stdio or over this server, because there is one log, not two.
-    access: listAccessLog(ctx.db, { limit: AI_LOG_ROWS }),
+    access,
+    accessLimit: limit,
+    // Whether asking for more would find any. The panel offers the button only
+    // when there is something behind it.
+    accessMore: access.length >= limit && limit < AI_LOG_ROWS_MAX,
+    accessMax: AI_LOG_ROWS_MAX,
     // An ordered list rather than mcp.mjs's map, because the panel renders rows.
     scopeInfo: SCOPES.map((id) => SCOPE_INFO[id]),
     client: mcpClientHints(ctx),
@@ -1344,6 +1600,104 @@ async function handleAiTokenDelete(ctx, [id]) {
   }
   ctx.setConfig(result.config);
   aiStateResponse(ctx, 200, result.config, { revoked: result.revoked });
+}
+
+/**
+ * Try a token the way a client would, and report what the client would get.
+ *
+ * "Is it working?" is otherwise a question a person can only answer by wiring
+ * up Claude Desktop and reading a error message written by somebody else's
+ * program. This runs the two calls every MCP client makes on connect —
+ * `initialize`, then `tools/list` — against the same gate and the same tool
+ * layer /api/mcp mounts, so what comes back is not a simulation of the client's
+ * view, it is the client's view.
+ *
+ * Three things it deliberately does not do. It does not echo the token back —
+ * the caller pasted it, and a value that goes out in a response is a value in a
+ * log somewhere. It does not stamp `lastUsedAt`, because the owner testing a
+ * token is not the client using it, and a panel that marked a token "used just
+ * now" every time somebody pressed a button would be lying about the one thing
+ * that field is for. And it leaves no audit row, because `initialize` and
+ * `tools/list` read no data — nothing was accessed, so nothing is logged.
+ *
+ * It takes the session token like every other Settings route: this is the
+ * person at the keyboard checking their own setup, and an AI token authorises
+ * none of it.
+ */
+async function handleAiTest(ctx) {
+  const body = await readJSON(ctx.req);
+  const presented = requireString(body, 'token', { max: 400 });
+  const config = ctx.config();
+
+  if (!aiConfig(config).enabled) {
+    sendJSON(ctx.res, 200, {
+      ok: false,
+      stage: 'switch',
+      detail: 'AI access is off, so a client presenting this token is refused with HTTP 403 before '
+        + 'the token is even read. Turn the switch on above and try again.',
+      tools: [],
+    });
+    return;
+  }
+
+  const verdict = await verifyToken(presented, { config });
+  if (!verdict.ok) {
+    ctx.logger.warn('server: an AI token failed its own connection test', { reason: verdict.reason });
+    sendJSON(ctx.res, 200, {
+      ok: false,
+      stage: 'token',
+      detail: verdict.reason === 'malformed-token'
+        ? 'That is not the shape of a Zelos token. A token looks like zlt_t_… — paste the whole thing, '
+          + 'including the zlt_ prefix.'
+        : 'A client presenting that would get HTTP 401. If you pasted it from a client that was working '
+          + 'before, the token has been revoked; mint a new one and paste that in instead.',
+      tools: [],
+    });
+    return;
+  }
+
+  const asClient = {
+    db: ctx.db,
+    config: ctx.config,
+    transport: 'http',
+    tokenId: verdict.token.id,
+    client: verdict.token.label,
+    logger: ctx.logger,
+  };
+
+  let handshake;
+  let listed;
+  try {
+    handshake = await ctx.mcp.handle(
+      { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18' } },
+      asClient,
+    );
+    listed = await ctx.mcp.handle({ jsonrpc: '2.0', id: 2, method: 'tools/list' }, asClient);
+  } catch (err) {
+    ctx.logger.error('server: the AI connection test failed', { error: err.stack || err.message });
+    throw new HttpError(500, 'the tool layer could not answer a handshake');
+  }
+
+  const result = handshake?.result ?? {};
+  const tools = Array.isArray(listed?.result?.tools) ? listed.result.tools : [];
+  sendJSON(ctx.res, 200, {
+    ok: true,
+    stage: 'ok',
+    token: { id: verdict.token.id, label: verdict.token.label },
+    protocolVersion: result.protocolVersion ?? null,
+    serverInfo: result.serverInfo ?? null,
+    // The paragraph every client puts in front of its model before it asks
+    // anything. Worth showing: it is what the AI is told Zelos is.
+    instructions: typeof result.instructions === 'string' ? result.instructions : '',
+    tools: tools.map((tool) => ({
+      name: String(tool.name ?? ''),
+      title: typeof tool.title === 'string' ? tool.title : '',
+    })),
+    detail: tools.length
+      ? 'The handshake worked and these are the tools that client can call. Nothing else is reachable.'
+      : 'The handshake worked, but no scope is ticked, so the client is handed an empty tool list and '
+        + 'can read nothing.',
+  });
 }
 
 /* --------------------------------------------------------------- /api/mcp */
@@ -1461,14 +1815,24 @@ async function handleMcp(ctx) {
   // Failed *authentication* never gets here, which is the distinction that
   // makes "last used" mean "last worked".
   //
+  // Not on every call, though. `touchToken` re-reads config.json and rewrites it
+  // atomically with two fsyncs, and a connected assistant can call several tools
+  // a second: the stamp is second-resolution, so sustained traffic was buying a
+  // whole rewrite per second to move a timestamp by one. Once a minute is the
+  // same answer to the only question the field is asked — "is this client still
+  // alive?" — for a hundredth of the I/O. The first call after a restart still
+  // stamps immediately, so a token that has just started working says so.
+  //
   // `ctx.config()` and not the `config` read at the top of this function: a
   // tool call takes real time, and the person at the keyboard may have revoked
   // a token or closed a scope while it ran. Writing back the snapshot this
   // request started with would undo that.
-  try {
-    ctx.setConfig(touchToken(verdict.token.id, { config: ctx.config() }));
-  } catch (err) {
-    logger.warn('server: could not record when an AI token was last used', { error: err.message });
+  if (ctx.dueForTouch(verdict.token.id)) {
+    try {
+      ctx.setConfig(touchToken(verdict.token.id, { config: ctx.config() }));
+    } catch (err) {
+      logger.warn('server: could not record when an AI token was last used', { error: err.message });
+    }
   }
 
   // A JSON-RPC notification has no id and gets no response body.
@@ -1516,6 +1880,7 @@ const ROUTES = [
   ['PUT', /^\/api\/ai$/, handleAiPut],
   ['POST', /^\/api\/ai\/tokens$/, handleAiTokenCreate],
   ['DELETE', new RegExp(`^/api/ai/tokens/${ID}$`), handleAiTokenDelete],
+  ['POST', /^\/api\/ai\/test$/, handleAiTest],
 ];
 
 /**
@@ -1566,6 +1931,10 @@ export function createServer({
   uiDir = path.join(ROOT, 'ui'),
   assetsDir = path.join(ROOT, 'assets'),
   heartbeatMs = HEARTBEAT_MS,
+  /* A seam, like heartbeatMs: "it stops working after a few seconds" is a
+     property worth a test, and a test that waits ten real seconds for it is a
+     test nobody runs. Production never passes this. */
+  handoffTtlMs = HANDOFF_TTL_MS,
   logger = log,
 } = {}) {
   if (!db) throw new TypeError('createServer needs an open database (core/db.mjs open())');
@@ -1592,6 +1961,23 @@ export function createServer({
   const mcpServer = mcp ?? { handle: mcpHandle };
   if (typeof mcpServer.handle !== 'function') throw new TypeError('createServer: mcp must expose handle()');
 
+  /**
+   * When each token's `lastUsedAt` was last written, so a busy client does not
+   * buy a config rewrite per call. It lives here rather than at module scope so
+   * two servers in one process — which is every test file in this repo — cannot
+   * throttle each other, and it is dropped along with the server.
+   */
+  const touchedAt = new Map();
+  /** Per-server, like the session token it hands out, and gone when it is. */
+  const handoffs = new HandoffPad({ ttlMs: handoffTtlMs });
+  const dueForTouch = (id) => {
+    const now = Date.now();
+    const last = touchedAt.get(id) ?? 0;
+    if (now - last < AI_TOUCH_EVERY_MS) return false;
+    touchedAt.set(id, now);
+    return true;
+  };
+
   const server = http.createServer(async (req, res) => {
     let url;
     try {
@@ -1610,6 +1996,37 @@ export function createServer({
     if (!originIsOwn(req.headers.origin, server.address()?.port)) {
       logger.warn('server: refused a request from a foreign origin', { origin: req.headers.origin });
       sendText(res, 403, 'Cross-origin requests are not accepted');
+      return;
+    }
+
+    /* The browser handoff. It sits here, before the static root and outside the
+       session gate, because its whole job is to be the one address a browser can
+       reach *without* the token and come away holding it. Everything in front of
+       it still applies: it is loopback-only by the Host check above, and a page
+       on another origin is refused by the Origin check above — so the only
+       caller that can spend one is a navigation on this machine, which is what
+       the launcher just started. */
+    if (url.pathname.startsWith(HANDOFF_PREFIX)) {
+      if (req.method !== 'GET') {
+        sendText(res, 405, 'Method not allowed', { Allow: 'GET' });
+        return;
+      }
+      if (!handoffs.spend(url.pathname.slice(HANDOFF_PREFIX.length))) {
+        sendText(res, 404, 'This one-time link has already been used, or it expired. '
+          + 'Open the address Zelos printed in your terminal instead.');
+        return;
+      }
+      // The token goes into the address the browser is sent to, which is the
+      // same place the printed launch URL puts it — ui/lib/api.js lifts it out
+      // and strips it from the address bar on the next tick. Nothing about it
+      // reaches another process, which is the entire point of the detour.
+      res.writeHead(302, {
+        ...SECURITY_HEADERS,
+        Location: `/?t=${encodeURIComponent(token)}`,
+        'Cache-Control': 'no-store',
+        'Content-Length': 0,
+      });
+      res.end();
       return;
     }
 
@@ -1642,6 +2059,7 @@ export function createServer({
           mcp: mcpServer,
           config: () => current,
           setConfig: (next) => { current = next; },
+          dueForTouch,
         });
       } catch (err) {
         logger.error('server: /api/mcp failed', { error: err.stack || err.message });
@@ -1673,6 +2091,10 @@ export function createServer({
       sweeps,
       scheduler: clock,
       heartbeatMs,
+      // The same tool layer /api/mcp mounts, so POST /api/ai/test can show a
+      // person exactly what their client would be shown and not an imitation.
+      mcp: mcpServer,
+      logger,
       config: () => current,
       setConfig: (next) => { current = next; },
     };
@@ -1708,6 +2130,15 @@ export function createServer({
     useScheduler(next) {
       clock = next;
       sweeps.useScheduler(next);
+    },
+    /**
+     * A one-time path — `/h/<id>` — that this server will trade exactly once,
+     * within seconds, for the session token. The launcher resolves it against
+     * the address it bound and hands *that* to the platform's opener, so the
+     * token itself never reaches an argument vector. See HandoffPad.
+     */
+    mintHandoff() {
+      return handoffs.mint();
     },
   };
   return server;

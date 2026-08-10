@@ -934,6 +934,87 @@ test('/api/state returns the board', async (t) => {
   assert.ok(Array.isArray(res.json.events));
 });
 
+/**
+ * REGRESSION. core/sweep.mjs wrote the counter, ui/lib/format.js rendered it and
+ * ui/app.js read `state.board.tokens` — and nothing ever put it in the payload
+ * between them, so a feature that existed at both ends existed nowhere.
+ */
+test('/api/state carries the token counter once there is one, and omits it cleanly before', async (t) => {
+  const ctx = await startServer(t);
+
+  const before = await call(ctx, 'GET', '/api/state');
+  assert.equal(before.status, 200);
+  assert.ok(!('tokens' in before.json),
+    'a machine that has never swept has no spend to report, which is not a spend of zero');
+
+  // Exactly what core/sweep.mjs records under this key after a run.
+  db.setKV(ctx.db, 'sweep.tokens', JSON.stringify({
+    day: todayKey(), tokensIn: 1234, tokensOut: 567, runs: 1, modelRuns: 1,
+    lifetime: { tokensIn: 1234, tokensOut: 567, runs: 1, modelRuns: 1 },
+    at: '2026-08-09T09:00:00+00:00',
+  }));
+
+  const after = await call(ctx, 'GET', '/api/state');
+  assert.equal(after.json.tokens.tokensIn, 1234);
+  assert.equal(after.json.tokens.tokensOut, 567);
+  assert.equal(after.json.tokens.day, todayKey());
+
+  // Anything unreadable is the same as nothing: the counter is chrome, and
+  // chrome does not get to break the board.
+  db.setKV(ctx.db, 'sweep.tokens', 'not json at all');
+  const junk = await call(ctx, 'GET', '/api/state');
+  assert.equal(junk.status, 200);
+  assert.ok(!('tokens' in junk.json));
+  assert.ok(Array.isArray(junk.json.items));
+});
+
+/**
+ * REGRESSION. The four-item bar was held by core/sweep.mjs's recomputeDerived,
+ * which only ever runs inside a sweep — while a snooze that comes due is woken
+ * by *reading* the board. So a fifth `now` item could arrive on a plain GET, and
+ * the loudest promise the product makes was false until the next sweep.
+ */
+test('a snooze waking on a read cannot push the now bar past four', async (t) => {
+  const ctx = await startServer(t);
+  for (const i of [0, 1, 2, 3]) {
+    db.upsertItem(ctx.db, {
+      key: `now-${i}`, bucket: 'now', headline: `Urgent thing number ${i}`, severity: 3,
+    });
+  }
+  const fifth = db.upsertItem(ctx.db, {
+    key: 'now-5', bucket: 'now', headline: 'The fifth urgent thing', severity: 0,
+  });
+
+  const untilMs = Math.ceil((Date.now() + 1_000) / 1000) * 1000;
+  const snoozed = await call(ctx, 'POST', `/api/items/${fifth.id}/state`, {
+    body: { state: 'snoozed', until: new Date(untilMs).toISOString() },
+  });
+  assert.equal(snoozed.json.state, 'snoozed');
+
+  const asleep = await call(ctx, 'GET', '/api/state');
+  assert.equal(asleep.json.counts.now, 4, 'four while the fifth is away');
+
+  await delay(untilMs - Date.now() + 250);
+
+  const woken = await call(ctx, 'GET', '/api/state');
+  assert.equal(woken.status, 200);
+  assert.equal(woken.json.counts.now, 4, 'and still four the moment it comes back');
+  const open = woken.json.items.filter((i) => i.state === 'open');
+  assert.equal(open.filter((i) => i.bucket === 'now').length, 4);
+
+  // Nothing was deleted and nobody's decision was overruled: the one that lost
+  // its place is awake, open, and now the user's work for today.
+  const demoted = open.find((i) => i.id === fifth.id);
+  assert.equal(demoted.bucket, 'today', 'the least urgent lost the place, and only the bucket');
+  assert.equal(demoted.state, 'open');
+  assert.equal(woken.json.counts.today, 1);
+
+  // A board that is already within the bar is left entirely alone.
+  const again = await call(ctx, 'GET', '/api/state');
+  assert.equal(again.json.counts.now, 4);
+  assert.equal(again.json.counts.today, 1);
+});
+
 test('an item state change is recorded, and an illegal one is refused', async (t) => {
   const ctx = await startServer(t);
   const { id } = db.upsertItem(ctx.db, { key: 'pay-the-invoice', bucket: 'money', headline: 'Pay the invoice' });
@@ -1087,6 +1168,37 @@ test('config round-trips through GET and PUT', async (t) => {
   assert.equal(bad.status, 400);
 });
 
+test('saving calendars forgets what CalDAV remembered about them', async (t) => {
+  // The CalDAV client keeps the layout it discovered — principal, home set, the
+  // URL whose listing produced calendars — so a sweep costs one request instead
+  // of four. A calendar the user has just edited is the one case that record
+  // must not survive: the password may have been corrected, a collection may
+  // have appeared on the server, or the account may be gone entirely.
+  const ctx = await startServer(t);
+  const cache = path.join(HOME, 'cache', 'caldav');
+  const stale = path.join(cache, 'deadbeef.json');
+  const plant = () => {
+    fs.mkdirSync(cache, { recursive: true });
+    fs.writeFileSync(stale, '{"schema":1,"listRoot":"http://127.0.0.1:1/dav/","at":9e12}');
+  };
+
+  plant();
+  const unrelated = await call(ctx, 'PUT', '/api/config', { body: { identity: { name: 'Nemo' } } });
+  assert.equal(unrelated.status, 200);
+  assert.equal(fs.existsSync(stale), true, 'a save that names no calendar must not throw the cache away');
+
+  const saved = await call(ctx, 'PUT', '/api/config', {
+    body: { calendars: [{ id: 'c_dav', kind: 'caldav', url: 'https://dav.example.test/', user: 'nemo' }] },
+  });
+  assert.equal(saved.status, 200);
+  assert.equal(fs.existsSync(stale), false, 'a calendar was written, so the remembered layout is stale by definition');
+
+  // Removing every calendar counts too — it is still a calendars edit.
+  plant();
+  await call(ctx, 'PUT', '/api/config', { body: { calendars: [] } });
+  assert.equal(fs.existsSync(stale), false);
+});
+
 test('malformed JSON is a 400, not a 500', async (t) => {
   const ctx = await startServer(t);
   const res = await fetch(`${ctx.base}/api/capture`, {
@@ -1216,6 +1328,186 @@ test('/api/calendar/test reads an ics feed and refuses a dangerous url', async (
   });
   assert.equal(missing.status, 200);
   assert.equal(missing.json.ok, false);
+});
+
+/* ================================================================== *
+ * The mail test, under the account's own TLS rule
+ *
+ * REGRESSION. `requireTls` was stored by core/config.mjs and enforced by
+ * core/sources/imap.mjs, and this route — the one place a person watches an
+ * account connect — never passed it on. So Settings could show a green tick for
+ * a configuration the sweep would refuse to run, or refuse one it would.
+ * ================================================================== */
+
+/**
+ * A cleartext IMAP server that never offers STARTTLS. Enough of the protocol for
+ * testConnection: greet, list capabilities, sign in, list one mailbox, leave.
+ */
+async function startMockImap(t) {
+  const received = [];
+  const sockets = new Set();
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on('error', () => {});
+    socket.on('close', () => sockets.delete(socket));
+    socket.write('* OK Zelos server-test mock ready\r\n');
+
+    let buffer = '';
+    socket.on('data', (chunk) => {
+      buffer += chunk.toString('latin1');
+      let idx;
+      while ((idx = buffer.indexOf('\r\n')) >= 0) {
+        const line = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+        received.push(line);
+        const [tag, rawVerb] = line.split(' ');
+        const verb = (rawVerb || '').toUpperCase();
+        if (verb === 'CAPABILITY') socket.write(`* CAPABILITY IMAP4rev1\r\n${tag} OK done\r\n`);
+        else if (verb === 'LOGIN') socket.write(`${tag} OK LOGIN completed\r\n`);
+        else if (verb === 'LIST') socket.write(`* LIST (\\HasNoChildren) "/" "INBOX"\r\n${tag} OK done\r\n`);
+        else if (verb === 'LOGOUT') socket.write(`* BYE\r\n${tag} OK done\r\n`);
+        else socket.write(`${tag} BAD unexpected command in mock\r\n`);
+      }
+    });
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  t.after(async () => {
+    for (const socket of sockets) socket.destroy();
+    await new Promise((r) => server.close(r));
+  });
+  return {
+    port: server.address().port,
+    received,
+    sawCredentials: () => received.some((l) => /LOGIN|AUTHENTICATE/i.test(l)),
+  };
+}
+
+test('/api/mail/test connects under the same TLS rule the sweep will', async (t) => {
+  const ctx = await startServer(t);
+  const imap = await startMockImap(t);
+  await setSecret('mail.m_tls', SECRET_VALUE);
+  t.after(() => deleteSecret('mail.m_tls').catch(() => {}));
+
+  const body = {
+    host: '127.0.0.1', port: imap.port, secure: false, user: 'nemo', keyRef: 'mail.m_tls',
+  };
+
+  const refused = await call(ctx, 'POST', '/api/mail/test', { body: { ...body, requireTls: true } });
+  assert.equal(refused.status, 200);
+  assert.equal(refused.json.ok, false, 'the account required TLS and the server offered none');
+  assert.match(refused.json.error, /still in the clear/);
+  assert.ok(!imap.sawCredentials(), `credentials went over cleartext: ${imap.received.join(' | ')}`);
+  assert.ok(!refused.text.includes(SECRET_VALUE));
+
+  // ...and the setting is honoured in the other direction too: 127.0.0.1 with
+  // nothing asked for is the local-bridge case, which has to keep working.
+  const allowed = await call(ctx, 'POST', '/api/mail/test', { body });
+  assert.equal(allowed.json.ok, true, allowed.json.error);
+  assert.ok(imap.sawCredentials());
+});
+
+test('/api/mail/test refuses a requireTls that is not a boolean', async (t) => {
+  const ctx = await startServer(t);
+  for (const junk of ['true', 'false', 0, 1, 'yes', {}]) {
+    const res = await call(ctx, 'POST', '/api/mail/test', {
+      body: { host: 'imap.example.com', user: 'nemo', keyRef: 'mail.m_absent', requireTls: junk },
+    });
+    assert.equal(res.status, 400, JSON.stringify(junk));
+    assert.match(res.json.error, /requireTls/);
+  }
+});
+
+/* ================================================================== *
+ * The browser handoff
+ *
+ * REGRESSION. zelos.mjs gated the tokenless browser launch on
+ * `server.zelos.mintHandoff`, and no such function existed — so the branch was
+ * dead, and every launch went on putting the session token in an argument
+ * vector, which is the exact leak the change was written to close.
+ * ================================================================== */
+
+const handoffGet = (ctx, at, headers = {}) =>
+  fetch(`${ctx.base}${at}`, { redirect: 'manual', headers });
+
+test('a handoff is traded for the session token exactly once', async (t) => {
+  const ctx = await startServer(t);
+  assert.equal(typeof ctx.server.zelos.mintHandoff, 'function',
+    'zelos.mjs gates the whole tokenless launch on this existing');
+
+  const at = ctx.server.zelos.mintHandoff();
+  assert.match(at, /^\/h\/[0-9a-f]{64}$/);
+  assert.ok(!at.includes(ctx.token), 'the handoff must not be the token wearing a hat');
+
+  const first = await handoffGet(ctx, at);
+  assert.equal(first.status, 302);
+  assert.equal(first.headers.get('location'), `/?t=${ctx.token}`);
+  assert.equal(first.headers.get('cache-control'), 'no-store');
+  assert.equal(first.headers.get('referrer-policy'), 'no-referrer');
+  assert.equal(first.headers.get('access-control-allow-origin'), null, 'no CORS, ever');
+
+  const second = await handoffGet(ctx, at);
+  assert.equal(second.status, 404, 'a one-time link that works twice is not one-time');
+  assert.ok(!(await second.text()).includes(ctx.token));
+});
+
+test('a handoff that was never minted, or has expired, is refused the same way', async (t) => {
+  const ctx = await startServer(t, { handoffTtlMs: 40 });
+
+  const wrong = await handoffGet(ctx, `/h/${'a'.repeat(64)}`);
+  assert.equal(wrong.status, 404);
+  const wrongBody = await wrong.text();
+
+  const stale = ctx.server.zelos.mintHandoff();
+  await delay(90);
+  const expired = await handoffGet(ctx, stale);
+  assert.equal(expired.status, 404, 'a handoff nobody spent has to stop working on its own');
+  assert.equal(await expired.text(), wrongBody, 'and must not say which of the two it was');
+
+  // Two live handoffs do not spend each other, and the one minted after the
+  // expiry still works — the pad is not simply broken.
+  const fresh = ctx.server.zelos.mintHandoff();
+  assert.equal((await handoffGet(ctx, fresh)).status, 302);
+});
+
+test('a handoff cannot be spent by a page on another origin, or by anything but GET', async (t) => {
+  const ctx = await startServer(t);
+  const at = ctx.server.zelos.mintHandoff();
+
+  for (const origin of ['http://evil.example', 'https://127.0.0.1:1', 'null']) {
+    const res = await handoffGet(ctx, at, { Origin: origin });
+    assert.equal(res.status, 403, `${origin} was allowed to reach the handoff`);
+    assert.ok(!(await res.text()).includes(ctx.token));
+  }
+
+  const posted = await fetch(`${ctx.base}${at}`, { method: 'POST', redirect: 'manual' });
+  assert.equal(posted.status, 405);
+
+  const rebind = await rawRequest(ctx.port, `GET ${at} HTTP/1.1`, ['Host: evil.example']);
+  assert.equal(statusOf(rebind), 403);
+  assert.ok(!rebind.includes(ctx.token));
+
+  // None of that spent it: the person at the keyboard still gets their browser.
+  const mine = await handoffGet(ctx, at);
+  assert.equal(mine.status, 302);
+  assert.equal(mine.headers.get('location'), `/?t=${ctx.token}`);
+});
+
+test('handoffs are unique per mint and per server, and never reach the API gate', async (t) => {
+  const a = await startServer(t);
+  const b = await startServer(t);
+
+  const seen = new Set([...Array(20).keys()].map(() => a.server.zelos.mintHandoff()));
+  assert.equal(seen.size, 20, 'every handoff has to be its own value');
+
+  // A handoff minted by one server is worthless at the other, exactly like the
+  // session token it stands in for.
+  const foreign = b.server.zelos.mintHandoff();
+  assert.equal((await handoffGet(a, foreign)).status, 404);
+
+  // And spending one is not a way into anything else: it hands over the token
+  // and nothing about the request that spent it is authenticated.
+  const res = await fetch(`${a.base}/api/state`, { headers: { 'X-Zelos-Token': foreign.slice(3) } });
+  assert.equal(res.status, 401);
 });
 
 /* ================================================================== *

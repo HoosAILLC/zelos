@@ -5,7 +5,14 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 
-import { ImapClient, fetchRecent, guessImapHost, testConnection } from '../core/sources/imap.mjs';
+import {
+  ImapClient,
+  fetchRecent,
+  guessImapHost,
+  isLoopbackHost,
+  testConnection,
+  tlsRequiredByDefault,
+} from '../core/sources/imap.mjs';
 
 // Nothing here reads the Zelos home, but no test should ever be one refactor
 // away from writing into the user's real ~/.zelos.
@@ -838,6 +845,121 @@ test('a plaintext connection upgrades when the server advertises STARTTLS', asyn
       assert.ok(commands(received).includes('STARTTLS'), 'the upgrade was attempted before any credentials');
       assert.ok(!received.some((line) => /LOGIN|AUTHENTICATE/i.test(line)), 'no credentials on the plaintext socket');
       await client.close();
+    },
+  );
+});
+
+/* ================================================================== *
+ * Requiring TLS
+ *
+ * REGRESSION. With `secure: false` the client offered to upgrade and then went
+ * ahead regardless, because "the server did not advertise STARTTLS" and "there
+ * is nobody in the middle" look identical from here. Stripping one word out of
+ * a CAPABILITY reply was enough to be handed the password in the clear, and
+ * nothing anywhere said so.
+ * ================================================================== */
+
+test('the TLS requirement is on by default everywhere except loopback', () => {
+  for (const host of ['127.0.0.1', '127.0.0.2', '127.1.2.3', 'localhost', 'LOCALHOST',
+    'bridge.localhost', '::1', '[::1]', '0:0:0:0:0:0:0:1', '::ffff:127.0.0.1']) {
+    assert.equal(isLoopbackHost(host), true, host);
+    assert.equal(tlsRequiredByDefault(host), false, host);
+  }
+  // Near-misses. Each of these is a real network address that has fooled a
+  // loopback check written with `includes` or `startsWith` somewhere before.
+  for (const host of ['imap.example.com', '192.168.1.10', '128.0.0.1', '10.0.0.1',
+    '127.0.0.1.evil.example', 'localhost.evil.example', 'notlocalhost', '227.0.0.1',
+    '127.0.0.999', '::ffff:8.8.8.8', '']) {
+    assert.equal(isLoopbackHost(host), false, host);
+    assert.equal(tlsRequiredByDefault(host), true, host);
+  }
+});
+
+test('a client takes its TLS requirement from the host, and an explicit setting wins', () => {
+  assert.equal(new ImapClient({ host: 'imap.example.com', secure: false }).requireTls, true);
+  assert.equal(new ImapClient({ host: '127.0.0.1', port: 1143, secure: false }).requireTls, false);
+  assert.equal(new ImapClient({ host: 'imap.example.com', secure: false, requireTls: false }).requireTls, false);
+  assert.equal(new ImapClient({ host: '127.0.0.1', secure: false, requireTls: true }).requireTls, true);
+  // Anything that is not a deliberate `false` is a requirement. A form field
+  // that arrives as the string "false" must not switch encryption off.
+  assert.equal(new ImapClient({ host: '127.0.0.1', secure: false, requireTls: 'false' }).requireTls, true);
+});
+
+test('a server that never offers STARTTLS gets no credentials, and says why', async () => {
+  await withServer(
+    {
+      greeting: '* OK Zelos mock ready',
+      onCommand: ({ tag, verb, send }) => {
+        // A capability list with STARTTLS quietly removed — exactly what a
+        // machine in the middle would send.
+        if (verb === 'CAPABILITY') {
+          send(`* CAPABILITY IMAP4rev1\r\n${tag} OK CAPABILITY completed\r\n`);
+          return;
+        }
+        send(`${tag} OK fine\r\n`);
+      },
+    },
+    async ({ port, received }) => {
+      const client = new ImapClient({
+        host: '127.0.0.1', port, secure: false, requireTls: true,
+        user: 'nemo', pass: 'hunter2', timeoutMs: 3000,
+      });
+
+      await assert.rejects(
+        () => client.connect(),
+        (err) => {
+          assert.match(err.message, /IMAP 127\.0\.0\.1:\d+/);
+          assert.match(err.message, /still in the clear/);
+          assert.match(err.message, /never offered STARTTLS/);
+          assert.match(err.message, /requireTls/, 'the error has to name the way out');
+          return true;
+        },
+      );
+      // And the credential gate holds on its own, without connect() in front.
+      await assert.rejects(() => client.login(), /still in the clear/);
+
+      assert.ok(!received.some((line) => /LOGIN|AUTHENTICATE/i.test(line)),
+        `credentials went out over cleartext: ${received.join(' | ')}`);
+      assert.ok(!received.some((line) => line.includes('hunter2')));
+      await client.close();
+    },
+  );
+});
+
+test('a loopback bridge still connects and logs in with no TLS at all', async () => {
+  await withServer(
+    { greeting: '* OK Zelos mock ready', onCommand: session({}) },
+    async ({ port, received }) => {
+      // No requireTls given: 127.0.0.1 is where Proton Bridge lives, and that
+      // is the documented reason plaintext is still allowed.
+      const client = new ImapClient({ host: '127.0.0.1', port, secure: false, user: 'nemo', pass: 'p', timeoutMs: 3000 });
+      await client.connect();
+      await client.login();
+      assert.ok(commands(received).some((c) => c.startsWith('LOGIN')), 'the bridge case must keep working');
+      await client.close();
+    },
+  );
+});
+
+test('testConnection carries the requirement through and reports it as a failure', async () => {
+  await withServer(
+    {
+      greeting: '* OK Zelos mock ready',
+      onCommand: ({ tag, verb, send }) => {
+        if (verb === 'CAPABILITY') {
+          send(`* CAPABILITY IMAP4rev1\r\n${tag} OK CAPABILITY completed\r\n`);
+          return;
+        }
+        send(`${tag} OK fine\r\n`);
+      },
+    },
+    async ({ port, received }) => {
+      const refused = await testConnection({
+        host: '127.0.0.1', port, secure: false, requireTls: true, user: 'nemo', pass: 'hunter2', timeoutMs: 3000,
+      });
+      assert.equal(refused.ok, false);
+      assert.match(refused.error, /still in the clear/);
+      assert.ok(!received.some((line) => /LOGIN|AUTHENTICATE/i.test(line)));
     },
   );
 });

@@ -20,6 +20,9 @@ import {
   BUCKET_TAG, severityOf, carriedFor, dueLabel, isOverdue, personLabel,
 } from './format.js';
 
+/* Every deadline on a row goes through dueBit() below, which is the only place
+ * in this module allowed to call dueLabel/isOverdue — see its own note. */
+
 /** A safe external link, or null. The server already screened it; so do we. */
 function linkFor(item) {
   const raw = item?.link;
@@ -56,10 +59,31 @@ function untilLabel(iso, tz) {
   return `until ${day}${time ? ` ${time}` : ''}`;
 }
 
+/**
+ * The deadline, as this app says it: the words and whether they are hot.
+ *
+ * It exists so that the zone is threaded exactly once. `dueLabel` and
+ * `isOverdue` both take a zone and both default it to the BROWSER's, and for a
+ * while every row here called them without one — so a bare "due 2026-08-12" was
+ * judged against whatever zone the laptop happened to be set to while the
+ * carried-for badge beside it was judged in the zone the user configured. The
+ * two readings disagree by a whole day for anyone travelling, which is the one
+ * time a deadline matters most. Every deadline on a row goes through here, and
+ * `now` is passed explicitly so the label and the redness are the same instant.
+ */
+export function dueBit(item, { tz, now = Date.now() } = {}) {
+  // A caller that forgot the zone gets the CONFIGURED one rather than the
+  // browser's, which is the failure this helper was written to make impossible.
+  const zone = tz || timezone();
+  const text = dueLabel(item, now, zone);
+  if (!text) return null;
+  return { text, hot: isOverdue(item, now, zone) };
+}
+
 function metaLine(item, { tz }) {
   const bits = [];
-  const due = dueLabel(item);
-  if (due) bits.push({ text: due, class: isOverdue(item) ? 'meta-hot' : '' });
+  const due = dueBit(item, { tz });
+  if (due) bits.push({ text: due.text, class: due.hot ? 'meta-hot' : '' });
   const who = personLabel(item);
   if (who) bits.push({ text: who, class: '' });
   const carried = carriedFor(item, todayKey(tz));
@@ -212,7 +236,7 @@ export function itemRow(item, { tz, showBucket = true } = {}) {
 export function itemHero(item, { tz } = {}) {
   const link = linkFor(item);
   const carried = carriedFor(item, todayKey(tz));
-  const due = dueLabel(item);
+  const due = dueBit(item, { tz });
   const snooze = snoozeControl(item);
 
   return el('article', { class: `hero sev-${severityOf(item)}` }, [
@@ -221,7 +245,7 @@ export function itemHero(item, { tz } = {}) {
     el('h2', { class: 'hero-headline', text: item.headline || '(no headline)' }),
     item.why ? el('p', { class: 'hero-why', text: item.why }) : null,
     el('p', { class: 'hero-meta mono' }, [
-      due ? el('span', { class: isOverdue(item) ? 'meta-hot' : '', text: due }) : null,
+      due ? el('span', { class: due.hot ? 'meta-hot' : '', text: due.text }) : null,
       personLabel(item) ? el('span', { text: personLabel(item) }) : null,
       carried ? el('span', { class: 'meta-carried', text: carried }) : null,
     ]),

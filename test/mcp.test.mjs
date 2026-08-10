@@ -269,9 +269,14 @@ describe('toolsFor — a disabled scope has no tools to show', () => {
     assert.ok(toolsFor(cfg(ALL_ON)).length >= 7);
   });
 
+  /**
+   * `zelos_search` is the one tool more than one scope can produce, because it
+   * is the one tool that reads more than one kind and filters each kind against
+   * its own scope inside itself. Every other tool belongs to exactly one.
+   */
   test('each scope contributes exactly its own tools', () => {
-    assert.deepEqual(names({ board: true }), ['zelos_board', 'zelos_item']);
-    assert.deepEqual(names({ calendar: true }), ['zelos_calendar']);
+    assert.deepEqual(names({ board: true }), ['zelos_board', 'zelos_item', 'zelos_search']);
+    assert.deepEqual(names({ calendar: true }), ['zelos_calendar', 'zelos_search']);
     assert.deepEqual(names({ 'mail.metadata': true }), ['zelos_search', 'zelos_thread']);
     assert.deepEqual(names({ drafts: true }), ['zelos_drafts']);
     assert.deepEqual(names({ people: true }), ['zelos_people']);
@@ -279,8 +284,18 @@ describe('toolsFor — a disabled scope has no tools to show', () => {
   });
 
   test('turning on the calendar turns on nothing else', () => {
-    assert.deepEqual(names({ calendar: true }), ['zelos_calendar']);
-    assert.equal(names({ calendar: true }).includes('zelos_search'), false);
+    assert.deepEqual(names({ calendar: true }), ['zelos_calendar', 'zelos_search']);
+    // Search over the calendar is not search over the mail: the mail tools stay
+    // away, and so does every other scope's tool.
+    assert.equal(names({ calendar: true }).includes('zelos_thread'), false);
+    assert.equal(names({ calendar: true }).includes('zelos_board'), false);
+    assert.equal(names({ calendar: true }).includes('zelos_people'), false);
+    assert.equal(names({ calendar: true }).includes('zelos_drafts'), false);
+  });
+
+  test('a scope with nothing searchable brings no search', () => {
+    // drafts and people own no searchable kind, so search is not theirs to give.
+    assert.deepEqual(names({ drafts: true, people: true }), ['zelos_drafts', 'zelos_people']);
   });
 
   test('mail.bodies implies mail.metadata but adds no tool of its own', () => {
@@ -289,10 +304,11 @@ describe('toolsFor — a disabled scope has no tools to show', () => {
   });
 
   test('it accepts a list, a map, an ai block or a whole config', () => {
-    assert.deepEqual(names(['board']), ['zelos_board', 'zelos_item']);
-    assert.deepEqual(names({ board: true }), ['zelos_board', 'zelos_item']);
-    assert.deepEqual(names({ enabled: true, scopes: { board: true } }), ['zelos_board', 'zelos_item']);
-    assert.deepEqual(names(cfg({ board: true })), ['zelos_board', 'zelos_item']);
+    const board = ['zelos_board', 'zelos_item', 'zelos_search'];
+    assert.deepEqual(names(['board']), board);
+    assert.deepEqual(names({ board: true }), board);
+    assert.deepEqual(names({ enabled: true, scopes: { board: true } }), board);
+    assert.deepEqual(names(cfg({ board: true })), board);
     assert.deepEqual(toolsFor(undefined), []);
     assert.deepEqual(toolsFor('board'), []);
   });
@@ -313,7 +329,8 @@ describe('toolsFor — a disabled scope has no tools to show', () => {
       const res = await handle(rpc('tools/list'), { db, config: cfg(scopes) });
       return res.result.tools.map((t) => t.name).sort();
     };
-    assert.deepEqual(await listed({ board: true, calendar: true }), ['zelos_board', 'zelos_calendar', 'zelos_item']);
+    assert.deepEqual(await listed({ board: true, calendar: true }),
+      ['zelos_board', 'zelos_calendar', 'zelos_item', 'zelos_search']);
     assert.deepEqual(await listed(ALL_ON_NO_BODIES), [
       'zelos_board', 'zelos_calendar', 'zelos_drafts', 'zelos_item', 'zelos_people', 'zelos_search', 'zelos_thread',
     ]);
@@ -331,10 +348,15 @@ describe('tools/call — a disabled scope is refused even when the name is known
   test('every tool is refused when its own scope is off', async () => {
     const { db, itemId, msgId } = seeded();
     for (const [name, args] of everyCall({ itemId, msgId })) {
-      const scope = TOOLS.find((t) => t.name === name).scope;
-      const scopes = { ...ALL_ON, [scope]: false };
+      const tool = TOOLS.find((t) => t.name === name);
+      const scope = tool.scope;
+      // Every scope that could produce this tool, closed. Only zelos_search has
+      // more than one, and a tool more than one scope can grant is refused only
+      // when all of them are off — closing one of three would prove nothing.
+      const scopes = { ...ALL_ON };
+      for (const id of tool.scopes) scopes[id] = false;
       // mail.bodies implies mail.metadata, so closing metadata means closing both.
-      if (scope === 'mail.metadata') scopes['mail.bodies'] = false;
+      if (tool.scopes.includes('mail.metadata')) scopes['mail.bodies'] = false;
       const ctx = { db, config: cfg(scopes) };
 
       const listed = (await handle(rpc('tools/list'), ctx)).result.tools.map((t) => t.name);
@@ -1026,15 +1048,66 @@ describe('what the tools return', () => {
     assert.deepEqual(res.result.structuredContent.messages, []);
   });
 
+  /**
+   * Search used to be mail's alone. A person who had granted only the calendar
+   * had no search tool at all, and the only way to get one was to grant mail —
+   * which is precisely the trade this app exists to avoid, given the filtering
+   * that makes it safe was already inside the tool.
+   */
+  test('a client holding only the calendar can search its own calendar', async () => {
+    const { db } = seeded();
+    const ctx = { db, config: cfg({ calendar: true }) };
+
+    const listed = (await handle(rpc('tools/list'), ctx)).result.tools.map((t) => t.name).sort();
+    assert.deepEqual(listed, ['zelos_calendar', 'zelos_search']);
+
+    const res = await call(ctx, 'zelos_search', { query: 'pre-con' });
+    const found = res.result.structuredContent;
+    assert.deepEqual(found.kinds, ['event'], 'only the kinds this scope owns are searched at all');
+    assert.ok(found.results.length >= 1, 'and the event it was looking for comes back');
+    for (const hit of found.results) assert.equal(hit.kind, 'event');
+
+    // The grant did not widen: a query that only matches mail finds nothing,
+    // and no message text is anywhere in the answer.
+    const mail = await call(ctx, 'zelos_search', { query: 'retainage' });
+    assert.deepEqual(mail.result.structuredContent.results, []);
+    const wire = JSON.stringify([res, mail]);
+    assert.equal(wire.includes(SNIPPET), false, 'a calendar grant must not return a mail snippet');
+    assert.equal(wire.includes(BODY_CANARY), false);
+  });
+
+  test('a board-only client searches board items, and nothing else', async () => {
+    const { db } = seeded();
+    const ctx = { db, config: cfg({ board: true }) };
+    const res = await call(ctx, 'zelos_search', { query: 'retainage' });
+    const found = res.result.structuredContent;
+    assert.deepEqual(found.kinds, ['item'], 'board owns items and only items');
+    for (const hit of found.results) assert.equal(hit.kind, 'item');
+    assert.equal(JSON.stringify(res).includes(SNIPPET), false);
+  });
+
+  test('with nothing searchable granted, search is not there to be called', async () => {
+    const { db } = seeded();
+    const ctx = { db, config: cfg({ drafts: true, people: true }) };
+    const listed = (await handle(rpc('tools/list'), ctx)).result.tools.map((t) => t.name);
+    assert.equal(listed.includes('zelos_search'), false);
+
+    const res = await call(ctx, 'zelos_search', { query: 'retainage' });
+    assert.equal(res.result, undefined);
+    assert.equal(res.error.code, ERROR_CODES.SCOPE_DENIED);
+    assert.match(res.error.message, /any one of/, 'the refusal names every scope that would have granted it');
+    assert.deepEqual(res.error.data.scopes, ['mail.metadata', 'calendar', 'board']);
+  });
+
   test('search restricts kinds to the scopes that are on', async () => {
     const { db } = seeded();
     const mailOnly = await call({ db, config: cfg({ 'mail.metadata': true }) }, 'zelos_search', { query: 'retainage' });
     assert.deepEqual(mailOnly.result.structuredContent.kinds, ['message']);
     for (const hit of mailOnly.result.structuredContent.results) assert.equal(hit.kind, 'message');
 
-    const asked = await call({ db, config: cfg(ALL_ON) }, 'zelos_search', { query: 'retainage', kinds: ['capture'] });
-    assert.deepEqual(asked.result.structuredContent.kinds, ['capture']);
-    assert.equal(asked.result.structuredContent.results[0].capture.text, 'Ask the bank about the retainage release date');
+    const asked = await call({ db, config: cfg(ALL_ON) }, 'zelos_search', { query: 'invoice', kinds: ['message'] });
+    assert.deepEqual(asked.result.structuredContent.kinds, ['message']);
+    assert.ok(asked.result.structuredContent.results.length >= 1);
 
     // Asking for a kind whose scope is off yields nothing, not an error.
     const denied = await call({ db, config: cfg({ 'mail.metadata': true }) }, 'zelos_search', { query: 'retainage', kinds: ['item'] });
@@ -1086,5 +1159,318 @@ describe('what the tools return', () => {
     const res = await call({ db, config: cfg(ALL_ON) }, 'zelos_board', {});
     assert.equal(res.result.content[0].type, 'text');
     assert.deepEqual(JSON.parse(res.result.content[0].text), res.result.structuredContent);
+  });
+});
+
+/* ================================================================== *
+ * REGRESSION — a scope returns its own kind, and the audit says so
+ *
+ * Widening `zelos_search` so any scope that owns a searchable kind could reach
+ * it was right; what shipped with it was not. `capture` was mapped to `board`,
+ * so a client granted nothing but the board — "headline, why it matters, which
+ * bucket, when it is due" — could search the notes the owner had typed into
+ * Zelos themselves and get them back verbatim, including notes no board item
+ * had ever referenced. A board grant is not a grant to read a diary.
+ *
+ * The second half is the audit log. Every row carried the tool's NOMINAL scope,
+ * which for `zelos_search` is `mail.metadata`, so a board-only token searching
+ * the board left a row reading `mail.metadata`. The log is the only place a
+ * person can see what a connected AI actually read; a row naming a scope the
+ * call never used is worse than no row at all.
+ *
+ * These tests use one canary word per kind, each living in exactly one place,
+ * so a hit names the kind that answered rather than merely saying "something
+ * came back".
+ * ================================================================== */
+
+const ONLY = Object.freeze({
+  capture: 'PRIVATENOTECANARY',
+  message: 'MESSAGESUBJECTCANARY',
+  event: 'EVENTTITLECANARY',
+  item: 'ITEMHEADLINECANARY',
+});
+
+/** One indexed row per kind, and nothing shared between them. */
+function fourKinds() {
+  const db = freshDb();
+
+  const capture = dbm.insertCapture(db, `${ONLY.capture} — what the doctor said, and who not to tell`);
+
+  const msgId = dbm.upsertMessage(db, message({
+    uid: 7001,
+    messageId: '<canary@example.test>',
+    threadKey: 'thread-canary',
+    subject: `${ONLY.message} quarterly numbers`,
+    snippet: 'nothing notable in here',
+    text: 'nothing notable in here',
+  })).id;
+
+  dbm.upsertEvent(db, {
+    calendarId: 'c_work',
+    uid: 'evt-canary',
+    title: `${ONLY.event} pre-con`,
+    description: 'nothing notable in here',
+    location: 'Site trailer',
+    startsAt: '2026-08-11T14:00:00-04:00',
+    endsAt: '2026-08-11T15:00:00-04:00',
+  });
+
+  const itemId = dbm.upsertItem(db, {
+    key: 'canary-item',
+    kind: 'money',
+    bucket: 'now',
+    headline: `${ONLY.item} chase the invoice`,
+    why: 'nothing notable in here',
+    // The item cites the note it came from, which is how a capture reaches
+    // zelos_item at all — the case the search fix must not leave open.
+    sourceRefs: [`cap:${capture.id}`, `msg:${msgId}`],
+  }, { runId: 'run_1' }).id;
+
+  // Items are indexed by the sweep, not by the upsert, so index them here.
+  dbm.reindex(db);
+  return { db, captureId: capture.id, msgId, itemId };
+}
+
+describe('a scope reaches its own kind and no other', () => {
+  const OWNS = [
+    ['board', 'item'],
+    ['calendar', 'event'],
+    ['mail.metadata', 'message'],
+  ];
+
+  test('each scope searches exactly the kind it owns', async () => {
+    const { db } = fourKinds();
+
+    for (const [scope, owned] of OWNS) {
+      const ctx = { db, config: cfg({ [scope]: true }) };
+
+      const own = (await call(ctx, 'zelos_search', { query: ONLY[owned] })).result.structuredContent;
+      assert.deepEqual(own.kinds, [owned], `${scope} must search ${owned} and nothing else`);
+      assert.equal(own.results.length, 1, `${scope} must still find its own ${owned}`);
+      assert.equal(own.results[0].kind, owned);
+
+      // Every other kind's canary: not a hit, and not a word of it in the wire.
+      for (const [kind, word] of Object.entries(ONLY)) {
+        if (kind === owned) continue;
+        const res = await call(ctx, 'zelos_search', { query: word });
+        const found = res.result.structuredContent;
+        assert.deepEqual(found.results, [], `${scope} returned a ${kind} it was never granted`);
+        assert.equal(found.kinds.includes(kind), false, `${scope} searched ${kind} at all`);
+      }
+    }
+  });
+
+  test('a board-only client cannot read a capture, which is the whole finding', async () => {
+    const { db } = fourKinds();
+    const ctx = { db, config: cfg({ board: true }) };
+
+    const res = await call(ctx, 'zelos_search', { query: ONLY.capture });
+    const found = res.result.structuredContent;
+    assert.deepEqual(found.kinds, ['item'], 'board owns items; captures belong to no scope');
+    assert.deepEqual(found.results, []);
+    assert.equal(JSON.stringify(res).includes('what the doctor said'), false,
+      'the text of a private note reached a client that was granted the board');
+  });
+
+  test('no combination of scopes returns a capture', async () => {
+    const { db } = fourKinds();
+    let calls = 0;
+
+    for (let mask = 0; mask < (1 << SCOPES.length); mask += 1) {
+      const on = Object.fromEntries(SCOPES.map((s, i) => [s, Boolean(mask & (1 << i))]));
+      const ctx = { db, config: cfg(on) };
+      const res = await call(ctx, 'zelos_search', { query: ONLY.capture });
+      calls += 1;
+      const wire = JSON.stringify(res);
+      // The query itself is echoed back — that is the caller's own word. A
+      // `"ref"` or the note's text is not.
+      assert.equal(wire.includes('"kind": "capture"'), false, `a capture came back with ${JSON.stringify(on)}`);
+      assert.equal(wire.includes('what the doctor said'), false, `a note leaked with ${JSON.stringify(on)}`);
+      assert.equal(wire.includes('cap:'), false, `a capture ref leaked with ${JSON.stringify(on)}`);
+    }
+    assert.equal(calls, 64, 'the sweep must cover every combination of the six scopes');
+  });
+
+  test('capture is not a kind the tool offers, so asking for it is refused', async () => {
+    const { db } = fourKinds();
+    const schema = TOOLS.find((t) => t.name === 'zelos_search').inputSchema;
+    assert.deepEqual(schema.properties.kinds.items.enum, ['message', 'event', 'item'],
+      'the schema must not advertise a kind no scope can authorise');
+
+    const res = await call({ db, config: cfg(ALL_ON) }, 'zelos_search', { query: ONLY.capture, kinds: ['capture'] });
+    assert.equal(res.result, undefined);
+    assert.equal(res.error.code, ERROR_CODES.INVALID_PARAMS);
+    assert.match(res.error.message, /message, event, item/);
+  });
+
+  test('zelos_item does not hand over the note the item was derived from', async () => {
+    const { db, itemId, msgId } = fourKinds();
+    const res = await call({ db, config: cfg(ALL_ON) }, 'zelos_item', { id: itemId });
+    const payload = res.result.structuredContent;
+
+    assert.deepEqual(payload.sources.map((s) => s.kind), ['message'],
+      'the mail source belongs to mail; the capture belongs to nobody');
+    assert.equal(payload.sources[0].ref, `msg:${msgId}`);
+    assert.equal(JSON.stringify(res).includes(ONLY.capture), false);
+    assert.equal(JSON.stringify(res).includes('what the doctor said'), false);
+  });
+});
+
+describe('the audit log names the scope that actually authorised the call', () => {
+  const newest = (db) => listAccessLog(db, { limit: 1 })[0];
+
+  test('a board-only search is logged as a board read, not a mail read', async () => {
+    const { db } = fourKinds();
+    await call({ db, config: cfg({ board: true }) }, 'zelos_search', { query: ONLY.item });
+    const row = newest(db);
+    assert.equal(row.tool, 'zelos_search');
+    assert.equal(row.scope, 'board', 'the log claimed a scope the call never used');
+    assert.equal(row.ok, true);
+    assert.equal(row.rows, 1);
+  });
+
+  test('the same call under the calendar is logged as a calendar read', async () => {
+    const { db } = fourKinds();
+    await call({ db, config: cfg({ calendar: true }) }, 'zelos_search', { query: ONLY.event });
+    assert.equal(newest(db).scope, 'calendar');
+  });
+
+  test('a search across three grants says all three, and a narrowed one says what it spent', async () => {
+    const { db } = fourKinds();
+    const ctx = { db, config: cfg(ALL_ON) };
+
+    await call(ctx, 'zelos_search', { query: ONLY.message });
+    assert.equal(newest(db).scope, 'mail.metadata+mail.bodies+calendar+board',
+      'a search over every kind spends every scope that owns one — and this one returned a message '
+      + 'with its body, which is the bodies scope, not the metadata one');
+
+    await call({ db, config: cfg(ALL_ON_NO_BODIES) }, 'zelos_search', { query: ONLY.message });
+    assert.equal(newest(db).scope, 'mail.metadata+calendar+board',
+      'the same search without the bodies scope reads subjects, and says only that');
+
+    await call(ctx, 'zelos_search', { query: ONLY.event, kinds: ['event'] });
+    assert.equal(newest(db).scope, 'calendar', 'a search narrowed to events spends the calendar alone');
+    assert.equal(newest(db).detail, null, 'and it is not a mail read, so it is not noted as one');
+  });
+
+  test('a single-scope tool logs what it always did', async () => {
+    const { db } = fourKinds();
+    await call({ db, config: cfg({ board: true }) }, 'zelos_board', {});
+    assert.equal(newest(db).scope, 'board');
+    await call({ db, config: cfg({ calendar: true }) }, 'zelos_calendar', {});
+    assert.equal(newest(db).scope, 'calendar');
+  });
+
+  test('a refusal names every scope that would have granted it', async () => {
+    const { db } = fourKinds();
+    const res = await call({ db, config: cfg({ drafts: true }) }, 'zelos_search', { query: ONLY.item });
+    assert.equal(res.error.code, ERROR_CODES.SCOPE_DENIED);
+    const row = newest(db);
+    assert.equal(row.ok, false);
+    assert.equal(row.scope, 'mail.metadata+calendar+board');
+
+    // A tool with one grant still reads as one scope, so the panel's column is
+    // unchanged for everything but search.
+    await call({ db, config: cfg({ board: true }) }, 'zelos_people', {});
+    assert.equal(newest(db).scope, 'people');
+  });
+});
+
+/* ================================================================== *
+ * The four-item `now` bar
+ *
+ * The board promises four items in `now`, and that promise is enforced on
+ * reads as well as on sweeps: reading the board is what wakes a snooze that has
+ * come due, so a fifth `now` item can appear with no sweep anywhere near it.
+ * core/server.mjs holds the bar on /api/state for exactly that reason.
+ *
+ * `zelos_board` did not, and the same database therefore answered four to the
+ * app and five to a connected AI. It is the same rule or it is not a rule, so
+ * this tool now calls the same `capNowBucket` the server does.
+ * ================================================================== */
+
+describe('the board an AI reads is the board the app shows', () => {
+  /** Four open `now` items, plus a fifth asleep past its wake-up time. */
+  function boardWithADueSnooze() {
+    const db = freshDb();
+    for (let i = 0; i < 4; i += 1) {
+      dbm.upsertItem(db, {
+        key: `awake-${i}`,
+        kind: 'money',
+        bucket: 'now',
+        headline: `Open now item ${i}`,
+        why: 'it is already on the board',
+        severity: 3,
+        sourceRefs: [],
+      }, { runId: 'run_1' });
+    }
+    // Lowest severity, so the board's own reading order puts it fifth and the
+    // demotion is the one this test can name rather than whichever tied first.
+    const fifth = dbm.upsertItem(db, {
+      key: 'asleep',
+      kind: 'money',
+      bucket: 'now',
+      headline: 'The one that was asleep',
+      why: 'it was snoozed until this morning',
+      severity: 1,
+      sourceRefs: [],
+    }, { runId: 'run_1' }).id;
+    dbm.setItemState(db, fifth, 'snoozed', { snoozedUntil: '2020-01-01T09:00:00-05:00' });
+    return { db, fifth };
+  }
+
+  const openNow = (db) => db
+    .prepare("SELECT COUNT(*) AS n FROM items WHERE state = 'open' AND bucket = 'now'").get().n;
+
+  test('REGRESSION: a snooze waking on the read does not put a fifth item on the bar', async () => {
+    const { db, fifth } = boardWithADueSnooze();
+    assert.equal(openNow(db), 4, 'the fifth is asleep, so the bar starts intact');
+
+    const res = await call({ db, config: cfg({ board: true }) }, 'zelos_board', {});
+    const items = res.result.structuredContent.items;
+
+    assert.equal(items.filter((i) => i.bucket === 'now').length, 4,
+      'reading the board woke the fifth and handed it over — the app holds this bar on every read');
+    assert.equal(openNow(db), 4, 'and the board itself is held, so the app and the AI cannot disagree');
+
+    // Nothing is deleted and no decision of the user's is overruled: the woken
+    // item is open, and still theirs to finish, one bucket down.
+    const woken = dbm.getItem(db, fifth);
+    assert.equal(woken.state, 'open');
+    assert.equal(woken.bucket, 'today');
+    assert.ok(items.some((i) => i.id === fifth && i.bucket === 'today'), 'and it came back, in its new bucket');
+  });
+
+  test('a board that is already inside the bar is left exactly as it was', async () => {
+    const { db } = boardWithADueSnooze();
+    dbm.setItemState(db, 'nothing-to-wake', 'open'); // no-op; the snoozed one stays asleep
+    const before = JSON.stringify(db.prepare('SELECT * FROM items ORDER BY id').all());
+
+    // Four open `now` items and one asleep: the read wakes it, the bar is held,
+    // and a second read has nothing left to do.
+    await call({ db, config: cfg({ board: true }) }, 'zelos_board', {});
+    const settled = JSON.stringify(db.prepare('SELECT * FROM items ORDER BY id').all());
+    assert.notEqual(settled, before, 'the first read had a wake and a demotion to do');
+
+    await call({ db, config: cfg({ board: true }) }, 'zelos_board', {});
+    assert.equal(JSON.stringify(db.prepare('SELECT * FROM items ORDER BY id').all()), settled,
+      'a read of a board already inside the bar must change nothing at all');
+  });
+
+  test('the bar is held whatever the caller filtered for', async () => {
+    // A caller asking only for `today` still leaves the board held: the wake
+    // happens on any read, so the repair cannot be conditional on the filter.
+    const { db } = boardWithADueSnooze();
+    await call({ db, config: cfg({ board: true }) }, 'zelos_board', { bucket: 'today' });
+    assert.equal(openNow(db), 4);
+  });
+
+  test('the only thing it takes from the sweep is that one demotion rule', () => {
+    const imported = [...MCP_SOURCE.matchAll(/import\s*\{([^}]*)\}\s*from\s*'\.\/sweep\.mjs'/g)]
+      .map((m) => m[1].split(',').map((s) => s.trim()).filter(Boolean));
+    assert.deepEqual(imported, [['capNowBucket']],
+      'core/mcp.mjs reached further into the sweep than the one rule it is allowed');
+    assert.equal(/\bimport\s*\(/.test(MCP_SOURCE), false,
+      'a dynamic import is a specifier decided at run time; this file may not have one');
   });
 });

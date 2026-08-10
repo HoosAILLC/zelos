@@ -11,6 +11,12 @@
  * Overlaps are packed cluster-then-greedy-column (see format.js `packColumns`),
  * and month cells sort conflicts first so a triple-booked day cannot hide behind
  * "+4".
+ *
+ * The grid opens where the day is, not at 00:00: the now-line when today is on
+ * screen, otherwise the first event in the range. It does that on arrival and
+ * when the range moves — never on the re-render a finished sweep causes, which
+ * would drag a reader back to the morning while they were looking at Thursday
+ * evening.
  */
 
 import { el, button, meander } from '../lib/dom.js';
@@ -33,13 +39,100 @@ const MODES = [
  * read, and Week is one tap away.
  */
 const view = {
-  mode: window.matchMedia?.('(min-width: 48rem)').matches === false ? 'day' : 'week',
+  // Both optional calls matter: a browser without matchMedia, and a test runner
+  // whose window stub has no layout engine behind it, must both land on 'week'
+  // rather than throwing before this module has finished loading.
+  mode: window.matchMedia?.('(min-width: 48rem)')?.matches === false ? 'day' : 'week',
   anchor: null,
 };
 
-/** Where the grid scrolls to on open — 7am, not midnight. */
+/** Where the grid scrolls to when there is nothing better to aim at — 7am. */
 const DEFAULT_SCROLL_HOUR = 7;
 const MIN_CHIP_MINUTES = 22;
+
+/**
+ * How far above the opening target the grid starts.
+ *
+ * The two targets want different margins. The now-line keeps two hours of the
+ * morning above it, because what just happened is usually why the calendar was
+ * opened at all. A first event only needs enough room that it is not welded to
+ * the top edge, where it reads as a header rather than as the first thing in
+ * the day.
+ */
+const NOW_MARGIN_MINUTES = 120;
+const EVENT_MARGIN_MINUTES = 45;
+
+/**
+ * The opening scroll position, in minutes from midnight.
+ *
+ * `nowMinutes` is passed only when today is actually one of the days on screen;
+ * a week in March has a now-line nowhere in it, and aiming at 14:20 of a week
+ * that has no today is aiming at nothing. `firstEventMinutes` is the earliest
+ * timed event anywhere in the range, so a quiet Tuesday opens on the 10am that
+ * is the only thing in it rather than on the empty small hours above it.
+ * With neither — an empty range, or a range with only all-day entries — the
+ * working day is the honest guess.
+ */
+export function openingScrollMinutes({ nowMinutes = null, firstEventMinutes = null } = {}) {
+  if (nowMinutes !== null && Number.isFinite(nowMinutes)) {
+    return Math.max(0, nowMinutes - NOW_MARGIN_MINUTES);
+  }
+  if (firstEventMinutes !== null && Number.isFinite(firstEventMinutes)) {
+    return Math.max(0, firstEventMinutes - EVENT_MARGIN_MINUTES);
+  }
+  return DEFAULT_SCROLL_HOUR * 60;
+}
+
+/**
+ * The earliest timed minute among spans, or null when there is none. All-day
+ * spans are skipped: they live in their own strip above the grid and start at
+ * minute zero, so counting them would aim every range at midnight — which is
+ * the bug this whole mechanism exists to end.
+ */
+export function earliestStartMinutes(spans) {
+  let earliest = null;
+  for (const span of spans || []) {
+    if (!span || span.allDay) continue;
+    const start = Number(span.start);
+    if (!Number.isFinite(start)) continue;
+    if (earliest === null || start < earliest) earliest = start;
+  }
+  return earliest;
+}
+
+/** What makes two renders "the same place": the mode and the days on screen. */
+export function rangeSignature(mode, keys) {
+  return `${mode}|${keys[0] || ''}|${keys[keys.length - 1] || ''}`;
+}
+
+/**
+ * Whether this render should move the scroll at all.
+ *
+ * The calendar rebuilds its whole grid on every render, and a render happens
+ * whenever a sweep lands. Aiming the fresh scroller at the opening position
+ * each time would throw a reader who had scrolled down to the evening back to
+ * the morning, on a schedule they do not control. So the opening position is
+ * applied on the two occasions it is wanted — arriving at the view, and moving
+ * to a different range — and on every other render the position the user left
+ * behind is put back instead.
+ */
+export function shouldOpenAtTarget({ signature, lastSignature, wasOnScreen }) {
+  return !wasOnScreen || signature !== lastSignature;
+}
+
+/** Where the grid was left, so a re-render can put it back. */
+const scrollMemory = { signature: '', top: 0 };
+
+/**
+ * The view node from the last render, and the route day already applied.
+ *
+ * The node answers one question: was the calendar on screen a moment ago? The
+ * shell builds the replacement view before swapping it in, so during a
+ * same-view re-render the previous node is still in the document, and after a
+ * navigation elsewhere it is not. That is the difference between "leave this
+ * reader's scroll alone" and "this is an arrival, open where it is useful".
+ */
+const mounted = { node: null, sub: null };
 
 function anchorKey() {
   const today = nowMark().key || dayKey(state.board.now) || dayKey(new Date().toISOString());
@@ -49,6 +142,27 @@ function anchorKey() {
 
 function move(days) {
   view.anchor = addDaysToKey(anchorKey(), days);
+}
+
+/**
+ * The day named by the route, when the route is naming one worth honouring.
+ *
+ * `#/calendar/2026-08-11` is how search sends somebody to an event it found:
+ * a link, rather than one view reaching into another view's state. The rule
+ * has to be narrow in both directions. The anchor must move when that hash is
+ * arrived at — including arriving at the same hash a second time, which is what
+ * clicking the same result again means — and it must NOT move on the ordinary
+ * re-renders that happen while the hash sits there unchanged, or the ‹ and ›
+ * buttons would be undone by the next sweep that landed.
+ *
+ * The mode is left alone throughout: whichever of day, week and month the user
+ * last chose is the size they read this calendar at, and a search hit is not a
+ * reason to change it.
+ */
+export function anchorFromRoute(sub, applied, arriving = false) {
+  if (typeof sub !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(sub)) return null;
+  if (sub === applied && !arriving) return null;
+  return sub;
 }
 
 function keysForRange() {
@@ -212,7 +326,7 @@ function allDayStrip(keys) {
   ]);
 }
 
-function timeGrid(keys) {
+function timeGrid(keys, { wasOnScreen }) {
   const { key: todayKeyStr, minutes: nowMinutes } = nowMark();
   const compact = keys.length > 1;
 
@@ -240,17 +354,20 @@ function timeGrid(keys) {
     el('div', { class: 'cal-body' }, [hours, days]),
   ]);
 
-  // Open at the working day rather than at 00:00.
-  //
-  // Two frames, not one. A rAF callback runs BEFORE the layout of the frame it
-  // belongs to, so a scroller attached in this same task still reports
-  // scrollHeight === clientHeight there; the assignment is silently clamped to
-  // zero and the grid opens at midnight. The second frame is after layout.
-  //
-  // Even two is not a guarantee: if the grid has not been given its height yet
-  // the assignment clamps to zero again, silently, and the user gets midnight.
-  // So the result is checked and retried a bounded number of times — never a
-  // loop, and it stops the moment the scroller is genuinely scrollable.
+  // Where this render should start, and whether it is allowed to say so.
+  const signature = rangeSignature(view.mode, keys);
+  const openAtTarget = shouldOpenAtTarget({
+    signature,
+    lastSignature: scrollMemory.signature,
+    wasOnScreen,
+  });
+  const restoreTop = scrollMemory.top;
+  scrollMemory.signature = signature;
+  if (openAtTarget) scrollMemory.top = 0;
+  scroller.addEventListener('scroll', () => {
+    scrollMemory.top = scroller.scrollTop;
+  }, { passive: true });
+
   /**
    * How many title lines each chip can actually show.
    *
@@ -267,20 +384,66 @@ function timeGrid(keys) {
     }
   };
 
-  const openAtWorkingDay = (attempt = 0) => {
-    if (!scroller.isConnected) return;
-    const minH = parseFloat(getComputedStyle(scroller).getPropertyValue('--min-h')) || 0.8;
-    const target = nowMinutes !== null && keys.includes(todayKeyStr)
-      ? Math.max(0, nowMinutes - 120)
-      : DEFAULT_SCROLL_HOUR * 60;
-    scroller.scrollTop = target * minH;
-    if (scroller.scrollTop === 0 && target > 0 && attempt < 5) {
-      requestAnimationFrame(() => openAtWorkingDay(attempt + 1));
-    }
+  const targetMinutes = openingScrollMinutes({
+    nowMinutes: keys.includes(todayKeyStr) ? nowMinutes : null,
+    firstEventMinutes: earliestStartMinutes(keys.flatMap((key) => spansForDay(key))),
+  });
+
+  /**
+   * Put the scroller at `top`, and keep trying if the browser refuses.
+   *
+   * An assignment to `scrollTop` on an element that is not yet scrollable is
+   * silently clamped to zero — and zero is midnight, the exact place this whole
+   * mechanism exists to avoid. So the result is read back, and a clamp is
+   * retried a bounded number of times: never a loop, and it stops the moment
+   * the position takes.
+   */
+  /**
+   * Put the scroller at `top`, and keep trying until it takes.
+   *
+   * Two things can swallow the attempt, and both were doing so. A scroller
+   * that is not in the document yet ignores the assignment entirely — the
+   * shell builds a view node and swaps it in afterwards, and in this app that
+   * can land a second or more after the render that created it, so a budget
+   * counted in frames expired long before the grid existed. A scroller that is
+   * attached but not yet laid out clamps the assignment to zero, and zero is
+   * midnight: the exact place this whole mechanism exists to avoid.
+   *
+   * So the budget is wall-clock rather than a frame count, and it ends the
+   * moment the position takes. rAF stops in a hidden tab, which is the right
+   * behaviour here too — there is nothing to scroll for until someone looks.
+   */
+  const SETTLE_BUDGET_MS = 3_000;
+  const applyScrollTop = (top, deadline = performance.now() + SETTLE_BUDGET_MS) => {
+    const again = () => {
+      if (performance.now() < deadline) requestAnimationFrame(() => applyScrollTop(top, deadline));
+    };
+    if (!scroller.isConnected) { again(); return; }
+    scroller.scrollTop = top;
+    if (scroller.scrollTop === 0 && top > 0) { again(); return; }
+    // Remember where it actually landed. Leaving the memory at zero let any
+    // re-render that arrived before the browser's own scroll event restore
+    // midnight over the position just applied.
+    scrollMemory.top = scroller.scrollTop;
   };
+
+  const settleScroll = () => {
+    if (!openAtTarget) {
+      applyScrollTop(restoreTop);
+      return;
+    }
+    const minH = parseFloat(getComputedStyle(scroller).getPropertyValue('--min-h')) || 0.8;
+    applyScrollTop(targetMinutes * minH);
+  };
+
+  // Two frames, not one. A rAF callback runs BEFORE the layout of the frame it
+  // belongs to, so a scroller attached in this same task still reports
+  // scrollHeight === clientHeight there, and both the measurement and the
+  // scroll would be taken against a grid with no height yet. The second frame
+  // is after layout.
   requestAnimationFrame(() => requestAnimationFrame(() => {
     budgetChipTitles();
-    openAtWorkingDay();
+    settleScroll();
   }));
 
   return el('div', { class: `cal-grid mode-${view.mode}`, style: { '--cols': String(keys.length) } }, [
@@ -351,19 +514,69 @@ function monthGrid(keys) {
 }
 
 /**
+ * Take the line off the grid, and take the day marker with it.
+ *
+ * Removing the line alone left the highlight behind on whichever column was
+ * today when the grid was built — so a day grid showing the 12th, ticked at
+ * 00:03 on the 13th, dropped its line and went on drawing the 12th as today.
+ * Losing the line is the quiet half of that; the tinted column is the half a
+ * user reads, and it went on naming the wrong date until something forced a
+ * full render. Every column is cleared rather than only the line's parent,
+ * because the claim being withdrawn is "today is on this screen", and no column
+ * on this screen is entitled to it.
+ */
+function dropNowLine(line) {
+  line.remove();
+  for (const column of document.querySelectorAll('.cal-days .cal-col')) {
+    column.classList?.remove('is-today');
+  }
+}
+
+/**
  * Move the now-line without rebuilding the grid.
  *
  * Re-rendering the calendar once a minute would be simpler and would also throw
  * the user's scroll position back to the top every sixty seconds. The line is
  * the only thing that actually changed, so it is the only thing that moves.
+ *
+ * The DAY has to move with it. The line is a child of the column that was today
+ * when the grid was built, and `nowMark()` rolls its key past midnight rather
+ * than giving up — so a window left open to 00:03 was putting the line at three
+ * minutes past the top of YESTERDAY's column, which reads as a confident claim
+ * about the wrong day. The line follows its day into the neighbouring column
+ * when that day is on screen, and leaves altogether when it is not: a grid
+ * showing last week has no honest place to draw "now".
  */
 export function tickNowLine() {
   const line = document.querySelector('.cal-days .now-line');
   if (!line) return;
-  const { minutes } = nowMark();
-  if (minutes === null) {
-    line.remove();
+  const { key, minutes } = nowMark();
+  if (minutes === null || !key) {
+    dropNowLine(line);
     return;
+  }
+
+  // Matched by reading each column's own key rather than by building a selector
+  // out of one: the columns are already in hand, and a query never has to be
+  // trusted with a value.
+  let column = null;
+  for (const candidate of document.querySelectorAll('.cal-days .cal-col')) {
+    if (candidate.dataset?.day === key) {
+      column = candidate;
+      break;
+    }
+  }
+  if (!column) {
+    dropNowLine(line);
+    return;
+  }
+
+  if (line.parentNode !== column) {
+    // The old column stops being today at the same moment, or the grid paints
+    // two of them until the next full render.
+    line.parentNode?.classList?.remove('is-today');
+    column.classList?.add('is-today');
+    column.appendChild(line);
   }
   line.style.top = `calc(${minutes} * var(--min-h))`;
 }
@@ -372,8 +585,18 @@ export function tickNowLine() {
 
 export function renderCalendar(ctx) {
   const rerender = ctx.rerender;
+  // Read before anything is built: the previous view node is still in the
+  // document at this point, and whether it is decides both where the grid opens
+  // and whether the day in the route is applied again.
+  const wasOnScreen = Boolean(mounted.node?.isConnected);
+
+  const jump = anchorFromRoute(ctx.sub, mounted.sub, !wasOnScreen);
+  if (jump) view.anchor = jump;
+  mounted.sub = typeof ctx.sub === 'string' ? ctx.sub : null;
+
   const keys = keysForRange();
   const body = el('div', { class: 'view view-calendar' }, [toolbar(keys, rerender), meander()]);
+  mounted.node = body;
 
   // "No calendar connected" is a claim about the CONFIG, so it branches on the
   // config. Branching on the events list alone told a connected calendar with a
@@ -391,6 +614,6 @@ export function renderCalendar(ctx) {
     return body;
   }
 
-  body.appendChild(view.mode === 'month' ? monthGrid(keys) : timeGrid(keys));
+  body.appendChild(view.mode === 'month' ? monthGrid(keys) : timeGrid(keys, { wasOnScreen }));
   return body;
 }

@@ -3,7 +3,9 @@
   "version": "1.0.0",
   "description": "A local-first second brain. Reads your mail and calendar, thinks with a model you choose, and gives you one page worth looking at.",
   "type": "module",
-  "bin": { "zelos": "./zelos.mjs" },
+  "bin": {
+    "zelos": "./zelos.mjs"
+  },
   "main": "./core/server.mjs",
   "files": [
     "core/",
@@ -11,18 +13,35 @@
     "assets/",
     "docs/*.md",
     "zelos.mjs",
+    "README.md",
     "LICENSE"
   ],
-  "engines": { "node": ">=22.5.0" },
+  "engines": {
+    "node": ">=22.13.0"
+  },
   "homepage": "https://zelos-app.netlify.app",
-  "repository": { "type": "git", "url": "https://zelos-app.netlify.app" },
-  "bugs": { "url": "https://zelos-app.netlify.app" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/HoosAILLC/zelos.git"
+  },
+  "bugs": {
+    "url": "https://github.com/HoosAILLC/zelos/issues"
+  },
   "scripts": {
     "start": "node zelos.mjs",
     "test": "node --test \"test/*.test.mjs\"",
     "test:watch": "node --test --watch \"test/*.test.mjs\""
   },
-  "keywords": ["second-brain", "local-first", "imap", "calendar", "llm", "ollama", "privacy", "mcp"],
+  "keywords": [
+    "second-brain",
+    "local-first",
+    "imap",
+    "calendar",
+    "llm",
+    "ollama",
+    "privacy",
+    "mcp"
+  ],
   "license": "MIT",
   "private": false
 }

@@ -358,6 +358,17 @@ textarea.input, .draft-body, .ask-field, .capture-field {
 }
 .sweepline.is-bad .sweepline-text { color: var(--accent-text); }
 
+/* The day's token spend. Dimmer than the sweep text beside it — it is a thing
+   to notice when you go looking, not a thing to be told. When the database has
+   no counter the node is empty, and an empty node must take no room at all
+   rather than push the sweep bar down a line. */
+.sweepline-tokens {
+  font-size: 0.6875rem;
+  color: var(--ink-3);
+  opacity: 0.75;
+}
+.sweepline-tokens:empty { display: none; }
+
 .sweepbar {
   height: 2px;
   margin-top: 0.3rem;
@@ -399,7 +410,12 @@ textarea.input, .draft-body, .ask-field, .capture-field {
   bottom: 0;
   z-index: 25;
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  /* Columns flow from the number of tabs rather than being counted here. A
+     literal `repeat(6, …)` was a copy of VIEWS.length in a second file, and it
+     went wrong the moment a seventh view was added: the extra tab wrapped onto
+     a row of its own, off the bottom of the bar. */
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(0, 1fr);
   background: var(--ground);
   border-top: 1px solid var(--line);
   padding-bottom: env(safe-area-inset-bottom, 0);
@@ -412,9 +428,22 @@ textarea.input, .draft-body, .ask-field, .capture-field {
   justify-content: center;
   gap: 0.1rem;
   min-height: var(--tap);
+  min-width: 0;
   padding: 0.5rem 0.15rem 0.7rem;
   font-size: 0.6875rem;
   color: var(--ink-3);
+}
+/* Seven tabs on a 320px phone leaves ~45px each, and "Calendar" is wider than
+   that at this size. The label shrinks and, at the last, clips with a mark
+   rather than pushing its neighbours off the bar. */
+.tab-label {
+  max-width: 100%;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+@media (max-width: 23rem) {
+  .tab { font-size: 0.625rem; padding-left: 0.1rem; padding-right: 0.1rem; }
 }
 .tab.is-current { color: var(--ink); font-weight: 600; }
 .tab-count { font-size: 0.625rem; color: var(--accent-text); }
@@ -1832,3 +1861,50 @@ textarea.input:focus,
   .ai-log-tool { flex: none; width: 11rem; overflow-wrap: anywhere; }
   .ai-log-scope { flex: none; width: 9rem; overflow-wrap: anywhere; }
 }
+
+/* ── search ──────────────────────────────────────────────────────────────
+   The one view that is a question rather than an answer, so it leads with the
+   field and lets the results be quiet underneath. Kinds are labelled in mono
+   and lowercase — a label, not a heading — because the thing worth reading is
+   the title beside it, not the category it fell into. */
+.search-lede { color: var(--ink-2); max-width: 62ch; margin-bottom: 1rem; }
+
+.search-form { display: flex; flex-direction: column; gap: 0.6rem; }
+.search-field {
+  width: 100%;
+  /* 16px minimum: iOS zooms the whole page when a focused field is smaller,
+     and the board never recovers its scroll position afterwards. */
+  font-size: 1rem;
+  min-height: var(--tap);
+}
+.search-actions { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
+.search-hint { color: var(--ink-3); font-size: 0.78rem; }
+.search-status { color: var(--ink-3); font-size: 0.82rem; }
+.search-results { display: flex; flex-direction: column; gap: 0.9rem; }
+
+.hit {
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-left: 3px solid transparent;
+  border-radius: var(--radius);
+  padding: 0.7rem 0.85rem;
+}
+.hit-head { display: flex; align-items: baseline; gap: 0.6rem; flex-wrap: wrap; }
+.hit-kind {
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  color: var(--accent-text);
+  flex: none;
+}
+.hit-title { font-weight: 600; line-height: 1.3; overflow-wrap: anywhere; }
+/* The excerpt is the evidence, so it keeps the searched line's shape rather
+   than being reflowed into a paragraph — but it must never widen the card. */
+.hit-excerpt {
+  color: var(--ink-2);
+  font-size: 0.94rem;
+  margin-top: 0.25rem;
+  overflow-wrap: anywhere;
+}
+.hit-meta { color: var(--ink-3); font-size: 0.78rem; margin-top: 0.3rem; }
+.hit-tools { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-top: 0.55rem; }

@@ -122,6 +122,57 @@ export function instant(iso) {
   return Number.isNaN(t) ? null : t;
 }
 
+/**
+ * The instant a DEADLINE written as a bare date actually falls due.
+ *
+ * `instant()` reads "2026-08-12" as UTC midnight because it is the ordering
+ * function: it needs one rule that never consults a zone, and for sorting, an
+ * arbitrary but consistent point inside the day is fine. As a *deadline* that
+ * rule is wrong twice over for anyone west of Greenwich — the item turns
+ * overdue-red at 8pm the evening before in New York, and then reads "due 16h
+ * ago" for the whole of the day it is actually due.
+ *
+ * A bare date means "some time that day", so the moment it becomes late is the
+ * END of that day, not the start: at 9am on the 12th an item due the 12th is
+ * due, not overdue, which is the only reading that makes "due today" behave.
+ * Start-of-day would paint it red for every one of the hours the person still
+ * has to do it in.
+ *
+ * The offset is resolved from the day's own local noon rather than from UTC
+ * noon, so a zone far from Greenwich still lands on the right side of its own
+ * DST switch. A zone that changes offset late in the evening can still be an
+ * hour out at the very last minute of that one day a year, which is a smaller
+ * error than the whole-day one this replaces.
+ *
+ * The answer is remembered per zone and per day-key, because the two Intl
+ * lookups behind it cost something like a hundred times the string parse they
+ * replaced, and a board row asks for the same deadline twice — once for its
+ * words and once for whether it is late. Both instants the lookups are taken at
+ * are derived from the zone and the key alone, so the memo is exact rather than
+ * an approximation: the same pair can never produce a different answer, DST
+ * boundary or not. The cap is only there so a window left open for a month
+ * cannot accumulate keys without limit.
+ */
+const DUE_CACHE_MAX = 512;
+const dueCache = new Map();
+
+export function dueInstant(iso, tz = localTimezone()) {
+  const w = wallClock(iso);
+  if (!w) return null;
+  if (!w.dateOnly) return instant(iso);
+  const key = dayKey(iso);
+  const memoKey = `${tz}|${key}`;
+  if (dueCache.has(memoKey)) return dueCache.get(memoKey);
+  const utcNoon = Date.parse(`${key}T12:00:00Z`);
+  if (Number.isNaN(utcNoon)) return null;
+  const localNoon = utcNoon - offsetMinutes(offsetFor(tz, new Date(utcNoon))) * 60_000;
+  const parsed = Date.parse(`${key}T23:59:59.999${offsetFor(tz, new Date(localNoon))}`);
+  const t = Number.isNaN(parsed) ? null : parsed;
+  if (dueCache.size >= DUE_CACHE_MAX) dueCache.clear();
+  dueCache.set(memoKey, t);
+  return t;
+}
+
 /** Day-key arithmetic that never crosses a Date object. */
 export function addDaysToKey(key, n) {
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(key);

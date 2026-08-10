@@ -8,15 +8,33 @@
  *
  * Assertions are on what hits the socket (method, path, Depth, Authorization,
  * request body) as much as on what comes back.
+ *
+ * The client remembers what it discovered, in a file under the Zelos home, so
+ * this file gets a throwaway home of its own and empties the cache before every
+ * test. Mock servers are handed a fresh port by the OS and a port can be reused
+ * once a server has closed, so a test that counted requests could otherwise be
+ * answered from what a previous test's server had taught the cache.
  */
 
-import test from 'node:test';
+import test, { after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import http from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
 import { Buffer } from 'node:buffer';
 
-import { discover, fetchRange, testConnection } from '../core/sources/caldav.mjs';
-import { parseICS_toEvents } from '../core/sources/ics.mjs';
+/* Settled before the modules that read it are evaluated, which static imports
+   would not allow — hence the dynamic imports below. */
+const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'zelos-caldav-home-'));
+process.env.ZELOS_HOME = HOME;
+process.env.ZELOS_LOG_LEVEL = 'silent';
+
+const { discover, fetchRange, testConnection, invalidate } = await import('../core/sources/caldav.mjs');
+const { parseICS_toEvents } = await import('../core/sources/ics.mjs');
+
+beforeEach(() => invalidate());
+after(() => fs.rmSync(HOME, { recursive: true, force: true }));
 
 const USER = 'nemo@example.test';
 const PASS = 'app-specific-password';
@@ -607,6 +625,343 @@ test('responses that are not calendar data are ignored', async (t) => {
   t.after(() => mock.close());
 
   assert.deepEqual(await fetchRange({ url: mock.origin, user: USER, pass: PASS }), []);
+});
+
+/* ------------------------------------------------------------------ *
+ * What a second sweep costs
+ * ------------------------------------------------------------------ */
+
+/** Every PROPFIND the mock was asked for, in order. */
+const propfinds = (mock) => mock.requests.filter((r) => r.method === 'PROPFIND').map((r) => r.path);
+const reports = (mock) => mock.requests.filter((r) => r.method === 'REPORT').map((r) => r.path);
+
+test('the discovery walk happens once across two sweeps, not once per sweep', async (t) => {
+  const mock = await startServer(NEXTCLOUD_ROUTES);
+  t.after(() => mock.close());
+
+  const window = { from: '2026-08-01T00:00:00Z', to: '2026-11-30T00:00:00Z' };
+  await fetchRange({ url: mock.origin, user: USER, pass: PASS, ...window });
+
+  assert.deepEqual(
+    propfinds(mock),
+    ['/', '/remote.php/dav/principals/users/nemo/', '/remote.php/dav/calendars/nemo/'],
+    'the first sweep pays for the whole walk',
+  );
+
+  mock.requests.length = 0;
+  await fetchRange({ url: mock.origin, user: USER, pass: PASS, ...window });
+
+  assert.deepEqual(
+    propfinds(mock),
+    ['/remote.php/dav/calendars/nemo/'],
+    'the second sweep re-reads only the collection listing — that is where the ctags are',
+  );
+});
+
+test('a changed account is rediscovered rather than answered from the last one', async (t) => {
+  const mock = await startServer(NEXTCLOUD_ROUTES, { requireAuth: false });
+  t.after(() => mock.close());
+
+  await fetchRange({ url: mock.origin, user: USER, pass: PASS });
+  mock.requests.length = 0;
+
+  await fetchRange({ url: mock.origin, user: 'someone.else@example.test', pass: PASS });
+  assert.deepEqual(
+    propfinds(mock),
+    ['/', '/remote.php/dav/principals/users/nemo/', '/remote.php/dav/calendars/nemo/'],
+    'a different username is a different account and gets its own walk',
+  );
+
+  // And the edits that change neither URL nor username still get a fresh walk
+  // when Settings says so.
+  mock.requests.length = 0;
+  await fetchRange({ url: mock.origin, user: USER, pass: PASS });
+  assert.equal(propfinds(mock).length, 1, 'the first account is still remembered');
+
+  invalidate({ url: mock.origin, user: USER });
+  mock.requests.length = 0;
+  await fetchRange({ url: mock.origin, user: USER, pass: PASS });
+  assert.equal(propfinds(mock).length, 3, 'invalidate() puts the full walk back');
+});
+
+test('a ctag that has not moved skips the calendar-query entirely', async (t) => {
+  let ctag = 'sync/42';
+  const collections = () => `<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav" xmlns:cs="http://calendarserver.org/ns/">
+ <d:response>
+  <d:href>/remote.php/dav/calendars/nemo/personal/</d:href>
+  <d:propstat>
+   <d:prop>
+    <d:resourcetype><d:collection/><cal:calendar/></d:resourcetype>
+    <d:displayname>Personal</d:displayname>
+    <cs:getctag>${ctag}</cs:getctag>
+   </d:prop>
+   <d:status>HTTP/1.1 200 OK</d:status>
+  </d:propstat>
+ </d:response>
+</d:multistatus>`;
+
+  const mock = await startServer({
+    'PROPFIND /': NEXTCLOUD_PRINCIPAL,
+    'PROPFIND /remote.php/dav/principals/users/nemo/': NEXTCLOUD_HOME,
+    'PROPFIND /remote.php/dav/calendars/nemo/': () => collections(),
+    'REPORT /remote.php/dav/calendars/nemo/personal/': () => reportBody([EVENT_ICS]),
+  });
+  t.after(() => mock.close());
+
+  const sweep = () => fetchRange({
+    url: mock.origin,
+    user: USER,
+    pass: PASS,
+    from: '2026-08-01T00:00:00Z',
+    to: '2026-11-30T00:00:00Z',
+  });
+
+  const first = await sweep();
+  assert.equal(first.length, 1);
+  assert.equal(reports(mock).length, 1);
+
+  mock.requests.length = 0;
+  const second = await sweep();
+  assert.deepEqual(reports(mock), [], 'an unchanged ctag means no REPORT at all');
+  assert.deepEqual(second, first, 'and the caller still gets the events, not an empty answer');
+
+  // The collection changes, so the ctag changes, so the query runs again.
+  ctag = 'sync/43';
+  mock.requests.length = 0;
+  const third = await sweep();
+  assert.deepEqual(reports(mock), ['/remote.php/dav/calendars/nemo/personal/']);
+  assert.deepEqual(third, first);
+});
+
+test('a calendar that advertises no ctag is read every time', async (t) => {
+  // NEXTCLOUD_COLLECTIONS gives `work` no getctag, so there is nothing that
+  // could say it had not changed. Skipping it would be a guess.
+  const mock = await startServer(NEXTCLOUD_ROUTES);
+  t.after(() => mock.close());
+
+  const sweep = () => fetchRange({ url: mock.origin, user: USER, pass: PASS });
+  await sweep();
+  mock.requests.length = 0;
+  await sweep();
+
+  assert.deepEqual(reports(mock), ['/remote.php/dav/calendars/nemo/work/']);
+});
+
+test('a remembered layout that stops working falls back to the full walk', async (t) => {
+  let listable = true;
+  const mock = await startServer({
+    'PROPFIND /': NEXTCLOUD_PRINCIPAL,
+    'PROPFIND /remote.php/dav/principals/users/nemo/': NEXTCLOUD_HOME,
+    'PROPFIND /remote.php/dav/calendars/nemo/': () =>
+      (listable ? NEXTCLOUD_COLLECTIONS : { status: 404, body: 'Not Found' }),
+    'REPORT *': () => reportBody([EVENT_ICS]),
+  });
+  t.after(() => mock.close());
+
+  assert.equal((await fetchRange({ url: mock.origin, user: USER, pass: PASS })).length, 2);
+
+  listable = false;
+  mock.requests.length = 0;
+  assert.deepEqual(await fetchRange({ url: mock.origin, user: USER, pass: PASS }), []);
+  assert.deepEqual(
+    propfinds(mock),
+    [
+      '/remote.php/dav/calendars/nemo/',            // the remembered hop, now a 404
+      '/remote.php/dav/principals/users/nemo/',     // the rung above it, which still answers
+      '/',                                          // ...but points back at the 404, so the walk runs
+      '/remote.php/dav/principals/users/nemo/',
+      '/remote.php/dav/calendars/nemo/',
+      '/',                                          // ...down to the last candidate root
+    ],
+    'the record is dropped and rediscovery is attempted, rather than the sweep giving up',
+  );
+
+  // And once the server is well again, the next sweep works without anyone
+  // clearing anything by hand.
+  listable = true;
+  assert.equal((await fetchRange({ url: mock.origin, user: USER, pass: PASS })).length, 2);
+});
+
+/* ------------------------------------------------------------------ *
+ * The rungs above the listing root
+ * ------------------------------------------------------------------ */
+
+/**
+ * The layout record keeps three URLs, and the two above the listing root are
+ * the ones that make a *moved* collection cheap. A provider that renames a
+ * calendar almost always leaves the home set alone, and one that moves the home
+ * set almost always leaves the principal alone — so a listing that stops
+ * answering walks back up the record before it re-runs the walk from the URL
+ * the user typed. Remembering them and never reading them back would be two
+ * strings that cost a write and bought nothing.
+ *
+ * The layout here is the one a person creates by pasting the address of a
+ * single calendar into Settings: the listing root is that collection, and the
+ * home set is somewhere else entirely.
+ */
+const MOVED_PRINCIPAL = `<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:">
+ <d:response><d:href>/dav/one/</d:href>
+  <d:propstat>
+   <d:prop><d:current-user-principal><d:href>/dav/principals/nemo/</d:href></d:current-user-principal></d:prop>
+   <d:status>HTTP/1.1 200 OK</d:status>
+  </d:propstat>
+ </d:response>
+</d:multistatus>`;
+
+const homeSetDoc = (href) => `<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav">
+ <d:response><d:href>/dav/principals/nemo/</d:href>
+  <d:propstat>
+   <d:prop><cal:calendar-home-set><d:href>${href}</d:href></cal:calendar-home-set></d:prop>
+   <d:status>HTTP/1.1 200 OK</d:status>
+  </d:propstat>
+ </d:response>
+</d:multistatus>`;
+
+const listingDoc = (href, name, ctag) => `<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav" xmlns:cs="http://calendarserver.org/ns/">
+ <d:response><d:href>${href}</d:href>
+  <d:propstat>
+   <d:prop>
+    <d:resourcetype><d:collection/><cal:calendar/></d:resourcetype>
+    <d:displayname>${name}</d:displayname>
+    <cal:supported-calendar-component-set><cal:comp name="VEVENT"/></cal:supported-calendar-component-set>
+    <cs:getctag>${ctag}</cs:getctag>
+   </d:prop>
+   <d:status>HTTP/1.1 200 OK</d:status>
+  </d:propstat>
+ </d:response>
+</d:multistatus>`;
+
+const GONE = { status: 404, body: 'Not Found' };
+
+test('a collection that moved is found from the remembered home set, not by walking again', async (t) => {
+  let oneLists = true;
+  let homeLists = false;
+
+  const mock = await startServer({
+    // Depth:0 asks who I am; Depth:1 asks what is here. Same path, so the body
+    // is what tells them apart.
+    'PROPFIND /dav/one/': ({ body }) => {
+      if (body.includes('current-user-principal')) return MOVED_PRINCIPAL;
+      return oneLists ? listingDoc('/dav/one/', 'The one calendar', 'one/1') : GONE;
+    },
+    'PROPFIND /dav/principals/nemo/': homeSetDoc('/dav/home/nemo/'),
+    'PROPFIND /dav/home/nemo/': () => (homeLists ? listingDoc('/dav/home/nemo/personal/', 'Personal', 'home/1') : GONE),
+    'REPORT *': () => reportBody([EVENT_ICS]),
+  });
+  t.after(() => mock.close());
+
+  const sweep = () => fetchRange({ url: `${mock.origin}/dav/one/`, user: USER, pass: PASS });
+
+  // The home set will not list, so discovery settles on the collection itself —
+  // which is how the listing root and the home set come to be different URLs.
+  assert.equal((await sweep()).length, 1);
+
+  // The provider moves the calendar out of that collection and starts answering
+  // on the home set.
+  oneLists = false;
+  homeLists = true;
+  mock.requests.length = 0;
+  assert.equal((await sweep()).length, 1, 'a moved collection lost the sweep its calendars');
+  assert.deepEqual(
+    propfinds(mock),
+    ['/dav/one/', '/dav/home/nemo/'],
+    'the remembered home set was never asked; the whole walk ran instead',
+  );
+
+  // And the record now names the URL that answered, so the sweep after it is
+  // back to the one request it was before anything moved.
+  mock.requests.length = 0;
+  assert.equal((await sweep()).length, 1);
+  assert.deepEqual(propfinds(mock), ['/dav/home/nemo/']);
+});
+
+test('a home set that moved is found from the remembered principal', async (t) => {
+  let homeSet = '/dav/home/nemo/';
+
+  const mock = await startServer({
+    'PROPFIND /dav/one/': ({ body }) => (body.includes('current-user-principal') ? MOVED_PRINCIPAL : GONE),
+    'PROPFIND /dav/principals/nemo/': () => homeSetDoc(homeSet),
+    'PROPFIND /dav/home/nemo/': () =>
+      (homeSet === '/dav/home/nemo/' ? listingDoc('/dav/home/nemo/personal/', 'Personal', 'h1/1') : GONE),
+    'PROPFIND /dav/home2/nemo/': () => listingDoc('/dav/home2/nemo/personal/', 'Personal', 'h2/1'),
+    'REPORT *': () => reportBody([EVENT_ICS]),
+  });
+  t.after(() => mock.close());
+
+  const sweep = () => fetchRange({ url: `${mock.origin}/dav/one/`, user: USER, pass: PASS });
+  assert.equal((await sweep()).length, 1);
+
+  // The account is migrated to a new home set. The principal is the one URL a
+  // server almost never moves, and asking it is two requests where the walk is
+  // four — so nothing here should touch the well-known path or the origin.
+  homeSet = '/dav/home2/nemo/';
+  mock.requests.length = 0;
+  assert.equal((await sweep()).length, 1, 'a moved home set lost the sweep its calendars');
+  assert.deepEqual(
+    propfinds(mock),
+    ['/dav/home/nemo/', '/dav/principals/nemo/', '/dav/home2/nemo/'],
+    'the remembered principal was never asked; the whole walk ran instead',
+  );
+
+  mock.requests.length = 0;
+  assert.equal((await sweep()).length, 1);
+  assert.deepEqual(propfinds(mock), ['/dav/home2/nemo/'], 'the new layout was not remembered');
+});
+
+test('a rejected credential is still a credential answer, cache or no cache', async (t) => {
+  let authRequired = false;
+  const server = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      if (authRequired) {
+        res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="dav"' });
+        res.end('Unauthorized');
+        return;
+      }
+      const route = NEXTCLOUD_ROUTES[`${req.method} ${req.url}`];
+      if (!route) {
+        res.writeHead(404, { 'content-type': 'text/plain' });
+        res.end('Not Found');
+        return;
+      }
+      const body = typeof route === 'function' ? route({ body: '' }) : route;
+      res.writeHead(207, { 'content-type': 'application/xml; charset=utf-8' });
+      res.end(typeof body === 'string' ? body : body.body ?? '');
+    });
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  await fetchRange({ url: origin, user: USER, pass: PASS });
+
+  authRequired = true;
+  await assert.rejects(
+    () => fetchRange({ url: origin, user: USER, pass: PASS }),
+    /rejected the credentials/,
+    'a 401 on the remembered hop must reach the caller, not be swallowed as a stale cache',
+  );
+});
+
+test('the layout cache holds no credentials', async (t) => {
+  const mock = await startServer(NEXTCLOUD_ROUTES);
+  t.after(() => mock.close());
+
+  await fetchRange({ url: mock.origin, user: USER, pass: PASS });
+
+  const dir = path.join(HOME, 'cache', 'caldav');
+  const files = fs.readdirSync(dir);
+  assert.ok(files.length >= 1, 'something was remembered');
+  for (const name of files) {
+    const raw = fs.readFileSync(path.join(dir, name), 'utf8');
+    assert.equal(raw.includes(PASS), false, 'the calendar password must never be written down');
+    assert.equal(raw.includes(USER), false, 'nor the username the key was derived from');
+    assert.equal(fs.statSync(path.join(dir, name)).mode & 0o777, 0o600);
+  }
 });
 
 /* ------------------------------------------------------------------ *

@@ -31,7 +31,7 @@ process.env.ZELOS_SECRETS_BACKEND = 'encrypted-file';
 process.env.ZELOS_LOG_LEVEL = 'silent';
 after(() => fs.rmSync(home, { recursive: true, force: true }));
 
-const { open: openDb, migrate, close: closeDb, listMessages, getItemByKey } =
+const { open: openDb, migrate, close: closeDb, listMessages, getItemByKey, itemRowId, getKV } =
   await import('../core/db.mjs');
 const { runSweep } = await import('../core/sweep.mjs');
 const { createServer, listen } = await import('../core/server.mjs');
@@ -941,5 +941,138 @@ describe('the anthropic wire protocol, driven by the real sweep', () => {
     } finally {
       await anthropic.close();
     }
+  });
+});
+
+/* ================================================================== *
+ * The two promises no single sweep can keep.
+ *
+ * Everything above judges one run. These are the properties that only
+ * break once the user has lived with the board for a while: a `now`
+ * bucket that fills up four items at a time, and finished work that
+ * comes back because the model was never told it was finished. Both are
+ * driven through the real sweep against a real model socket and read
+ * back through the real HTTP server the browser talks to.
+ * ================================================================== */
+
+describe('the board over several runs: sweep.mjs -> db.mjs -> /api/state', () => {
+  const queued = [];
+  const prompts = [];
+  let boardDb;
+  let boardModel;
+  let boardServer;
+  let boardBase;
+  let boardToken;
+
+  const nowItem = (key, severity) => ({
+    key,
+    bucket: 'now',
+    headline: `Deal with ${key}`,
+    why: 'Something concrete breaks today.',
+    person: '',
+    personEmail: '',
+    dueAt: null,
+    severity,
+    sourceRefs: [],
+    link: null,
+    draft: null,
+  });
+
+  const sweepOnce = () => runSweep({
+    db: boardDb,
+    config: boardConfig,
+    mode: 'full',
+    deps: { getSecret: async () => null },
+  });
+
+  let boardConfig;
+
+  before(async () => {
+    boardModel = await startMockModel((_call, body) => {
+      prompts.push(body.messages.map((m) => m.content).join('\n'));
+      return JSON.stringify(queued.shift() ?? { first: null, items: [], notes: [] });
+    });
+
+    boardDb = openDb(path.join(home, 'board-over-runs.db'));
+    migrate(boardDb);
+
+    // No mail and no calendars: the subject here is what the board does with
+    // model replies over time, and an empty inbox keeps that the only variable.
+    boardConfig = structuredClone(config);
+    boardConfig.mail = [];
+    boardConfig.calendars = [];
+    boardConfig.model = { ...config.model, baseUrl: `${boardModel.origin}/v1`, keyRef: null };
+
+    queued.push({ first: null, notes: [], items: [0, 1, 2, 3].map((i) => nowItem(`older-${i}`, 1)) });
+    await sweepOnce();
+    queued.push({ first: null, notes: [], items: [0, 1, 2, 3].map((i) => nowItem(`newer-${i}`, 3)) });
+    await sweepOnce();
+
+    boardServer = createServer({ db: boardDb, config: boardConfig, token: FIXED_TOKEN, heartbeatMs: 50 });
+    boardBase = (await listen(boardServer, { port: 0 })).url.replace(/\/$/, '');
+    boardToken = boardServer.sessionToken;
+  });
+
+  after(async () => {
+    await new Promise((done) => boardServer.close(done));
+    closeDb(boardDb);
+    await boardModel.close();
+  });
+
+  const boardGet = async (p) => {
+    const res = await fetch(boardBase + p, { headers: { 'X-Zelos-Token': boardToken } });
+    return { status: res.status, body: await res.json() };
+  };
+
+  test('two legal replies of four now items each leave four on the board, not eight', async () => {
+    const { body } = await boardGet('/api/state');
+    const inNow = body.items.filter((i) => i.bucket === 'now');
+    assert.equal(inNow.length, 4, `the page must never show more than four, got ${inNow.length}`);
+    assert.equal(body.counts.now, 4, 'and the rail must agree with the rows');
+    assert.deepEqual(
+      inNow.map((i) => i.payload.key).sort(),
+      ['newer-0', 'newer-1', 'newer-2', 'newer-3'],
+      'the survivors are the ones the board ranks first, by severity',
+    );
+  });
+
+  test('the four that lost their place are carried as today, not dropped', async () => {
+    const { body } = await boardGet('/api/state');
+    assert.equal(body.items.length, 8, 'every item the model produced is still on the board');
+    for (const key of ['older-0', 'older-1', 'older-2', 'older-3']) {
+      const row = getItemByKey(boardDb, key);
+      assert.equal(row.bucket, 'today', `${key} should have been demoted, not deleted`);
+      assert.equal(row.state, 'open', 'demotion is a bucket change and nothing else');
+    }
+  });
+
+  test('an item the user finishes is named to the next prompt as already handled', async () => {
+    const done = await fetch(`${boardBase}/api/items/${itemRowId('newer-0')}/state`, {
+      method: 'POST',
+      headers: { 'X-Zelos-Token': boardToken, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ state: 'done' }),
+    });
+    assert.equal(done.status, 200);
+
+    queued.push({ first: null, notes: [], items: [] });
+    const third = await sweepOnce();
+    assert.equal(third.ok, true, third.error);
+
+    const prompt = prompts.at(-1);
+    assert.match(prompt, /ALREADY HANDLED — DO NOT RAISE THESE AGAIN/);
+    assert.match(prompt, /key=newer-0 · done/);
+    assert.ok(!prompts[0].includes('ALREADY HANDLED'),
+      'the first run had nothing handled and was told nothing');
+  });
+
+  test('what the runs cost is recorded where the UI can read it', () => {
+    const totals = JSON.parse(getKV(boardDb, 'sweep.tokens'));
+    assert.match(totals.day, /^\d{4}-\d{2}-\d{2}$/);
+    assert.equal(totals.tokensIn, 3 * 1234, 'every successful run added what the endpoint reported');
+    assert.equal(totals.tokensOut, 3 * 567);
+    assert.equal(totals.runs, 3);
+    assert.equal(totals.modelRuns, 3);
+    assert.equal(totals.lifetime.tokensIn, 3 * 1234);
+    assert.ok(totals.at, 'and it says when it was last touched');
   });
 });
