@@ -228,7 +228,7 @@ describe('clampToDisplays', () => {
 describe('WindowState', () => {
   let dir;
   before(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zelos-winstate-')); });
-  after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
 
   it('starts from the defaults and writes what it captured', () => {
     const file = path.join(dir, 'window.json');
@@ -632,7 +632,7 @@ describe('the shell, booted against a stub Electron', () => {
 
   after(async () => {
     await main?.shutdown();
-    fs.rmSync(sandbox, { recursive: true, force: true });
+    fs.rmSync(sandbox, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     delete process.env.ZELOS_HOME;
     delete process.env.ZELOS_PORT;
     delete process.env.ZELOS_LOG_LEVEL;
@@ -964,7 +964,7 @@ describe('parseShellArgs', () => {
 describe('the lock on the data home', () => {
   let dir;
   before(() => { dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'zelos-lock-'))); });
-  after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
 
   const freshHome = (name) => path.join(dir, name);
 
@@ -1217,7 +1217,7 @@ describe('lockHolderState', () => {
 describe('a home on a filesystem that cannot do the lock', () => {
   let dir;
   before(() => { dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'zelos-nolink-'))); });
-  after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
 
   /**
    * Make the named fs calls fail for the lock file only, the way FAT32 does.

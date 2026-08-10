@@ -1515,6 +1515,6 @@ test('handoffs are unique per mint and per server, and never reach the API gate'
  * ================================================================== */
 
 test.after(() => {
-  fs.rmSync(HOME, { recursive: true, force: true });
-  fs.rmSync(STATIC_ROOT, { recursive: true, force: true });
+  fs.rmSync(HOME, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  fs.rmSync(STATIC_ROOT, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });

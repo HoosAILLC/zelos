@@ -63,7 +63,7 @@ function withSandboxedUserHome(dir, fn) {
 }
 
 test.after(() => {
-  fs.rmSync(HOME_ROOT, { recursive: true, force: true });
+  fs.rmSync(HOME_ROOT, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 test('paths() creates the home where it says and never touches the real one', () => {

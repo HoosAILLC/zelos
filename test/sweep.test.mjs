@@ -36,7 +36,7 @@ function fresh() {
 test.after(async () => {
   for (const db of openDbs) close(db);
   for (const server of servers) await new Promise((r) => server.close(r));
-  fs.rmSync(HOME_ROOT, { recursive: true, force: true });
+  fs.rmSync(HOME_ROOT, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 /* ------------------------------------------------------------------ *

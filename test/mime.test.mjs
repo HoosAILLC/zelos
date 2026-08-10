@@ -18,7 +18,7 @@ import {
 // Pure functions, no disk — but the real ~/.zelos stays off limits regardless.
 const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zelos-mime-test-'));
 process.env.ZELOS_HOME = home;
-after(() => fs.rmSync(home, { recursive: true, force: true }));
+after(() => fs.rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
 
 /* ------------------------------------------------------------------ *
  * decodeWords — RFC 2047

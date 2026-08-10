@@ -55,7 +55,7 @@ const { getSecret } = await import('../core/secrets.mjs');
 
 test.after(() => {
   globalThis.fetch = realFetch;
-  fs.rmSync(HOME_ROOT, { recursive: true, force: true });
+  fs.rmSync(HOME_ROOT, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 /* ------------------------------------------------------ the mock server */

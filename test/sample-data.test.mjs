@@ -52,7 +52,7 @@ function fresh() {
 
 test.after(() => {
   for (const db of opened) { try { close(db); } catch { /* already gone */ } }
-  fs.rmSync(HOME_ROOT, { recursive: true, force: true });
+  fs.rmSync(HOME_ROOT, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 /* ================================================================== *

@@ -18,7 +18,7 @@ import {
 // away from writing into the user's real ~/.zelos.
 const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zelos-imap-test-'));
 process.env.ZELOS_HOME = home;
-after(() => fs.rmSync(home, { recursive: true, force: true }));
+after(() => fs.rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
 
 /* ================================================================== *
  * A mock IMAP server.

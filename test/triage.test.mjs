@@ -29,7 +29,7 @@ function fresh() {
 
 test.after(() => {
   for (const db of openDbs) close(db);
-  fs.rmSync(HOME_ROOT, { recursive: true, force: true });
+  fs.rmSync(HOME_ROOT, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 const NOW = '2026-08-08T09:00:00-04:00';

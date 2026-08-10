@@ -29,7 +29,7 @@ const {
 
 process.on('exit', () => {
   try {
-    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   } catch {
     /* best effort */
   }

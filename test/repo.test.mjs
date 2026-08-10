@@ -35,7 +35,7 @@ const SANDBOX = fs.mkdtempSync(path.join(os.tmpdir(), 'zelos-repo-'));
 process.env.ZELOS_HOME = path.join(SANDBOX, 'home');
 process.env.ZELOS_SECRETS_BACKEND = 'encrypted-file';
 
-after(() => fs.rmSync(SANDBOX, { recursive: true, force: true }));
+after(() => fs.rmSync(SANDBOX, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
 
 /* ================================================================== *
  * The suite's own blast radius
@@ -470,7 +470,7 @@ describe('the command line', () => {
 
   test('neither --help nor --version creates a Zelos home', async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zelos-noop-'));
-    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     await run(process.execPath, ['zelos.mjs', '--help'], { env: { ZELOS_HOME: home } });
     await run(process.execPath, ['zelos.mjs', '--version'], { env: { ZELOS_HOME: home } });
     assert.equal(fs.existsSync(home), false, 'printing help should not touch the disk');
@@ -525,7 +525,7 @@ describe('a first launch with nothing configured', () => {
 
   after(() => {
     child?.kill('SIGKILL');
-    fs.rmSync(path.dirname(home), { recursive: true, force: true });
+    fs.rmSync(path.dirname(home), { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   test('the launch URL carries a fresh 32-byte session token', () => {

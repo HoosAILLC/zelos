@@ -45,7 +45,7 @@ const {
 
 after(() => {
   for (const db of OPEN_DBS) { try { dbm.close(db); } catch { /* already closed */ } }
-  fs.rmSync(HOME_ROOT, { recursive: true, force: true });
+  fs.rmSync(HOME_ROOT, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 /* ================================================================== *

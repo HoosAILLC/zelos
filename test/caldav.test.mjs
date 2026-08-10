@@ -34,7 +34,7 @@ const { discover, fetchRange, testConnection, invalidate } = await import('../co
 const { parseICS_toEvents } = await import('../core/sources/ics.mjs');
 
 beforeEach(() => invalidate());
-after(() => fs.rmSync(HOME, { recursive: true, force: true }));
+after(() => fs.rmSync(HOME, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
 
 const USER = 'nemo@example.test';
 const PASS = 'app-specific-password';

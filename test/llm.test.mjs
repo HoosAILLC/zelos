@@ -274,7 +274,7 @@ before(async () => {
 after(async () => {
   unpin();
   await mock.close();
-  fs.rmSync(process.env.ZELOS_HOME, { recursive: true, force: true });
+  fs.rmSync(process.env.ZELOS_HOME, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 beforeEach(() => mock.reset());

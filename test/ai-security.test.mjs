@@ -69,7 +69,7 @@ const OPEN_SERVERS = [];
 after(async () => {
   for (const s of OPEN_SERVERS) await new Promise((r) => s.close(r));
   for (const db of OPEN_DBS) { try { dbm.close(db); } catch { /* already closed */ } }
-  fs.rmSync(SANDBOX, { recursive: true, force: true });
+  fs.rmSync(SANDBOX, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 /* ================================================================== *

@@ -288,9 +288,16 @@ describe('npm pack produces a tarball that runs', { skip: PACK_SKIP }, () => {
        flags are held to what bsdtar and GNU tar both document: -t, -x, -z, -f
        and -C. Nothing GNU-only (--wildcards, --warning, --occurrence) may go in
        here, because those are the flags that would pass on Linux and fail on
-       the other two. */
+       the other two.
+
+       Both calls pass a BASENAME with cwd set, never an absolute path. tar has
+       treated 'host:path' as a remote archive since long before Windows had a
+       tar, so an absolute Windows path is read as a host called C — which is
+       exactly how this failed there: 'tar could not list C:\Users\...' with
+       exit 2, on a tarball that was sitting right where it said it was. */
     entries = (await new Promise((resolve, reject) => {
-      const child = spawn('tar', ['-tzf', tarball], { stdio: ['ignore', 'pipe', 'inherit'] });
+      const child = spawn('tar', ['-tzf', path.basename(tarball)],
+        { cwd: path.dirname(tarball), stdio: ['ignore', 'pipe', 'inherit'] });
       let out = '';
       child.stdout.on('data', (d) => { out += d; });
       child.on('error', (e) => reject(new Error(`could not run tar: ${e.message}`)));
@@ -306,7 +313,8 @@ describe('npm pack produces a tarball that runs', { skip: PACK_SKIP }, () => {
       .split('\n').map((l) => l.trim()).filter(Boolean).map((l) => l.replace(/^package\//, ''));
 
     await new Promise((resolve, reject) => {
-      const child = spawn('tar', ['-xzf', tarball, '-C', extractDir], { stdio: ['ignore', 'inherit', 'inherit'] });
+      const child = spawn('tar', ['-xzf', path.basename(tarball), '-C', extractDir],
+        { cwd: path.dirname(tarball), stdio: ['ignore', 'inherit', 'inherit'] });
       child.on('error', (e) => reject(new Error(`could not run tar: ${e.message}`)));
       child.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`tar exited ${code}`))));
     });

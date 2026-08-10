@@ -88,7 +88,7 @@ const ITEM = {
 
 test.after(() => {
   for (const db of dbs) close(db);
-  fs.rmSync(HOME_ROOT, { recursive: true, force: true });
+  fs.rmSync(HOME_ROOT, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 /* ------------------------------------------------------------ open/migrate */
@@ -658,7 +658,7 @@ test('the FTS5 refusal names what to install, and does not leave a database behi
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zelos-fts5-'));
   const probe = open(path.join(home, 'probe.db'));
   close(probe);
-  fs.rmSync(home, { recursive: true, force: true });
+  fs.rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 /**

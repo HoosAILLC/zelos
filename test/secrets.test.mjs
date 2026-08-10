@@ -53,7 +53,7 @@ function unforce() {
 
 test.after(() => {
   delete process.env.ZELOS_SECRETS_BACKEND;
-  fs.rmSync(HOME_ROOT, { recursive: true, force: true });
+  fs.rmSync(HOME_ROOT, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 /* ------------------------------------------------------- argv containment */
