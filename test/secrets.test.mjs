@@ -464,3 +464,51 @@ test('Windows CI: DPAPI is the detected backend and really round-trips a secret'
   assert.ok(!(await listRefs()).includes(DPAPI_REF), 'a deleted ref must leave the index');
   assert.deepEqual(await deleteSecret(DPAPI_REF), { ok: true, deleted: false }, 'deleting twice is not an error');
 });
+
+/**
+ * The PowerShell in this module is written inside JavaScript template literals,
+ * which means two escaping systems sit on top of each other and neither one
+ * complains when you use the wrong one. That is not hypothetical: a newline
+ * strip shipped here as `EndsWith("\r\n")`, which in PowerShell is four literal
+ * characters and matches nothing, so every stored secret kept its terminator.
+ * It looked right, it passed every check that could be run on this machine, and
+ * it failed only on a real Windows runner.
+ *
+ * These assertions are cheap, they run everywhere, and they would have caught
+ * it: PowerShell escapes with a backtick, so a backslash escape in these
+ * scripts is always a mistake.
+ */
+test('the PowerShell scripts use PowerShell escaping, not JavaScript escaping', () => {
+  for (const action of ['set', 'get']) {
+    const cmd = describeCommand({ name: 'windows-dpapi', action, ref: 'mail.m_1' });
+    const script = Buffer.from(cmd.args[cmd.args.indexOf('-EncodedCommand') + 1], 'base64')
+      .toString('utf16le');
+
+    // \r \n \t inside a PowerShell string are literal characters, never escapes.
+    const backslashEscape = /\\[rnt]/.exec(script);
+    assert.equal(backslashEscape, null,
+      `${action}: ${backslashEscape?.[0]} is a JavaScript escape; PowerShell would read it literally`);
+
+    // A backtick cannot survive a template literal, so seeing one means the
+    // script was assembled some other way and this guard no longer covers it.
+    assert.ok(!script.includes('`'), `${action}: a backtick reached the script`);
+
+    // The value must never be interpolated into the script text itself.
+    assert.ok(!/\$\{/.test(script), `${action}: the script interpolates at build time`);
+  }
+});
+
+test('the DPAPI scripts state their own encoding rather than inheriting it', () => {
+  // The console code page differs by locale, and on a double-byte locale it is
+  // not a reversible byte mapping — so a non-ASCII password would be corrupted
+  // silently. Both directions must name UTF-8 explicitly.
+  const set = describeCommand({ name: 'windows-dpapi', action: 'set', ref: 'mail.m_1' });
+  const setScript = Buffer.from(set.args[set.args.indexOf('-EncodedCommand') + 1], 'base64').toString('utf16le');
+  assert.match(setScript, /UTF8\.GetString/);
+  assert.ok(!/\[Console\]::In\b/.test(setScript));
+
+  const get = describeCommand({ name: 'windows-dpapi', action: 'get', ref: 'mail.m_1' });
+  const getScript = Buffer.from(get.args.at(-1), 'base64').toString('utf16le');
+  assert.match(getScript, /UTF8\.GetBytes/);
+  assert.ok(!/\[Console\]::Out\b/.test(getScript));
+});

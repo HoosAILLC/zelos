@@ -124,6 +124,16 @@ function psEncoded(script) {
  * by `-replace '\r?\n$'`: .NET's `$` matches before a final newline as well as
  * at the very end, so that pattern ate the whole trailing run and a secret that
  * legitimately ended in a blank line could not be stored.
+ *
+ * The terminator is matched as a string built from `[char]10` / `[char]13`
+ * rather than as an escape, and cast to `[string]` explicitly because
+ * `String.EndsWith(char)` does not exist in the .NET Framework that Windows
+ * PowerShell 5.1 runs on — PowerShell would coerce it, and relying on that is
+ * how the previous version of this line looked correct and was not. PowerShell escapes with a backtick, not a backslash, so `"\r\n"`
+ * written here is the four literal characters and matches nothing — which is
+ * exactly how it shipped once, passing every local check and failing only on a
+ * real Windows runner. A backtick cannot appear in these scripts anyway: they
+ * are JavaScript template literals, and it would end the string.
  */
 // String.raw so the PowerShell regex escapes survive JavaScript's own escaping.
 const DPAPI_SET = String.raw`
@@ -132,7 +142,9 @@ $in=[Console]::OpenStandardInput()
 $ms=New-Object System.IO.MemoryStream
 $in.CopyTo($ms)
 $v=[Text.Encoding]::UTF8.GetString($ms.ToArray())
-if($v.EndsWith("\r\n")){$v=$v.Substring(0,$v.Length-2)}elseif($v.EndsWith("\n")){$v=$v.Substring(0,$v.Length-1)}
+$lf=[string][char]10
+$cr=[string][char]13
+if($v.EndsWith($lf)){$v=$v.Substring(0,$v.Length-1); if($v.EndsWith($cr)){$v=$v.Substring(0,$v.Length-1)}}
 $p=$env:ZELOS_SECRET_FILE
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $p) | Out-Null
 $blob=ConvertFrom-SecureString -SecureString (ConvertTo-SecureString -String $v -AsPlainText -Force)
