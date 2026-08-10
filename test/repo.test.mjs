@@ -74,6 +74,52 @@ describe('the test suite stays inside its sandbox', () => {
     }
 
     assert.ok(reaching >= 5, `only ${reaching} test files were examined — the scan is broken`);
+
+    /* Setting the variable once at the top is not the same as keeping it set.
+       A test can DELETE it again — that is what `unforce()` in secrets.test.mjs
+       does — and detection then runs against the operator's own login keychain
+       for the rest of the file. The textual check above passed happily while
+       exactly that was happening, which is how two tests came to be writing
+       into a real keychain on every developer machine that ran the suite.
+
+       So a file that opts back out has to say who is allowed to: every
+       `delete process.env.ZELOS_SECRETS_BACKEND` must sit in a file that also
+       gates those tests on CI. This is a heuristic and it is deliberately a
+       loud one — if it fires on something legitimate, the fix is to name the
+       gate, not to widen the pattern. */
+    const optOut = [];
+    for (const name of fs.readdirSync(path.join(ROOT, 'test')).sort()) {
+      if (!name.endsWith('.test.mjs')) continue;
+      const src = fs.readFileSync(path.join(ROOT, 'test', name), 'utf8');
+      const delRe = /delete\s+process\.env\.ZELOS_SECRETS_BACKEND/g;
+      let hit;
+      while ((hit = delRe.exec(src)) !== null) {
+        /* Deleting it in a teardown hook is the opposite of a hazard — it is
+           the file putting the environment back. What matters is a delete that
+           lands mid-run, before something that can reach the secret store. The
+           two are told apart by which came last before this line: an `after(`
+           means teardown, a `test(`/`it(` means we are inside a live test. */
+        const before = src.slice(0, hit.index);
+        const lastHook = Math.max(before.lastIndexOf('after('), before.lastIndexOf('afterEach('));
+        const lastTest = Math.max(before.lastIndexOf('\ntest('), before.lastIndexOf('\n  it('));
+        if (lastHook > lastTest) continue;
+        // A conditional restore — `if (previous === undefined) delete …` — is
+        // putting the environment back the way it was found, which is the same
+        // intent as a teardown and equally safe. The hazard is an
+        // UNCONDITIONAL delete in the middle of a run, which is what turns
+        // detection loose on the operator's own keychain.
+        const line = src.slice(before.lastIndexOf('\n') + 1, src.indexOf('\n', hit.index));
+        if (/\b(previous|prior|saved|original)/i.test(line)) continue;
+        if (/process\.env\.CI/.test(src)) continue;
+        optOut.push(name);
+        break;
+      }
+    }
+    assert.deepEqual(optOut, [], 'these tests un-force the secret backend without gating on CI, '
+      + 'so they use the real keychain of whatever machine runs them:\n  '
+      + `${optOut.join('\n  ')}\n`
+      + 'Gate them on process.env.CI, the way test/secrets.test.mjs does.');
+
     assert.deepEqual(unforced, [], 'these tests can reach the real secret store and do not force a backend:\n  '
       + `${unforced.join('\n  ')}\n`
       + "Add process.env.ZELOS_SECRETS_BACKEND = 'encrypted-file' before the core modules load.");

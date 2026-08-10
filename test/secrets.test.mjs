@@ -105,14 +105,24 @@ test('Windows DPAPI passes an encoded script and the path by env, never the valu
   assert.equal(set.file, 'powershell.exe');
   assert.ok(set.args.includes('-NoProfile') && set.args.includes('-NonInteractive'));
   const script = Buffer.from(set.args[set.args.indexOf('-EncodedCommand') + 1], 'base64').toString('utf16le');
-  assert.match(script, /\[Console\]::In\.ReadToEnd\(\)/, 'the value arrives on stdin');
+  // The value arrives on stdin, and the script decodes those bytes as UTF-8
+  // itself. Reading through [Console]::In instead would decode with whatever
+  // code page the machine's locale sets, which round-trips by accident on a
+  // single-byte locale and corrupts non-ASCII on a Japanese or Chinese one.
+  assert.match(script, /OpenStandardInput\(\)/, 'the value arrives on stdin');
+  assert.match(script, /UTF8\.GetString/, 'and is decoded as UTF-8 rather than by locale');
+  assert.ok(!/\[Console\]::In\b/.test(script), 'Console.In would inherit the console code page');
   assert.match(script, /ConvertFrom-SecureString/);
   assert.ok(!/-Key\b/.test(script), 'CurrentUser DPAPI scope, not a hardcoded key');
   assert.match(set.env.ZELOS_SECRET_FILE, /Zelos[\\/]secrets[\\/]mail\.m_1\.dpapi$/);
   assert.equal(set.stdinWrites, 1);
 
   const get = describeCommand({ name: 'windows-dpapi', action: 'get', ref: 'mail.m_1' });
-  assert.match(Buffer.from(get.args.at(-1), 'base64').toString('utf16le'), /SecureStringToBSTR/);
+  const getScript = Buffer.from(get.args.at(-1), 'base64').toString('utf16le');
+  assert.match(getScript, /SecureStringToBSTR/);
+  // Same argument in the other direction: the value leaves as UTF-8 bytes.
+  assert.match(getScript, /UTF8\.GetBytes/, 'the value is encoded as UTF-8 on the way out');
+  assert.ok(!/\[Console\]::Out\b/.test(getScript), 'Console.Out would use the console code page');
   assert.equal(describeCommand({ name: 'windows-dpapi', action: 'delete', ref: 'mail.m_1' }), null);
 });
 
@@ -234,7 +244,31 @@ test('refs and values are validated before anything is spawned', async () => {
 
 /* --------------------------------------------- the backend this machine uses */
 
-test('this machine\'s real backend round-trips a hostile-looking value', async (t) => {
+/**
+ * These two let detection run, which means they use the REAL credential store
+ * of whatever machine they are on — the operator's login keychain on macOS,
+ * their keyring on Linux, their DPAPI profile on Windows. They write an item
+ * and delete it, under a ref of their own, so nothing of the user's is touched.
+ * It is still their keychain, and running a project's tests should not put
+ * anything in it.
+ *
+ * So they are held to the same gate as the live DPAPI round-trip below: a
+ * throwaway CI runner, or not at all. On a developer's own machine the
+ * encrypted-file fallback tests above cover the same store-read-delete contract
+ * without leaving the repository.
+ *
+ * test/repo.test.mjs has a guard for this, but it is textual — it checks that a
+ * file mentions ZELOS_SECRETS_BACKEND, which this file does, so it passed while
+ * these two tests quietly opted back out. The guard now looks for the opt-out
+ * as well; this comment exists so the next person to add an `unforce()` knows
+ * why it is watched.
+ */
+const REAL_STORE_ONLY_ON_CI = process.env.CI
+  ? false
+  : "this test uses the machine's real credential store, so it runs only on a throwaway CI runner "
+    + '(set CI=1 if you genuinely want it to touch your keychain)';
+
+test('this machine\'s real backend round-trips a hostile-looking value', { skip: REAL_STORE_ONLY_ON_CI }, async (t) => {
   useHome('native');
   unforce();
   const b = await backend();
@@ -272,7 +306,7 @@ test('this machine\'s real backend round-trips a hostile-looking value', async (
   assert.ok(!(await listRefs()).includes(ref));
 });
 
-test('the index file records refs and nothing else', async (t) => {
+test('the index file records refs and nothing else', { skip: REAL_STORE_ONLY_ON_CI }, async (t) => {
   useHome('index');
   unforce();
   const b = await backend();

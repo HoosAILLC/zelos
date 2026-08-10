@@ -108,10 +108,31 @@ function psEncoded(script) {
   return Buffer.from(script, 'utf16le').toString('base64');
 }
 
+/*
+ * Both scripts move bytes themselves rather than letting PowerShell choose.
+ *
+ * `[Console]::In` and `[Console]::Out` decode and encode using the console's
+ * code page — CP437 on a US runner, CP1252 on much of Europe, CP932 in Japan.
+ * Zelos writes UTF-8 on stdin and reads UTF-8 back, so on a single-byte locale
+ * the two mistakes are inverses and cancel: the bytes survive by accident. On a
+ * double-byte locale (Japanese, Chinese, Korean) the mapping is not reversible,
+ * and an IMAP password with any non-ASCII character in it comes back corrupted
+ * — silently, surfacing weeks later as a login failure nobody can explain.
+ *
+ * So the standard streams are opened raw and encoded explicitly. This is also
+ * why the trailing newline is removed by an exact `EndsWith` test rather than
+ * by `-replace '\r?\n$'`: .NET's `$` matches before a final newline as well as
+ * at the very end, so that pattern ate the whole trailing run and a secret that
+ * legitimately ended in a blank line could not be stored.
+ */
 // String.raw so the PowerShell regex escapes survive JavaScript's own escaping.
 const DPAPI_SET = String.raw`
 $ErrorActionPreference='Stop'
-$v=[Console]::In.ReadToEnd() -replace '\r?\n$',''
+$in=[Console]::OpenStandardInput()
+$ms=New-Object System.IO.MemoryStream
+$in.CopyTo($ms)
+$v=[Text.Encoding]::UTF8.GetString($ms.ToArray())
+if($v.EndsWith("\r\n")){$v=$v.Substring(0,$v.Length-2)}elseif($v.EndsWith("\n")){$v=$v.Substring(0,$v.Length-1)}
 $p=$env:ZELOS_SECRET_FILE
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $p) | Out-Null
 $blob=ConvertFrom-SecureString -SecureString (ConvertTo-SecureString -String $v -AsPlainText -Force)
@@ -124,7 +145,12 @@ $p=$env:ZELOS_SECRET_FILE
 if(-not (Test-Path -LiteralPath $p)){ exit ${NOT_FOUND_EXIT} }
 $ss=ConvertTo-SecureString -String ([System.IO.File]::ReadAllText($p))
 $b=[Runtime.InteropServices.Marshal]::SecureStringToBSTR($ss)
-try{ [Console]::Out.Write([Runtime.InteropServices.Marshal]::PtrToStringBSTR($b)) }
+try{
+  $bytes=[Text.Encoding]::UTF8.GetBytes([Runtime.InteropServices.Marshal]::PtrToStringBSTR($b))
+  $out=[Console]::OpenStandardOutput()
+  $out.Write($bytes,0,$bytes.Length)
+  $out.Flush()
+}
 finally{ [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b) }
 `;
 
