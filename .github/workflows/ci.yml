@@ -39,12 +39,15 @@ jobs:
       # Node's test runner has no glob of its own, so the files are listed.
       # Shell globbing does the expansion, which is why this is bash on every OS.
       #
+      # --test-force-exit is deliberately NOT used here. It was added to stop a
+      # Windows hang, and it stopped it — by aborting the process instead:
+      # 'Assertion failed: !(handle->flags & UV_HANDLE_CLOSING), src\win\async.c'
+      # on Node 22 and 24, a libuv teardown bug that newer Node has fixed. The
+      # leaked handles it was papering over have since been closed properly, so
+      # the flag has nothing left to do and one thing left to break.
+      #
       # --test-timeout turns a test that blocks forever into a named failing
-      # test instead of a silent job. --test-force-exit covers the other half,
-      # which is what actually bit here: every test can PASS and the runner
-      # still hang, because one socket or server the suite opened is keeping
-      # the event loop alive. That is a leak worth knowing about, but it is not
-      # a reason for CI to sit for ten minutes and then report nothing.
+      # test instead of a job that sits silent until the runner is killed.
       - name: Run the suite
         shell: bash
-        run: node --test --test-timeout=60000 --test-force-exit test/*.test.mjs
+        run: node --test --test-timeout=60000 test/*.test.mjs
