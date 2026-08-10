@@ -712,7 +712,10 @@ test('there is no code path that sends mail, runs a command, or opens a link', (
     assert.ok(!/\beval\s*\(|new\s+Function\s*\(|node:vm\b/.test(source), `${where} can evaluate a string`);
     // child_process exists in exactly two places, and neither takes content.
     if (/child_process/.test(source)) {
-      assert.ok(['core/secrets.mjs', 'zelos.mjs'].includes(where), `${where} spawns processes`);
+      // path.relative() answers in the platform's separators, and this list is
+      // written the way the repository reads. Compare on one shape, not two.
+      const posix = where.split(path.sep).join('/');
+      assert.ok(['core/secrets.mjs', 'zelos.mjs'].includes(posix), `${posix} spawns processes`);
       assert.ok(!/shell\s*:\s*true/.test(source), `${where} spawns through a shell`);
       // Only `spawn` is imported: `exec`/`execFile` route the command line
       // through /bin/sh, which is a different thing wearing the same coat.
@@ -944,7 +947,32 @@ test('hostile field values cannot corrupt the database or the search index', (t)
   assert.equal(db.reindex(handle), nasty.length);
 });
 
-test('a full lifecycle writes only inside the Zelos home, at 0600/0700', async (t) => {
+/**
+ * Windows has no POSIX modes to assert — chmod there sets little more than the
+ * read-only flag — so the mode half of this test is skipped on it, out loud.
+ * The half that matters everywhere, that a full lifecycle writes NOTHING
+ * outside the Zelos home, still runs on every platform: see the test below.
+ */
+const WINDOWS_NO_POSIX_MODES = process.platform === 'win32'
+  ? 'POSIX modes are not implemented on Windows; see docs/SECURITY.md section 5.'
+  : false;
+
+test('a full lifecycle writes nothing outside the Zelos home', async (t) => {
+  // The containment claim, on every platform. It was previously reachable only
+  // through the mode test above, so on Windows — where that cannot run — the
+  // one assertion that IS meaningful there was not being made at all.
+  const before = fs.readdirSync(CANARY);
+  const home = paths();
+  const handle = db.open(home.db);
+  db.migrate(handle);
+  db.insertCapture(handle, 'a note');
+  db.close(handle);
+  await secrets.setSecret('containment.probe', MODEL_KEY);
+  t.after(() => secrets.deleteSecret('containment.probe'));
+  assert.deepEqual(fs.readdirSync(CANARY), before, 'something was written beside the Zelos home');
+});
+
+test('a full lifecycle writes only inside the Zelos home, at 0600/0700', { skip: WINDOWS_NO_POSIX_MODES }, async (t) => {
   const before = fs.readdirSync(CANARY);
 
   const home = paths();

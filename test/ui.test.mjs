@@ -22,14 +22,24 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const UI = path.join(ROOT, 'ui');
 
-const core = await import(path.join(ROOT, 'core/time.mjs'));
-const ui = await import(path.join(UI, 'lib/time.js'));
-const fmt = await import(path.join(UI, 'lib/format.js'));
+/**
+ * A module specifier for a file on disk.
+ *
+ * import() takes a URL, not a path, and on POSIX an absolute path happens to
+ * be an acceptable one. On Windows it is not: 'C:\\…' parses as a URL whose
+ * scheme is 'c', and every dynamic import in this file threw at load — which
+ * is why the whole file failed on that platform rather than any one test.
+ */
+const fileUrl = (...parts) => pathToFileURL(path.join(...parts)).href;
+
+const core = await import(fileUrl(ROOT, 'core/time.mjs'));
+const ui = await import(fileUrl(UI, 'lib/time.js'));
+const fmt = await import(fileUrl(UI, 'lib/format.js'));
 
 /* ------------------------------------------------------------ 1. parity */
 
@@ -497,7 +507,7 @@ async function settle() {
 
 test('itemsInBucket keeps snoozed rows off the panes; snoozedItems carries them', async () => {
   stubBrowserGlobals();
-  const store = await import(path.join(UI, 'lib/store.js'));
+  const store = await import(fileUrl(UI, 'lib/store.js'));
   store.state.board = {
     ...store.state.board,
     items: [
@@ -517,7 +527,7 @@ test('itemsInBucket keeps snoozed rows off the panes; snoozedItems carries them'
 
 test('setItemState carries the snooze deadline, and only when one was chosen', async (t) => {
   stubBrowserGlobals();
-  const { api } = await import(path.join(UI, 'lib/api.js'));
+  const { api } = await import(fileUrl(UI, 'lib/api.js'));
   let captured = null;
   globalThis.fetch = async (reqPath, init = {}) => {
     captured = { path: reqPath, body: init.body ? JSON.parse(init.body) : null };
@@ -543,7 +553,7 @@ test('setItemState carries the snooze deadline, and only when one was chosen', a
 
 test('the snooze chooser offers three future deadlines in the configured zone', async () => {
   stubBrowserGlobals();
-  const items = await import(path.join(UI, 'lib/items.js'));
+  const items = await import(fileUrl(UI, 'lib/items.js'));
   const tz = 'America/New_York';
   const noon = Date.parse('2026-08-11T16:00:00Z'); // Tuesday, noon in New York
 
@@ -562,7 +572,7 @@ test('the snooze chooser offers three future deadlines in the configured zone', 
 
 test('a toast dismisses itself, and an action toast is given longer', async (t) => {
   stubBrowserGlobals();
-  const store = await import(path.join(UI, 'lib/store.js'));
+  const store = await import(fileUrl(UI, 'lib/store.js'));
   t.mock.timers.enable({ apis: ['setTimeout'] });
 
   store.notify('saved');
@@ -590,7 +600,7 @@ test('a toast dismisses itself, and an action toast is given longer', async (t) 
 
 test('done raises an Undo that restores the exact prior state, deadline included', async (t) => {
   stubBrowserGlobals();
-  const store = await import(path.join(UI, 'lib/store.js'));
+  const store = await import(fileUrl(UI, 'lib/store.js'));
   t.mock.timers.enable({ apis: ['setTimeout'] });
 
   const board = {
@@ -772,7 +782,7 @@ test('the day cost is stated in tokens, or not at all', () => {
 
 test('a window left open past midnight keeps its date, its now-line and its day', async () => {
   stubBrowserGlobals();
-  const store = await import(path.join(UI, 'lib/store.js'));
+  const store = await import(fileUrl(UI, 'lib/store.js'));
   store.state.board = {
     ...store.state.board,
     now: '2026-08-11T23:30:00-04:00',
@@ -794,7 +804,7 @@ test('a window left open past midnight keeps its date, its now-line and its day'
 
 test('an untouched window refetches the board on a timer, and stops while hidden', async (t) => {
   stubBrowserGlobals();
-  const store = await import(path.join(UI, 'lib/store.js'));
+  const store = await import(fileUrl(UI, 'lib/store.js'));
   t.mock.timers.enable({ apis: ['setInterval'] });
 
   let fetched = 0;
@@ -902,7 +912,7 @@ test('the search route is registered, and its view module answers to it', async 
 
   assert.ok(fs.existsSync(path.join(UI, 'views/search.js')), 'ui/views/search.js is missing');
   stubBrowserGlobals();
-  const mod = await import(path.join(UI, 'views/search.js'));
+  const mod = await import(fileUrl(UI, 'views/search.js'));
   assert.equal(typeof mod.renderSearch, 'function', 'search.js must export renderSearch');
 });
 
@@ -916,7 +926,7 @@ test('the search route is registered, and its view module answers to it', async 
  */
 test('a search hit knows where — and whether — it can be opened', async () => {
   stubBrowserGlobals();
-  const search = await import(path.join(UI, 'views/search.js'));
+  const search = await import(fileUrl(UI, 'views/search.js'));
 
   assert.deepEqual(search.refParts('msg:abc'), { prefix: 'msg', id: 'abc' });
   // Message ids are not guaranteed to be colon-free; only the first one splits.
@@ -954,7 +964,7 @@ test('a search hit knows where — and whether — it can be opened', async () =
 
 test('the results summary counts in the words the app uses, board first', async () => {
   stubBrowserGlobals();
-  const search = await import(path.join(UI, 'views/search.js'));
+  const search = await import(fileUrl(UI, 'views/search.js'));
   assert.equal(
     search.summariseKinds([
       { kind: 'message' }, { kind: 'item' }, { kind: 'message' }, { kind: 'event' },
@@ -971,7 +981,7 @@ test('the results summary counts in the words the app uses, board first', async 
 
 test('the calendar opens where the day is, not at midnight', async () => {
   stubBrowserGlobals();
-  const cal = await import(path.join(UI, 'views/calendar.js'));
+  const cal = await import(fileUrl(UI, 'views/calendar.js'));
 
   // Now wins, with two hours of context above it.
   assert.equal(cal.openingScrollMinutes({ nowMinutes: 14 * 60, firstEventMinutes: 9 * 60 }), 12 * 60);
@@ -1035,7 +1045,7 @@ test('no rule still branches on a theme attribute that is never set', () => {
  */
 test('a deadline is read in the configured zone, wherever the browser thinks it is', async () => {
   stubBrowserGlobals();
-  const items = await import(path.join(UI, 'lib/items.js'));
+  const items = await import(fileUrl(UI, 'lib/items.js'));
   const item = { due_at: '2026-08-12' };
   // 1pm UTC on the 12th. In New York that is 9am of the day it is due; in
   // Kiritimati it is 3am of the day AFTER. Two zones, two honest answers, and
@@ -1126,7 +1136,7 @@ test('a deadline costs its zone lookup once per zone and day, not once per row',
  */
 test('a run of failed heartbeats says so, and one blip does not', async (t) => {
   stubBrowserGlobals();
-  const store = await import(path.join(UI, 'lib/store.js'));
+  const store = await import(fileUrl(UI, 'lib/store.js'));
   t.mock.timers.enable({ apis: ['setInterval'] });
 
   const board = {
@@ -1190,8 +1200,8 @@ test('the heartbeat states its failure in the same words the boot path uses', ()
  */
 test('past midnight the now-line changes column, or leaves', async (t) => {
   stubBrowserGlobals();
-  const store = await import(path.join(UI, 'lib/store.js'));
-  const cal = await import(path.join(UI, 'views/calendar.js'));
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const cal = await import(fileUrl(UI, 'views/calendar.js'));
 
   // A grid small enough to reason about: the handful of node behaviours
   // tickNowLine actually uses, and nothing else.
@@ -1312,8 +1322,8 @@ test('what was typed into the token test survives a repaint', () => {
  */
 test('the TLS choice maps to the three values config stores, and junk lands on the safe one', async () => {
   stubBrowserGlobals();
-  const settings = await import(path.join(UI, 'views/settings.js'));
-  const config = await import(path.join(ROOT, 'core/config.mjs'));
+  const settings = await import(fileUrl(UI, 'views/settings.js'));
+  const config = await import(fileUrl(ROOT, 'core/config.mjs'));
 
   assert.deepEqual(settings.TLS_CHOICES.map((c) => c.value), ['auto', 'require', 'allow']);
   for (const choice of settings.TLS_CHOICES) {
@@ -1388,8 +1398,8 @@ test('the mail editor can set requireTls, and the test connects under the same r
  */
 test('a now-line that leaves takes the today marker with it', async (t) => {
   stubBrowserGlobals();
-  const store = await import(path.join(UI, 'lib/store.js'));
-  const cal = await import(path.join(UI, 'views/calendar.js'));
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const cal = await import(fileUrl(UI, 'views/calendar.js'));
 
   const node = (day) => {
     const self = {

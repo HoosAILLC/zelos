@@ -650,7 +650,15 @@ describe('a first launch with nothing configured', () => {
     assert.deepEqual(wrongMethod, [], `the UI calls routes with a method they refuse:\n  ${wrongMethod.join('\n  ')}`);
   });
 
-  test('SIGINT stops it cleanly', async () => {
+  /* Windows has no POSIX signals: process.kill(pid,'SIGINT') there terminates
+     the process outright rather than delivering something a handler can catch,
+     so this cannot test a graceful shutdown on that platform — it would only
+     be testing that a killed process stops. What goes untested as a result is
+     real and worth naming: whether Ctrl-C on Windows closes the database and
+     releases the port cleanly is unverified. */
+  test('SIGINT stops it cleanly', { skip: process.platform === 'win32'
+    ? 'Windows does not deliver POSIX signals; a graceful Ctrl-C cannot be tested here'
+    : false }, async () => {
     child.kill('SIGINT');
     assert.equal(await exited, 0, 'Ctrl-C should be a clean exit, not a hang or a crash');
   });
