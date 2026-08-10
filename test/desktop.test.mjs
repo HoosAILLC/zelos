@@ -835,25 +835,34 @@ describe('the shell, booted against a stub Electron', () => {
       'a renderer that keeps dying after each successful load must eventually be explained');
   });
 
-  it('closing keeps a scheduled Zelos alive only where there is somewhere to keep it', () => {
+  it('closing honours the residency rule rather than a hardcoded answer', async () => {
+    /* What is being tested here is the WIRING: that the close handler asks
+       shouldStayResidentOnClose and does what it says. The rule's own truth
+       table is tested separately, further down, where every platform is
+       supplied as data instead of being whatever this machine happens to be.
+
+       Asserting a fixed answer here is what went wrong twice: "always stays
+       resident" was a macOS assumption that failed on Linux, and "only macOS
+       stays resident" was a Linux assumption that failed on Windows — where a
+       tray really does exist and really is somewhere to go. */
+    const { shouldStayResidentOnClose } = await import(
+      pathToFileURL(path.join(REPO, 'desktop', 'main.js')).href);
+    const expected = shouldStayResidentOnClose({
+      platform: process.platform,
+      hasTray: recorded.trays.length > 0,
+      autoSweep: booted.zelos.config.sweep.auto === true,
+      trayConfirmed: process.env.ZELOS_TRAY_RESIDENT === '1',
+    });
+
     const win = recorded.windows[0];
     let prevented = false;
     win.emit('close', { preventDefault: () => { prevented = true; } });
 
-    /* This is deliberately platform-branched rather than asserted flat, because
-       the answer genuinely differs and the flat version was a macOS assumption
-       that failed the moment CI ran it on Linux. macOS keeps an application
-       alive with no window at all — the menu bar is still there to bring it
-       back. Linux and Windows have only the tray, so hiding into a tray that
-       cannot be proven to exist leaves an app with no window, no icon and no
-       way back to either. Where that cannot be proven, closing closes. */
-    if (process.platform === 'darwin') {
-      assert.equal(prevented, true, 'closing the window must not end a scheduled Zelos on macOS');
-      assert.equal(win.visible, false, 'it should have gone to the background, not stayed up');
-    } else {
-      assert.equal(prevented, false,
-        'without a tray it can prove, closing must really close rather than hide into nowhere');
-    }
+    assert.equal(prevented, expected,
+      expected
+        ? 'this platform can keep a scheduled Zelos running, so closing must not end it'
+        : 'with nowhere to go, closing must really close rather than hide into nowhere');
+    if (expected) assert.equal(win.visible, false, 'it should have gone to the background');
 
     // Where it was is remembered either way: that is not a residency question.
     const state = JSON.parse(fs.readFileSync(path.join(home, 'window.json'), 'utf8'));
