@@ -955,3 +955,55 @@ describe('a first launch with nothing configured', () => {
     assert.equal(await exited, 0, 'Ctrl-C should be a clean exit, not a hang or a crash');
   });
 });
+
+/* ------------------------------------------------------------------ *
+ * Line endings
+ * ------------------------------------------------------------------ */
+
+test('no tracked source file carries a carriage return', () => {
+  /* REGRESSION, and the cheapest kind: one clear failure instead of several
+     confusing ones.
+
+     A dozen tests in this suite are guards that read PRODUCTION SOURCE and
+     match a pattern against it — "paintActions is called on the way out",
+     "the SQL in this file targets its own audit log". Those patterns are
+     written with \n. Git's default on Windows checks out CRLF, so on a Windows
+     runner every one of them misses, and the build reports three unrelated
+     regex mismatches in three different files, each of which is correct about
+     the code it is checking. That is exactly how it arrived: green on macOS and
+     Linux, red on all four Windows legs.
+
+     `.gitattributes` sets `eol=lf` so the working tree is LF everywhere. This
+     asserts the result rather than the setting, because a checkout can ignore
+     the file — a clone made before it existed, a `core.autocrlf` set by hand,
+     an export that does its own thing. When that happens the answer should be
+     this test naming the files, not a guard elsewhere failing for a reason that
+     looks like a code defect. */
+  const roots = ['core', 'ui', 'test', 'desktop', 'docs'];
+  const offenders = [];
+
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name === 'node_modules' || entry.name === 'dist' || entry.name === 'shots') continue;
+        walk(full);
+        continue;
+      }
+      if (!/\.(mjs|js|css|html|md|json|yml)$/.test(entry.name)) continue;
+      if (fs.readFileSync(full, 'utf8').includes('\r')) offenders.push(path.relative(ROOT, full));
+    }
+  };
+  for (const r of roots) {
+    const dir = path.join(ROOT, r);
+    if (fs.existsSync(dir)) walk(dir);
+  }
+  for (const f of ['zelos.mjs', 'package.json', 'README.md']) {
+    const full = path.join(ROOT, f);
+    if (fs.existsSync(full) && fs.readFileSync(full, 'utf8').includes('\r')) offenders.push(f);
+  }
+
+  assert.deepEqual(offenders, [],
+    'these files have CRLF line endings, which silently breaks every guard in this suite that '
+    + `matches a pattern against source text:\n  ${offenders.join('\n  ')}`);
+});

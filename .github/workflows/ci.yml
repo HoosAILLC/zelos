@@ -148,7 +148,28 @@ jobs:
         run: |
           dbus-run-session -- bash -c '
             set -e
-            echo -n "" | gnome-keyring-daemon --unlock --components=secrets
+            # --login, not --unlock. `--unlock` opens a login keyring that
+            # already exists, and a fresh runner has none, so the daemon came up
+            # with no default collection and secret-tool failed with "Object
+            # does not exist at path /org/freedesktop/secrets/collection/login"
+            # — a red build that looked like libsecret rejecting our argv when
+            # it was this step never giving it anywhere to write. `--login`
+            # creates the keyring from the password on stdin if it is missing.
+            #
+            # A password rather than an empty string: an empty one asks
+            # gnome-keyring for an UNENCRYPTED keyring on some versions, which
+            # prompts, and there is nobody here to answer. It is a throwaway
+            # runner and this value protects nothing.
+            mkdir -p "$HOME/.local/share/keyrings"
+            eval "$(printf "zelos-ci\n" | gnome-keyring-daemon --daemonize --login)"
+            export GNOME_KEYRING_CONTROL SSH_AUTH_SOCK
+            eval "$(gnome-keyring-daemon --start --components=secrets)"
+            export GNOME_KEYRING_CONTROL SSH_AUTH_SOCK
+            # Prove the collection is really there before the suite runs, so a
+            # bootstrap failure is reported as one instead of as every libsecret
+            # assertion failing for its own apparent reason.
+            secret-tool store --label=zelos-ci-probe service zelos-ci-probe key probe <<< "x"
+            secret-tool clear service zelos-ci-probe key probe
             node --test --test-timeout=180000 test/secrets.test.mjs
             # Read the output, not the exit code: secret-tool `search` is
             # documented to exit 0 whether or not it matched anything, and a

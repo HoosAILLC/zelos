@@ -1,0 +1,30 @@
+# Line endings are LF in the working tree on every platform, not just in the
+# repository. Git's default on Windows is to check out CRLF, and a dozen tests
+# in this suite are guards that read PRODUCTION SOURCE and match a pattern
+# against it — "this function is called on the way out", "this file's SQL
+# touches only its own table". Those patterns are written with \n, so on a
+# Windows checkout they miss, and the failure arrives as three unrelated-looking
+# regex mismatches rather than as "your files have carriage returns in them".
+# That is exactly how it arrived: green on macOS and Linux, red on all four
+# Windows legs, in guards that were correct about the code they were checking.
+#
+# `text=auto` still normalises to LF in the repository, which was already true.
+# `eol=lf` is the half that was missing: it fixes the WORKING TREE too.
+#
+# test/repo.test.mjs asserts at runtime that no tracked source file contains a
+# carriage return, so a checkout that ignores this file fails once, loudly, and
+# says why — rather than through whichever guard happens to notice first.
+* text=auto eol=lf
+
+# Binaries, so Git never inspects or rewrites them.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.icns binary
+*.ico binary
+*.zip binary
+*.dmg binary
+*.exe binary
+*.woff2 binary
+*.mp4 binary
