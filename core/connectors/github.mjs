@@ -681,8 +681,35 @@ export default {
       return inScope(scope, n?.repository?.full_name);
     };
 
+    /* THE VALIDATOR IS ONLY VALID FOR THE QUESTION IT WAS ASKED.
+       `Last-Modified` describes the answer to one URL under one filter. Change
+       what is being asked for — add a repo, switch CI activity on, widen from
+       participating to watched, raise how many to keep — and the stored
+       validator still describes the OLD question, so GitHub answers 304 and the
+       connector says "nothing new" about notifications that were sitting on the
+       server the whole time.
+
+       Measured before this existed: a sweep scoped to one repo stores a
+       validator; the user adds a second repo in Settings; the next sweep sends
+       the old `If-Modified-Since`, gets a 304, and reports zero rows while the
+       new repo's notifications were in the response body both times. Widening
+       from `participating=true` to `false` was the worst case, because the URL
+       genuinely changes and the validator is still the narrow one. On a quiet
+       account the validator can hold for a day, so the user edits Settings,
+       sees a confident green zero, and has nothing to read.
+
+       So the shape of the question is hashed into the cursor, and a validator
+       minted under a different shape is dropped rather than sent. Dropping it
+       costs one full read, once, which is exactly what a changed question is
+       worth. (`onConfigChanged` exists in the interface but nothing calls it,
+       so this cannot be done on the write side.) */
+    const shape = JSON.stringify([participating, includeCi, keep, base, [...scope].sort()]);
+    const shapeChanged = typeof cursor.shape === 'string' && cursor.shape !== shape;
+
     const matched = [];
-    let lastModified = typeof cursor.lastModified === 'string' ? cursor.lastModified : null;
+    let lastModified = shapeChanged || typeof cursor.lastModified !== 'string'
+      ? null
+      : cursor.lastModified;
     let pollIntervalMs = Number(cursor.pollIntervalMs) || 0;
     let dropped = 0;
 
@@ -714,13 +741,29 @@ export default {
       if (page === 1) pollIntervalMs = pollIntervalFrom(res.headers, pollIntervalMs);
 
       if (res.status === 304) {
-        /* A successful read of nothing, and it cost NOTHING against the
-           5,000/hr — that is the entire reason the conditional dance is here.
-           The cursor is handed back with only the poll bookkeeping advanced: the
-           `Last-Modified` validator is kept, because clearing it would turn
-           every subsequent sweep back into a full read. */
-        ctx.emit(`${ctx.label}: nothing new`, 0, 0);
-        return nothing({ lastModified, pollIntervalMs, polledAtMs: nowMs });
+        /* On PAGE ONE this is a successful read of nothing, and it cost nothing
+           against the 5,000/hr — the entire reason the conditional dance is
+           here. The validator is kept, because clearing it would turn every
+           later sweep back into a full read.
+
+           On any LATER page it is not that at all, and the first cut treated it
+           as if it were: it returned `nothing(...)`, which threw away every row
+           already matched from page one AND stored the new validator, so those
+           notifications were lost and the next sweep's genuine 304 meant they
+           never came back. Measured with a server answering page 1 with fifty
+           notifications and page 2 with 304 — which is what a caching proxy or a
+           corporate TLS-inspecting middlebox does — the connector returned zero
+           rows and kept the advanced cursor.
+
+           The conditional header is only sent on page one, so a 304 here is an
+           intermediary's opinion rather than GitHub's. Stop walking and keep
+           what we have. */
+        if (page === 1) {
+          ctx.emit(`${ctx.label}: nothing new`, 0, 0);
+          return nothing({ lastModified, shape, pollIntervalMs, polledAtMs: nowMs });
+        }
+        ctx.log?.warn?.('a 304 arrived mid-walk, which only an intermediary can mean; keeping the pages already read', { page });
+        break;
       }
 
       if (page === 1) {
@@ -752,7 +795,7 @@ export default {
 
     return {
       parts: [{ label: '', rows, error: null, note: null }],
-      cursor: { lastModified, pollIntervalMs, polledAtMs: nowMs },
+      cursor: { lastModified, shape, pollIntervalMs, polledAtMs: nowMs },
     };
   },
 

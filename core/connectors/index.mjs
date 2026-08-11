@@ -41,6 +41,7 @@ import fireflies from './fireflies.mjs';
 import linear from './linear.mjs';
 import todoist from './todoist.mjs';
 import folder from './folder.mjs';
+import whatsapp from './whatsapp.mjs';
 
 /** Where a source's config entry lives on disk. */
 export const CONFIG_KEYS = Object.freeze(['mail', 'calendars', 'sources']);
@@ -187,7 +188,7 @@ export function assertShape(c, seen = new Set()) {
 }
 
 const seenTypes = new Set();
-const LIST = [imap, ics, caldav, file, rss, github, slack, fireflies, linear, todoist, folder]
+const LIST = [imap, ics, caldav, file, rss, github, slack, fireflies, linear, todoist, folder, whatsapp]
   .map((c) => deepFreeze(assertShape(c, seenTypes)));
 const BY_TYPE = new Map(LIST.map((c) => [c.type, c]));
 
