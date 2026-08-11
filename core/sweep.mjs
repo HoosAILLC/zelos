@@ -20,14 +20,19 @@
  * anything a message asked for.
  */
 
-import fs from 'node:fs/promises';
-
 import { loadConfig } from './config.mjs';
 import { complete as llmComplete, extractJSON, LLMError } from './llm.mjs';
 import { getSecret as realGetSecret } from './secrets.mjs';
-import { fetchRecent } from './sources/imap.mjs';
-import { parseICS_toEvents } from './sources/ics.mjs';
-import { fetchRange as caldavFetchRange } from './sources/caldav.mjs';
+import {
+  enabledSources,
+  get as connectorFor,
+  originsFor,
+  sourceCursorKey,
+  sourceStateKey,
+} from './connectors/index.mjs';
+import { ICS_MAX_INSTANCES } from './connectors/calendar.mjs';
+import { read as imapRead } from './connectors/imap.mjs';
+import { AuthError, RateLimitError, AUTH_BLOCK_MS, createHttp, createMeter, secretHash } from './connectors/http.mjs';
 import {
   upsertMessages,
   upsertEvents,
@@ -94,14 +99,20 @@ const NOW_BOARD_LIMIT = 4;
  */
 const RESOLVED_LIMIT = 40;
 
-const ICS_TIMEOUT_MS = 20_000;
-const ICS_MAX_BYTES = 8 * 1024 * 1024;
+/**
+ * How large a cursor may be, serialised.
+ *
+ * `kv` has no ceiling of its own, and a connector caching a page of results in
+ * its cursor would be a second message store with no index, no search and no
+ * cleanup — one that /api/state never shows and no `zelos doctor` check counts.
+ * Four kilobytes is generous for the thing a cursor actually is: a page token,
+ * an ETag, a high-water timestamp.
+ */
+const CURSOR_MAX_CHARS = 4096;
 
 /* ------------------------------------------------------------------ *
  * Small helpers
  * ------------------------------------------------------------------ */
-
-const isEnabled = (x) => !!x && x.enabled !== false;
 
 function activeHoursOf(config) {
   const raw = config?.sweep?.activeHours;
@@ -210,80 +221,15 @@ function bumpPendingNew(db, n) {
 
 /* ------------------------------------------------------------------ *
  * Sources
+ *
+ * Everything that knows what a particular KIND of source is like now lives in
+ * core/connectors/. What is left here is the two default readers, and they are
+ * left here because they are the shape of `deps` — the seam the desktop shell
+ * and 38 tests inject through. Their signatures are byte-identical to what they
+ * were when they held the vendor branches themselves; that is the whole
+ * migration gate, and it is why `deps.fetchEvents` stays FAMILY-level rather
+ * than becoming three per-kind seams.
  * ------------------------------------------------------------------ */
-
-/**
- * Read an .ics document over HTTP.
- *
- * At most one redirect is followed, and credentials are never carried across an
- * origin change — a calendar URL that redirects elsewhere must not hand that
- * host the user's password.
- */
-async function fetchIcsText(rawUrl, { user, pass, signal, timeoutMs = ICS_TIMEOUT_MS } = {}) {
-  const url = new URL(String(rawUrl).replace(/^webcal:/i, 'https:'));
-  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-    throw new Error(`calendar URL must be http, https or webcal (got ${url.protocol})`);
-  }
-
-  const headers = { accept: 'text/calendar, text/plain;q=0.8, */*;q=0.5' };
-  if (user) {
-    headers.authorization = `Basic ${Buffer.from(`${user}:${pass ?? ''}`).toString('base64')}`;
-  }
-
-  const request = async (target, withAuth) => {
-    const signals = [AbortSignal.timeout(timeoutMs)];
-    if (signal) signals.push(signal);
-    const sendHeaders = withAuth ? headers : { accept: headers.accept };
-    return fetch(target, {
-      headers: sendHeaders,
-      redirect: 'manual',
-      signal: AbortSignal.any(signals),
-    });
-  };
-
-  let res = await request(url, true);
-  if (res.status >= 300 && res.status < 400) {
-    const location = res.headers.get('location');
-    if (!location) throw new Error(`calendar at ${url.host} redirected without a destination`);
-    const next = new URL(location, url);
-    const sameOrigin = next.origin === url.origin;
-    res = await request(next, sameOrigin);
-  }
-  if (!res.ok) throw new Error(`calendar at ${url.host} returned ${res.status}`);
-
-  const text = await res.text();
-  if (text.length > ICS_MAX_BYTES) {
-    throw new Error(`calendar at ${url.host} returned ${text.length} bytes — refusing to parse it`);
-  }
-  if (!text.includes('BEGIN:VCALENDAR')) {
-    throw new Error(`calendar at ${url.host} did not return an iCalendar document`);
-  }
-  return text;
-}
-
-/**
- * How many expanded instances one iCalendar document may contribute.
- *
- * The number is set HERE rather than left to `parseICS_toEvents`'s own default
- * for one reason: this file is the only place that can tell the user a calendar
- * was truncated, and it can only tell them if it knows what the ceiling was.
- * `expand()` drops the overflow from the far end of the window and logs
- * `ics.warn("more than max=… instances in the window; dropped …")` — a line that
- * reaches a terminal nobody is reading and no screen at all. Passing the cap in
- * and comparing the count out is what turns that into something a person sees.
- */
-const ICS_MAX_INSTANCES = 1_500;
-
-/**
- * True when a parse came back exactly at the ceiling.
- *
- * At the ceiling, not over it: the overflow is already gone by the time the
- * array is returned, so "was anything dropped" is not answerable from here — and
- * the wording chosen below is true either way. A document holding exactly 1,500
- * instances and nothing more raises the same note, which costs a rare reader one
- * sentence about a limit they are in fact standing on.
- */
-const filledIcsBudget = (events) => (events?.length ?? 0) >= ICS_MAX_INSTANCES;
 
 /**
  * Carry "this was truncated" back out with the events.
@@ -291,7 +237,7 @@ const filledIcsBudget = (events) => (events?.length ?? 0) >= ICS_MAX_INSTANCES;
  * A property on the array rather than a `{events, truncated}` wrapper, because
  * the caller spreads and maps the result and both of those drop it silently —
  * so the shape stays exactly what every existing caller, including an injected
- * `deps.fetchEvents`, already returns. The reader is the calendar task below,
+ * `deps.fetchEvents`, already returns. The reader is the calendar connector,
  * which looks at it BEFORE the `.map`.
  */
 function markTruncated(events) {
@@ -300,74 +246,39 @@ function markTruncated(events) {
   return list;
 }
 
-/** The default calendar reader: ics over http, CalDAV, or a local file. */
+/**
+ * The default calendar reader: whichever connector the kind names.
+ *
+ * The two `calendar.kind` comparisons this function used to open with are gone;
+ * the registry answers the same question and a fourth calendar kind adds no
+ * line here. What did NOT change is the argument object, the return value, or
+ * the fact that a truncated read comes back as an array wearing a property.
+ */
 async function defaultFetchEvents({ calendar, pass, from, to, timezone, email, signal }) {
-  const window = { from, to, tzid: timezone, email, max: ICS_MAX_INSTANCES };
-
-  if (calendar.kind === 'file') {
-    const text = await fs.readFile(calendar.url, 'utf8');
-    const events = parseICS_toEvents(text, window);
-    return filledIcsBudget(events) ? markTruncated(events) : events;
+  const connector = connectorFor(calendar.kind);
+  if (!connector || typeof connector.read !== 'function') {
+    throw new Error(`no calendar reader named ${calendar.kind}`);
   }
-  if (calendar.kind === 'caldav') {
-    const docs = await caldavFetchRange({
-      url: calendar.url,
-      user: calendar.user,
-      pass,
-      from,
-      to,
-      signal,
-    });
-    const events = [];
-    // Each document is expanded and capped on its own, so the truncation is
-    // per-document: a collection of a hundred small VEVENT files cannot fill the
-    // budget between them, and one enormous recurring series can.
-    let truncated = false;
-    for (const doc of docs) {
-      const part = parseICS_toEvents(doc, window);
-      if (filledIcsBudget(part)) truncated = true;
-      events.push(...part);
-    }
-    return truncated ? markTruncated(events) : events;
-  }
-  const text = await fetchIcsText(calendar.url, { user: calendar.user, pass, signal });
-  const events = parseICS_toEvents(text, window);
-  return filledIcsBudget(events) ? markTruncated(events) : events;
+  const { events, truncated } = await connector.read({
+    source: calendar,
+    pass,
+    signal,
+    window: { from, to, tzid: timezone, email, max: ICS_MAX_INSTANCES },
+  });
+  return truncated ? markTruncated(events) : events;
 }
 
 /**
- * The default mail reader: one IMAP connection per mailbox.
+ * The default mail reader.
  *
- * `signal` is forwarded, and that is the half of Ctrl-C that used to be missing.
- * The caller's check between mailboxes only ever caught a sweep between reads;
- * a read already on the wire ran to its own end, so the first Ctrl-C did
- * nothing a user could see and what actually ended the process was the
- * launcher's 5 s escape timer — a force-exit, not a stop. `fetchRecent` now
- * hands the signal to the client, which fails the command in flight and
- * destroys the socket, so `abort()` below is reached with the connection
- * already closed rather than still reading.
- *
- * `requireTls` is forwarded deliberately, and `?? null` rather than `|| null`,
- * because the setting is three-valued: `false` is a standing permission to talk
- * to this one host in the clear, and collapsing it into "not set" would put the
- * requirement back on a Proton Bridge the user has already excused. An account
- * saved before the field existed has no value at all, which is what `null`
- * means — the client then decides from the host, as it always has.
+ * A shim, and worth its two lines: `{...DEFAULT_DEPS, ...deps}` below replaces
+ * exactly this function when a caller injects one, and naming it here keeps the
+ * seam visible from the run loop rather than only from the connector. The body,
+ * and the paragraph explaining why `requireTls` is forwarded with `??` and not
+ * `||`, moved to core/connectors/imap.mjs with the rest of IMAP's semantics.
  */
 function defaultFetchMail({ account, mailbox, pass, sinceDays, limit, onProgress, signal }) {
-  return fetchRecent({
-    host: account.host,
-    port: account.port,
-    secure: account.secure,
-    user: account.user,
-    pass,
-    requireTls: account.requireTls ?? null,
-    mailbox,
-    sinceDays,
-    limit,
-    onProgress,
-    signal,
-  });
+  return imapRead({ account, mailbox, pass, sinceDays, limit, onProgress, signal });
 }
 
 const DEFAULT_DEPS = Object.freeze({
@@ -377,29 +288,149 @@ const DEFAULT_DEPS = Object.freeze({
   getSecret: realGetSecret,
 });
 
-/**
- * Mailboxes to read for one account: the configured list plus the sent folder,
- * which is not optional — `promised` is mined from what the user themselves
- * wrote, and without the sent folder half the board cannot exist.
- */
-function mailboxesFor(account) {
-  const list = Array.isArray(account.mailboxes) && account.mailboxes.length
-    ? account.mailboxes.filter((m) => typeof m === 'string' && m.trim())
-    : ['INBOX'];
-  const out = [...new Set(list)];
-  const sent = typeof account.sentMailbox === 'string' ? account.sentMailbox.trim() : '';
-  if (sent && !out.includes(sent)) out.push(sent);
-  return out;
+/* ------------------------------------------------------------------ *
+ * Per-source memory: a cursor and a state row
+ *
+ * Two `kv` rows per source, following the SWEEP_KV pattern in core/triage.mjs.
+ * No collision is possible: SWEEP_KV's five keys are all `sweep.*` and these
+ * are all `source.*`.
+ *
+ *   source.<id>.cursor   opaque, whatever the connector last returned
+ *   source.<id>.state    {lastAt, lastOkAt, notBefore, authBlockedUntil,
+ *                         secretHash, spent, windowStartedAt}
+ *
+ * TWO ROWS RATHER THAN ONE, AND THE SPLIT IS LOAD-BEARING. The cursor is
+ * written only when the fetch succeeded AND the rows were stored; the state is
+ * written on every attempt, including the failures. Shared, a failed run would
+ * either lose the record of the failure or lose the cursor.
+ *
+ * Neither row is created for a source that has nothing to remember, which is
+ * why the four connectors that predate this — imap, ics, caldav, file — leave
+ * `kv` exactly as they found it. They declare no limits and return no cursor,
+ * so there is nothing a later run would read.
+ * ------------------------------------------------------------------ */
+
+function readSourceState(db, id) {
+  try {
+    const raw = getKV(db, sourceStateKey(id));
+    const parsed = raw ? JSON.parse(raw) : null;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    // A state row we cannot read is a state row we ignore: the worst it costs
+    // is one early retry, and refusing to sweep over it would be absurd.
+    return {};
+  }
 }
 
-function directionOf(message, mailbox, account, identityEmail) {
-  // Compared against the trimmed name, because that is what mailboxesFor asked for.
-  if (mailbox === String(account.sentMailbox ?? '').trim()) return 'out';
-  const from = String(message?.from?.email ?? '').toLowerCase();
-  if (from && (from === String(identityEmail).toLowerCase() || from === String(account.user).toLowerCase())) {
-    return 'out';
+function writeSourceState(db, id, state) {
+  setKV(db, sourceStateKey(id), JSON.stringify(state));
+}
+
+function readCursor(db, id) {
+  try {
+    const raw = getKV(db, sourceCursorKey(id));
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
   }
-  return 'in';
+}
+
+/**
+ * Store what a connector handed back, or refuse it and say why.
+ *
+ * `null` clears the row — that is how a connector says "the validator I was
+ * using is gone, start clean" — while `undefined` never reaches here at all and
+ * means "leave whatever was there". Anything that will not serialise, or that
+ * is larger than a cursor has any business being, is dropped rather than
+ * stored: the alternative is a `kv` row nobody can read and a sweep that fails
+ * on it at the same point every time.
+ */
+function writeCursor(db, id, cursor) {
+  if (cursor === null) {
+    setKV(db, sourceCursorKey(id), '');
+    return;
+  }
+  let text;
+  try {
+    text = JSON.stringify(cursor);
+  } catch (err) {
+    slog.warn('a source returned a cursor that will not serialise; ignoring it', { id, error: errorText(err) });
+    return;
+  }
+  if (typeof text !== 'string') return;
+  if (text.length > CURSOR_MAX_CHARS) {
+    slog.warn('a source returned a cursor larger than the ceiling; ignoring it', { id, chars: text.length, max: CURSOR_MAX_CHARS });
+    return;
+  }
+  setKV(db, sourceCursorKey(id), text);
+}
+
+/** True when a connector could ever read its own state back. */
+function keepsState(connector) {
+  const lim = connector?.limits ?? {};
+  return (lim.minIntervalMs > 0) || !!lim.budget;
+}
+
+/**
+ * Is this source resting, and why?
+ *
+ * -> null to read it, or a sentence for the debug log.
+ *
+ * A gated source pushes NOTHING into `sources[]`. It did not fail, and its rows
+ * are already in the database — `gatherPromptInput` reads from there, not from
+ * this fetch — so the board is identical either way. Reporting it as `ok: true`
+ * with a count of zero would inflate `stats.sourcesOk`, a number three files
+ * consume, with sources that were never read; reporting it as a failure would
+ * put a red banner on the screen forty-seven times a day for a source that is
+ * deliberately resting. Settings can read `source.<id>.state` when it wants to
+ * show "next attempt at 14:20".
+ */
+function restingFor(connector, state, nowMs) {
+  const minInterval = Number(connector?.limits?.minIntervalMs) || 0;
+  const lastAt = Number(state.lastAt) || 0;
+  if (minInterval > 0 && lastAt && nowMs - lastAt < minInterval) {
+    return `read ${Math.round((nowMs - lastAt) / 1000)}s ago; this source asks for ${Math.round(minInterval / 1000)}s between reads`;
+  }
+  const notBefore = Number(state.notBefore) || 0;
+  if (notBefore && nowMs < notBefore) {
+    return `rate limited; not before ${new Date(notBefore).toISOString()}`;
+  }
+  return null;
+}
+
+/**
+ * Is this source resting on a credential the host already refused?
+ *
+ * Checked after the secret is read, because the answer depends on WHICH secret:
+ * the block lifts the moment the stored credential changes. That is the real
+ * shape of the failure — the user rotates a token and pastes a narrower one —
+ * and it is why the hash is stored rather than a flag. Retrying a 401 against a
+ * host that allows fifty calls a day burns forty-eight of them before lunch.
+ */
+/**
+ * Stamp a row with the source it came from — and nothing else.
+ *
+ * The one thing this must NOT do is fill in a `uid`. core/db.mjs:384 reads
+ * `Number.isFinite(Number(msg.uid)) ? Number(msg.uid) : null`, so an OMITTED uid
+ * becomes null and `uid: null` becomes 0 — two different `messageRowId`s for the
+ * same message (measured: 58ac70ac2a9131aa against 36c5d228c13041e4). If this
+ * function normalised a missing uid to null "for tidiness", every connector
+ * without an integer identity would re-insert every row it has ever seen on
+ * every sweep: `stats.newMessages` would never settle, `shouldRunFull` would
+ * force a full run every time, and the user would be billed for a model call
+ * every thirty minutes. The spread copies what the connector emitted, exactly.
+ */
+function stampFor(connector, source) {
+  return connector.sink === 'events'
+    ? (row) => ({ ...row, calendarId: source.id })
+    : (row) => ({ ...row, sourceId: source.id });
+}
+
+function authResting(state, secret, nowMs) {
+  const until = Number(state.authBlockedUntil) || 0;
+  if (!until || nowMs >= until) return null;
+  if (state.secretHash && state.secretHash !== secretHash(secret)) return null;
+  return `the stored credential was refused; not retrying until ${new Date(until).toISOString()} or until it changes`;
 }
 
 function errorText(err) {
@@ -567,132 +598,163 @@ export async function runSweep({
 
   emit('fetch', 'Reading mail and calendars', 0, 0);
 
-  const mailAccounts = (Array.isArray(config.mail) ? config.mail : []).filter(isEnabled);
-  const calendars = (Array.isArray(config.calendars) ? config.calendars : []).filter(isEnabled);
+  const from = new Date(Date.now() - CALENDAR_BACK_DAYS * 86_400_000).toISOString();
+  const to = new Date(Date.now() + CALENDAR_FORWARD_DAYS * 86_400_000).toISOString();
 
-  const mailTasks = mailAccounts.map(async (account) => {
-    const label = account.label || account.host || account.id;
-    let pass = null;
-    try {
-      pass = account.keyRef ? await getSecret(account.keyRef) : null;
-    } catch (err) {
-      sources.push({ kind: 'mail', id: account.id, label, ok: false, count: 0, error: storedError(err) });
-      return [];
+  /**
+   * One loop, every source, whatever kind it is.
+   *
+   * This replaced two near-identical loops — one for mail, one for calendars —
+   * that between them held every string a user reads when a fetch goes wrong.
+   * The acceptance criterion for the replacement was that every one of those
+   * strings comes out byte-identical, so they are quoted here rather than
+   * rephrased: `label` falls through the same chain (`host` is undefined on a
+   * calendar and `url` is undefined on a mail account, so each lands where it
+   * always did — verified against both of the chains this replaced), and the
+   * no-password sentence is the sentence, not a description of one.
+   */
+  const sourceTasks = enabledSources(config).map(async ({ connector, source }) => {
+    const label = source.label || source.host || source.url || source.id;
+    const nothing = { sink: connector.sink, rows: [], cursor: undefined, sourceId: source.id };
+    const state = readSourceState(db, source.id);
+    const startedMs = Date.now();
+
+    const resting = restingFor(connector, state, startedMs);
+    if (resting) {
+      slog.debug(`source resting: ${label}`, { id: source.id, why: resting });
+      return nothing;
     }
-    if (!pass) {
+
+    /* The keyRef is used exactly as configured and is never synthesised here. A
+       calendar saved before the Settings editor started minting
+       `calendar.${id}` has none, and inventing one would make this loop look up
+       a secret for a source that has never had one — a lookup that does not
+       happen today. core/config.mjs mints the default where the entry is
+       created, which is the only place that can know it is new. */
+    let secret = null;
+    try {
+      secret = source.keyRef ? await getSecret(source.keyRef) : null;
+    } catch (err) {
+      sources.push({ kind: connector.family, id: source.id, label, ok: false, count: 0, error: storedError(err) });
+      return nothing;
+    }
+    if (connector.credential?.required && !secret) {
       sources.push({
-        kind: 'mail',
-        id: account.id,
+        kind: connector.family,
+        id: source.id,
         label,
         ok: false,
         count: 0,
         error: `No password stored for ${label}. Add it in Settings — Zelos never writes it to disk in the clear.`,
       });
-      return [];
+      return nothing;
     }
 
-    const collected = [];
-    // Mailboxes are read one at a time per account: they share a host, and
-    // opening four IMAP connections to the same server at once is how a sweep
-    // gets rate-limited or refused.
-    for (const mailbox of mailboxesFor(account)) {
-      if (abort()) break;
-      try {
-        const rows = await fetchMail({
-          account,
-          mailbox,
-          pass,
-          sinceDays: account.lookbackDays ?? 14,
-          limit: account.maxMessages ?? 400,
-          onProgress: (p) => emit('mail', `${label}: ${p.message}`, p.done, p.total),
-          signal,
-        });
-        for (const row of rows || []) {
-          collected.push({
-            ...row,
-            sourceId: account.id,
-            direction: directionOf(row, mailbox, account, identityEmail),
-          });
-        }
-        sources.push({
-          kind: 'mail',
-          id: account.id,
-          label: `${label} / ${mailbox}`,
-          ok: true,
-          count: rows?.length ?? 0,
-          error: null,
-        });
-      } catch (err) {
-        slog.warn(`mail source failed: ${label} / ${mailbox}`, { error: storedError(err) });
-        sources.push({
-          kind: 'mail',
-          id: account.id,
-          label: `${label} / ${mailbox}`,
-          ok: false,
-          count: 0,
-          error: storedError(err),
-        });
+    const stillRefused = authResting(state, secret, startedMs);
+    if (stillRefused) {
+      slog.debug(`source resting: ${label}`, { id: source.id, why: stillRefused });
+      return nothing;
+    }
+
+    const meter = createMeter(connector.limits, state, startedMs);
+    const record = (patch) => {
+      // Written only when something would read it back. The four connectors
+      // that predate this interface declare no limits and return no cursor, so
+      // they leave `kv` exactly as they found it.
+      const next = { ...state, lastAt: startedMs, spent: meter.spent, windowStartedAt: meter.windowStartedAt, ...patch };
+      if (keepsState(connector) || Object.keys(state).length || patch.authBlockedUntil || patch.notBefore) {
+        writeSourceState(db, source.id, next);
       }
-    }
-    return collected;
-  });
+    };
 
-  const from = new Date(Date.now() - CALENDAR_BACK_DAYS * 86_400_000).toISOString();
-  const to = new Date(Date.now() + CALENDAR_FORWARD_DAYS * 86_400_000).toISOString();
-
-  const calendarTasks = calendars.map(async (calendar) => {
-    const label = calendar.label || calendar.url || calendar.id;
     try {
-      const pass = calendar.keyRef ? await getSecret(calendar.keyRef) : null;
-      const events = await fetchEvents({
-        calendar,
-        pass,
-        from,
-        to,
+      const result = await connector.collect({
+        source,
+        label,
+        secret,
+        cursor: readCursor(db, source.id),
+        window: { from, to },
         timezone: tz,
-        email: identityEmail || null,
+        identityEmail,
+        now,
+        emit: (message, done = 0, total = 0) => emit(connector.family, message, done, total),
         signal,
+        log: slog.child(`[${connector.type} ${source.id}]`),
+        http: createHttp({
+          origins: originsFor(connector, source),
+          limits: connector.limits,
+          credential: connector.credential,
+          graphql: connector.graphql === true,
+          secret,
+          signal,
+          meter,
+          log: slog,
+        }),
+        /* The sweep's own injected deps, and ONLY the four that already exist.
+           `fetchMail` and `fetchEvents` are here because imap, ics, caldav and
+           file are older than this interface and the suite injects through
+           them; a new connector reaches the network through `ctx.http` and has
+           no business knowing this field is here. */
+        deps: { fetchMail, fetchEvents },
       });
-      // Read before the map, which drops it along with every other non-index
-      // property on the array. See markTruncated.
-      const truncated = events?.truncated === true;
-      const rows = (events || []).map((e) => ({ ...e, calendarId: calendar.id }));
-      /* A truncated calendar is reported as a source that did NOT come back
-         whole, and `ok: false` is the deliberate half of that.
-         `ui/views/now.js` — the only screen that renders `sources[]` — filters
-         on `s.ok === false` and reads `s.error` off what survives, so a note
-         attached to an `ok: true` entry is a string with no reader, which is the
-         exact shape of the bug being fixed: `expand()` already logs this and the
-         log reaches nobody. The count still says how many entries were kept, and
-         the banner it lands in is headed "The last sweep could not read
-         everything" — which is precisely what happened. */
-      if (truncated) {
+
+      const rows = [];
+      const maxRows = Number.isInteger(connector.limits.maxRows) ? connector.limits.maxRows : null;
+      for (const part of result?.parts || []) {
+        const at = part.label ? `${label} / ${part.label}` : label;
+        if (part.error) {
+          slog.warn(`${connector.family} source failed: ${at}`, { error: storedError(part.error) });
+          sources.push({ kind: connector.family, id: source.id, label: at, ok: false, count: 0, error: storedError(part.error) });
+          continue;
+        }
+        let kept = Array.isArray(part.rows) ? part.rows : [];
+        let note = part.note ?? null;
+        if (maxRows !== null && kept.length > maxRows) {
+          // The same shape a truncated calendar reports: a non-zero count with
+          // `ok: false`, because "I read the first 200 and dropped the rest" is
+          // neither a success nor a failure.
+          note = note || `This source returned ${kept.length.toLocaleString('en-US')} entries and Zelos keeps ${maxRows.toLocaleString('en-US')}, so the rest were dropped.`;
+          kept = kept.slice(0, maxRows);
+        }
+        rows.push(...kept.map(stampFor(connector, source)));
         sources.push({
-          kind: 'calendar',
-          id: calendar.id,
-          label,
-          ok: false,
-          count: rows.length,
-          error: `This calendar filled Zelos's ceiling of ${ICS_MAX_INSTANCES.toLocaleString('en-US')} entries for the window, so anything past the ${ICS_MAX_INSTANCES.toLocaleString('en-US')}th was dropped from the far end of it. Narrow the subscription, or split it in two.`,
+          kind: connector.family,
+          id: source.id,
+          label: at,
+          ok: !note,
+          count: kept.length,
+          error: note ? storedError(note) : null,
         });
-      } else {
-        sources.push({ kind: 'calendar', id: calendar.id, label, ok: true, count: rows.length, error: null });
       }
-      emit('calendar', `${label}: ${rows.length} entries`, rows.length, rows.length);
-      return rows;
+
+      record({ lastOkAt: startedMs, notBefore: 0, authBlockedUntil: 0, secretHash: null });
+      return { sink: connector.sink, rows, cursor: result?.cursor, sourceId: source.id };
     } catch (err) {
-      slog.warn(`calendar source failed: ${label}`, { error: storedError(err) });
-      sources.push({ kind: 'calendar', id: calendar.id, label, ok: false, count: 0, error: storedError(err) });
-      return [];
+      slog.warn(`${connector.family} source failed: ${label}`, { error: storedError(err) });
+      sources.push({ kind: connector.family, id: source.id, label, ok: false, count: 0, error: storedError(err) });
+      /* The only two failures Zelos reacts to rather than merely reports.
+         Everything else is "try again next sweep", which is today's behaviour
+         and is right: an unreachable host is the case this product is built
+         around. A refused credential and a stated rate limit are different —
+         retrying either costs the user something and buys nothing. */
+      if (err instanceof AuthError) {
+        record({ authBlockedUntil: startedMs + AUTH_BLOCK_MS, secretHash: secretHash(secret) });
+      } else if (err instanceof RateLimitError) {
+        record({ notBefore: startedMs + (err.retryAfterMs || 0) });
+      } else {
+        record({});
+      }
+      return nothing;
     }
   });
 
-  const [mailResults, calendarResults] = await Promise.all([
-    Promise.all(mailTasks),
-    Promise.all(calendarTasks),
-  ]);
-  const fetchedMessages = mailResults.flat();
-  const fetchedEvents = calendarResults.flat();
+  const results = await Promise.all(sourceTasks);
+  const fetchedMessages = [];
+  const fetchedEvents = [];
+  for (const r of results) {
+    if (r.sink === 'events') fetchedEvents.push(...r.rows);
+    else fetchedMessages.push(...r.rows);
+  }
 
   stats.sourcesOk = sources.filter((s) => s.ok).length;
   stats.sourcesFailed = sources.length - stats.sourcesOk;
@@ -714,6 +776,27 @@ export async function runSweep({
   } catch (err) {
     slog.error('could not store fetched sources', { error: storedError(err) });
     return finish(false, storedMessage(`Could not store what was fetched: ${errorText(err)}`));
+  }
+
+  /* ROWS FIRST, CURSORS SECOND, and the order is the guarantee.
+     A cursor advanced before the upsert loses rows forever if the process dies
+     between the two — the connector would come back next sweep asking for
+     everything AFTER a page it never stored. This way round the crash costs one
+     repeated fetch and nothing else, because every sink is an upsert on a
+     deterministic id (core/db.mjs:270) and the COALESCE at core/db.mjs:369
+     already means a cheaper re-fetch never blanks a richer earlier one.
+     core/db.mjs:20-24 states that re-fetching is the normal case; this inherits
+     that claim rather than reinventing it.
+
+     Deliberately NOT one transaction with the rows. Design work on this
+     considered folding both into a single COMMIT and it needs per-source
+     persist plus a re-entrancy guard, because `withTransaction` cannot nest —
+     `upsertMessages` opens its own and SQLite answers "cannot start a
+     transaction within a transaction" (measured on Node 26.3.0). Both of those
+     are behaviour changes wearing a refactor's clothes. */
+  for (const r of results) {
+    if (r.cursor === undefined) continue;
+    writeCursor(db, r.sourceId, r.cursor);
   }
 
   /* ---- 3. light or full ------------------------------------------- */

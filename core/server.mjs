@@ -53,7 +53,11 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
-import { loadConfig, saveConfig, validateConfig, paths, isValidRef } from './config.mjs';
+import { CALENDAR_DEFAULTS, loadConfig, saveConfig, validateConfig, paths, isValidRef } from './config.mjs';
+/* The registry, so the two places below that used to name source kinds by hand
+   ask it instead. It costs this process nothing new: every module it pulls in —
+   core/sources/imap.mjs, caldav.mjs, ics.mjs — is already imported below. */
+import { describe as describeConnectors, typesFor } from './connectors/index.mjs';
 import { getSecret, setSecret, deleteSecret, listRefs, backend } from './secrets.mjs';
 import {
   listBoard, bucketCounts, listEvents, listDrafts, updateDraft, lastRun,
@@ -69,7 +73,11 @@ import { handle as mcpHandle } from './mcp.mjs';
 import { sampleStatus, seedSampleData, clearSampleData } from './sample-data.mjs';
 import { complete, stream, listModels, probeLocal, isLocalAddress, PRESETS } from './llm.mjs';
 import { safeUrl, screenContent, cap, wrapUntrusted, scrubForPrompt, SafetyError } from './safety.mjs';
-import { testConnection as testMailConnection } from './sources/imap.mjs';
+import {
+  testConnection as testMailConnection,
+  connectDeviceCode,
+  MS_LOGIN_ORIGIN,
+} from './sources/imap.mjs';
 import {
   testConnection as testCalDavConnection,
   invalidate as forgetCalDavLayouts,
@@ -1176,6 +1184,26 @@ function handlePresets(ctx) {
   sendJSON(ctx.res, 200, PRESETS);
 }
 
+/**
+ * Every connector this build has, as the JSON-safe half of its manifest.
+ *
+ * This route exists because the Settings screen has to render a picker, a set of
+ * fields and a credential prompt for a source type it has never heard of, and
+ * `ui/` reaches `core/` only over HTTP — test/repo.test.mjs asserts the UI is
+ * standalone, so importing the registry there is not available and would not be
+ * wanted. `describe()` is deliberately not the manifest: no functions, no
+ * `collect`, no `check`, nothing a connector could use to smuggle markup into a
+ * page.
+ *
+ * It reads nothing from disk and answers with no user data at all — it is a
+ * description of the build — but it stays behind the session token like every
+ * other /api route, because a route that opts out of the gate is the beginning
+ * of an argument about which other ones could.
+ */
+function handleConnectors(ctx) {
+  sendJSON(ctx.res, 200, { connectors: describeConnectors() });
+}
+
 async function handleLocalProbe(ctx) {
   sendJSON(ctx.res, 200, await probeLocal({}));
 }
@@ -1196,6 +1224,36 @@ function requireTlsFrom(body) {
   return value;
 }
 
+/**
+ * `auth` and the `oauth` block, read off a request body the way core/config.mjs
+ * validates them on disk.
+ *
+ * The endpoint is deliberately NOT readable from the body. A request-supplied
+ * token endpoint would be a one-field exfiltration route for the refresh token —
+ * the most valuable secret this app holds — and `assertTokenEndpoint` refusing
+ * everything but Microsoft and loopback is a backstop, not a reason to offer the
+ * field. The only way to point this anywhere else is `createServer({deviceAuth})`
+ * at construction, which is a seam for the test rig and reaches no wire.
+ *
+ * `tokenRef` is not read either: it is `keyRef`, always, because that is where
+ * core/sources/imap.mjs §6 files a grant so that removing the account removes it.
+ */
+function mailAuthFrom(body, keyRef) {
+  const method = body?.auth === undefined || body?.auth === null ? 'password' : body.auth;
+  if (method !== 'password' && method !== 'xoauth2') {
+    throw new HttpError(400, 'auth must be "password" or "xoauth2"');
+  }
+  if (method === 'password') return { method, oauth: null };
+
+  const block = body?.oauth;
+  if (!block || typeof block !== 'object' || Array.isArray(block)) {
+    throw new HttpError(400, 'oauth must be an object with clientId and tenantId when auth is xoauth2');
+  }
+  const clientId = requireString(block, 'clientId', { max: 64 });
+  const tenantId = requireString(block, 'tenantId', { max: 128, required: false }) || 'common';
+  return { method, oauth: { clientId, tenantId, tokenRef: keyRef } };
+}
+
 async function handleMailTest(ctx) {
   const body = await readJSON(ctx.req);
   const host = requireString(body, 'host', { max: 255 });
@@ -1204,23 +1262,258 @@ async function handleMailTest(ctx) {
   const port = Number(body.port ?? 993);
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new HttpError(400, 'port must be a port number');
   const requireTls = requireTlsFrom(body);
-  const pass = await secretFor(keyRef);
-  if (!pass) throw new HttpError(400, `no password is stored for ${keyRef} — save it first with POST /api/secrets`);
+  const { method, oauth } = mailAuthFrom(body, keyRef);
+
+  /* An OAuth account has no password to be missing, and asking for one here is
+     how the button would report "save it first with POST /api/secrets" about an
+     account that is signed in perfectly well. What it needs instead is a stored
+     GRANT, and `accessTokenFor` already says so in a sentence a person can act
+     on ("this account has not been connected to Microsoft on this machine") — so
+     the check belongs there, where the answer is, and not here. */
+  const pass = method === 'xoauth2' ? '' : await secretFor(keyRef);
+  if (method !== 'xoauth2' && !pass) {
+    throw new HttpError(400, `no password is stored for ${keyRef} — save it first with POST /api/secrets`);
+  }
 
   // The test has to connect under the same rule the sweep will, or it is not a
   // test of this account: an account that will refuse to send its password in
   // the clear at 07:00 must refuse here too, while the user is watching and can
-  // do something about it.
+  // do something about it. The same goes for how it signs in — a test that used
+  // a password while the sweep used a bearer token would be a test of a
+  // different account.
   const result = await testMailConnection({
     host,
     port,
     secure: body.secure !== false,
     user,
     pass,
+    auth: method,
+    oauth: oauth ? { ...oauth, endpoint: ctx.deviceSignIns.endpoint } : null,
     requireTls,
     timeoutMs: 30_000,
   });
   sendJSON(ctx.res, 200, result);
+}
+
+/* ------------------------------------------------- /api/mail/oauth (RFC 8628)
+ *
+ * "Sign in with Microsoft", which is a device authorization grant and is three
+ * HTTP requests from this panel's point of view: POST to start one, GET to ask
+ * whether the person has finished in their browser, DELETE to give up.
+ *
+ * The polling loop lives on THIS side of the wire on purpose. RFC 8628 §3.5
+ * pins the interval — five seconds, plus five more every time the server says
+ * `slow_down` — and core/sources/imap.mjs implements exactly that, with the
+ * back-off, the expiry and the `authorization_pending` handling under test. A
+ * browser-driven poll would either duplicate all of it in ui/ (a second
+ * implementation of the one thing a rate limit punishes) or ignore it. So the
+ * page asks a question with no timing content at all, and everything the RFC has
+ * an opinion about happens where it is already written down.
+ *
+ * The device code never crosses back to the page. Whoever holds it collects the
+ * tokens when the user finishes, so it stays in this process; what the panel
+ * gets is the user code, which is meant for a human's eyes, and the address to
+ * type it at.
+ */
+
+/** How many device sign-ins one server will run at once. */
+const MAX_DEVICE_SIGNINS = 4;
+
+/**
+ * How long a finished flow is readable after it finished.
+ *
+ * Long enough that a panel polling every two seconds cannot miss the verdict if
+ * the tab was in the background when it landed, short enough that a laptop left
+ * open for a day is not holding a list of every mailbox somebody connected.
+ */
+const DEVICE_FLOW_LINGER_MS = 5 * 60_000;
+
+/**
+ * The device sign-ins one server has in flight.
+ *
+ * Per-server rather than at module scope, like `handoffs` and `touchedAt` above
+ * it: every test file in this repo builds more than one server in a process, and
+ * two of them sharing a table would let one cancel the other's sign-in.
+ */
+class DeviceSignInPad {
+  constructor({ endpoint = MS_LOGIN_ORIGIN, sleep = undefined, logger = log } = {}) {
+    this.endpoint = endpoint;
+    this.sleep = sleep;
+    this.logger = logger;
+    this.flows = new Map();
+  }
+
+  /** Forget anything finished long enough ago that nobody is still reading it. */
+  #sweep(now = Date.now()) {
+    for (const [id, flow] of this.flows) {
+      if (flow.finishedAt && now - flow.finishedAt > DEVICE_FLOW_LINGER_MS) this.flows.delete(id);
+    }
+  }
+
+  /** What a caller may see: never the device code, never the tokens. */
+  static #view(flow) {
+    return {
+      id: flow.id,
+      state: flow.state,
+      keyRef: flow.keyRef,
+      userCode: flow.userCode,
+      verificationUri: flow.verificationUri,
+      message: flow.message,
+      expiresAt: flow.expiresAt,
+      scope: flow.scope,
+      error: flow.error,
+      reconnect: flow.reconnect,
+    };
+  }
+
+  async begin({ keyRef, clientId, tenantId }) {
+    this.#sweep();
+    const live = [...this.flows.values()].filter((f) => f.state === 'pending').length;
+    if (live >= MAX_DEVICE_SIGNINS) {
+      throw new HttpError(429, `${live} Microsoft sign-ins are already waiting for a code — finish or cancel one first`);
+    }
+
+    const controller = new AbortController();
+    const flow = {
+      id: crypto.randomBytes(8).toString('hex'),
+      state: 'pending',
+      keyRef,
+      userCode: '',
+      verificationUri: '',
+      message: '',
+      expiresAt: '',
+      scope: '',
+      error: null,
+      reconnect: false,
+      finishedAt: 0,
+      controller,
+    };
+
+    /* `connectDeviceCode` is begin + poll + store in one call, and it is used
+       whole rather than as its three parts so that every protocol DECISION stays
+       in the module that has the tests: the five-second floor, `slow_down`, the
+       expiry, and — the one nobody would think to re-derive here — the refusal
+       of a grant that came back without a refresh token, which would work
+       perfectly for an hour and then stop. */
+    let announce;
+    const shown = new Promise((resolve) => { announce = resolve; });
+    const run = connectDeviceCode({
+      clientId,
+      tenantId,
+      tokenRef: keyRef,
+      endpoint: this.endpoint,
+      signal: controller.signal,
+      ...(this.sleep ? { sleep: this.sleep } : {}),
+      onCode: (code) => {
+        flow.userCode = code.userCode;
+        flow.verificationUri = code.verificationUri;
+        flow.message = code.message;
+        flow.expiresAt = code.expiresAt;
+        announce(true);
+      },
+    })
+      .then((result) => {
+        flow.state = 'connected';
+        flow.scope = result.scope || '';
+        this.logger.info('server: a mailbox was connected to Microsoft', { keyRef });
+      })
+      .catch((err) => {
+        flow.state = err?.code === 'cancelled' ? 'cancelled' : 'failed';
+        /* The message verbatim, like POST /api/mail/test already echoes
+           `testConnection`'s. It was written for a person by the module that
+           knows what went wrong, and the alternative — a code the page maps back
+           to a sentence — is a second vocabulary that goes stale. It cannot
+           carry a credential: the only place these strings quote is the token
+           endpoint's own `error` and `error_description`, capped, and that
+           endpoint is Microsoft or loopback and nothing else. */
+        flow.error = err?.message || 'the sign-in failed';
+        flow.code = err?.code || 'oauth_error';
+        flow.reconnect = err?.reconnect === true;
+      })
+      .finally(() => {
+        flow.finishedAt = Date.now();
+      });
+    // Nothing awaits `run`; it is the background half. Swallowed here so a
+    // rejection that somehow escapes the catch above cannot become an
+    // unhandledRejection that takes the whole process down at 07:00.
+    run.catch(() => {});
+
+    /* Whichever comes first: the code to show, or the flow ending without one.
+       A bad client id, an unreachable endpoint and a tenant that is not a tenant
+       all fail inside `beginDeviceAuthorization`, before `onCode` — so this
+       resolves `false` and the caller gets the reason as a 502 instead of an id
+       for a flow that is already dead. */
+    await Promise.race([shown, run.then(() => false)]);
+    if (flow.state !== 'pending') {
+      /* A client id that is not a GUID and a tenant that is not a tenant are the
+         caller's fault and are reported as such — a 502 about those would send
+         the reader to look at Microsoft, which never heard from us. Everything
+         else genuinely happened upstream. */
+      const mine = flow.code === 'not_configured' || flow.code === 'bad_tenant'
+        || flow.code === 'bad_endpoint' || flow.code === 'bad_scope';
+      throw new HttpError(mine ? 400 : 502, flow.error || 'the Microsoft sign-in could not be started');
+    }
+
+    this.flows.set(flow.id, flow);
+    return DeviceSignInPad.#view(flow);
+  }
+
+  read(id) {
+    this.#sweep();
+    const flow = this.flows.get(id);
+    return flow ? DeviceSignInPad.#view(flow) : null;
+  }
+
+  cancel(id) {
+    const flow = this.flows.get(id);
+    if (!flow) return null;
+    flow.controller.abort();
+    return DeviceSignInPad.#view(flow);
+  }
+
+  /** Every flow, abandoned. Called when the server closes. */
+  closeAll() {
+    for (const flow of this.flows.values()) flow.controller.abort();
+    this.flows.clear();
+  }
+}
+
+/**
+ * `mail.<account id>`, and nothing else.
+ *
+ * The grant is written to whatever ref this names, so an unconstrained one would
+ * let a mistyped body drop a token blob over `model.default` and take the LLM
+ * key with it. Nothing legitimate calls this with anything but a mail account's
+ * own keyRef — that is where core/sources/imap.mjs stores a grant, so that
+ * removing the account removes it — and a route that accepts more than its
+ * caller needs is a route somebody will one day reach with more.
+ */
+function mailRefFrom(body) {
+  const keyRef = requireString(body, 'keyRef', { max: 64 });
+  if (!isValidRef(keyRef) || !keyRef.startsWith('mail.')) {
+    throw new HttpError(400, 'keyRef must name a mail account, like mail.m_9f3a1c');
+  }
+  return keyRef;
+}
+
+async function handleMailOAuthBegin(ctx) {
+  const body = await readJSON(ctx.req);
+  const keyRef = mailRefFrom(body);
+  const clientId = requireString(body, 'clientId', { max: 64 });
+  const tenantId = requireString(body, 'tenantId', { max: 128, required: false }) || 'common';
+  sendJSON(ctx.res, 200, await ctx.deviceSignIns.begin({ keyRef, clientId, tenantId }));
+}
+
+function handleMailOAuthStatus(ctx, [id]) {
+  const flow = ctx.deviceSignIns.read(id);
+  if (!flow) throw new HttpError(404, 'no sign-in is waiting under that id — it finished, expired, or this server was restarted');
+  sendJSON(ctx.res, 200, flow);
+}
+
+function handleMailOAuthCancel(ctx, [id]) {
+  const flow = ctx.deviceSignIns.cancel(id);
+  if (!flow) throw new HttpError(404, 'no sign-in is waiting under that id');
+  sendJSON(ctx.res, 200, { ...flow, state: 'cancelled' });
 }
 
 /** Read a fetch Response body with a hard byte cap, so a huge .ics cannot OOM us. */
@@ -1300,10 +1593,26 @@ async function fetchIcsOnce(href, headers) {
   return second;
 }
 
+/** "ics, caldav or file" — a list a person reads, from a list the code holds. */
+function orList(items) {
+  if (items.length <= 1) return items[0] ?? '';
+  return `${items.slice(0, -1).join(', ')} or ${items[items.length - 1]}`;
+}
+
 async function handleCalendarTest(ctx) {
   const body = await readJSON(ctx.req);
-  const kind = body.kind === undefined ? 'ics' : body.kind;
-  if (!['ics', 'caldav', 'file'].includes(kind)) throw new HttpError(400, 'kind must be ics, caldav or file');
+  /* The default is the blank a new calendar is created with, read off
+     core/config.mjs rather than restated as 'ics' here. Restating it is how a
+     default drifts: the two would disagree the day somebody changed one, and the
+     symptom would be a Test button that probes a different kind from the one the
+     form is about to save. */
+  const kind = body.kind === undefined ? CALENDAR_DEFAULTS.kind : body.kind;
+  /* Asked of the registry, not of a hardcoded array. This was
+     `['ics', 'caldav', 'file']`, which meant a new calendar connector was
+     unreachable from the Test button until somebody remembered to edit an HTTP
+     handler — in a file that knows nothing about calendars. */
+  const kinds = typesFor('calendars');
+  if (!kinds.includes(kind)) throw new HttpError(400, `kind must be ${orList(kinds)}`);
 
   if (kind === 'caldav') {
     const url = requireString(body, 'url', { max: 2_048 });
@@ -1331,7 +1640,12 @@ async function handleCalendarTest(ctx) {
     return;
   }
 
-  // webcal: is how Apple and friends publish an https .ics.
+  /* Everything else is read as a subscribed .ics — the same fallback
+     `enabledSources` makes for a calendar kind no connector claims, and the same
+     one core/doctor.mjs makes for a calendar connector with no `check` of its
+     own. Three readers, one decision about what an unremarkable calendar address
+     is; a fourth answer here would be the one that surprises somebody.
+     webcal: is how Apple and friends publish an https .ics. */
   const raw = requireString(body, 'url', { max: 2_048 }).replace(/^webcal:/i, 'https:');
   const url = safeUrl(raw);
   if (!url || !/^https?:/.test(url)) throw new HttpError(400, 'url must be an http, https or webcal address');
@@ -2059,7 +2373,11 @@ const ROUTES = [
   ['GET', /^\/api\/model\/list$/, handleModelList],
   ['GET', /^\/api\/model\/presets$/, handlePresets],
   ['GET', /^\/api\/local\/probe$/, handleLocalProbe],
+  ['GET', /^\/api\/connectors$/, handleConnectors],
   ['POST', /^\/api\/mail\/test$/, handleMailTest],
+  ['POST', /^\/api\/mail\/oauth$/, handleMailOAuthBegin],
+  ['GET', new RegExp(`^/api/mail/oauth/${ID}$`), handleMailOAuthStatus],
+  ['DELETE', new RegExp(`^/api/mail/oauth/${ID}$`), handleMailOAuthCancel],
   ['POST', /^\/api\/calendar\/test$/, handleCalendarTest],
   ['POST', /^\/api\/ask$/, handleAsk],
   ['PUT', new RegExp(`^/api/drafts/${ID}$`), handleDraftPut],
@@ -2149,6 +2467,21 @@ export function createServer({
    * server built with the default logger genuinely has no file.
    */
   logFile = null,
+  /**
+   * The two injectable parts of "Sign in with Microsoft": `endpoint`, the origin
+   * a device code and a token are asked for, and `sleep`, how the poll waits
+   * between attempts.
+   *
+   * A seam for the same reason `heartbeatMs` is one. RFC 8628 §3.5 sets a
+   * five-second floor on polling and `slow_down` adds five more, so a test that
+   * drove this against a real timer would take a minute per case and would
+   * therefore be written not to drive it at all. `endpoint` is a seam for the
+   * blunter reason that the alternative is contacting Microsoft from a test run.
+   *
+   * Neither is reachable from a request — see `mailAuthFrom`. Production passes
+   * nothing and gets `https://login.microsoftonline.com` and a real timer.
+   */
+  deviceAuth = {},
 } = {}) {
   if (!db) throw new TypeError('createServer needs an open database (core/db.mjs open())');
 
@@ -2189,6 +2522,11 @@ export function createServer({
   const touchedAt = new Map();
   /** Per-server, like the session token it hands out, and gone when it is. */
   const handoffs = new HandoffPad({ ttlMs: handoffTtlMs });
+  const deviceSignIns = new DeviceSignInPad({
+    endpoint: deviceAuth.endpoint ?? MS_LOGIN_ORIGIN,
+    sleep: deviceAuth.sleep,
+    logger,
+  });
   const dueForTouch = (id) => {
     const now = Date.now();
     const last = touchedAt.get(id) ?? 0;
@@ -2316,6 +2654,7 @@ export function createServer({
       logger,
       config: () => current,
       setConfig: (next) => { current = next; },
+      deviceSignIns,
     };
 
     try {
@@ -2335,6 +2674,14 @@ export function createServer({
       else sendJSON(res, 500, { error: 'internal error', detail: whereTheReasonWent });
     }
   });
+
+  /* A device sign-in outlives the request that started it — that is the whole
+     point of it — so it has to be told when the process it is polling from has
+     stopped caring. Without this, closing the server left a loop dialling a
+     token endpoint every five seconds for the fifteen minutes a device code
+     lives, which in a test run means a socket opened after `t.after` tore the
+     mock server down. */
+  server.on('close', () => deviceSignIns.closeAll());
 
   server.sessionToken = token;
   server.zelos = {

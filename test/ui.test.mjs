@@ -1731,20 +1731,78 @@ test('Settings can set who you are, and the value has a reader on the other end'
 });
 
 /**
- * `sentMailbox` is appended to every fetch by core/sweep.mjs's `mailboxesFor()`
- * and had no writer anywhere in `ui/` — the string appeared exactly once, in a
- * blank-account literal. The stored default is the bare word "Sent", which is
- * wrong for Gmail, Microsoft 365 and iCloud: three of the eight providers this
- * app hardcodes and the three largest. Reproduced against a Microsoft 365
- * folder set: `{label:"Work / Sent", ok:false, error:"Mailbox doesn't exist:
- * Sent"}` on every sweep forever, run still `ok:true`, doctor still "pass".
+ * `sentMailbox` is appended to every fetch by `mailboxesFor()` and had no writer
+ * anywhere in `ui/` — the string appeared exactly once, in a blank-account
+ * literal. The stored default is the bare word "Sent", which is wrong for Gmail,
+ * Microsoft 365 and iCloud: three of the eight providers this app hardcodes and
+ * the three largest. Reproduced against a Microsoft 365 folder set:
+ * `{label:"Work / Sent", ok:false, error:"Mailbox doesn't exist: Sent"}` on
+ * every sweep forever, run still `ok:true`, doctor still "pass".
  *
  * WRITER: the field below, into `saveConfig({ mail: [...] })`. READER:
- * `mailboxesFor()` and `directionOf()` in core/sweep.mjs, plus the mail check in
- * core/doctor.mjs — pinned in test/doctor.test.mjs. The prefill's own source is
- * the SPECIAL-USE flag `listMailboxes()` has computed since the client was
- * written and which nothing outside a test had ever read.
+ * `mailboxesFor()` and `directionOf()` in core/connectors/imap.mjs, plus the
+ * mail check in core/doctor.mjs — pinned in test/doctor.test.mjs. The prefill's
+ * own source is the SPECIAL-USE flag `listMailboxes()` has computed since the
+ * client was written and which nothing outside a test had ever read.
+ *
+ * The two readers used to sit in core/sweep.mjs and were moved to the IMAP
+ * connector when the run loop stopped knowing what an IMAP account is. Nothing
+ * about the behaviour changed — the functions moved file, character for
+ * character — so the assertion follows them, and it now pins the whole chain
+ * rather than one end of it: the reader exists, AND the run loop still reaches
+ * it. Pinning only the new file would have let a later edit orphan the reader
+ * without this test noticing, which is the exact failure it was written for.
  */
+test('the Outlook note tells the user to press something that exists', async () => {
+  /* REGRESSION, and it shipped for a few hours in exactly this shape.
+     `core/sources/imap.mjs` grew AUTHENTICATE XOAUTH2 and the device grant, the
+     preset note was rewritten to say "Set “How Zelos signs in” to “Sign in with
+     Microsoft”", and `core/doctor.mjs:660` renders that note verbatim to anyone
+     whose mail sign-in fails — which, for outlook.com, hotmail, live and msn,
+     is now everyone. The control it names did not exist. The advice was
+     therefore worse than the false sentence it replaced: the old one was wrong
+     about Microsoft, the new one sent people looking around the screen for a
+     button.
+
+     So this asserts the CHAIN, not the parts. The note names a label; the label
+     is a real option; the option's value is what config validates and what the
+     connector reads; and the form places the control and can actually start,
+     poll and cancel a sign-in. Any one of those drifting on its own is the bug. */
+  stubBrowserGlobals();
+  const settings = await import(fileUrl(UI, 'views/settings.js'));
+  const src = fs.readFileSync(path.join(UI, 'views/settings.js'), 'utf8');
+
+  const outlook = settings.IMAP_HINTS.find((h) => h.host === 'outlook.office365.com');
+  assert.ok(outlook?.note, 'the Outlook preset lost its note — it is the only warning that Microsoft stopped taking passwords');
+
+  const named = /“([^”]+)”\s*$|to “([^”]+)”/.exec(outlook.note);
+  const wanted = settings.MAIL_AUTH_CHOICES.find((c) => c.value === 'xoauth2');
+  assert.ok(wanted, 'there is no xoauth2 option for the note to point at');
+  assert.ok(outlook.note.includes(wanted.label.replace(/\s*\(.*\)$/, '')) || outlook.note.includes('Sign in with Microsoft'),
+    `the note does not name the option a user has to pick: ${JSON.stringify(outlook.note)}`);
+
+  // The value the UI stores is the one the other two halves already agree on.
+  const cfg = fs.readFileSync(path.join(ROOT, 'core/config.mjs'), 'utf8');
+  assert.match(cfg, /MAIL_AUTH_METHODS[^\n]*'xoauth2'/, 'config does not validate the value this picker writes');
+  const connector = fs.readFileSync(path.join(ROOT, 'core/connectors/imap.mjs'), 'utf8');
+  assert.match(connector, /xoauth2/, 'the IMAP connector does not read the value this picker writes');
+
+  // The control is placed in the returned form, not merely constructed.
+  const form = /function mailForm\(account, \{ onSaved, onCancel \}\)[\s\S]*?\n\}/m.exec(src);
+  assert.ok(form, 'mailForm is missing');
+  assert.match(form[0], /field\('How Zelos signs in', authSelect/, 'the sign-in picker is built but never placed');
+  assert.match(form[0], /credentialSlot/, 'the credential block has nowhere to render');
+
+  // And all three ends of the device flow are reachable from here.
+  for (const call of ['beginMailOAuth', 'mailOAuthStatus', 'cancelMailOAuth']) {
+    assert.match(form[0], new RegExp(`api\\.${call}\\(`), `the form never calls api.${call}`);
+  }
+  const apiSrc = fs.readFileSync(path.join(UI, 'lib/api.js'), 'utf8');
+  for (const call of ['beginMailOAuth', 'mailOAuthStatus', 'cancelMailOAuth']) {
+    assert.match(apiSrc, new RegExp(`${call}:`), `ui/lib/api.js has no ${call}`);
+  }
+});
+
 test('the mail editor can set the sent folder, and takes it from the server when asked', async () => {
   stubBrowserGlobals();
   const settings = await import(fileUrl(UI, 'views/settings.js'));
@@ -1785,10 +1843,14 @@ test('the mail editor can set the sent folder, and takes it from the server when
     assert.equal(settings.sentMailboxFromTest(junk, 'Sent'), 'Sent', JSON.stringify(junk));
   }
 
-  // The reader, named.
+  // The reader, named — and the path from the run loop to it, also named.
+  const imap = fs.readFileSync(path.join(ROOT, 'core/connectors/imap.mjs'), 'utf8');
+  assert.match(imap, /account\.sentMailbox === 'string' \? account\.sentMailbox\.trim\(\)/,
+    'core/connectors/imap.mjs no longer reads sentMailbox, so this field writes to nothing');
+  assert.match(imap, /mailboxesFor\(account\)/, 'the reader exists but nothing in the connector calls it');
   const sweep = fs.readFileSync(path.join(ROOT, 'core/sweep.mjs'), 'utf8');
-  assert.match(sweep, /account\.sentMailbox === 'string' \? account\.sentMailbox\.trim\(\)/,
-    'core/sweep.mjs no longer reads sentMailbox, so this field writes to nothing');
+  assert.match(sweep, /from '\.\/connectors\/index\.mjs'/,
+    'the run loop no longer reaches the connector registry, so the reader above runs for nobody');
 });
 
 /**
