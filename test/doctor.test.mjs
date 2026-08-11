@@ -578,3 +578,101 @@ describe('the calendar reader follows one redirect', () => {
     assert.ok(check.action);
   });
 });
+
+/* ================================================================== *
+ * 6. The two calendar probes that are not an .ics over http
+ * ================================================================== */
+
+/**
+ * These lived in `checkCalendar` as `if (calendar.kind === 'file')` and
+ * `if (calendar.kind === 'caldav')` and had no test of their own: the group
+ * above only ever exercises the http reader, so the two branches a user with a
+ * local file or a Fastmail account actually takes were carried by nothing.
+ *
+ * They now live in core/connectors/file.mjs and core/connectors/caldav.mjs, and
+ * doctor reaches them through `connector.check(source, ctx)` rather than by
+ * knowing what kinds exist. What is pinned here is the SENTENCES, because they
+ * are what the person who is stuck reads, and a refactor that quietly reworded
+ * them would be a regression no other assertion could see.
+ */
+describe('the calendar probes that belong to a connector', () => {
+  const calendar = (over = {}) => ({
+    id: 'c_1', enabled: true, label: 'Team', kind: 'file', url: '', user: '', keyRef: null, ...over,
+  });
+
+  test('a local .ics is read off the disk and counted', async () => {
+    const home = freshHome();
+    const file = path.join(home, 'team.ics');
+    fs.writeFileSync(file, ICS);
+    freshHome({ config: { calendars: [calendar({ url: file })] } });
+
+    const check = byId(await diagnose({ deps: SILENT_DEPS }), 'calendar.c_1');
+    assert.equal(check.status, 'pass', check.detail);
+    assert.match(check.detail, /1 entry/);
+    assert.ok(check.detail.includes(file), 'the path is what the reader has to check');
+  });
+
+  test('a path that is not a readable file says so, and says what to do', async () => {
+    const home = freshHome();
+    freshHome({ config: { calendars: [calendar({ url: path.join(home, 'nothing-here.ics') })] } });
+
+    const missing = byId(await diagnose({ deps: SILENT_DEPS }), 'calendar.c_1');
+    assert.equal(missing.status, 'fail', missing.detail);
+    assert.match(missing.detail, /ENOENT|no such file/i);
+    assert.match(missing.action, /readable \.ics file on this machine/);
+
+    // A directory is the case a bare readFile reports as something else entirely.
+    freshHome({ config: { calendars: [calendar({ url: home })] } });
+    const dir = byId(await diagnose({ deps: SILENT_DEPS }), 'calendar.c_1');
+    assert.equal(dir.status, 'fail', dir.detail);
+    assert.match(dir.detail, /that path is not a file/);
+  });
+
+  test('a CalDAV collection is counted, and a refusal names the app-password rule', async () => {
+    freshHome({ config: { calendars: [calendar({ kind: 'caldav', url: 'https://dav.example.com/', user: 'me', keyRef: 'calendar.c_1' })] } });
+
+    const asked = [];
+    const ok = byId(await diagnose({
+      deps: {
+        ...SILENT_DEPS,
+        getSecret: async () => 'hunter2',
+        testCalDav: async (spec) => { asked.push(spec); return { ok: true, calendars: [{}, {}], error: null }; },
+      },
+    }), 'calendar.c_1');
+    assert.equal(ok.status, 'pass', ok.detail);
+    assert.match(ok.detail, /2 calendars at https:\/\/dav\.example\.com\//);
+    // The stored password is handed over, or this is a test of an anonymous
+    // connection rather than of the user's account.
+    assert.equal(asked[0].pass, 'hunter2');
+    assert.equal(asked[0].user, 'me');
+
+    const refused = byId(await diagnose({
+      deps: {
+        ...SILENT_DEPS,
+        getSecret: async () => 'hunter2',
+        testCalDav: async () => ({ ok: false, calendars: [], error: 'the server said 401' }),
+      },
+    }), 'calendar.c_1');
+    assert.equal(refused.status, 'fail', refused.detail);
+    assert.match(refused.detail, /the server said 401/);
+    assert.match(refused.action, /app-specific password/);
+  });
+
+  test('a secret store that will not answer is not reported twice', async () => {
+    /* The secret-store line above is already a `fail` when this happens, and
+       sending the reader to re-check their calendar address instead is how a
+       diagnosis wastes somebody's afternoon. The connection is tried
+       unauthenticated and the server's answer is the diagnosis. */
+    freshHome({ config: { calendars: [calendar({ kind: 'caldav', url: 'https://dav.example.com/', user: 'me', keyRef: 'calendar.c_1' })] } });
+    const asked = [];
+    const check = byId(await diagnose({
+      deps: {
+        ...SILENT_DEPS,
+        getSecret: async () => { throw new Error('the keychain is locked'); },
+        testCalDav: async (spec) => { asked.push(spec); return { ok: true, calendars: [{}], error: null }; },
+      },
+    }), 'calendar.c_1');
+    assert.equal(check.status, 'pass', check.detail);
+    assert.equal(asked[0].pass, null);
+  });
+});

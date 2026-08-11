@@ -36,6 +36,13 @@ import { guessImapHost, testConnection as testImapConnection } from './sources/i
 import { testConnection as testCalDavConnection } from './sources/caldav.mjs';
 import { parseICS } from './sources/ics.mjs';
 import { safeUrl } from './safety.mjs';
+/* The registry, for the same reason core/sweep.mjs reads it: a diagnostic that
+   keeps its own list of source kinds is a second list, and the one that goes
+   stale is always the one nobody is looking at. It costs no new weight here —
+   every module the registry pulls in (core/sources/imap.mjs, caldav.mjs,
+   ics.mjs) is already imported above. */
+import { get as connectorFor, enabledSources, originsFor, unknownSources } from './connectors/index.mjs';
+import { createHttp } from './connectors/http.mjs';
 
 /**
  * The floor is not the version that added `node:sqlite` — it is the version
@@ -592,42 +599,125 @@ async function checkModelEndpoint(config, deps, { key, keyChecked, timeoutMs, si
   );
 }
 
+/**
+ * Is the string under this account's `keyRef` a Microsoft grant, or a password?
+ *
+ * Parsed here rather than by importing `loadOAuthTokens`, because that function
+ * reads core/secrets.mjs directly and this file reads secrets through
+ * `deps.getSecret` — a diagnosis that bypassed the injected reader would be
+ * testing a different machine's keychain than every other line in this report.
+ * The `kind` field is what tells the two apart: a password that happens to be
+ * valid JSON does not carry it, which is the case core/sources/imap.mjs:2032
+ * names.
+ */
+function storedGrant(raw) {
+  if (typeof raw !== 'string' || !raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' && parsed.kind === 'xoauth2' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * What an OAuth mailbox is missing, in the order a person can fix it, or null.
+ *
+ * Separate from the password path because none of its three failures has
+ * anything to do with a password, and the advice underneath used to say so
+ * anyway: "most sign-in failures here are a provider that refuses ordinary
+ * passwords" is a true and completely useless sentence to read about an account
+ * that is not sending one.
+ */
+function oauthTrouble(account, grant, name) {
+  const clientId = String(account.oauth?.clientId ?? '').trim();
+  if (!clientId) {
+    return {
+      detail: `${name} is set to sign in with Microsoft, but no application (client) ID is stored, so there is no app registration to sign in against.`,
+      action: 'Open Settings → Mail, edit this account and follow the steps under "Sign in with Microsoft" — '
+        + 'they end with an application (client) ID and a directory (tenant) ID to paste in. Zelos ships no registration of its own, by design.',
+    };
+  }
+  if (!grant) {
+    return {
+      detail: `${name} has an app registration but has never been signed in on this machine, so there is no token to open the mailbox with.`,
+      action: 'Open Settings → Mail, edit this account and press "Sign in with Microsoft". '
+        + 'Zelos shows a code, you type it at microsoft.com/devicelogin, and the panel finishes on its own.',
+    };
+  }
+  if (!grant.refreshToken) {
+    return {
+      detail: `${name} is signed in to Microsoft, but the stored grant has no refresh token, so it will stop working within the hour.`,
+      action: 'The app registration has to request the offline_access scope. Add it under API permissions, then sign in again from Settings → Mail.',
+    };
+  }
+  return null;
+}
+
 async function checkMailAccount(account, deps, { timeoutMs }) {
   const name = account.label || account.host || account.id;
   const id = `mail.${account.id}`;
   const label = `Mail · ${name}`;
   const guess = guessImapHost(account.user || '');
+  const oauth = account.auth === 'xoauth2';
 
   if (!account.host) {
     return check(id, label, 'fail', 'No IMAP server is set for this account.',
       `Open Settings → Mail and fill in the server.${guess.host ? ` For ${account.user || 'that address'} it is usually ${guess.host}, port ${guess.port}.` : ''}`);
   }
 
-  let pass = null;
+  let stored = null;
   try {
-    pass = account.keyRef ? await deps.getSecret(account.keyRef) : null;
+    stored = account.keyRef ? await deps.getSecret(account.keyRef) : null;
   } catch (err) {
-    return check(id, label, 'fail', `Zelos could not read the stored password: ${errorText(err)}`,
-      'See the secret store line above. Re-entering the password in Settings → Mail usually settles it.');
+    return check(id, label, 'fail', `Zelos could not read the stored ${oauth ? 'Microsoft sign-in' : 'password'}: ${errorText(err)}`,
+      `See the secret store line above. ${oauth ? 'Signing in again' : 'Re-entering the password'} in Settings → Mail usually settles it.`);
   }
-  if (!pass) {
+
+  const grant = storedGrant(stored);
+  if (oauth) {
+    const trouble = oauthTrouble(account, grant, name);
+    if (trouble) return check(id, label, 'fail', trouble.detail, trouble.action);
+  } else if (!stored) {
     return check(
       id, label, 'fail',
       `No password is stored for ${name}, so Zelos cannot sign in.`,
       `Open Settings → Mail and enter it. ${guess.note}`,
+    );
+  } else if (grant) {
+    /* A grant under an account that is set to send a password. It happens one
+       way: somebody connected the mailbox to Microsoft and then switched the
+       picker back. The sweep would send the whole JSON blob as a password —
+       which fails, with `LOGIN failed`, about a mailbox the user just watched
+       sign in successfully. */
+    return check(
+      id, label, 'fail',
+      `${name} holds a Microsoft sign-in but is set to send a password, so Zelos would offer the stored token as one.`,
+      'Open Settings → Mail and set "How Zelos signs in" to "Sign in with Microsoft", or enter a password to replace the stored sign-in.',
     );
   }
 
   // `requireTls` is forwarded so this connects under the same rule the sweep
   // will. A diagnosis that signs in where the real run would refuse to is not a
   // diagnosis, it is a second, more permissive client — and it would report an
-  // account as healthy on the morning its mail stops arriving.
+  // account as healthy on the morning its mail stops arriving. `auth` and the
+  // `oauth` block are forwarded for exactly the same reason, and were not: the
+  // doctor signed every account in with a password whatever the config said, so
+  // an OAuth mailbox came back "sign-in failed" no matter how healthy it was.
   const result = await deps.testImap({
     host: account.host,
     port: account.port ?? 993,
     secure: account.secure !== false,
     user: account.user,
-    pass,
+    pass: oauth ? '' : stored,
+    auth: oauth ? 'xoauth2' : 'password',
+    oauth: oauth
+      ? {
+        clientId: String(account.oauth?.clientId ?? '').trim(),
+        tenantId: String(account.oauth?.tenantId ?? '').trim() || 'common',
+        tokenRef: account.keyRef,
+      }
+      : null,
     requireTls: account.requireTls ?? null,
     timeoutMs,
   });
@@ -646,7 +736,27 @@ async function checkMailAccount(account, deps, { timeoutMs }) {
         `Zelos stopped before your password left this machine. Use the TLS port in Settings → Mail — ${guess.host ? `${guess.host}:${guess.port}` : 'usually 993'} — and if this host really is a local bridge that cannot do TLS, turn requireTls off for this account.`,
       );
     }
-    const authish = /auth|login|credential|password|invalid|denied/i.test(reason);
+    const authish = /auth|login|credential|password|invalid|denied|token|oauth/i.test(reason);
+    /* An OAuth account gets its own sentence, and the reason is that the one
+       below is actively misleading for it. "Most sign-in failures here are a
+       provider that refuses ordinary passwords" is what a user of a mailbox that
+       sends no password would read while their real problem — a revoked grant, a
+       scope the registration never asked for, an administrator who turned IMAP
+       off — went unnamed. `result.reconnect` is the flag core/sources/imap.mjs
+       sets for "this grant is dead and retrying will not revive it", which is the
+       one case worth telling somebody to do something about. */
+    if (oauth) {
+      return check(
+        id, label, 'fail',
+        `${account.host}: ${reason}`,
+        result?.reconnect
+          ? 'The Microsoft sign-in for this mailbox is no longer good — a changed password, a revoked consent, a new conditional access policy or 90 days of inactivity all do this. '
+            + 'Open Settings → Mail, edit this account and press "Sign in with Microsoft" again.'
+          : `If this says the server does not offer AUTH=XOAUTH2, the host is wrong — Microsoft's is ${guess.host || 'outlook.office365.com'}:993. `
+            + 'If it names a scope, the app registration is missing IMAP.AccessAsUser.All under API permissions. '
+            + 'Everything else is worth trying again: an unreachable sign-in endpoint is not a broken account.',
+      );
+    }
     return check(
       id, label, 'fail',
       `${account.host}: ${reason}`,
@@ -687,9 +797,13 @@ async function checkMailAccount(account, deps, { timeoutMs }) {
         : `Zelos will read nothing from ${missing.length === 1 ? 'that folder' : 'those folders'}. Pick from what the server actually has: ${[...names].slice(0, 8).join(', ')}${names.size > 8 ? ', …' : ''}`,
     );
   }
+  /* The method is named on the passing line, not only on the failing ones. This
+     whole check exists because a config can say one thing while the sweep does
+     another, and "Signed in" without saying HOW is the sentence that let that go
+     unnoticed for a release. */
   return check(
     id, label, 'pass',
-    `Signed in to ${account.host} · ${names.size} folder${names.size === 1 ? '' : 's'} · reading ${wanted.join(', ')}${sent ? '' : ' · no sent folder is set, so nothing you wrote is read'}`,
+    `Signed in to ${account.host}${oauth ? ' with Microsoft' : ''} · ${names.size} folder${names.size === 1 ? '' : 's'} · reading ${wanted.join(', ')}${sent ? '' : ' · no sent folder is set, so nothing you wrote is read'}`,
   );
 }
 
@@ -713,6 +827,44 @@ async function readCapped(response, maxBytes) {
   return Buffer.concat(chunks).toString('utf8');
 }
 
+/**
+ * The ctx a connector's `check(source, ctx)` is handed.
+ *
+ * Every network path in it is one of doctor's own `deps`, which is what keeps
+ * rule 2 at the top of this file true for connector code as well as for this
+ * one: the whole suite runs against a deps object whose every network function
+ * throws, so a check that reached past this would be a diagnostic no test could
+ * hold still — and, worse, one a user could not predict from their config.
+ *
+ * `http` is the same origin-pinned transport `collect` gets, built from what the
+ * connector declared plus what the USER configured (`originsFor`). A check may
+ * therefore contact exactly the addresses the sweep may, and nothing else. It is
+ * built rather than lazily created because a connector reading `ctx.http` and
+ * finding `undefined` is a crash in a diagnostic, which is the one place a crash
+ * is least affordable.
+ */
+function checkContext(connector, source, deps, { timeoutMs, signal, secret = null }) {
+  return {
+    secret,
+    timeoutMs,
+    signal,
+    maxBytes: MAX_ICS_BYTES,
+    getSecret: deps.getSecret,
+    testCalDav: deps.testCalDav,
+    testImap: deps.testImap,
+    http: createHttp({
+      origins: originsFor(connector, source),
+      limits: connector.limits,
+      credential: connector.credential,
+      graphql: connector.graphql === true,
+      secret,
+      signal,
+      timeoutMs,
+      fetchImpl: deps.fetchImpl,
+    }),
+  };
+}
+
 async function checkCalendar(calendar, deps, { timeoutMs, signal }) {
   const name = calendar.label || calendar.url || calendar.id;
   const id = `calendar.${calendar.id}`;
@@ -723,32 +875,32 @@ async function checkCalendar(calendar, deps, { timeoutMs, signal }) {
       'Open Settings → Calendars and paste the subscription link (it ends in .ics), the CalDAV server address, or the path to a local file.');
   }
 
-  if (calendar.kind === 'file') {
+  /* The kind is LOOKED UP, not switched on. This used to be
+     `if (calendar.kind === 'file')` and `if (calendar.kind === 'caldav')`, which
+     meant every connector anyone ever adds needed an edit here — in a file that
+     knows nothing about it — to be diagnosable at all. Both branches now live in
+     the connector that owns the protocol, and this is the only line that has to
+     know a connector might have a probe. */
+  const connector = connectorFor(calendar.kind);
+  if (connector?.check) {
     try {
-      const stat = fs.statSync(calendar.url);
-      if (!stat.isFile()) throw new Error('that path is not a file');
-      if (stat.size > MAX_ICS_BYTES) throw new Error(`the file is larger than ${MAX_ICS_BYTES} bytes`);
-      const parsed = parseICS(fs.readFileSync(calendar.url, 'utf8'));
-      return check(id, label, 'pass', `${calendar.url} · ${parsed.vevents.length} entr${parsed.vevents.length === 1 ? 'y' : 'ies'}`);
+      const verdict = await connector.check(calendar, checkContext(connector, calendar, deps, { timeoutMs, signal }));
+      return check(id, label, verdict?.status ?? 'fail', verdict?.detail ?? '', verdict?.action ?? null);
     } catch (err) {
+      /* A check that throws is a bug in a connector, and a bug in a connector
+         must not take the whole report down with it: the person running this
+         command is already stuck, and "zelos doctor crashed" is the least
+         useful thing it could tell them. */
       return check(id, label, 'fail', `${calendar.url}: ${errorText(err)}`,
-        'Check the path in Settings → Calendars. It must be a readable .ics file on this machine.');
+        'That is a failure inside Zelos rather than in your settings. Check the address in Settings → Calendars, and report this if it keeps happening.');
     }
   }
 
-  if (calendar.kind === 'caldav') {
-    let pass = null;
-    try {
-      pass = calendar.keyRef ? await deps.getSecret(calendar.keyRef) : null;
-    } catch { /* reported as a connection failure below */ }
-    const result = await deps.testCalDav({ url: calendar.url, user: calendar.user || '', pass, timeoutMs, signal });
-    if (!result?.ok) {
-      return check(id, label, 'fail', `${calendar.url}: ${result?.error || 'the connection failed'}`,
-        'Check the server address, the username and the password in Settings → Calendars. iCloud and Fastmail need an app-specific password here, not your account password.');
-    }
-    return check(id, label, 'pass', `${result.calendars.length} calendar${result.calendars.length === 1 ? '' : 's'} at ${calendar.url}`);
-  }
-
+  /* No probe of its own — so the address is read as a subscribed .ics below.
+     That is the same fallback `enabledSources` makes for a calendar kind no
+     connector claims (core/connectors/index.mjs), and deliberately so: the two
+     are one decision about what an unremarkable calendar address is, and they
+     should stay one. */
   // webcal: is how Apple and friends publish an https .ics.
   const url = safeUrl(String(calendar.url).replace(/^webcal:/i, 'https:'));
   if (!url || !/^https?:/i.test(url)) {
@@ -828,6 +980,118 @@ async function checkCalendar(calendar, deps, { timeoutMs, signal }) {
   }
 }
 
+/**
+ * One entry in `config.sources` — the third place config keeps a source, and
+ * until now the one doctor could not see at all.
+ *
+ * `mail` and `calendars` each have a hand-written check above because each has a
+ * hand-written editor and twenty years of provider-specific advice to give. This
+ * one has neither and must never grow either: everything it knows about the
+ * source comes off the manifest — the label, which settings are required, what
+ * the credential is called and where you mint one — so a connector added next
+ * month is diagnosed by this function without it being edited.
+ *
+ * What it does NOT do is guess at the protocol. If the connector declares a
+ * `check`, that is the probe; if it does not, this reports what is configured
+ * and says plainly that nothing was contacted. A `pass` that means "I did not
+ * look" would be the exact failure the database check at the top of this file
+ * exists because of.
+ */
+async function checkSource(source, deps, { timeoutMs, signal }) {
+  const connector = connectorFor(source.type);
+  const name = source.label || source.id;
+  const id = `source.${source.id}`;
+  const label = `${connector.label} · ${name}`;
+  const settings = source.settings && typeof source.settings === 'object' ? source.settings : {};
+
+  const missing = (connector.fields ?? []).filter((f) => f.required
+    && String(settings[f.name] ?? '').trim() === '');
+  if (missing.length) {
+    const names = missing.map((f) => `“${f.label}”`).join(', ');
+    return check(
+      id, label, 'fail',
+      `${name} has no ${missing.map((f) => f.label.toLowerCase()).join(', ')} yet, so there is nothing for Zelos to read.`,
+      `Open Settings → Sources, edit ${name}, and fill in ${names}.`,
+    );
+  }
+
+  let secret = null;
+  if (connector.credential && source.keyRef) {
+    try {
+      secret = await deps.getSecret(source.keyRef);
+    } catch (err) {
+      return check(id, label, 'fail', `Zelos could not read the stored credential for ${name}: ${errorText(err)}`,
+        'See the secret store line above — that is where this failed. Re-entering it in Settings → Sources usually settles it.');
+    }
+  }
+  /* `credential: null` and `{required: false}` are different facts and this is
+     one of the two places that has to keep them apart — see core/connectors/
+     file.mjs. A source with nothing to paste must never be told something is
+     missing. */
+  if (connector.credential?.required && !secret) {
+    const what = connector.credential.label;
+    const mint = connector.credential.url ? ` You create one at ${connector.credential.url}.` : '';
+    return check(
+      id, label, 'fail',
+      `No ${what.toLowerCase()} is stored for ${name}, so Zelos cannot read it.`,
+      `Open Settings → Sources and paste it. ${connector.credential.help || ''}${mint}`.trim(),
+    );
+  }
+
+  if (!connector.check) {
+    const where = (connector.fields ?? []).find((f) => f.type === 'url' && settings[f.name]);
+    return check(
+      id, label, 'pass',
+      `Configured${where ? ` · ${settings[where.name]}` : ''} · read on the next sweep. Nothing was contacted: this source offers no test of its own.`,
+    );
+  }
+
+  try {
+    const verdict = await connector.check(source, checkContext(connector, source, deps, { timeoutMs, signal, secret }));
+    return check(id, label, verdict?.status ?? 'fail', verdict?.detail ?? '', verdict?.action ?? null);
+  } catch (err) {
+    return check(id, label, 'fail', `${name}: ${errorText(err)}`,
+      'That is a failure inside Zelos rather than in your settings. Check this source in Settings → Sources, and report it if it keeps happening.');
+  }
+}
+
+/**
+ * The entries config holds that name no connector at all.
+ *
+ * `unknownSources()` has existed since the registry landed and had no reader
+ * outside the tests, which is why a hand-edited `"type": "runes"` used to be a
+ * source that appears in Settings, contributes nothing, and has nothing anywhere
+ * saying why. This is that reader.
+ *
+ * The two halves are different faults and get different statuses. A `sources[]`
+ * entry naming nothing is read by NOTHING — `enabledSources` drops it — so it is
+ * broken, and doctor's exit code should say so. A `calendars[]` entry with an
+ * unrecognised kind is still read, as a subscribed .ics, so it is worth knowing
+ * rather than broken; `validateConfig` also rejects that kind, so this line is a
+ * second and plainer voice on the same fact rather than the only one.
+ *
+ * Disabled entries are skipped. A source switched off is contributing nothing on
+ * purpose, and a diagnostic that complains about it is a diagnostic people learn
+ * to ignore.
+ */
+function checkUnknownSources(cfg) {
+  const unknown = unknownSources(cfg).filter((u) => u.source?.enabled !== false);
+  if (!unknown.length) return null;
+
+  const named = unknown.map((u) => {
+    const what = u.source?.label || u.id || '(no id)';
+    return `${what} (${u.at === 'calendars' ? 'calendar' : 'source'} ${u.id || '?'}) names the kind “${u.type || '(blank)'}”`;
+  });
+  const anySource = unknown.some((u) => u.at === 'sources');
+  return check(
+    'sources.unknown', 'Unrecognised', anySource ? 'fail' : 'warn',
+    `${named.join('; ')} — ${unknown.length === 1 ? 'and no connector in this build claims it' : 'and no connector in this build claims them'}.`,
+    anySource
+      ? 'Nothing reads a source whose type Zelos does not know, so it contributes nothing to the board and never will. Fix the type in Settings, or delete the entry. If it is a source a newer Zelos supports, update Zelos.'
+      : 'Zelos reads it as a subscribed .ics anyway, which is what it did before it kept a list of kinds — so it may well be working. Set the kind in Settings → Calendars to be sure of what is being read.',
+  );
+}
+
 /* ------------------------------------------------------------------ *
  * diagnose
  * ------------------------------------------------------------------ */
@@ -902,6 +1166,20 @@ export async function diagnose({ config = null, timeoutMs = 10_000, signal, deps
         checks.push(await checkCalendar(calendar, d, { timeoutMs, signal }));
       }
     }
+
+    /* `sources` gets no "you have not added one" warning, and mail and calendars
+       do. That is not an oversight: an install with neither mail nor a calendar
+       cannot do its job, which is a fact worth a line on a new machine, while an
+       install with no feeds is the ordinary case and a third "nothing here yet"
+       line would be noise on every single run. Only entries that name a
+       connector are checked; the ones that do not are the report below. */
+    for (const source of (Array.isArray(cfg.sources) ? cfg.sources : [])) {
+      if (!source?.enabled || !connectorFor(source.type)) continue;
+      checks.push(await checkSource(source, d, { timeoutMs, signal }));
+    }
+
+    const unknown = checkUnknownSources(cfg);
+    if (unknown) checks.push(unknown);
   }
 
   const counts = { pass: 0, warn: 0, fail: 0, skip: 0 };
@@ -912,8 +1190,14 @@ export async function diagnose({ config = null, timeoutMs = 10_000, signal, deps
      code reports, so a fresh install that has simply not been set up yet does
      not look like a fault. `ready` is "Zelos can actually do its job": a model
      to think with, and at least one source to think about. */
-  const sources = (Array.isArray(cfg?.mail) ? cfg.mail : []).filter((a) => a?.enabled).length
-    + (Array.isArray(cfg?.calendars) ? cfg.calendars : []).filter((c) => c?.enabled).length;
+  /* Counted by asking the registry, not by adding up two of the three places
+     config keeps a source. The old sum was `mail` plus `calendars`, written
+     before `sources` existed — so an install whose only source was a feed was
+     told it was not ready, and the ! lines it was sent to look at were about
+     mail it had deliberately not connected. `enabledSources` is the same
+     function the sweep reads, so "ready" and "will actually fetch something"
+     cannot drift apart. */
+  const sources = enabledSources(cfg).length;
   const ready = counts.fail === 0 && Boolean(String(cfg?.model?.model ?? '').trim()) && sources > 0;
 
   return {
