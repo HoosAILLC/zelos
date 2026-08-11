@@ -20,8 +20,17 @@ import crypto from 'node:crypto';
 import { localTimezone } from './time.mjs';
 import { log } from './log.mjs';
 
-/** Keys whose value is a credential. Never written to config.json. */
-const SECRET_KEYS = new Set([
+/**
+ * Keys whose value is a credential. Never written to config.json.
+ *
+ * Exported for core/connectors/index.mjs, which refuses a connector declaring a
+ * settings field by any of these names. `stripSecrets` deletes them anywhere at
+ * any depth on every save, so such a field could never be stored — it would
+ * vanish on save with a warning that reads like a false positive. The export is
+ * one-way on purpose: config.mjs must never import the registry (core/sources/
+ * caldav.mjs imports this file, so the reverse edge would be a cycle).
+ */
+export const SECRET_KEYS = new Set([
   'pass', 'password', 'passwd', 'apikey', 'api_key', 'key', 'token', 'secret', 'credentials',
 ]);
 
@@ -85,6 +94,30 @@ export const CALENDAR_DEFAULTS = deepFreeze({
   keyRef: null,
 });
 
+/**
+ * Defaults for one source that is neither mail nor a calendar.
+ *
+ * `settings` is the only untyped part of the config, and it is untyped here on
+ * purpose: what belongs in it is declared by the connector's `fields[]`, which
+ * the registry validates, not this file. config.mjs validates the ENVELOPE and
+ * the registry validates the PAYLOAD — a split forced by the fact that
+ * core/sources/caldav.mjs imports this module, so importing the registry back
+ * would be a cycle one eager `paths()` away from a TDZ crash at launch.
+ *
+ * The practical consequence is that a hand-edited `"type": "runes"` loads, the
+ * sweep reports that source unread, and `zelos doctor` names it — which is
+ * strictly better than refusing to load, and is the policy this file already
+ * argues for where a malformed section is repaired rather than rejected.
+ */
+export const SOURCE_DEFAULTS = deepFreeze({
+  id: '',
+  enabled: true,
+  label: '',
+  type: '',
+  keyRef: null,
+  settings: {},
+});
+
 export const DEFAULTS = deepFreeze({
   version: 1,
   identity: { name: '', email: '', timezone: '' },
@@ -99,6 +132,7 @@ export const DEFAULTS = deepFreeze({
   },
   mail: [],
   calendars: [],
+  sources: [],
   sweep: { intervalMinutes: 30, activeHours: [6, 23], auto: true },
   ui: { accent: '#5b8cff' },
   privacy: { maxItemsPerSweep: 150, sendBodies: true, bodyChars: 4000 },
@@ -291,6 +325,23 @@ function normalizeAccounts(cfg) {
       const cal = deepMerge(structuredClone(CALENDAR_DEFAULTS), c);
       if (!cal.id) cal.id = newId('c');
       return cal;
+    });
+  /* The keyRef is minted here for a source and NOT for a calendar, which looks
+     inconsistent and is not: mail has always had one minted (`mail.${id}`
+     above) and the calendar editor mints `calendar.${id}` in the UI, so both
+     arrive with one already. Minting a calendar's here would make the sweep
+     look up a secret for calendars saved before the UI did that — a lookup that
+     does not happen today. `${type}.${id}` matches both existing shapes, and
+     nothing may ever REQUIRE it: a source whose connector declares no
+     credential never needs one. */
+  cfg.sources = (Array.isArray(cfg.sources) ? cfg.sources : [])
+    .filter(isPlainObject)
+    .map((s) => {
+      const src = deepMerge(structuredClone(SOURCE_DEFAULTS), s);
+      if (!src.id) src.id = newId('s');
+      if (!isPlainObject(src.settings)) src.settings = {};
+      if (!src.keyRef && src.type) src.keyRef = `${src.type}.${src.id}`;
+      return src;
     });
   return cfg;
 }
@@ -498,6 +549,38 @@ export function validateConfig(cfg) {
       if (!isStr(c.user)) errors.push({ path: `${at}.user`, message: 'must be a string' });
       checkRef(errors, `${at}.keyRef`, c.keyRef, { allowNull: true });
     });
+  }
+
+  /**
+   * `sources` — the envelope, and deliberately not the payload.
+   *
+   * Absent rather than empty is valid, because a config.json written before this
+   * key existed has none and `zelos doctor` must not call it broken. What is
+   * checked is what every reader of the array needs to be true: an id it can
+   * key `kv` rows and a secret ref off, a boolean it can filter on, a type
+   * string, and a settings object. `type` is NOT checked against the registry —
+   * see SOURCE_DEFAULTS for why config cannot import it — and the per-connector
+   * fields are not checked here at all. The registry validates the payload; a
+   * source naming a connector that does not exist is reported by doctor, not by
+   * refusing to load the file.
+   */
+  if (cfg.sources !== undefined) {
+    if (!Array.isArray(cfg.sources)) errors.push({ path: 'sources', message: 'must be an array' });
+    else {
+      const seen = new Set();
+      cfg.sources.forEach((src, i) => {
+        const at = `sources[${i}]`;
+        if (!isPlainObject(src)) { errors.push({ path: at, message: 'must be an object' }); return; }
+        if (!isStr(src.id) || !src.id) errors.push({ path: `${at}.id`, message: 'is required' });
+        else if (seen.has(src.id)) errors.push({ path: `${at}.id`, message: `duplicate source id ${src.id}` });
+        else seen.add(src.id);
+        if (!isBool(src.enabled)) errors.push({ path: `${at}.enabled`, message: 'must be a boolean' });
+        if (!isStr(src.label)) errors.push({ path: `${at}.label`, message: 'must be a string' });
+        if (!isStr(src.type) || !src.type.trim()) errors.push({ path: `${at}.type`, message: 'is required' });
+        checkRef(errors, `${at}.keyRef`, src.keyRef, { allowNull: true });
+        if (!isPlainObject(src.settings)) errors.push({ path: `${at}.settings`, message: 'must be an object' });
+      });
+    }
   }
 
   const s = cfg.sweep;

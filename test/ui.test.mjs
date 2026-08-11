@@ -1731,19 +1731,27 @@ test('Settings can set who you are, and the value has a reader on the other end'
 });
 
 /**
- * `sentMailbox` is appended to every fetch by core/sweep.mjs's `mailboxesFor()`
- * and had no writer anywhere in `ui/` — the string appeared exactly once, in a
- * blank-account literal. The stored default is the bare word "Sent", which is
- * wrong for Gmail, Microsoft 365 and iCloud: three of the eight providers this
- * app hardcodes and the three largest. Reproduced against a Microsoft 365
- * folder set: `{label:"Work / Sent", ok:false, error:"Mailbox doesn't exist:
- * Sent"}` on every sweep forever, run still `ok:true`, doctor still "pass".
+ * `sentMailbox` is appended to every fetch by `mailboxesFor()` and had no writer
+ * anywhere in `ui/` — the string appeared exactly once, in a blank-account
+ * literal. The stored default is the bare word "Sent", which is wrong for Gmail,
+ * Microsoft 365 and iCloud: three of the eight providers this app hardcodes and
+ * the three largest. Reproduced against a Microsoft 365 folder set:
+ * `{label:"Work / Sent", ok:false, error:"Mailbox doesn't exist: Sent"}` on
+ * every sweep forever, run still `ok:true`, doctor still "pass".
  *
  * WRITER: the field below, into `saveConfig({ mail: [...] })`. READER:
- * `mailboxesFor()` and `directionOf()` in core/sweep.mjs, plus the mail check in
- * core/doctor.mjs — pinned in test/doctor.test.mjs. The prefill's own source is
- * the SPECIAL-USE flag `listMailboxes()` has computed since the client was
- * written and which nothing outside a test had ever read.
+ * `mailboxesFor()` and `directionOf()` in core/connectors/imap.mjs, plus the
+ * mail check in core/doctor.mjs — pinned in test/doctor.test.mjs. The prefill's
+ * own source is the SPECIAL-USE flag `listMailboxes()` has computed since the
+ * client was written and which nothing outside a test had ever read.
+ *
+ * The two readers used to sit in core/sweep.mjs and were moved to the IMAP
+ * connector when the run loop stopped knowing what an IMAP account is. Nothing
+ * about the behaviour changed — the functions moved file, character for
+ * character — so the assertion follows them, and it now pins the whole chain
+ * rather than one end of it: the reader exists, AND the run loop still reaches
+ * it. Pinning only the new file would have let a later edit orphan the reader
+ * without this test noticing, which is the exact failure it was written for.
  */
 test('the mail editor can set the sent folder, and takes it from the server when asked', async () => {
   stubBrowserGlobals();
@@ -1785,10 +1793,14 @@ test('the mail editor can set the sent folder, and takes it from the server when
     assert.equal(settings.sentMailboxFromTest(junk, 'Sent'), 'Sent', JSON.stringify(junk));
   }
 
-  // The reader, named.
+  // The reader, named — and the path from the run loop to it, also named.
+  const imap = fs.readFileSync(path.join(ROOT, 'core/connectors/imap.mjs'), 'utf8');
+  assert.match(imap, /account\.sentMailbox === 'string' \? account\.sentMailbox\.trim\(\)/,
+    'core/connectors/imap.mjs no longer reads sentMailbox, so this field writes to nothing');
+  assert.match(imap, /mailboxesFor\(account\)/, 'the reader exists but nothing in the connector calls it');
   const sweep = fs.readFileSync(path.join(ROOT, 'core/sweep.mjs'), 'utf8');
-  assert.match(sweep, /account\.sentMailbox === 'string' \? account\.sentMailbox\.trim\(\)/,
-    'core/sweep.mjs no longer reads sentMailbox, so this field writes to nothing');
+  assert.match(sweep, /from '\.\/connectors\/index\.mjs'/,
+    'the run loop no longer reaches the connector registry, so the reader above runs for nobody');
 });
 
 /**
