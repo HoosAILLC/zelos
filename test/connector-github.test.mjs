@@ -57,7 +57,7 @@ async function githubServer(t, handler) {
 }
 
 /** A ctx shaped like the one the sweep builds, pointed at the loopback server. */
-function ctxFor(origin, { settings = {}, cursor = null } = {}) {
+function ctxFor(origin, { settings = {}, cursor = null, signal = null } = {}) {
   const emitted = [];
   return {
     source: { id: 's_gh', label: 'GitHub', settings: { apiBase: origin, ...settings } },
@@ -69,7 +69,7 @@ function ctxFor(origin, { settings = {}, cursor = null } = {}) {
     identityEmail: 'nemo@example.com',
     now: '2026-08-11T13:00:00+00:00',
     emit: (m) => emitted.push(m),
-    signal: null,
+    signal,
     log: { warn() {}, info() {}, debug() {} },
     emitted,
     http: createHttp({
@@ -85,6 +85,12 @@ const okJson = (res, body, headers = {}) => {
   res.writeHead(200, { 'content-type': 'application/json', ...headers });
   res.end(JSON.stringify(body));
 };
+
+/** The instant `ctxFor` hands the connector as `ctx.now`. */
+const NOW_MS = Date.parse('2026-08-11T13:00:00+00:00');
+
+/** github.mjs's MAX_POLL_MS. Written out so a change to it fails these tests. */
+const MAX_POLL_MS = 15 * 60_000;
 
 /* ================================================================== *
  * The request
@@ -111,6 +117,48 @@ test('includeWatched widens the request, and that is the only thing that does', 
   const { origin, seen } = await githubServer(t, (req, res) => okJson(res, []));
   await github.collect(ctxFor(origin, { settings: { includeWatched: true } }));
   assert.match(seen[0].url, /participating=false/, 'the setting did not reach the request');
+});
+
+/* ================================================================== *
+ * Scoping
+ * ================================================================== */
+
+test('REGRESSION: a repository address pasted without a scheme still matches', async (t) => {
+  /* The field hint promises "Pasting a repository’s web address works too", and
+     the strip used to require `^https?://`. Measured before the fix:
+     `github.com/octocat/Hello-World` parsed as owner `github.com`, repo
+     `octocat` — so `inScope` was false for every notification the account has
+     and the source returned 0 rows, `ok: true`, no error, forever. That is the
+     exact failure the function's own comment says it exists to prevent, and it
+     arrives on the commonest paste there is: Safari drops the scheme when you
+     copy an address, and a person retyping one never types `https://`.
+
+     Each spelling is driven through the real `collect` rather than through
+     `scopeList` alone, because the thing that broke was whether a row came
+     back, not what an exported helper returned. */
+  for (const typed of [
+    'github.com/octocat/Hello-World',
+    'www.github.com/octocat/Hello-World',
+    'https://github.com/octocat/Hello-World/pull/3',
+    'git@github.com:octocat/Hello-World.git',
+    'octocat/hello-world',
+  ]) {
+    const { origin } = await githubServer(t, (req, res) => okJson(res, [notification()]));
+    const rows = (await github.collect(ctxFor(origin, { settings: { repos: typed } }))).parts.flatMap((p) => p.rows);
+    assert.equal(rows.length, 1, `"${typed}" matched nothing, so this source is silently empty forever`);
+  }
+});
+
+test('a scope still excludes what it does not name', async (t) => {
+  /* The other half of the same fix: loosening the parse must not turn the
+     filter into "everything". */
+  const { origin } = await githubServer(t, (req, res) => okJson(res, [
+    notification({ id: '1', repository: { full_name: 'octocat/Hello-World' } }),
+    notification({ id: '2', repository: { full_name: 'acme/widgets' } }),
+  ]));
+  const rows = (await github.collect(ctxFor(origin, { settings: { repos: 'github.com/acme/widgets' } }))).parts.flatMap((p) => p.rows);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].folder, 'acme/widgets', 'the scope let through a repository it does not name');
 });
 
 /* ================================================================== *
@@ -173,6 +221,77 @@ test('every notification on one pull request is one board item', async (t) => {
     'the same pull request produced two threads, so it will be two items on the board');
 });
 
+test('REGRESSION: two discussions in one repository are two board items', async (t) => {
+  /* GitHub sends `subject.url: null` for a Discussion — subjectPath's own
+     comment says so — so a Discussion took the fallback written for CheckSuite
+     and every discussion in a repository collapsed onto `github:o/r:discussion`.
+     Measured: two notifications about two unrelated questions produced ONE
+     thread key, `messagesInThread` returned both, and `threadIndex`
+     (core/triage.mjs:403) counted them as a single conversation — so the model
+     was handed two fragments glued together and the board showed one row whose
+     contents changed each sweep. Merging is right for builds and false for
+     conversations. */
+  const discussion = (id, title) => notification({
+    id,
+    reason: 'mention',
+    subject: { title, type: 'Discussion', url: null },
+    repository: { full_name: 'octocat/Hello-World' },
+  });
+  const { origin } = await githubServer(t, (req, res) => okJson(res, [
+    discussion('1', 'Should we drop the retainage clause?'),
+    discussion('2', 'Crane schedule for the week of the 24th'),
+    discussion('3', 'Should we drop the retainage clause?'), // a second notification about the FIRST one
+  ]));
+  const rows = (await github.collect(ctxFor(origin))).parts.flatMap((p) => p.rows);
+
+  assert.equal(rows.length, 3);
+  assert.equal(new Set(rows.map((r) => r.threadKey)).size, 2,
+    'two unrelated discussions landed on one thread key, so the board shows them as one item');
+  assert.equal(rows[0].threadKey, rows[2].threadKey,
+    'two notifications about ONE discussion split into two threads, which is the defect the key exists to prevent');
+});
+
+test('CI activity still collapses to one thread per repository, on purpose', async (t) => {
+  /* The other half: a CheckSuite has no URL either, and merging IS the intent
+     there — "the build for this repo needs looking at" is one board item however
+     many workflows failed. A fix for the discussion case that split these too
+     would trade one defect for another. */
+  const build = (id, title) => notification({
+    id,
+    reason: 'ci_activity',
+    subject: { title, type: 'CheckSuite', url: null },
+    repository: { full_name: 'octocat/Hello-World' },
+  });
+  const { origin } = await githubServer(t, (req, res) => okJson(res, [
+    build('1', 'nightly workflow run failed'),
+    build('2', 'release workflow run failed'),
+  ]));
+  const rows = (await github.collect(ctxFor(origin, { settings: { includeCi: true } }))).parts.flatMap((p) => p.rows);
+  assert.equal(rows.length, 2);
+  assert.equal(new Set(rows.map((r) => r.threadKey)).size, 1,
+    'a repository\'s CI noise split into one board item per workflow');
+});
+
+test('REGRESSION: the body is capped, and the link survives the cap', async (t) => {
+  /* This was the only messages-sink connector in the repo with no BODY_CHARS.
+     Measured: a `subject.title` of 500,000 characters produced a `text` of
+     500,081, which goes into `messages.body` AND into the FTS index via
+     `indexDoc` (core/db.mjs:411) — four page-loads of it per sweep, bounded by
+     nothing but readCapped's 8 MiB. github.com caps an issue title at 256
+     characters; a GHES install or a proxy does not. */
+  const huge = 'x'.repeat(500_000);
+  const { origin } = await githubServer(t, (req, res) => okJson(res, [
+    notification({ subject: { title: huge, type: 'PullRequest', url: `${origin}/repos/o/r/pulls/456` } }),
+  ]));
+  const [row] = (await github.collect(ctxFor(origin))).parts.flatMap((p) => p.rows);
+
+  assert.ok(row.text.length <= 20_000,
+    `the body is ${row.text.length} characters — an unbounded payload string reached SQLite and the search index`);
+  assert.ok(row.snippet.length <= 400);
+  assert.match(row.text, /\/pull\/456$/,
+    'the truncation ate the link, which is the one line in the body a human clicks');
+});
+
 /* ================================================================== *
  * The cursor
  * ================================================================== */
@@ -226,6 +345,51 @@ test('REGRESSION: changing what is asked for throws the validator away', async (
     'widening the scope returned nothing — the notification was in the response body and was thrown away');
 });
 
+test('REGRESSION: a cursor asking for a day between polls cannot retire the source', async (t) => {
+  /* `pollIntervalFrom` clamps to 15 minutes when the header is PARSED, and for a
+     long time that was the only clamp. A cursor is a persisted kv row that
+     outlives the code that wrote it — an older release, a hand-edited row, a
+     restored backup — so the ceiling has to hold on the read as well.
+
+     Measured before the fix, with `{pollIntervalMs: 86_400_000}` in the cursor:
+     `collect` made ZERO requests, emitted "GitHub asked for 86400s between polls
+     — 86399s to go", and returned `rows: 0, error: null`, which the sweep
+     records as `ok: true, count: 0`. The same cursor came back unchanged, so the
+     number never shrank: a source silently stopped for a day while reporting a
+     successful read of nothing. */
+  const bad = { lastModified: null, shape: null, pollIntervalMs: 86_400_000 };
+
+  // Sixteen minutes since the last poll: past the ceiling, nowhere near a day.
+  const { origin, seen } = await githubServer(t, (req, res) => okJson(res, [notification()]));
+  const woken = await github.collect(ctxFor(origin, { cursor: { ...bad, polledAtMs: NOW_MS - 16 * 60_000 } }));
+  assert.equal(seen.length, 1, 'the connector asked GitHub for nothing — the out-of-range interval was obeyed');
+  assert.equal(woken.parts.flatMap((p) => p.rows).length, 1);
+  assert.equal(woken.cursor.pollIntervalMs, MAX_POLL_MS,
+    'the out-of-range interval was copied forward into the new cursor, so the next sweep suppresses itself instead');
+
+  // One second since the last poll: legitimately gated, but by 15 minutes.
+  const ctx = ctxFor(origin, { cursor: { ...bad, polledAtMs: NOW_MS - 1_000 } });
+  const gated = await github.collect(ctx);
+  assert.equal(seen.length, 1, 'the poll gate stopped working — 250ms after a read is not a polite interval');
+  assert.equal(gated.cursor.pollIntervalMs, MAX_POLL_MS,
+    'the cursor was handed back carrying the value it arrived with, so it never heals');
+  assert.ok(!/86400s/.test(ctx.emitted.join(' ')),
+    `the Now banner told the user GitHub asked for a day between polls: ${ctx.emitted.join(' ')}`);
+});
+
+test('the interval GitHub actually asks for is kept, and a missing header does not erase it', async (t) => {
+  /* The clamp must not become "always 15 minutes": a stated 300s is GitHub's
+     answer and is what the next sweep has to respect. */
+  const { origin } = await githubServer(t, (req, res) => okJson(res, [notification()], { 'x-poll-interval': '300' }));
+  const first = await github.collect(ctxFor(origin));
+  assert.equal(first.cursor.pollIntervalMs, 300_000, 'the interval the server stated was not carried in the cursor');
+
+  const { origin: quiet } = await githubServer(t, (req, res) => okJson(res, [notification()]));
+  const second = await github.collect(ctxFor(quiet, { cursor: { ...first.cursor, polledAtMs: 0 } }));
+  assert.equal(second.cursor.pollIntervalMs, 300_000,
+    'a response with no X-Poll-Interval threw away the interval the server stated last time');
+});
+
 /* ================================================================== *
  * Failure
  * ================================================================== */
@@ -248,4 +412,95 @@ test('an auth failure is an error, never an empty day', async (t) => {
 test('a 200 that is not a list of notifications is a failure, not zero rows', async (t) => {
   const { origin } = await githubServer(t, (req, res) => okJson(res, { message: 'Bad credentials' }));
   await assert.rejects(() => github.collect(ctxFor(origin)));
+});
+
+test('REGRESSION: a cancelled read does not report itself as a clean empty one', async (t) => {
+  /* Measured before the fix: with `signal.aborted` already true, `collect` made
+     zero requests and returned `rows: [], error: null, note: null` with a cursor
+     whose `polledAtMs` had advanced to now — which the sweep records as
+     `ok: true, count: 0`, i.e. "I read GitHub and there was nothing" for a read
+     that never asked. Nothing is lost today only because core/sweep.mjs:762
+     drops the run before cursors are persisted; that is the sweep's guarantee,
+     not this connector's. */
+  const { origin, seen } = await githubServer(t, (req, res) => okJson(res, [notification()]));
+  const before = { lastModified: 'Tue, 11 Aug 2026 12:30:00 GMT', shape: null, pollIntervalMs: 60_000, polledAtMs: 111 };
+  const stopped = await github.collect(ctxFor(origin, { cursor: before, signal: AbortSignal.abort() }));
+
+  assert.equal(seen.length, 0, 'the read was cancelled and the connector went to the network anyway');
+  assert.deepEqual(stopped.cursor, before,
+    'a read that never happened advanced the cursor, so the poll clock and the validator moved for nothing');
+  assert.ok(stopped.parts[0].note, 'a cancelled read is shaped exactly like a successful empty one');
+});
+
+test('REGRESSION: a read cancelled mid-walk keeps its rows and does not move the validator', async (t) => {
+  /* The sharper half. Pages 1-2 came back as a COMPLETE answer carrying the new
+     `Last-Modified`, so the pages never fetched would have been 304'd away on
+     the next sweep and lost for good. */
+  const controller = new AbortController();
+  const page = (n) => Array.from({ length: 50 }, (_, i) => notification({ id: `${n}-${i}` }));
+  const { origin, seen } = await githubServer(t, (req, res, nth) => {
+    if (nth === 1) controller.abort(); // the user pressed stop while page one was in flight
+    okJson(res, page(nth), { 'last-modified': `LM-PAGE-${nth}` });
+  });
+
+  const before = { lastModified: 'LM-OLD', shape: null, pollIntervalMs: 0, polledAtMs: 111 };
+  const result = await github.collect(ctxFor(origin, {
+    settings: { maxItems: 200 },
+    cursor: before,
+    signal: controller.signal,
+  }));
+
+  assert.equal(seen.length, 1, 'the walk carried on past the cancellation');
+  assert.equal(result.parts.flatMap((p) => p.rows).length, 50,
+    'the page already read was thrown away, and the next sweep will not be sent it again');
+  assert.equal(result.cursor.lastModified, 'LM-OLD',
+    'the validator advanced over pages that were never fetched, so those notifications can never arrive');
+});
+
+/* ================================================================== *
+ * The diagnostic
+ * ================================================================== */
+
+test('REGRESSION: doctor does not blame the network when GitHub is rate limiting', async (t) => {
+  /* A diagnostic that names the wrong cause is worse than one that says it does
+     not know. Measured before the fix: a 429 came back as `fail` with the action
+     "Check that this machine can reach GitHub, and that the API address in
+     Settings → Sources is right" — the machine can reach GitHub, it just did,
+     and the address is right. The detail printed the host twice, because the
+     transport's own message already names it. */
+  const { origin } = await githubServer(t, (req, res) => {
+    res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '600' });
+    res.end('{}');
+  });
+  const ctx = ctxFor(origin);
+  const verdict = await github.check(ctx.source, ctx);
+
+  const words = `${verdict.detail} ${verdict.action ?? ''}`;
+  assert.doesNotMatch(words, /can reach GitHub|API address/,
+    `doctor blamed the network for a rate limit: ${words}`);
+  assert.equal(verdict.status, 'warn',
+    'a rate limit set doctor\'s exit code, so a transient allowance reads as a broken configuration');
+  assert.match(verdict.detail, /rate limit/i, 'the detail does not say what actually happened');
+  assert.match(verdict.detail, /10 minutes/, 'Retry-After was on the error and the user was not told when to come back');
+  assert.equal((verdict.detail.match(/127\.0\.0\.1/g) ?? []).length, 1, 'the host is printed twice');
+});
+
+test('doctor still blames the token for a 401, and names the account on success', async (t) => {
+  /* The arm above must not swallow the two verdicts doctor exists to give. */
+  const { origin: bad } = await githubServer(t, (req, res) => {
+    res.writeHead(401, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ message: 'Bad credentials' }));
+  });
+  const badCtx = ctxFor(bad);
+  const refused = await github.check(badCtx.source, badCtx);
+  assert.equal(refused.status, 'fail');
+  assert.match(`${refused.detail} ${refused.action}`, /token/i);
+
+  const { origin: good } = await githubServer(t, (req, res) => okJson(res, { login: 'nemo' }, {
+    'x-oauth-scopes': 'notifications, read:user',
+  }));
+  const goodCtx = ctxFor(good);
+  const named = await github.check(goodCtx.source, goodCtx);
+  assert.equal(named.status, 'pass');
+  assert.match(named.detail, /@nemo/, 'doctor did not name the account, which is the line it exists to print');
 });

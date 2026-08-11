@@ -8,19 +8,25 @@
  * both files share — the read-time `date`, the missing `uid`, identity from an
  * id that cannot move, and a `note` rather than a silent trim — and they are not
  * restated here. What follows is only what is different about Todoist, and there
- * are three things, each of which has already been a bug somewhere.
+ * are four things, each of which has already been a bug somewhere.
  *
- *  1. A DATE-ONLY DUE DATE MUST NOT BE CONVERTED THROUGH A TIMEZONE. Todoist
- *     returns `due.date` as a bare `YYYY-MM-DD` for a task with no time on it,
- *     and `due.datetime` as a real instant for one with a time. They need
- *     opposite treatment. Feeding the bare date to `new Date()` reads it as UTC
- *     midnight; re-expressing that in any zone west of Greenwich lands it on the
- *     day BEFORE — so every task due today would read as one day overdue, for
- *     every user in the Americas, all the time. The instant needs exactly the
- *     conversion the bare date must not get: `2026-08-12T02:00:00Z` is nine in
- *     the evening on the 11th in New York, and reading its day key straight off
- *     the string calls a task due tonight "due tomorrow" and drops it out of
- *     today. `dueDayKey` below is five lines and both halves are load-bearing.
+ *  1. A DUE VALUE HAS THREE SHAPES AND ONLY ONE OF THEM MAY BE CONVERTED
+ *     THROUGH A TIMEZONE. Todoist returns `due.date` as a bare `YYYY-MM-DD` for
+ *     a task with no time on it, and `due.datetime` for one with a time — and
+ *     `due.datetime` is itself two different things. Feeding a bare date to
+ *     `new Date()` reads it as UTC midnight; re-expressing that in any zone west
+ *     of Greenwich lands it on the day BEFORE — so every task due today would
+ *     read as one day overdue, for every user in the Americas, all the time. A
+ *     datetime that carries an offset needs exactly the conversion the bare date
+ *     must not get: `2026-08-12T02:00:00Z` is nine in the evening on the 11th in
+ *     New York, and reading its day key straight off the string calls a task due
+ *     tonight "due tomorrow" and drops it out of today. And the third shape —
+ *     `2026-08-12T01:00:00`, a time with NO offset, which is what Todoist sends
+ *     for a task given a time in a workspace with no fixed zone — is a WALL
+ *     CLOCK, the digits the user typed, with no instant in it to convert. It has
+ *     to be read the way a bare date is; `new Date()` resolves it against the
+ *     MACHINE's zone, which is not the user's. `dueDayKey` below is six lines
+ *     and every branch is load-bearing.
  *
  *  2. TODOIST'S PRIORITY IS NUMBERED BACKWARDS FROM THE ONE PEOPLE SEE, AND
  *     BACKWARDS FROM LINEAR'S. In the API `priority: 4` is the most urgent and 1
@@ -36,6 +42,26 @@
  *     one standing obligation, re-armed, updating one row in place — not a new
  *     row every day forever.
  *
+ *  4. THE FILTER IS A DIFFERENT ENDPOINT, NOT A PARAMETER ON THIS ONE. Under
+ *     the old REST v2 API a filter rode along as `GET /tasks?filter=…`. API v1
+ *     removed it: "The filter and lang parameters were removed: A new dedicated
+ *     endpoint has been created specifically for filtering tasks:
+ *     /api/v1/tasks/filter" — Todoist's own v1 migration guide. Doist's own SDK
+ *     settles both halves of the shape: `TASKS_FILTER_PATH = "tasks/filter"`,
+ *     and the expression travels as `query`, beside `lang` and a `limit` capped
+ *     at 200. The plain list endpoint takes `project_id`, `section_id`,
+ *     `parent_id`, `label`, `ids` and `limit` — no filter of any kind.
+ *
+ *     This connector shipped addressing the removed parameter on the unfiltered
+ *     endpoint, which is the worst shape this bug has. `GET /api/v1/tasks` is a
+ *     perfectly valid request: it answers 200 with EVERY active task in the
+ *     account and ignores the parameter it does not know. So the user's whole
+ *     selection criterion was dropped in silence — `dueness` sorts undated tasks
+ *     last and future-dated ones after due-today, so any list shorter than
+ *     "Tasks to keep" got its remaining slots padded with tasks due weeks out,
+ *     under a source whose own label promises "due today or overdue". Nothing
+ *     threw, nothing warned, and the editable filter field did nothing at all.
+ *
  * The filter is the user's, with a default Zelos chooses. Todoist's filter
  * grammar is a real query language and it is theirs, not ours: shipping
  * `overdue | today` as the default and leaving the box editable means a person
@@ -44,12 +70,21 @@
  * about what "mine" means in somebody else's workspace.
  */
 
+import { AuthError, RateLimitError } from './http.mjs';
 import { dayKey, daysBetweenKeys, toZonedISO, todayKey, wallClock } from '../time.mjs';
 
 const ORIGIN = 'https://api.todoist.com';
-const ENDPOINT = `${ORIGIN}/api/v1/tasks`;
+/**
+ * NOT `/api/v1/tasks`. See note 4 at the top: that endpoint has no filter
+ * parameter and never refuses one, so pointing a filtered read at it is a
+ * request that succeeds and answers the wrong question.
+ */
+export const ENDPOINT = `${ORIGIN}/api/v1/tasks/filter`;
 
-/** Todoist's page ceiling for this endpoint. */
+/** The name this endpoint gives the filter expression. `filter` is the v2 one. */
+export const QUERY_PARAM = 'query';
+
+/** Todoist's page ceiling for this endpoint — the SDK types `limit` as 1…200. */
 const PAGE = 200;
 
 /**
@@ -80,6 +115,17 @@ const BUDGET_MS = 15 * 60 * 1000;
 const str = (v) => (typeof v === 'string' ? v : v == null ? '' : String(v));
 const collapse = (s) => str(s).replace(/\s+/g, ' ').trim();
 
+/**
+ * The filter as it appears in a sentence the user reads.
+ *
+ * Their own text, so quoting it is safe — but it is a free text field with no
+ * ceiling on it, and it is quoted into `sources[].error` and into a `zelos
+ * doctor` row that is printed whole (core/doctor.mjs:80 puts no cap on
+ * `errorText`). A 4,000-character filter would push the vendor's own sentence
+ * out past ERROR_CHARS, which is the half that says what went wrong.
+ */
+const shortFilter = (f) => (f.length > 120 ? `${f.slice(0, 119)}…` : f);
+
 function clampInt(value, fallback, min, max) {
   const n = Number(value);
   if (!Number.isFinite(n)) return fallback;
@@ -105,16 +151,32 @@ export function priorityLabel(priority) {
  * The day a due value falls on, in the reader's own zone.
  *
  * Note 1 at the top is the whole justification. A bare `YYYY-MM-DD` is a DAY and
- * has no instant to convert; a timestamp is an INSTANT and has no day until a
- * zone is named. Getting either backwards moves the answer by one day, which is
- * the entire difference between "due today" and "overdue" — the one distinction
- * this connector exists to make.
+ * has no instant to convert; a timestamp WITH AN OFFSET is an INSTANT and has no
+ * day until a zone is named. Getting either backwards moves the answer by one
+ * day, which is the entire difference between "due today" and "overdue" — the
+ * one distinction this connector exists to make.
+ *
+ * The third shape is the one that shipped broken. `2026-08-12T01:00:00` carries
+ * no offset, so it names no instant — it is a wall clock, exactly as a bare date
+ * is, and it must be read off the string. It used to fall through to
+ * `toZonedISO`, whose `new Date(text)` resolves an offset-less timestamp against
+ * whatever zone the HOST MACHINE is in. That is not the user's zone:
+ * core/sweep.mjs:135-138 supports the two differing on purpose, because a laptop
+ * set to UTC belonging to somebody in New York is an ordinary thing.
+ *
+ * Measured — one pure function, identical arguments, only the machine's TZ
+ * varied: `dueDayKey('2026-08-12T01:00:00', 'America/New_York')` answered
+ * 2026-08-12 under TZ=America/New_York and 2026-08-11 under TZ=UTC, Asia/Tokyo
+ * and Pacific/Kiritimati. One day early is `Overdue by 1 day`, a `\Flagged` row,
+ * +10 in `scoreInbound` (core/triage.mjs:434) and a model told that an
+ * obligation is late when it is not. One day late — `2026-08-11T23:00:00` read
+ * under Asia/Tokyo — reads "Due in 1 day" and drops out of today entirely.
  */
 export function dueDayKey(raw, timezone) {
   const text = collapse(raw);
   const w = wallClock(text);
   if (!w) return null;
-  if (w.dateOnly) return dayKey(text);
+  if (w.dateOnly || w.offset === null) return dayKey(text);
   return dayKey(toZonedISO(text, timezone || undefined) || text);
 }
 
@@ -165,6 +227,58 @@ function byUrgency(a, b) {
   return str(a.task?.id).localeCompare(str(b.task?.id));
 }
 
+/**
+ * A refusal the vendor put in the BODY, turned back into the class sweep reacts to.
+ *
+ * This is linear.mjs's `graphqlError` applied to Todoist's own error shape, and
+ * it is here because the header says this file inherits linear's note 2 — which
+ * it did not, in code. Todoist documents 4xx for these, and
+ * core/connectors/http.mjs already promotes a 401/403 to `AuthError`; this is
+ * the belt for the case where a refusal arrives inside a 200 or inside a status
+ * the transport passes through. Without it every non-task body produced one
+ * sentence — "the endpoint or its version has changed" — as a plain `Error`, so
+ * a dead token sent the reader hunting for an API change AND never reached
+ * core/sweep.mjs:740's AuthError arm, which means it was retried every sweep
+ * forever instead of resting for AUTH_BLOCK_MS.
+ *
+ * Returns null for a body that states no error, so a healthy answer is never
+ * rewritten into a failure.
+ */
+export function todoistError(body, describe) {
+  const list = Array.isArray(body?.errors) ? body.errors : [];
+  const fromList = list
+    .map((e) => collapse(typeof e === 'string' ? e : (e?.message ?? e?.error)))
+    .filter(Boolean)
+    .join('; ');
+  /* `{"error": "...", "error_code": 15, "error_tag": "..."}` is Todoist's own
+     in-band shape; the array is what a gateway in front of it tends to send. */
+  const text = (fromList || collapse(body?.error ?? body?.error_message)).slice(0, ERROR_CHARS);
+  if (!text) return null;
+
+  const code = [
+    str(body?.error_tag),
+    ...list.map((e) => str(e?.extensions?.code)),
+  ].join(' ').toUpperCase();
+
+  if (/AUTH|UNAUTHENTICATED|FORBIDDEN|TOKEN/.test(code) || /invalid (api )?token|authenticat|unauthoriz/i.test(text)) {
+    return new AuthError(
+      `${describe} rejected the API token: ${text}. Check it in Settings — Zelos will not keep trying with the one it has.`,
+    );
+  }
+  if (/RATE.?LIMIT|TOO_MANY/.test(code) || /rate limit|too many requests/i.test(text)) {
+    /* No `Retry-After` to read — this arrived in a body, so the transport's
+       header path never ran, and the declared window is the only number there
+       is. It is also the right one: the next sweep is a better retry than a
+       sleep inside this one. */
+    return new RateLimitError(`${describe} is rate limiting this source: ${text}`, { retryAfterMs: BUDGET_MS });
+  }
+  /* Quoting the vendor here is safe in a way quoting a non-JSON body is not:
+     this text came out of a JSON `error` field, so it is the vendor's own
+     sentence about the request, not a captive portal's HTML. It is what tells a
+     user their filter does not parse. */
+  return new Error(`${describe} refused the request: ${text}`);
+}
+
 /** -> {tasks, nextCursor}. Accepts both shapes this endpoint has answered with. */
 export function readPage(text, describe) {
   let body;
@@ -184,6 +298,10 @@ export function readPage(text, describe) {
      difference from an empty list. */
   const tasks = Array.isArray(body) ? body : Array.isArray(body?.results) ? body.results : null;
   if (tasks === null) {
+    /* Ask the body why before guessing. This only runs when there is no task
+       list, so a healthy answer never reaches it. */
+    const stated = todoistError(body, describe);
+    if (stated) throw stated;
     throw new Error(`${describe} answered with JSON that holds no task list — the endpoint or its version has changed`);
   }
   return { tasks, nextCursor: Array.isArray(body) ? '' : collapse(body?.next_cursor) };
@@ -328,29 +446,89 @@ export default {
        (core/sweep.mjs:533 calls `nowISO(tz)`) so its own day key is the answer. */
     const today = dayKey(str(ctx.now)) || todayKey(timezone || undefined);
 
-    const tasks = [];
+    /* KEYED BY TASK ID, NOT PUSHED INTO A LIST. The failure MAX_PAGES exists to
+       bound is a cursor that stops advancing — and a cursor that stops advancing
+       hands back the SAME page again. Concatenating it spends the user's "Tasks
+       to keep" on copies: measured against a server holding 30 distinct tasks
+       behind a non-advancing cursor, the connector emitted 50 rows carrying 17
+       distinct ids, `upsertMessages` collapsed them to 17 stored rows, and 13
+       real obligations never reached the board while the note claimed 40 "least
+       urgent" had been dropped. MAX_PAGES bounds the request count; only this
+       bounds the row set, which is where the damage lands. First occurrence
+       wins — a repeated page is the same task, not a newer one. */
+    const byId = new Map();
+    /* Counted and dropped, never given a row. A task with no id would get
+       `messageId: 'todoist:task:'` — the id EVERY id-less task gets — so they
+       all hash to one `messageRowId` and overwrite each other: three rows handed
+       to `upsertMessages`, two rows in the database, one obligation gone with no
+       error and a count of 3 reported to the board. fireflies.mjs already
+       settled this ("a transcript with no id is dropped rather than given a
+       colliding row id"); silently losing one is worse than saying so. */
+    let unidentified = 0;
+    /* Did the walk end with a cursor still in hand? That is a different loss
+       from the keep-cap's and it must not be reported as the same one. */
+    let truncated = false;
+    /* The vendor's sentence, when a later page failed and earlier pages did not. */
+    let cutShort = null;
+    let pagesRead = 0;
     let cursor = '';
     for (let page = 0; page < MAX_PAGES; page += 1) {
-      if (ctx.signal?.aborted === true) break;
+      if (ctx.signal?.aborted === true) {
+        truncated = pagesRead > 0 && Boolean(cursor);
+        break;
+      }
       /* The filter is the only thing in the query string and the credential is
          in a header, which is the rule core/connectors/index.mjs:138 states and
          core/connectors/http.mjs enforces by having no `as: 'query'` at all: a
          token in a URL lands in the vendor's access log, in every proxy's, and
-         in ours. A filter in one is a filter the user wrote and can see. */
+         in ours. A filter in one is a filter the user wrote and can see.
+
+         `query`, not `filter` — see note 4. */
       const url = new URL(ENDPOINT);
-      url.searchParams.set('filter', filter);
+      url.searchParams.set(QUERY_PARAM, filter);
       url.searchParams.set('limit', String(PAGE));
       if (cursor) url.searchParams.set('cursor', cursor);
 
-      const res = await ctx.http.get(url.href, { accept: 'application/json' });
-      const page1 = readPage(res.text, new URL(res.url || ENDPOINT).host);
-      tasks.push(...page1.tasks);
-      if (!page1.nextCursor) break;
-      cursor = page1.nextCursor;
+      let read;
+      try {
+        const res = await ctx.http.get(url.href, { accept: 'application/json' });
+        read = readPage(res.text, new URL(res.url || ENDPOINT).host);
+      } catch (err) {
+        /* PAGES ALREADY READ ARE NOT THROWN AWAY. A throw from page two used to
+           discard page one as well, so a two-page sweep stored zero rows
+           including the page that arrived intact — and the user was told a
+           budget was spent rather than that some of their tasks were missing.
+           (The transport defect that made that the NORMAL case, a missing
+           `x-ratelimit-remaining` read as zero remaining, is fixed in
+           core/connectors/http.mjs. This is the connector's half: a lost page
+           must not cost the rows already in hand.)
+
+           Two failures still propagate. Nothing in hand means there is nothing
+           to salvage and the sweep needs the real reason. And an `AuthError`
+           propagates even with rows in hand, because it is the one error whose
+           CLASS is load-bearing: core/sweep.mjs keys a six-hour rest on it, and
+           a revoked token downgraded to "some tasks are missing" would be
+           retried every sweep forever while the board quietly stopped
+           updating — worse than losing one page. */
+        if (pagesRead === 0 || err instanceof AuthError) throw err;
+        cutShort = collapse(err?.message).slice(0, ERROR_CHARS);
+        truncated = true;
+        break;
+      }
+      pagesRead += 1;
+      for (const task of read.tasks) {
+        if (!task || typeof task !== 'object') continue;
+        const id = str(task.id);
+        if (!id) { unidentified += 1; continue; }
+        if (!byId.has(id)) byId.set(id, task);
+      }
+      if (!read.nextCursor) break;
+      cursor = read.nextCursor;
+      /* Out of pages with the vendor still offering more. */
+      if (page === MAX_PAGES - 1) truncated = true;
     }
 
-    const ranked = tasks
-      .filter((task) => task && typeof task === 'object')
+    const ranked = [...byId.values()]
       /* A completed task should never be in a "today or overdue" answer, but the
          field exists in the payload under two names across versions and a
          checked task on the board is a promise the product broke. Cheap. */
@@ -371,11 +549,28 @@ export default {
     /* Reported rather than swallowed, for the reason spelled out in linear.mjs:
        the sweep renders a note as `ok: false` with the sentence in `error`, and
        obligations quietly dropped are the failure this product exists to
-       prevent. */
+       prevent. THREE losses are possible and they are said separately, because
+       only ONE of them is ordered. What the keep-cap drops really is the least
+       urgent — `ranked` is sorted before it is sliced. What a stopped page walk
+       drops was never fetched at all, and Todoist returns tasks in ITS order
+       (see `byUrgency`), so the most overdue task in the account may be among
+       the ones never seen. Folding the second into the first is the note telling
+       the user something false about their own list. */
+    const shown = shortFilter(filter);
+    const notes = [];
     const dropped = ranked.length - kept.length;
-    const note = dropped > 0
-      ? `Todoist returned ${ranked.length} tasks for "${filter}" and this source keeps ${keep} — the ${dropped} least urgent were dropped. Raise "Tasks to keep" in Settings if that is too few.`
-      : null;
+    if (dropped > 0) {
+      notes.push(`Todoist returned ${ranked.length} tasks for "${shown}" and this source keeps ${keep} — the ${dropped} least urgent were dropped. Raise "Tasks to keep" in Settings if that is too few.`);
+    }
+    if (truncated) {
+      notes.push(cutShort
+        ? `Todoist stopped answering part-way through "${shown}" (${cutShort}), so this is only what had already been read. The tasks that are missing are not necessarily the least urgent.`
+        : `"${shown}" matches more than the ${MAX_PAGES * PAGE} tasks this source reads in one sweep, so the rest were never fetched. They are not necessarily the least urgent — narrow the filter in Settings.`);
+    }
+    if (unidentified > 0) {
+      notes.push(`${unidentified} task${unidentified === 1 ? '' : 's'} arrived with no id and ${unidentified === 1 ? 'was' : 'were'} dropped — a task with no id cannot be stored without overwriting another one.`);
+    }
+    const note = notes.length ? notes.join(' ') : null;
 
     /* NO `cursor` KEY. The Todoist cursor paginates ONE answer and is spent when
        the answer ends; it is not a sync token and holding it across sweeps would
@@ -400,26 +595,47 @@ export default {
   async check(source, ctx) {
     const settings = source?.settings && typeof source.settings === 'object' ? source.settings : {};
     const filter = collapse(settings.filter) || DEFAULT_FILTER;
-    const today = todayKey();
+    const shown = shortFilter(filter);
+    /* THE USER'S ZONE WHEN DOCTOR HAS ONE TO GIVE. `todayKey()` and a `''`
+       timezone both fall back to the machine's zone, so the overdue count in
+       the pass line was measured somewhere the user does not live — the same
+       one-day error `dueDayKey` above exists to prevent, printed in the one
+       command a stuck person runs. It is read defensively because
+       `checkContext` (core/doctor.mjs:846) does not thread `identity.timezone`
+       through yet; when it does, this needs no further edit. Both halves take
+       the same zone either way, so the comparison is at least self-consistent. */
+    const timezone = str(ctx?.timezone);
+    const today = todayKey(timezone || undefined);
     try {
       const url = new URL(ENDPOINT);
-      url.searchParams.set('filter', filter);
+      url.searchParams.set(QUERY_PARAM, filter);
       url.searchParams.set('limit', String(PAGE));
       const res = await ctx.http.get(url.href, { accept: 'application/json' });
       const { tasks } = readPage(res.text, new URL(res.url || ENDPOINT).host);
       const overdue = tasks.filter((t) => {
-        const d = dueness(t, today, '');
+        const d = dueness(t, today, timezone);
         return d.overdueDays !== null && d.overdueDays > 0;
       }).length;
       return {
         status: 'pass',
-        detail: `"${filter}" matches ${tasks.length} task${tasks.length === 1 ? '' : 's'}${overdue ? `, ${overdue} of them overdue` : ''}`,
+        detail: `"${shown}" matches ${tasks.length} task${tasks.length === 1 ? '' : 's'}${overdue ? `, ${overdue} of them overdue` : ''}`,
       };
     } catch (err) {
+      /* THE FILTER IS NAMED IN THE FAILURE, because the docstring above says the
+         filter is the whole reason this probe runs the user's own query — and
+         the verdict used to be `Todoist: api.todoist.com returned 400` with the
+         one fact the probe exists to surface withheld, under an action that led
+         with the token. A refused credential is the exception and is the only
+         case where the token really is the first thing to check; core/sweep.mjs
+         and the transport both classify that one for us. */
+      const status = Number(err?.status) || 0;
+      const credentialRefused = err instanceof AuthError || status === 401 || status === 403;
       return {
         status: 'fail',
-        detail: `Todoist: ${collapse(err?.message) || 'the request failed'}`.slice(0, ERROR_CHARS),
-        action: 'Check the API token in Settings → Sources — you mint one at Todoist → Settings → Integrations → Developer. If the token is right, the filter is what Todoist refused.',
+        detail: `Todoist refused "${shown}": ${collapse(err?.message) || 'the request failed'}`.slice(0, ERROR_CHARS),
+        action: credentialRefused
+          ? 'Check the API token in Settings → Sources — you mint one at Todoist → Settings → Integrations → Developer.'
+          : `Check the Todoist filter in Settings → Sources: "${shown}" is what Todoist was asked for, and its filter grammar is what has to accept it. If the filter is right, check the API token — you mint one at Todoist → Settings → Integrations → Developer.`,
       };
     }
   },

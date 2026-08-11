@@ -62,20 +62,60 @@
  * re-read on every sweep, forever, and nothing anywhere says why.
  *
  * So the cursor stores a 10-hex-character digest of `name\0mtimeMs\0size` per
- * file and nothing else: 240 of them serialise to ~3,140 characters, measured,
- * with room left for the envelope. `test/connector-folder.test.mjs` reads the
- * 4,096 out of core/sweep.mjs as text and asserts a full cursor fits under it,
- * so the two cannot drift apart.
+ * file and nothing else. Serialised, one digest costs 13 characters (`"…",`),
+ * so the 300 this carries come to 3,915 with the envelope — measured — against
+ * a ceiling of 4,096. `test/connector-folder.test.mjs` reads that 4,096 out of
+ * core/sweep.mjs as text and asserts a full cursor fits under it, so the two
+ * cannot drift apart: 181 characters of slack is thin enough that one more
+ * field in the envelope would silently cost every cursor this source writes.
  *
  * A high-water mtime would have been smaller still, and was rejected: `cp -p`,
  * rsync, Syncthing and iCloud all preserve mtimes, so a file restored into the
  * folder with last month's timestamp would land below the mark and never be read
  * — a silent miss, which is the one failure mode this design refuses. The digest
- * set fails the other way instead: a folder holding more than 240 files forgets
- * the oldest, re-reads them next sweep, and upserts the rows it already had.
+ * set fails the other way instead: a folder holding more files than the cursor
+ * remembers re-reads some of them, and upserts rows it already had.
  *
  * The list is rebuilt from the directory each sweep rather than appended to, so
  * a file the user deletes drops out of the cursor on its own.
+ *
+ * WHAT THE CEILING COSTS, STATED HONESTLY. An earlier draft of this comment
+ * described that last case as a one-off — "forgets the oldest, re-reads them
+ * next sweep". It is not one-off, it is permanent: `kept` retains the NEWEST
+ * digests while `ready` reads the OLDEST files, so the two ends fight and the
+ * same files fall out every sweep (measured at 300 files against the old 240:
+ * 200, 100, 60, 60, … rows, and it stays at 60 forever). Raising the number to
+ * 300 moves where that starts, and nothing moves it further — any deterministic
+ * choice of 300 digests out of 400 files forgets 100 of them, so within a
+ * 4,096-character cursor this is a ceiling and not a bug to fix. What it costs
+ * is a re-read of a small local file and an idempotent upsert; what it never
+ * costs is a duplicate row (`messageId` hashes the bytes) or an extra model run
+ * (`pendingNew` is bumped by `inserted`, which is zero for a row that existed).
+ *
+ * ------------------------------------------------------------------------
+ * WHAT THE USER IS TOLD, AND HOW OFTEN
+ * ------------------------------------------------------------------------
+ *
+ * A part's `note` becomes `sources[].error` and core/sweep.mjs:719 sets
+ * `ok: !note`, so every sentence returned from here paints the source red on
+ * the board. That makes "how often" a design question rather than a wording
+ * one, and there are exactly two answers:
+ *
+ *  - A REFUSAL is a fact about one version of one file that will not change on
+ *    its own. It is recorded in the cursor and said ONCE. The trap this file
+ *    walked into for its whole first life is that both refusals decided during
+ *    the walk — a directory named `x.json`, an over-size file — were decided
+ *    ABOVE the `seen` gate, so their digests were written into the cursor and
+ *    nothing ever read them back: measured over six consecutive sweeps, the
+ *    identical sentence came out red every time for a file nobody was ever
+ *    going to fix. The gate is now the first thing after the lstat, above every
+ *    refusal, which is the only ordering that makes the promise true.
+ *  - A DEFERRAL is a fact about this sweep, and each cause now gets its own
+ *    sentence. They used to share the cap's — "Zelos reads 200 a sweep, and
+ *    will take it next time" — which is false for every cause but the cap and
+ *    named no file: a mode-000 file reported itself that way on every sweep
+ *    forever (measured: rows 1, 0, 0 and the same sentence three times), and so
+ *    did a sweep the user had cancelled.
  */
 
 import crypto from 'node:crypto';
@@ -100,10 +140,10 @@ const EXTENSIONS = new Set(['.json', '.txt']);
  * allocated. The read is capped a second time at the same number, because a
  * file can grow between the stat and the read.
  */
-const MAX_FILE_BYTES = 1_000_000;
+export const MAX_FILE_BYTES = 1_000_000;
 
 /** How many files one sweep will ingest. The rest wait for the next one. */
-const MAX_FILES_PER_SWEEP = 200;
+export const MAX_FILES_PER_SWEEP = 200;
 
 /**
  * How far into a directory listing this will walk at all.
@@ -112,20 +152,63 @@ const MAX_FILES_PER_SWEEP = 200;
  * materialises every entry before returning one, so a folder somebody pointed
  * at their Downloads directory costs the array before any cap can apply.
  */
-const MAX_DIR_ENTRIES = 5_000;
+export const MAX_DIR_ENTRIES = 5_000;
 
 /** How many file digests the cursor carries. See the header for the arithmetic. */
-const MAX_REMEMBERED = 240;
+export const MAX_REMEMBERED = 300;
 
 /** How many refused files are named in one report before it becomes a count. */
 const MAX_REPORTED = 5;
 
 /** Matches core/connectors/rss.mjs: the same board renders both. */
 const SNIPPET_CHARS = 400;
-const BODY_CHARS = 20_000;
+export const BODY_CHARS = 20_000;
 
-/** 40 bits. A collision means one file is never read; at 240 entries that is ~1e-6. */
+/**
+ * The subject, and the `link` glued onto the body.
+ *
+ * BODY_CHARS was doing this job for one field out of three, so the other two
+ * left by the side door: `{"title": "A".repeat(900000)}` reached
+ * `messages.subject`, the FTS title, every `GET /api/state` and the Settings
+ * export at its full 900,000 characters from a source whose bodies stop at
+ * 20,000 — measured — and `link` was concatenated AFTER the body was sliced,
+ * which put `text` at 50,003 characters for a 3-character body. A cap two of
+ * the four fields honour is not a cap. 300 is longer than any subject a person
+ * writes and shorter than anything that is really a document; 2,000 is past
+ * every URL length limit worth naming, so a longer one was never a link.
+ */
+const TITLE_CHARS = 300;
+const LINK_CHARS = 2_000;
+
+/**
+ * How far ahead of this machine's clock an mtime may be and still mean "a
+ * writer is busy with this right now".
+ *
+ * The mid-write guard in `scan` defers any file whose mtime is later than the
+ * instant the sweep began. Unbounded, that is not a deferral but a permanent
+ * silent miss: an SMB or NAS share whose clock runs fast, a Syncthing or iCloud
+ * peer a few seconds ahead, an archive unpacked with a bogus timestamp,
+ * `touch -t 203001010000`. Measured with a 30-day-ahead mtime, three
+ * consecutive sweeps read nothing and reported the file as "waiting" — and it
+ * would have waited until this machine's calendar caught up with it. The header
+ * calls a silent miss the one failure mode this design refuses, so the guard
+ * gets a window: inside it, wait; outside it, the CLOCK is wrong rather than
+ * the writer being busy, and the file is read. Content stability does not rest
+ * on this guard alone — `readStable` brackets the read with two stats on the
+ * same handle and compares both against the listing's — so the cost of being
+ * wrong here is a re-read, not a truncated note.
+ *
+ * The same number bounds a file's own stated `date` (see `fileDate`): a
+ * document claiming the year 9999 is choosing where it sits on a board ordered
+ * by `sent_at`, forever.
+ */
+const FUTURE_SKEW_MS = 2 * 60_000;
+
+/** 40 bits. A collision means one file is never read; at 300 entries that is ~2e-6. */
 const SIG_HEX = 10;
+
+/** The separator inside every digest below: the one byte a filename cannot hold. */
+const SEP = String.fromCharCode(0);
 
 const collapse = (s) => String(s ?? '').replace(/\s+/g, ' ').trim();
 const str = (v) => (typeof v === 'string' ? v : (v == null || typeof v === 'object' ? '' : String(v)));
@@ -149,6 +232,17 @@ const isPlainObject = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
  * module load — it creates directories, and core/connectors/index.mjs's header
  * is explicit about how close the config/registry import edge sits to a TDZ
  * crash at launch. core/sources/caldav.mjs:34 imports it the same way.
+ *
+ * A RELATIVE PATH RESOLVES AGAINST THE ZELOS HOME, NOT `process.cwd()`. The
+ * field hint says "Folder" and offers `~/.zelos/inbox`, so a bare `inbox` is a
+ * plausible thing to type — and `path.resolve('inbox')` measured as
+ * `…/Desktop/the claw/zelos/inbox`, which is simply wherever the process was
+ * started. The Electron shell has a different cwd launched from Finder, from a
+ * login item and from a terminal, so one saved config would name three folders
+ * on one machine: one of them written to, the others empty, and none of them
+ * reported as wrong (an empty folder that exists is a quiet success). The home
+ * is the only anchor this process has that does not move, and it is the one the
+ * default already points at.
  */
 export function resolveFolder(settings) {
   const raw = String(settings?.path ?? '').trim();
@@ -156,7 +250,7 @@ export function resolveFolder(settings) {
   if (raw === '~') return os.homedir();
 
   const tilde = /^~[\\/](.*)$/s.exec(raw);
-  if (!tilde) return path.resolve(raw);
+  if (!tilde) return path.isAbsolute(raw) ? path.resolve(raw) : path.resolve(paths().home, raw);
 
   const rest = tilde[1];
   const zelos = /^\.zelos(?:[\\/](.*))?$/s.exec(rest);
@@ -220,9 +314,18 @@ function decodeText(buf) {
  * `handle.readFile()` reads to EOF, which is the wrong verb for a file that may
  * be growing: the stat said 900 KB and the writer is still going. This stops at
  * the ceiling regardless of what the file has become since.
+ *
+ * The buffer is sized to the file rather than to the ceiling. It used to be
+ * `Buffer.alloc(cap + 1)` every time, which zero-filled a megabyte to carry two
+ * bytes: measured at 200 MB allocated across a sweep of 200 two-byte notes, on
+ * the hot path of a connector whose entire subject matter is small notes. The
+ * `+ 1` is the part that must survive — it is how a file that GREW between the
+ * stat and the read is detected, since `readStable` rejects any read whose
+ * length does not equal the size stat'ed on the same handle.
  */
-async function readCapped(handle, cap) {
-  const buf = Buffer.alloc(cap + 1);
+export async function readCapped(handle, cap, expected) {
+  const want = Number.isFinite(expected) ? Math.min(cap, Math.max(0, expected)) : cap;
+  const buf = Buffer.alloc(want + 1);
   let total = 0;
   while (total < buf.length) {
     const { bytesRead } = await handle.read(buf, total, buf.length - total, total);
@@ -286,17 +389,59 @@ function fieldsFrom(name, ext, text) {
   }
 
   const fields = {
-    title: collapse(str(doc.title)),
+    title: collapse(str(doc.title)).slice(0, TITLE_CHARS),
     body: str(doc.body),
     from: str(doc.from),
     date: str(doc.date),
-    link: collapse(str(doc.link)),
+    link: collapse(str(doc.link)).slice(0, LINK_CHARS),
   };
   if (!fields.title && !fields.body.trim()) {
     return { ok: false, why: 'is JSON with neither a title nor a body' };
   }
-  if (!fields.title) fields.title = stem;
+  if (!fields.title) fields.title = stem.slice(0, TITLE_CHARS);
   return { ok: true, fields };
+}
+
+/**
+ * When did the thing in this file happen? -> an ISO instant, always in UTC.
+ *
+ * The mtime is the honest fallback: for anything a script wrote, the moment it
+ * wrote it IS the event, and a row with no date sorts nowhere in particular on
+ * a board ordered by time. What is new here is that a STATED date is bounded by
+ * it, and normalised.
+ *
+ * BOUNDED, because `sent_at` is the sort key. `parseDate` accepts any year up
+ * to 9999 (core/sources/mime.mjs:743), so `{"date":"9999-01-01T00:00:00Z"}`
+ * measured as the top row of `listMessages` — above genuine mail, on every read
+ * for the rest of the install. The headline use for this connector is a shared
+ * sync folder, which is to say the writer is explicitly not guaranteed to be
+ * the user; subjects and bodies from a stranger are normal and fine (so is
+ * mail), but a stranger choosing what the board shows first is not. The mtime
+ * is the one timestamp here the operating system wrote, so it is the ceiling. A
+ * date in the PAST is left alone: backdating is a legitimate thing for a script
+ * to state and it cannot buy priority.
+ *
+ * NORMALISED, because core/db.mjs orders and filters `sent_at` as TEXT. A
+ * stored `2026-08-01T10:00:00-05:00` sorts as though it were 10:00 UTC — five
+ * hours before it happened — against every Z-form row, and this file emitted
+ * both forms: `parseDate` yields `+00:00` where the mtime fallback yields `Z`,
+ * and `+` (0x2B) sorts before `Z` (0x5A), so two rows at the same instant
+ * ordered by their suffix. One format, one meaning.
+ *
+ * THE MTIME IS BOUNDED TOO, and that is a debt from the fix above it. Now that
+ * a file stamped a month in the future is read rather than deferred forever,
+ * its mtime — the fallback and the ceiling — would sit a month in the future in
+ * `sent_at`, which is the same top-of-the-board pin arriving through the clock
+ * instead of through the payload. A machine cannot know what time it is
+ * anywhere else, so the honest reading of a timestamp ahead of this clock is
+ * "as good as now".
+ */
+function fileDate(raw, mtimeMs, nowMs) {
+  const ceiling = Math.min(mtimeMs, nowMs + FUTURE_SKEW_MS);
+  const parsed = parseDate(raw);
+  const ms = parsed ? Date.parse(parsed) : NaN;
+  if (Number.isFinite(ms) && ms <= ceiling + FUTURE_SKEW_MS) return new Date(ms).toISOString();
+  return new Date(ceiling).toISOString();
 }
 
 /**
@@ -324,38 +469,113 @@ function fieldsFrom(name, ext, text) {
  * already dismissed, because `items` carry state across an upsert on purpose
  * (core/db.mjs:22). Resurrecting a dismissed row silently is worse than an
  * extra note the user can see and dismiss.
+ *
+ * `threadKey` IS NOT `messageId`, AND THE GAP BETWEEN THEM IS THE POINT. It
+ * was, and that made every row a conversation of one: measured,
+ * `messagesInThread` returned exactly 1 row for every row this connector has
+ * ever written, and `threadIndex` (core/triage.mjs:520) saw a folder of N notes
+ * as N unrelated threads. A script that rewrites `status.txt` every morning is
+ * writing ONE conversation, and a human reads Monday's and Tuesday's status
+ * that way. So the thread is keyed on the two things that survive a rewrite —
+ * the folder and the filename — while `messageId` goes on hashing the bytes.
+ * Nothing in the argument above is weakened by that: `items` carry their state
+ * across an upsert keyed on `messageRowId`, never on `thread_key`, so a
+ * dismissed row still cannot be resurrected by a new file with the same name.
+ * The FULL PATH is hashed rather than the basename, because the basename is a
+ * display name: two sources both watching a folder called `inbox` would
+ * otherwise thread each other's files together.
  */
-function rowFor({ name, ext, bytes, text, stat, folderName }) {
+function rowFor({ name, ext, bytes, text, stat, dir, folderName, nowMs }) {
   const parsed = fieldsFrom(name, ext, text);
   if (!parsed.ok) return parsed;
 
   const { title, body, from, date, link } = parsed.fields;
   const digest = crypto.createHash('sha256').update(name).update('\u0000').update(bytes).digest('hex');
   const messageId = `folder:sha256:${digest.slice(0, 32)}`;
-  const trimmed = body.slice(0, BODY_CHARS);
+  const thread = crypto.createHash('sha256').update(`${dir}`).update(SEP).update(name).digest('hex');
+
+  /* The link is inside the body's budget rather than exempt from it: it is
+     measured first and the body takes what is left, so `text` cannot pass
+     BODY_CHARS however long either half is. Slicing the pair afterwards would
+     have been shorter to write and would silently drop the link for any body at
+     the ceiling — the half more likely to be worth keeping. */
+  const tail = link ? `\n\n${link}` : '';
+  const trimmed = body.slice(0, Math.max(0, BODY_CHARS - tail.length));
 
   return {
     ok: true,
     row: {
       messageId,
-      threadKey: messageId,
+      threadKey: `folder:name:${thread.slice(0, 32)}`,
       folder: folderName,
       direction: 'in',
       from: addressOf(from, folderName),
       to: [],
       cc: [],
       subject: title || '(untitled)',
-      /* The file's mtime is the honest fallback for "when did this happen":
-         for anything a script wrote, the moment it wrote it IS the event. An
-         unparseable `date` falls back to it rather than to null, because a row
-         with no date sorts nowhere in particular on a board ordered by time. */
-      date: parseDate(date) || new Date(stat.mtimeMs).toISOString(),
+      date: fileDate(date, stat.mtimeMs, nowMs),
       snippet: collapse(trimmed).slice(0, SNIPPET_CHARS),
-      text: link ? `${trimmed}\n\n${link}`.trim() : trimmed,
+      text: `${trimmed}${tail}`.trim(),
       hasAttachments: false,
       flags: [],
     },
   };
+}
+
+/**
+ * Why files were not read this sweep, kept apart by cause.
+ *
+ * One integer used to carry all five of these, and every one of them borrowed
+ * the cap's sentence — "N more files are waiting, Zelos reads 200 a sweep and
+ * will take them next time". For four of the five that sentence is simply
+ * untrue and it never names a file, so a mode-000 file reported itself that way
+ * on every sweep forever (measured: rows 1, 0, 0 over three sweeps, the same
+ * words each time, the filename never mentioned) and so did a sweep the user
+ * had cancelled before anything was read. Two of these causes deserve silence,
+ * two deserve a sentence of their own, and one is the cap.
+ */
+const noDeferrals = () => ({
+  /* Over MAX_FILES_PER_SWEEP. The only cause the cap's sentence is true of. */
+  capped: 0,
+  /* Mid-write, or changed under the read. Silent on purpose: it resolves itself
+     next sweep without the user doing anything, and a red banner for a file
+     that is thirty minutes from arriving is noise. */
+  busy: 0,
+  /* The walk stopped at MAX_DIR_ENTRIES. Its own sentence, because "waiting"
+     implies a queue that will drain and this one will not. */
+  walkCapped: false,
+  /* {name, why}. Named, with the errno in words: this is the one the user can
+     actually fix, and "permission denied" is a chmod away from solved. */
+  unreadable: [],
+});
+
+/**
+ * An errno, in words a person can act on at seven in the morning.
+ *
+ * The fallback carries the system's own message, which contains the path — the
+ * user's own path, already named elsewhere in these notes — and is sanitised
+ * the same way a filename is, because this string lands in `runs.stats_json`,
+ * in `GET /api/state` and in the Settings export.
+ */
+const ERRNO_TEXT = new Map([
+  ['EACCES', 'permission denied'],
+  ['EPERM', 'permission denied'],
+  ['EIO', 'the disk returned an I/O error'],
+  ['EBUSY', 'the file is in use'],
+  ['ELOOP', 'it is a symlink now, and Zelos does not follow one'],
+  ['EISDIR', 'it became a folder while Zelos was looking'],
+  ['ENAMETOOLONG', 'the name is too long for this filesystem'],
+  ['EMFILE', 'this process has no file descriptors left'],
+  ['ENFILE', 'this machine has no file descriptors left'],
+  ['ENOTDIR', 'part of the path stopped being a folder'],
+  ['ESTALE', 'the network mount went stale'],
+  ['ETIMEDOUT', 'the network mount timed out'],
+]);
+
+function readErrorText(err) {
+  const code = err?.code;
+  if (code && ERRNO_TEXT.has(code)) return ERRNO_TEXT.get(code);
+  return collapse(err?.message || String(err)).replace(/[<>]/g, ' ').slice(0, 90) || 'the read failed';
 }
 
 /**
@@ -379,7 +599,7 @@ async function scan(dir, seen, startedMs, log) {
   const ready = [];
   const refused = [];
   const present = [];
-  let deferred = 0;
+  const deferred = noDeferrals();
   let entries = 0;
 
   let handle;
@@ -391,7 +611,15 @@ async function scan(dir, seen, startedMs, log) {
   }
 
   for await (const dirent of handle) {
-    if (entries >= MAX_DIR_ENTRIES) { deferred += 1; break; }
+    /* THE WALK'S OWN CEILING, AND WHY IT IS NOT COUNTED. `deferred += 1` used
+       to stand here, which reported the loss of everything past entry 5,000 as
+       "1 more file" whatever the true number was — measured at 5,201 files:
+       three sweeps, "1 more file is waiting", permanently red, and the .json
+       that happened to sort past the cap never read and never mentioned.
+       Counting what was skipped would mean walking the entries in order to
+       count them, which is the cost this cap exists to refuse, so the sentence
+       says what is true instead: the walk stopped, and there is more behind it. */
+    if (entries >= MAX_DIR_ENTRIES) { deferred.walkCapped = true; break; }
     entries += 1;
 
     const name = dirent.name;
@@ -420,8 +648,28 @@ async function scan(dir, seen, startedMs, log) {
     let stat;
     try {
       stat = await fs.lstat(path.join(dir, name));
-    } catch {
-      deferred += 1;
+    } catch (err) {
+      // A name that vanished between the listing and the lstat is gone, not
+      // broken — that is `mv` finishing, and there is nothing to tell anyone.
+      if (err?.code !== 'ENOENT') deferred.unreadable.push({ name, why: readErrorText(err) });
+      continue;
+    }
+
+    /* THE CURSOR IS CONSULTED HERE, ABOVE EVERY REFUSAL, AND THE ORDER IS THE
+       WHOLE OF THE "TOLD ONCE" PROMISE. Both refusals below record their
+       signature in `present`, which is what the next sweep's cursor is built
+       from — but for the file's whole first life that record was written and
+       never read, because the gate sat UNDER them. Measured over six
+       consecutive sweeps of a folder holding one 1.2 MB log and one unpacked
+       `export.json/`: sweep 1 reported them, and so did sweeps 2 through 6,
+       word for word, every thirty minutes, for two files nobody was ever going
+       to fix. The refusals decided later in `collect` (bad JSON, NUL bytes)
+       were quiet after the first sweep the entire time, because they happen
+       after this line. `signature` is computed once and reused by both
+       branches, so this is a move rather than extra work. */
+    const sig = signature(name, stat);
+    if (seen.has(sig)) {
+      present.push({ name, sig, mtimeMs: stat.mtimeMs });
       continue;
     }
 
@@ -433,23 +681,17 @@ async function scan(dir, seen, startedMs, log) {
        read of a FIFO blocks until somebody writes, and a sweep that never
        returns is the one failure with no error message at all. */
     if (!stat.isFile()) {
-      present.push({ name, sig: signature(name, stat), mtimeMs: stat.mtimeMs });
+      present.push({ name, sig, mtimeMs: stat.mtimeMs });
       refused.push({ name, why: stat.isDirectory() ? 'is a folder, not a file' : 'is not a regular file' });
       continue;
     }
 
     if (stat.size > MAX_FILE_BYTES) {
-      present.push({ name, sig: signature(name, stat), mtimeMs: stat.mtimeMs });
+      present.push({ name, sig, mtimeMs: stat.mtimeMs });
       refused.push({
         name,
         why: `is ${stat.size.toLocaleString('en-US')} bytes and Zelos reads at most ${MAX_FILE_BYTES.toLocaleString('en-US')}`,
       });
-      continue;
-    }
-
-    const sig = signature(name, stat);
-    if (seen.has(sig)) {
-      present.push({ name, sig, mtimeMs: stat.mtimeMs });
       continue;
     }
 
@@ -463,11 +705,22 @@ async function scan(dir, seen, startedMs, log) {
        began was still being written during the scan; it is left for the next
        one, which is thirty minutes away and long finished.
        Strictly later, not later-or-equal: mtime has millisecond resolution and
-       a file written in the same millisecond the sweep started is complete. */
+       a file written in the same millisecond the sweep started is complete.
+       BOUNDED BY FUTURE_SKEW_MS, because "later than now" with no ceiling is
+       not a deferral, it is a file that is never read: measured with an mtime
+       30 days ahead, three consecutive sweeps returned zero rows and called it
+       "waiting". Past the window the clock is wrong rather than the writer
+       being busy — a NAS, a sync peer, an unpacked archive, `touch -t` — and
+       the file is read. `readStable` still brackets the read with two stats, so
+       a writer that really is busy is caught there instead. */
     if (stat.mtimeMs > startedMs) {
-      log?.debug?.(`${name} changed after this sweep started; leaving it for the next one`);
-      deferred += 1;
-      continue;
+      const ahead = stat.mtimeMs - startedMs;
+      if (ahead <= FUTURE_SKEW_MS) {
+        log?.debug?.(`${name} changed after this sweep started; leaving it for the next one`);
+        deferred.busy += 1;
+        continue;
+      }
+      log?.debug?.(`${name} is stamped ${Math.round(ahead / 1000)}s in the future; reading it rather than waiting for this machine's clock`);
     }
 
     ready.push({ name, ext, sig, stat });
@@ -478,7 +731,7 @@ async function scan(dir, seen, startedMs, log) {
   // happens to list last.
   ready.sort((a, b) => (a.stat.mtimeMs - b.stat.mtimeMs) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   if (ready.length > MAX_FILES_PER_SWEEP) {
-    deferred += ready.length - MAX_FILES_PER_SWEEP;
+    deferred.capped += ready.length - MAX_FILES_PER_SWEEP;
     ready.length = MAX_FILES_PER_SWEEP;
   }
 
@@ -520,7 +773,7 @@ async function readStable(dir, entry, log) {
     if (before.size !== entry.stat.size || before.mtimeMs !== entry.stat.mtimeMs) return { changed: true };
 
     log?.debug?.(`reading ${entry.name} (${before.size} bytes)`);
-    const bytes = await readCapped(handle, MAX_FILE_BYTES);
+    const bytes = await readCapped(handle, MAX_FILE_BYTES, before.size);
 
     const after = await handle.stat();
     if (after.size !== before.size || after.mtimeMs !== before.mtimeMs) return { changed: true };
@@ -532,13 +785,59 @@ async function readStable(dir, entry, log) {
   }
 }
 
-/** The refusals, as one sentence a person can act on. */
+/** `“a.json” is a folder, not a file; “b.txt” is 1,200,000 bytes, and 2 more` */
+function nameList(entries, format) {
+  const named = entries.slice(0, MAX_REPORTED).map(format);
+  const rest = entries.length - named.length;
+  return `${named.join('; ')}${rest > 0 ? `, and ${rest} more` : ''}`;
+}
+
+/** The refusals, as one sentence a person can act on. Said once per version. */
 function refusalNote(folderName, refused) {
-  const named = refused.slice(0, MAX_REPORTED).map((r) => `“${displayName(r.name)}” ${r.why}`);
-  const rest = refused.length - named.length;
-  const tail = rest > 0 ? `, and ${rest} more` : '';
+  const list = nameList(refused, (r) => `“${displayName(r.name)}” ${r.why}`);
   return `Zelos left ${refused.length} file${refused.length === 1 ? '' : 's'} in ${folderName} unread: `
-    + `${named.join('; ')}${tail}. Nothing was moved or deleted — they are still there.`;
+    + `${list}. Nothing was moved or deleted — they are still there.`;
+}
+
+/**
+ * The files that could not be read, as their own sentence.
+ *
+ * This one repeats while the condition does, and that is correct: a file the
+ * user cannot read today is a file they can chmod, and the next sweep will try
+ * it again. What it must never do is what it used to do — borrow the cap's
+ * "will take it next time", which promised a queue that was never going to
+ * drain, and name no file at all.
+ */
+function unreadableNote(folderName, unreadable) {
+  const list = nameList(unreadable, (r) => `“${displayName(r.name)}” (${r.why})`);
+  return `Zelos could not read ${unreadable.length} file${unreadable.length === 1 ? '' : 's'} in ${folderName}: `
+    + `${list}. Nothing was moved or deleted, and Zelos will try again on the next sweep.`;
+}
+
+/**
+ * Everything the user is told about one sweep, in one string or in none.
+ *
+ * Order is by what a person can do about it: refusals name files that need a
+ * decision, unreadable files need a permission, the walk cap needs a smaller
+ * folder, and the per-sweep cap needs nothing at all but explains a count.
+ * `busy` says nothing (it fixes itself in thirty minutes) and neither does an
+ * aborted sweep, which is handled before this is called.
+ */
+function sweepNote(folderName, refused, deferred) {
+  const notes = [];
+  if (refused.length) notes.push(refusalNote(folderName, refused));
+  if (deferred.unreadable.length) notes.push(unreadableNote(folderName, deferred.unreadable));
+  if (deferred.walkCapped) {
+    notes.push(`${folderName} holds more than ${MAX_DIR_ENTRIES.toLocaleString('en-US')} entries, `
+      + `so Zelos looked at the first ${MAX_DIR_ENTRIES.toLocaleString('en-US')} and stopped — anything past that `
+      + 'is not being read at all. Point this source at a folder that holds only what it should read.');
+  }
+  if (deferred.capped > 0) {
+    const n = deferred.capped;
+    notes.push(`${n} more file${n === 1 ? '' : 's'} in ${folderName} ${n === 1 ? 'is' : 'are'} waiting — `
+      + `Zelos reads ${MAX_FILES_PER_SWEEP} a sweep, and will take ${n === 1 ? 'it' : 'them'} next time.`);
+  }
+  return notes.length ? notes.join(' ') : null;
 }
 
 export default {
@@ -628,16 +927,57 @@ export default {
           cursor: null,
         };
       }
+      /* NEVER SEEN, AND THE PARENT IS MISSING TOO. `~/Dowloads/zelos` is a
+         typo; `/Volumes/archive/inbox` on an unplugged disk is a volume that is
+         not there. Both used to report "nothing waiting" — green, silent,
+         forever, while the script wrote into the folder next door. The parent
+         is what tells them apart from the case above: `mkdir ~/.zelos/inbox` is
+         one directory away from done and stays quiet, but a path whose PARENT
+         does not exist was never a folder on this machine at all. (The review
+         that found this proposed the opposite test — report when the parent
+         exists — which would have painted every fresh install red for the
+         default path and stayed silent for the typo it was about.) */
+      const parent = path.dirname(dir);
+      let parentThere = false;
+      if (parent && parent !== dir) {
+        parentThere = await fs.stat(parent).then((s) => s.isDirectory(), () => false);
+      }
+      if (!parentThere) {
+        ctx.emit(`${ctx.label}: folder missing`, 0, 0);
+        return {
+          parts: [{
+            label: '',
+            rows: [],
+            error: null,
+            note: `${dir} does not exist, and neither does the folder it would sit in. `
+              + 'Nothing is being read. Check the path in Settings → Sources — a mistyped folder and a '
+              + 'volume that is not mounted both look like this.',
+          }],
+          cursor: null,
+        };
+      }
+
       ctx.emit(`${ctx.label}: nothing waiting`, 0, 0);
       return { parts: [{ label: '', rows: [], error: null, note: null }], cursor: null };
     }
 
     const rows = [];
     const refused = [...walked.refused];
-    let deferred = walked.deferred;
+    const deferred = walked.deferred;
+    let aborted = false;
 
     for (const entry of walked.ready) {
-      if (ctx?.signal?.aborted) { deferred += 1; continue; }
+      /* A CANCELLED SWEEP REPORTS NOTHING AND REMEMBERS NOTHING. It used to
+         count the rest as deferred, which produced "5 more files are waiting —
+         Zelos reads 200 a sweep" for a sweep that read zero files because the
+         user pressed stop (measured with an already-aborted signal), and
+         core/sweep.mjs stores that sentence in `runs.stats_json`. The cursor
+         goes back as `undefined` below for the same reason: an aborted walk
+         that saw nothing would otherwise hand back an empty `seen` and erase
+         every digest this source has — latent today, since sweep.mjs returns
+         before `writeCursor`, and live the moment cursors are written per
+         source as they resolve. */
+      if (ctx?.signal?.aborted) { aborted = true; break; }
 
       let read;
       try {
@@ -645,13 +985,15 @@ export default {
       } catch (err) {
         // EACCES on one file must not lose the other 199. Deferred rather than
         // refused: a permission a user fixes with chmod changes neither mtime
-        // nor size, so recording it would mean never looking again.
+        // nor size, so recording it in the cursor would mean never looking
+        // again — but it is named in the report, which is the half that was
+        // missing.
         log?.warn?.(`could not read ${entry.name}: ${err?.message || String(err)}`);
-        deferred += 1;
+        deferred.unreadable.push({ name: entry.name, why: readErrorText(err) });
         continue;
       }
       if (read.gone) continue;
-      if (read.changed) { deferred += 1; continue; }
+      if (read.changed) { deferred.busy += 1; continue; }
 
       const text = decodeText(read.bytes);
       /* A .txt that is really a binary. The extension is a claim, not a fact —
@@ -670,7 +1012,9 @@ export default {
         bytes: read.bytes,
         text,
         stat: read.stat,
+        dir,
         folderName,
+        nowMs: startedMs,
       });
       walked.present.push({ name: entry.name, sig: entry.sig, mtimeMs: entry.stat.mtimeMs });
       if (!built.ok) {
@@ -680,29 +1024,29 @@ export default {
       rows.push(built.row);
     }
 
+    ctx.emit(`${ctx.label}: ${rows.length} file${rows.length === 1 ? '' : 's'}`, rows.length, rows.length);
+
+    if (aborted) {
+      // The rows already read are real and their ids are deterministic, so they
+      // are worth handing back; the cursor is not, because this walk never
+      // finished looking. `undefined` is how the host is told to keep what it
+      // already had (core/sweep.mjs:788).
+      return { parts: [{ label: '', rows, error: null, note: null }], cursor: undefined };
+    }
+
     /* Rebuilt from what is on disk right now, newest first, capped. Newest
        first because the oldest files are the ones most likely already handled,
        so if the folder is larger than the cursor it is the long-settled files
-       that get re-read — steady work rather than a set that thrashes between
-       two halves of the folder every sweep. */
+       that get re-read. Read the header before changing the ordering: with a
+       folder larger than MAX_REMEMBERED this end and the oldest-first read end
+       disagree permanently, and reversing either one only moves which files
+       churn — nothing inside a 4,096-character cursor makes it converge. */
     const kept = walked.present
       .sort((a, b) => b.mtimeMs - a.mtimeMs)
       .slice(0, MAX_REMEMBERED)
       .map((p) => p.sig);
 
-    const parts = [];
-    if (refused.length) parts.push({ label: '', rows, error: null, note: refusalNote(folderName, refused) });
-    else if (deferred > 0) {
-      parts.push({
-        label: '',
-        rows,
-        error: null,
-        note: `${deferred} more file${deferred === 1 ? '' : 's'} in ${folderName} ${deferred === 1 ? 'is' : 'are'} `
-          + `waiting — Zelos reads ${MAX_FILES_PER_SWEEP} a sweep, and will take ${deferred === 1 ? 'it' : 'them'} next time.`,
-      });
-    } else parts.push({ label: '', rows, error: null, note: null });
-
-    ctx.emit(`${ctx.label}: ${rows.length} file${rows.length === 1 ? '' : 's'}`, rows.length, rows.length);
+    const parts = [{ label: '', rows, error: null, note: sweepNote(folderName, refused, deferred) }];
     return { parts, cursor: { v: 1, seen: kept } };
   },
 
@@ -756,17 +1100,38 @@ export default {
     }
 
     let ready = 0;
+    let large = 0;
     let ignored = 0;
     let entries = 0;
+    let capped = false;
     try {
       const handle = await fs.opendir(dir);
       for await (const dirent of handle) {
-        if (entries >= MAX_DIR_ENTRIES) break;
+        if (entries >= MAX_DIR_ENTRIES) { capped = true; break; }
         entries += 1;
         if (dirent.name.startsWith('.')) continue;
         if (dirent.isSymbolicLink()) { ignored += 1; continue; }
         if (!EXTENSIONS.has(path.extname(dirent.name).toLowerCase())) { ignored += 1; continue; }
-        if (!dirent.isFile()) { ignored += 1; continue; }
+
+        /* THE SAME QUESTIONS THE SWEEP ASKS, ASKED THE SAME WAY. This counted
+           `dirent.isFile()` and stopped there, and both halves of that were
+           wrong. The dirent carries the readdir type, which is UV_DIRENT_UNKNOWN
+           on an NFS or FUSE mount — every entry then answers false and doctor
+           reports an empty folder that `collect` (which lstats) reads without
+           trouble. And a file the sweep will always refuse was counted as
+           readable: measured, doctor said "pass · 2 readable .json/.txt files"
+           about a folder whose 1.2 MB `dump.txt` the board was complaining
+           about by name. Two surfaces disagreeing about one folder is worse
+           than either being wrong. */
+        let st;
+        try {
+          st = await fs.lstat(path.join(dir, dirent.name));
+        } catch {
+          ignored += 1;
+          continue;
+        }
+        if (!st.isFile()) { ignored += 1; continue; }
+        if (st.size > MAX_FILE_BYTES) { large += 1; continue; }
         ready += 1;
       }
     } catch (err) {
@@ -780,11 +1145,20 @@ export default {
     /* The count is of everything eligible, not of everything unread: `check`
        is handed the source, not the cursor, so it cannot know what has already
        been read — and inventing a second, disagreeing answer to that question
-       would be worse than saying plainly what this number counts. */
+       would be worse than saying plainly what this number counts.
+       An over-size file is named as its own number rather than raised to a
+       `warn`: the sweep says which file it is, once, and a doctor that is
+       permanently yellow about a log somebody parked in the folder is the same
+       fatigue this file spends its cursor avoiding. */
     return {
       status: 'pass',
       detail: `${dir} · ${ready} readable .json/.txt file${ready === 1 ? '' : 's'}`
+        + `${large ? ` · ${large} too large for Zelos to read` : ''}`
         + `${ignored ? ` · ${ignored} ignored` : ''}`
+        + (capped
+          ? ` · more than ${MAX_DIR_ENTRIES.toLocaleString('en-US')} entries, so only the first `
+            + `${MAX_DIR_ENTRIES.toLocaleString('en-US')} were counted`
+          : '')
         + ' · already-read files are skipped on the next sweep',
     };
   },

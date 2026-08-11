@@ -280,9 +280,20 @@ export function slackFailure(method, body) {
  * proxy replaying a cached page, and either way it is an infinite loop against a
  * rate-limited API. Both endings are treated the same way — stop — because the
  * caller cannot do anything useful with the difference.
+ *
+ * The ONE ending the caller can do something about is the page cap itself, and
+ * it used to be silent. `MAX_LIST_PAGES` x `LIST_PAGE` is 2,000 conversations;
+ * an Enterprise Grid workspace with more than that had the `maxChannels` cut
+ * applied to an arbitrary prefix of an order Slack documents nothing about, so
+ * the set of channels read could differ between sweeps for a reason
+ * `onlyChannels` cannot explain — while line 795's note already answers exactly
+ * that question for the OTHER cut. So the array comes back wearing
+ * `.truncated`, the same "array with a non-index property" core/sweep.mjs's
+ * `markTruncated` uses, and the caller turns it into a sentence.
  */
 async function paginate(ctx, method, params, pick, { maxPages, stop = () => false }) {
   const out = [];
+  out.truncated = false;
   let cursor = '';
   for (let page = 0; page < maxPages; page += 1) {
     const body = await slackGet(ctx, method, cursor ? { ...params, cursor } : params);
@@ -292,6 +303,8 @@ async function paginate(ctx, method, params, pick, { maxPages, stop = () => fals
     const next = String(body?.response_metadata?.next_cursor ?? '');
     if (!next || next === cursor) break;
     cursor = next;
+    // Slack still had more to give and this was the last page allowed.
+    if (page === maxPages - 1) out.truncated = true;
   }
   return out;
 }
@@ -527,10 +540,10 @@ function wanted(only, conv, folder) {
  * `conversations.list` returns channels in an order Slack documents nothing
  * about, so a cap applied to it would silently include a different set of
  * channels on different days. Sorted here instead: direct messages first
- * (someone typed your name), then group DMs, then channels alphabetically. The
- * cut is still arbitrary at the boundary but it is STABLE, which is the property
- * that makes "why is #zoning missing" answerable — and the answer is
- * `onlyChannels`, not a larger cap.
+ * (someone typed your name), then group DMs, then channels — with `sortKey`
+ * below breaking the tie inside a rank. The cut is still arbitrary at the
+ * boundary but it is STABLE, which is the property that makes "why is #zoning
+ * missing" answerable — and the answer is `onlyChannels`, not a larger cap.
  */
 function rank(conv) {
   if (conv?.is_im) return 0;
@@ -538,7 +551,69 @@ function rank(conv) {
   return 2;
 }
 
+/**
+ * The tiebreaker inside a rank, and it is deliberately NOT the display name.
+ *
+ * The cut used to be applied to a list sorted by `folder`, and a DM's folder is
+ * `@dana` — which means the cut could not be decided until every IM in the
+ * workspace had been named, one `users.info` each, BEFORE `onlyChannels` and
+ * before `maxChannels`. Measured: 200 IMs, `onlyChannels: 'site-ops'`,
+ * `maxChannels: 1` — 120 calls made, 118 of them `users.info`, zero
+ * `conversations.history`, then a RateLimitError out of `collect`, so the 118
+ * names it had just paid for were never even cached. A user token in a company
+ * where you have DMed a hundred people could not read a message, ever.
+ *
+ * A partner's user id sorts just as arbitrarily as their display name and is
+ * MORE stable — it is free, and it does not change when somebody edits their
+ * profile, which the old key did. `readList` is re-sorted by folder once the
+ * survivors have names, so the order the board and `ctx.emit` see is unchanged;
+ * the only difference is WHICH conversations survive a cut that has more DMs
+ * than `maxChannels`, and that was arbitrary before and is arbitrary now.
+ */
+function sortKey(conv) {
+  if (conv?.is_im) return collapse(conv.user) || collapse(conv.id);
+  return prettyName(conv) || collapse(conv.id);
+}
+
 /* ----------------------------------------------------------------- cursor */
+
+/**
+ * The shape written below, and the only shape `readCursor` will read back.
+ *
+ * It was written and never read, which made it decoration. It is branched on
+ * now: `seen` and `users` are two hand-rolled encodings, and a future version
+ * that changes either would be misread here as garbage that happens to
+ * typecheck — see `validMark` for what a misread mark costs.
+ */
+export const CURSOR_VERSION = 1;
+
+/**
+ * A high-water mark that is really a Slack `ts`, and really in the past.
+ *
+ * `oldest` is sent to Slack verbatim and the reduce at the bottom of `collect`
+ * only ever moves a mark UPWARD, so a mark that is too large is permanent: the
+ * channel answers with nothing forever and the part reports `ok: true, count:
+ * 0` — the exact shape of a quiet week, with no error on any surface. Three
+ * ways to get one, all measured: a cursor written by a version that stored
+ * milliseconds (`"1754899320001"` — Slack has no messages after the year
+ * 57000), one that stored an ISO string (`Number(ts)` is NaN, so the mark never
+ * advances and the full lookback is re-read every sweep forever), and a plain
+ * bad value like `"99999999999.000000"`.
+ *
+ * So a mark is kept only if it looks like epoch seconds with Slack's optional
+ * six decimals AND is not in the future. Anything else is dropped and the
+ * channel re-reads from the lookback floor, which costs one call and inserts
+ * nothing (every row upserts by a stable id). The five minutes of slack is for
+ * clock skew between this machine and Slack's, not for a real future message.
+ */
+const TS_RE = /^\d{9,11}(\.\d{1,6})?$/;
+const FUTURE_SLACK_MS = 5 * 60_000;
+
+export function validMark(value, nowMs) {
+  if (typeof value !== 'string' || !TS_RE.test(value)) return false;
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 && n * 1000 <= nowMs + FUTURE_SLACK_MS;
+}
 
 /**
  * The cursor, trimmed until it will actually be stored.
@@ -550,7 +625,7 @@ function rank(conv) {
  * marks — the channels being read right now — are the last thing to go.
  */
 export function packCursor({ seen = {}, users = {}, usersAt = 0 } = {}, budget = CURSOR_CHAR_BUDGET) {
-  const out = { v: 1, seen: { ...seen }, users: { ...users }, usersAt: Number(usersAt) || 0 };
+  const out = { v: CURSOR_VERSION, seen: { ...seen }, users: { ...users }, usersAt: Number(usersAt) || 0 };
   const size = () => JSON.stringify(out).length;
 
   const userIds = Object.keys(out.users);
@@ -562,16 +637,35 @@ export function packCursor({ seen = {}, users = {}, usersAt = 0 } = {}, budget =
   return out;
 }
 
-/** What came back from `kv` last time, with every field defended. */
+/**
+ * What came back from `kv` last time, with every field defended.
+ *
+ * `v` is BRANCHED ON rather than merely written. A cursor from a version this
+ * one does not know is not partially trusted — `seen` and `users` are two
+ * hand-rolled encodings and a future version that changes either would be read
+ * here as garbage that happens to typecheck. Dropping it costs one sweep of
+ * re-reading the lookback and inserts nothing; misreading it can black a
+ * channel out permanently (see `validMark`).
+ *
+ * An entry in `users` whose value equals its own key is NOT a name. That is what
+ * `resolveUser` caches when `users:read` is missing or a lookup fails, and
+ * persisting it made the failure outlive its cause: measured, one sweep without
+ * the scope wrote `{"U_DANA":"U_DANA"}`, the user added the scope and
+ * reinstalled exactly as this file's own error text tells them to, and the next
+ * sweep made ZERO `users.info` calls and still showed `@U_DANA` — for the seven
+ * days until the whole cache aged out. Dropped on write AND on read, so a
+ * cursor already carrying one recovers on the next sweep rather than in a week.
+ */
 function readCursor(raw, nowMs) {
   const cursor = isObj(raw) ? raw : {};
-  const seen = isObj(cursor.seen) ? cursor.seen : {};
-  const usersAt = Number(cursor.usersAt) || 0;
+  const known = Number(cursor.v) === CURSOR_VERSION;
+  const seen = known && isObj(cursor.seen) ? cursor.seen : {};
+  const usersAt = known ? Number(cursor.usersAt) || 0 : 0;
   const fresh = usersAt && nowMs - usersAt < USER_CACHE_MAX_AGE_MS;
   const users = fresh && isObj(cursor.users) ? cursor.users : {};
   return {
-    seen: Object.fromEntries(Object.entries(seen).filter(([, v]) => typeof v === 'string' && v)),
-    names: new Map(Object.entries(users).filter(([, v]) => typeof v === 'string' && v)),
+    seen: Object.fromEntries(Object.entries(seen).filter(([, v]) => validMark(v, nowMs))),
+    names: new Map(Object.entries(users).filter(([k, v]) => typeof v === 'string' && v && v !== k)),
     usersAt: fresh ? usersAt : 0,
   };
 }
@@ -748,6 +842,11 @@ export default {
        whichever answer. Up to four calls, only ever on the failure path, and the
        user is told in a note which halves of their Slack are dark and why. */
     let conversations = [];
+    /* Whether the list is the WHOLE list, which is what decides below whether a
+       high-water mark for a channel that is not in it may be forgotten. Two ways
+       to lose it: a refused scope, and the paging ceiling. */
+    let listComplete = true;
+    let listTruncated = false;
     try {
       conversations = await paginate(
         ctx,
@@ -756,18 +855,22 @@ export default {
         (b) => b.channels,
         { maxPages: MAX_LIST_PAGES },
       );
+      listTruncated = conversations.truncated === true;
+      listComplete = !listTruncated;
     } catch (err) {
       if (err.slackError !== 'missing_scope') throw err;
       const refused = [];
       for (const type of breadth.types) {
         try {
-          conversations.push(...await paginate(
+          const page = await paginate(
             ctx,
             'conversations.list',
             { types: type, exclude_archived: 'true', limit: LIST_PAGE },
             (b) => b.channels,
             { maxPages: MAX_LIST_PAGES },
-          ));
+          );
+          if (page.truncated === true) listTruncated = true;
+          conversations.push(...page);
         } catch (inner) {
           if (inner instanceof AuthError || inner instanceof RateLimitError) throw inner;
           if (inner.slackError !== 'missing_scope') throw inner;
@@ -775,31 +878,84 @@ export default {
         }
       }
       if (refused.length === breadth.types.length) throw err;
+      listComplete = false;
       notes.push(`Slack would not list ${refused.join(', ')} — this token is missing ${collapse(err.slackNeeded) || 'a read scope'}.`);
     }
 
-    // DM partners have to be named before `onlyChannels` can be matched against
-    // them, and before the board has a folder to file the rows under.
-    for (const conv of conversations) {
-      if (conv?.is_im && conv.user) await resolveUser(ctx, conv.user, names, state);
+    if (listTruncated) {
+      /* Said out loud, because line 795's note already answers the same
+         question for the other cut. Without it, an Enterprise Grid workspace
+         over the ceiling gets `maxChannels` applied to an arbitrary 2,000-entry
+         prefix of an order Slack documents nothing about — so which channels
+         are read can change between sweeps for a reason `onlyChannels` cannot
+         explain, and nothing on any surface says so. */
+      notes.push(`Slack has more conversations than Zelos will page through (${MAX_LIST_PAGES * LIST_PAGE}), so this is a prefix of the workspace — name the ones you want in “Only these conversations”.`);
     }
 
-    const chosen = conversations
+    /* WHICH CONVERSATIONS, AND WHOSE NAMES GET PAID FOR.
+       Filter and cap FIRST, resolve names SECOND — see `sortKey` for the 118
+       wasted `users.info` calls that ordering used to cost. The only reason a
+       DM needs a name before the cut is `onlyChannels`, and that is bounded
+       here: selection may never cost more calls than reading costs. */
+    const eligible = conversations
       .filter((conv) => isObj(conv) && collapse(conv.id))
       .filter((conv) => !conv.is_archived)
       .filter((conv) => !breadth.membersOnly || conv.is_im || conv.is_mpim || conv.is_member === true)
-      .map((conv) => ({ conv, folder: folderFor(conv, resolve) }))
-      .filter(({ conv, folder }) => wanted(only, conv, folder))
-      .sort((a, b) => rank(a.conv) - rank(b.conv) || a.folder.localeCompare(b.folder));
+      .sort((a, b) => rank(a) - rank(b) || sortKey(a).localeCompare(sortKey(b)));
+
+    let lookups = 0;
+    const chosen = [];
+    for (const conv of eligible) {
+      /* A name is bought only when it is the ONLY thing that can decide this
+         conversation: the user narrowed by name, this is a DM, the partner is
+         not already in the cursor's cache, and no cheaper key (the channel
+         name, or the partner's raw id — `folderFor` renders an unresolved DM as
+         `@U04ABCDEF`, which `matchKey` reduces to the id) has matched already. */
+      const needsName = only.length && conv.is_im && conv.user
+        && !names.has(collapse(conv.user))
+        && !wanted(only, conv, folderFor(conv, resolve));
+      if (needsName && lookups < maxChannels) {
+        lookups += 1;
+        await resolveUser(ctx, conv.user, names, state);
+      }
+      const folder = folderFor(conv, resolve);
+      if (wanted(only, conv, folder)) chosen.push({ conv, folder });
+    }
 
     if (chosen.length > maxChannels) {
       notes.push(`${chosen.length} conversations matched and Zelos read the first ${maxChannels}.`);
     }
     const readList = chosen.slice(0, maxChannels);
 
+    /* The names the BOARD needs — a DM has no folder without one — bought now
+       that the cut has happened, so this costs at most `maxChannels` calls and
+       usually far fewer (the survivors of the loop above are already cached).
+       Then re-sorted by folder, which is the order the user reads and the order
+       `ctx.emit` reports; the cut above was decided on ids for cost, not for
+       presentation. */
+    for (const entry of readList) {
+      const partner = entry.conv.is_im ? collapse(entry.conv.user) : '';
+      if (partner && !names.has(partner)) {
+        await resolveUser(ctx, partner, names, state);
+        entry.folder = folderFor(entry.conv, resolve);
+      }
+    }
+    readList.sort((a, b) => rank(a.conv) - rank(b.conv) || a.folder.localeCompare(b.folder));
+
     const floorTs = isoToTs(new Date(nowMs - lookbackDays * 86_400_000).toISOString());
     const parts = [];
-    const seen = {};
+    /* SEEDED FROM WHAT WAS ALREADY KNOWN, not empty.
+       This object is the whole cursor, so anything missing from it at the end is
+       forgotten — and the loop below reaches only the conversations it gets
+       through. Starting it empty meant a rate limit, an abort, or one channel's
+       error threw away the marks of every conversation the loop did not reach,
+       which made the sweep AFTER a throttle strictly more expensive than the one
+       that was throttled: measured with four primed marks and Slack refusing the
+       second channel, the stored cursor came back holding one, and the next
+       sweep asked the other three for the full `lookbackDays` window again. On a
+       genuinely throttled workspace that never converges. `packCursor` already
+       trims oldest-first if this grows past what will store. */
+    const seen = { ...prior.seen };
     let rateLimited = null;
 
     for (let i = 0; i < readList.length; i += 1) {
@@ -841,7 +997,8 @@ export default {
           }
         }
 
-        const rows = kept.map((msg) => messageRow(msg, { channelId, folder, resolve, selfUser, selfBot }));
+        const direct = conv.is_im === true || conv.is_mpim === true;
+        const rows = kept.map((msg) => messageRow(msg, { channelId, folder, resolve, selfUser, selfBot, direct }));
 
         /* The high-water mark is the newest `ts` SEEN, not the newest kept: a
            channel whose last fortnight is entirely join notices would otherwise
@@ -856,11 +1013,17 @@ export default {
       } catch (err) {
         if (err instanceof AuthError) throw err;
         if (err instanceof RateLimitError) {
-          /* Stop, keep everything already read, and keep the marks for it. The
-             alternative — rethrowing — throws away twelve channels that arrived
-             to report the thirteenth, and buys a `notBefore` this connector does
-             not need: `ctx.http` has already closed out the persisted budget
-             window, which is the same backoff by a slower road. */
+          /* Stop, and keep everything already read — rethrowing would throw away
+             twelve channels that arrived in order to report the thirteenth.
+             What this does NOT do is claim the backoff has been handled: an HTTP
+             429 closes out the persisted budget window inside `ctx.http`, but
+             the 200-with-`{ok:false,error:"ratelimited"}` form is synthesised by
+             `slackFailure` above and never touches the meter, so a run that
+             swallows one leaves core/sweep.mjs recording `notBefore: 0` with the
+             rest of the budget open. Measured: `"spent":5` of 120 after a
+             throttle. So the swallow is worth it only when something was
+             actually read; when nothing was, it is pure loss, and the error is
+             propagated below so the host can rest the source. */
           rateLimited = err;
           break;
         }
@@ -868,18 +1031,67 @@ export default {
       }
     }
 
+    /* A throttle that cost the whole sweep is a failure, not a quiet result:
+       nothing was read, so there is nothing to protect by swallowing it, and
+       the sweep's `notBefore` is worth more than a part that says zero. */
+    if (rateLimited && !parts.length) throw rateLimited;
+
     if (rateLimited) {
       notes.push(`Slack rate limited this token part-way through — ${parts.length} of ${readList.length} conversations were read. The rest arrive on the next sweep.`);
     }
     if (state.namesUnavailable) {
       notes.push(`Names are shown as Slack ids: this token is missing ${state.namesNeeded || 'users:read'}.`);
     }
-    if (notes.length) parts.push({ label: '', rows: [], error: null, note: notes.join(' ') });
+    if (notes.length) {
+      /* A note on a ROWS-LESS part reads as a failure. core/sweep.mjs:724 sets
+         `ok: !note` and `count: kept.length`, so "25 conversations matched and
+         Zelos read the first 20" — nothing wrong, the cap doing exactly its job
+         — measured as `sourcesOk: 20, sourcesFailed: 1` with a zero count: a red
+         Slack on the Now banner, forever, on an ordinary configuration. Carried
+         by the last part that has rows it is instead the shape core/sweep.mjs
+         :713 documents for a truncated calendar and core/connectors/folder.mjs
+         :694 already emits — a non-zero count with `ok: false`, "neither a
+         success nor a failure". A part of its own only when there is no such
+         part, which is the case where zero really is the whole story. */
+      const text = notes.join(' ');
+      const carrier = [...parts].reverse().find((p) => !p.error && p.rows.length);
+      if (carrier) carrier.note = carrier.note ? `${carrier.note} ${text}` : text;
+      else parts.push({ label: '', rows: [], error: null, note: text });
+    }
 
-    /* Only the conversations read this time survive into the cursor. A channel
-       the user removed from `onlyChannels` keeps a mark forever otherwise, and
-       the cursor grows monotonically towards the ceiling that silently drops it. */
-    const users = Object.fromEntries([...names.entries()].slice(-USER_CACHE_MAX));
+    /* A READ OF ZERO IS A RESULT AND HAS TO BE REPORTED AS ONE.
+       core/sweep.mjs:703 iterates `result?.parts || []`, so an empty array
+       pushes nothing into `sources[]` at all. Measured end to end with a healthy
+       token and `conversations.list` answering `{ok:true, channels: []}`:
+       `stats.sources` came back `[]`, `sourcesOk` 0, `sourcesFailed` 0 — the
+       source absent from the run record, from /api/state, from the Now banner
+       and from the settings export, not ok, not failed, no count. That is the
+       single most common first-run state there is (a bot token not yet invited
+       to a channel), plus a typo in `onlyChannels` and `breadth: channels` on a
+       token whose only conversations are DMs. core/connectors/github.mjs:658 and
+       core/connectors/rss.mjs:186 both emit an empty part for this reason. */
+    if (!parts.length) parts.push({ label: '', rows: [], error: null, note: null });
+
+    /* A mark is dropped only when its conversation is genuinely GONE — absent
+       from a listing that could have contained it. Dropping the ones merely not
+       read this sweep is what cost the marks above; dropping the ones a missing
+       scope or a paging ceiling hid would cost them the same way by a different
+       route, so `listComplete` gates it — and so does the breadth, because a
+       mark carries no type: `breadth: 'channels'` asks for no `im` at all, so
+       every DM would look gone and switching the setting back would re-read a
+       week of each. `packCursor` is what bounds the growth. */
+    const askedForEverything = breadth.types.length === BREADTHS.all.types.length;
+    if (listComplete && askedForEverything) {
+      const live = new Set(conversations.map((conv) => collapse(conv?.id)).filter(Boolean));
+      for (const id of Object.keys(seen)) if (!live.has(id)) delete seen[id];
+    }
+
+    /* An id cached as its own name is a FAILURE, not a name, and persisting one
+       outlives its cause: see `readCursor`. Dropped here so the sweep after the
+       user adds `users:read` looks the person up again. */
+    const users = Object.fromEntries(
+      [...names.entries()].filter(([id, name]) => name !== id).slice(-USER_CACHE_MAX),
+    );
     return {
       parts,
       cursor: packCursor({ seen, users, usersAt: prior.usersAt || nowMs }),
@@ -904,9 +1116,9 @@ export default {
  * `sources[]` entries with different ids, and `messageRowId` already mixes the
  * source id in.
  */
-function messageRow(msg, { channelId, folder, resolve, selfUser, selfBot }) {
+function messageRow(msg, { channelId, folder, resolve, selfUser, selfBot, direct = false }) {
   const ts = collapse(msg.ts);
-  const threadTs = collapse(msg.thread_ts) || ts;
+  const threadTs = collapse(msg.thread_ts);
   const body = messageBody(msg, resolve);
   const authorId = collapse(msg.user);
   const mine = (selfUser && authorId === selfUser) || (selfBot && collapse(msg.bot_id) === selfBot);
@@ -925,9 +1137,31 @@ function messageRow(msg, { channelId, folder, resolve, selfUser, selfBot }) {
     /* A Slack thread IS `thread_ts`, and it is namespaced with the channel
        because `messagesInThread` (core/db.mjs:448) matches `thread_key` across
        every source in the database — an unqualified `1754899320.001700` is a
-       string a feed guid could collide with. A message outside a thread threads
-       with itself, which is what `ts` already is. */
-    threadKey: `slack:${channelId}:${threadTs}`,
+       string a feed guid could collide with.
+
+       WHAT A MESSAGE OUTSIDE A THREAD BELONGS TO, which is most of Slack.
+       Slack sets `thread_ts` only inside an explicit thread, so this used to
+       fall back to the message's own `ts` — one thread per message. A DM IS the
+       conversation, and that fallback made the connector's own reason for
+       existing false. Measured on a four-message DM ("When can I expect the
+       shop drawings?" / "I will have them to you Thursday." / "Thursday
+       works."): four distinct thread keys, so core/triage.mjs:537's
+       `threadIndex` gave every one of them `count: 1`, which makes
+       `thread.latest === msg` unconditionally true — `+14 "nobody answered"`
+       (:628) on EVERY message the user has ever sent in Slack, forever,
+       regardless of the reply that came a second later, and a permanently false
+       `hasOutbound` so a real back-and-forth never earns the `+4 "a
+       conversation, not a cold arrival"`. The `promised` bucket this file's
+       header says `direction` exists to feed was mined from an index that
+       thought every answered promise was unanswered.
+
+       So a DM or group DM threads on the CHANNEL. A public or private channel
+       keeps the per-message fallback: #general is not one conversation, and
+       collapsing a busy channel into a single thread would make its newest
+       message the "latest" of everything anyone said in it. */
+    threadKey: threadTs
+      ? `slack:${channelId}:${threadTs}`
+      : (direct ? `slack:${channelId}` : `slack:${channelId}:${ts}`),
     folder,
     direction: mine ? 'out' : 'in',
     from: { name: author, email: '' },

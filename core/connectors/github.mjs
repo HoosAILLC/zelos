@@ -42,8 +42,10 @@
  * mirror of somebody else's unread count.
  */
 
+import crypto from 'node:crypto';
+
 import { parseDate } from '../sources/mime.mjs';
-import { AuthError } from './http.mjs';
+import { AuthError, RateLimitError } from './http.mjs';
 
 /** The public API. A user on GitHub Enterprise Server overrides it; see `fields`. */
 const DEFAULT_API = 'https://api.github.com';
@@ -84,6 +86,23 @@ const MAX_NOTIFICATIONS = PER_PAGE * MAX_PAGES;
 
 const DEFAULT_KEEP = 50;
 const SNIPPET_CHARS = 400;
+
+/**
+ * The house cap on a message body, and this file was the only messages-sink
+ * connector without one.
+ *
+ * rss.mjs, slack.mjs, fireflies.mjs, folder.mjs and whatsapp.mjs all cap at
+ * 20,000; linear.mjs and todoist.mjs at 4,000. github.mjs declared SNIPPET_CHARS
+ * alone, which capped what the BOARD shows and nothing else: measured, a
+ * notification whose `subject.title` is 500,000 characters produced a `text` of
+ * 500,081, and that string goes into `messages.body` AND into the FTS index via
+ * `indexDoc` (core/db.mjs:411). Nothing bounded it but `readCapped`'s 8 MiB
+ * per-response ceiling, so one sweep could push four page-loads of title text
+ * into SQLite. github.com caps an issue title at 256 characters; a GHES install,
+ * a proxy, or a rewritten payload does not, and "the vendor would never" is the
+ * assumption every other cap in this repo exists because somebody made.
+ */
+const BODY_CHARS = 20_000;
 
 /**
  * The interval to assume when GitHub does not state one, and the ceiling on the
@@ -240,17 +259,43 @@ export function subjectPath(url) {
  * in two threads that can never merge — which is the exact defect this function
  * exists to prevent, arriving through the back door.
  *
- * A subject with no URL — every `CheckSuite`, which is what `ci_activity` is —
- * falls back to repository-plus-type. That collapses ALL of a repository's CI
- * noise into one thread, deliberately: "the build for this repo needs looking
- * at" is one board item however many workflows failed.
+ * A `CheckSuite` — which is what `ci_activity` is, and which GitHub sends with
+ * `"url": null` — falls back to repository-plus-type. That collapses ALL of a
+ * repository's CI noise into one thread, deliberately: "the build for this repo
+ * needs looking at" is one board item however many workflows failed.
+ *
+ * THAT COLLAPSE IS FOR BUILDS AND FOR NOTHING ELSE, and the first cut applied it
+ * to every URL-less subject. `Discussion` is the other type GitHub sends with a
+ * null `subject.url` — see the comment on `subjectPath`, which says so — so it
+ * took the CI fallback and every discussion in a repository landed on the one
+ * key `github:o/r:discussion`. Measured: two notifications about two different
+ * discussions produced one thread key, `messagesInThread` returned both, and
+ * `threadIndex` (core/triage.mjs:403) counted two unrelated questions as one
+ * conversation, so the model was shown two fragments glued together. Merging is
+ * right for builds and a lie about conversations.
+ *
+ * So a URL-less subject that is not a check suite is discriminated by its TITLE,
+ * hashed because a title is unbounded text and a thread key is an index column.
+ * Renaming a discussion therefore starts a new board item, which is the cost of
+ * this and is worth paying: a renamed discussion appearing twice is a nuisance,
+ * and every discussion in a repository appearing once is a defect. A subject
+ * with neither URL nor title has nothing to key on and keeps the old collapse.
  */
+const CHECK_SUITE = 'checksuite';
+
+const titleHash = (title) => crypto.createHash('sha256').update(title).digest('hex').slice(0, 12);
+
 export function threadKeyFor(notification) {
   const repo = String(notification?.repository?.full_name ?? '').trim().toLowerCase() || 'github';
   const path = subjectPath(notification?.subject?.url);
   if (path) return `github:${repo}:${path.replace(/^pulls\//, 'issues/')}`;
   const type = String(notification?.subject?.type ?? '').trim().toLowerCase() || 'thread';
-  return `github:${repo}:${type}`;
+  /* Collapsed the same way `notificationRow` collapses it for the subject line,
+     so a title that gained a line break between two notifications about one
+     discussion still lands on one key. */
+  const title = collapse(notification?.subject?.title).toLowerCase();
+  if (type === CHECK_SUITE || !title) return `github:${repo}:${type}`;
+  return `github:${repo}:${type}:${titleHash(title)}`;
 }
 
 /**
@@ -317,6 +362,22 @@ export function webUrlFor(notification) {
  * `octocat/hello-world` and a payload that says `octocat/Hello-World` compare
  * unequal as raw strings — and the source silently returns nothing, forever,
  * with no error, which is the failure this product exists to not have.
+ *
+ * THE HOST STRIP USED TO REQUIRE A SCHEME, and that left the same failure open
+ * on the far commoner paste. Measured: `github.com/acme/widgets` parsed as owner
+ * `github.com`, repo `acme`, so `inScope` was false for every notification the
+ * account has and the source returned nothing, forever, with `ok: true` and no
+ * error anywhere. Safari's address bar drops the scheme when you copy, chat
+ * clients print the bare host, and a person retyping an address does not type
+ * `https://`. `@acme` and an SSH remote (`git@github.com:acme/widgets.git`) went
+ * the same way.
+ *
+ * A DOT IN THE FIRST SEGMENT IS WHAT IDENTIFIES A HOST, which is exact rather
+ * than a heuristic: a GitHub login — user or organisation — may contain only
+ * letters, digits and hyphens, so a dotted first segment is never an owner. Repo
+ * NAMES may contain dots (`acme/widgets.js`), and the second segment is left
+ * alone. That covers github.com, www.github.com and any GitHub Enterprise Server
+ * host without this function needing to know the configured API address.
  */
 export function scopeList(raw) {
   const text = String(raw ?? '');
@@ -326,12 +387,19 @@ export function scopeList(raw) {
     const entry = piece
       .trim()
       .toLowerCase()
-      .replace(/^https?:\/\/[^/]+\//, '')
+      // https:// , ssh:// , git://
+      .replace(/^[a-z][a-z0-9+.-]*:\/\//, '')
+      // `git@github.com:...`, and the `@` a person puts in front of a handle
+      .replace(/^[^@/:]*@/, '')
+      // a bare host, with an optional port, ending in `/` or the SSH remote's `:`
+      .replace(/^[a-z0-9-]+(?:\.[a-z0-9-]+)+(?::\d+)?[/:]/, '')
       .replace(/^\/+|\/+$/g, '');
     if (!entry) continue;
     const parts = entry.split('/').filter(Boolean);
     if (!parts.length) continue;
-    out.push({ owner: parts[0], repo: parts.length > 1 ? parts[1] : null });
+    // `.git` is how every clone URL ends and is never part of the repository name.
+    const repo = parts.length > 1 ? parts[1].replace(/\.git$/, '') : '';
+    out.push({ owner: parts[0], repo: repo || null });
   }
   return out;
 }
@@ -389,7 +457,15 @@ export function notificationRow(notification, { identityEmail = '' } = {}) {
      one in is the obvious thing to do and it would quietly break the ranking
      this connector exists to feed. The link is the thread's own web address and
      nothing else. */
-  const body = [`${label} · ${typeWord(subject.type)} · ${folder}`, title, link].join('\n');
+  /* CAPPED, and the truncation is spent on the title rather than on the link.
+     The last line is where a human clicks; slicing the joined string alone would
+     have thrown the link away to make room for the 19,000th character of a
+     title nobody is reading. The join is still sliced afterwards, because
+     `link` comes off `repository.html_url`, which is also a payload string with
+     no length anybody here controls. */
+  const head = `${label} · ${typeWord(subject.type)} · ${folder}`;
+  const room = Math.max(0, BODY_CHARS - head.length - link.length - 2);
+  const body = [head, title.slice(0, room), link].join('\n').slice(0, BODY_CHARS);
 
   const you = String(identityEmail ?? '').trim();
   const me = you ? [{ name: '', email: you }] : [];
@@ -453,6 +529,31 @@ export function pollIntervalFrom(headers, previousMs = 0) {
 }
 
 /**
+ * The interval a CURSOR is asking for, with the ceiling applied — and applying
+ * it here, on the read, is the whole point of the function existing.
+ *
+ * `pollIntervalFrom` clamps to `MAX_POLL_MS` when the header is parsed, and for
+ * a long time that was the only clamp. It is the wrong side to guard alone: a
+ * cursor is a PERSISTED kv row that outlives the code which wrote it. An older
+ * release of this connector, a hand-edited row, a restored backup, or a future
+ * change to `pollIntervalFrom` can all hand this version a number it would
+ * never have stored itself.
+ *
+ * Measured before this existed: a cursor of `{pollIntervalMs: 86_400_000,
+ * polledAtMs: a second ago}` made `collect` skip every request, emit "GitHub
+ * asked for 86400s between polls — 86399s to go", return `rows: 0, error: null`
+ * — which the sweep records as `ok: true, count: 0` — and hand the same cursor
+ * straight back, so the number never shrank. That is a source that has quietly
+ * stopped for a day while reporting a successful read of nothing, which the
+ * comment on MAX_POLL_MS calls the one failure mode this product cannot afford.
+ * The ceiling now holds whatever wrote the cursor.
+ */
+export function pollIntervalOf(cursor) {
+  const ms = Math.min(Number(cursor?.pollIntervalMs), MAX_POLL_MS);
+  return Number.isFinite(ms) && ms > 0 ? ms : 0;
+}
+
+/**
  * How long is left of the interval GitHub asked for, or 0 to poll now.
  *
  * A clock that went BACKWARDS polls immediately rather than waiting out a
@@ -461,9 +562,9 @@ export function pollIntervalFrom(headers, previousMs = 0) {
  * the ordinary NTP-correction case — with the source showing no error at all.
  */
 export function pollWaitMs(cursor, nowMs) {
-  const interval = Number(cursor?.pollIntervalMs);
+  const interval = pollIntervalOf(cursor);
   const last = Number(cursor?.polledAtMs);
-  if (!Number.isFinite(interval) || interval <= 0) return 0;
+  if (interval <= 0) return 0;
   if (!Number.isFinite(last) || last <= 0) return 0;
   const elapsed = nowMs - last;
   if (elapsed < 0) return 0;
@@ -665,9 +766,15 @@ export default {
        Now banner for a connector behaving correctly. */
     const wait = pollWaitMs(cursor, nowMs);
     if (wait > 0) {
-      ctx.emit(`${ctx.label}: GitHub asked for ${Math.round(Number(cursor.pollIntervalMs) / 1000)}s between polls`
+      const stated = pollIntervalOf(cursor);
+      ctx.emit(`${ctx.label}: GitHub asked for ${Math.round(stated / 1000)}s between polls`
         + ` — ${Math.ceil(wait / 1000)}s to go`, 0, 0);
-      return nothing(cursor);
+      /* The CLAMPED number goes back, not the one that arrived. `pollIntervalOf`
+         already stops an out-of-range cursor from suppressing the read, but a
+         cursor returned unchanged carries the bad value forever and prints it in
+         the line above — so the ceiling is written through on first contact and
+         the row heals itself instead of being re-clamped on every sweep. */
+      return nothing({ ...cursor, pollIntervalMs: stated });
     }
 
     const scope = scopeList(settings.repos);
@@ -710,11 +817,17 @@ export default {
     let lastModified = shapeChanged || typeof cursor.lastModified !== 'string'
       ? null
       : cursor.lastModified;
-    let pollIntervalMs = Number(cursor.pollIntervalMs) || 0;
+    /* Clamped on the way in as well. `pollIntervalFrom` returns this untouched
+       when a response carries no `X-Poll-Interval` — the header is optional and
+       304s from an intermediary often drop it — so reading the raw cursor value
+       here would copy an out-of-range number forward into the next cursor and
+       the source would suppress itself on the sweep after this one instead. */
+    let pollIntervalMs = pollIntervalOf(cursor);
     let dropped = 0;
+    let aborted = false;
 
     for (let page = 1; page <= MAX_PAGES; page += 1) {
-      if (ctx.signal?.aborted === true) break;
+      if (ctx.signal?.aborted === true) { aborted = true; break; }
 
       /* `all=false` is sent explicitly rather than left to the default, and it
          is the one query parameter here that is a promise: Zelos never asks for
@@ -791,6 +904,42 @@ export default {
       ctx.log?.warn('dropped notifications with no id — they would all hash to one row', { dropped });
     }
 
+    /* A CANCELLED READ IS NOT AN EMPTY DAY, and the first cut shaped it exactly
+       like one: with `signal.aborted` already true, `collect` made zero requests
+       and returned `rows: [], error: null, note: null` alongside a cursor whose
+       `polledAtMs` had advanced to now — "I read GitHub and there was nothing".
+       The mid-walk case is the sharper one: pages 1 and 2 came back as a
+       COMPLETE answer carrying the new `Last-Modified`, so the pages never
+       fetched would have been 304'd away on the next sweep and lost.
+
+       Nothing is lost today, because core/sweep.mjs:762 drops the whole run
+       before cursors are persisted — but that is the sweep's guarantee and not
+       this connector's, and a second caller would not have it. So the cursor is
+       handed back UNTOUCHED: the validator, the interval and the poll clock all
+       stay where they were, the next read repeats this one, and the rows already
+       in hand are still returned (they upsert to the same row ids, so repeating
+       them costs nothing). The note is what stops it reading as a clean zero —
+       core/sweep.mjs:711 turns any note into `ok: false` with a count, which is
+       the shape it already uses for a truncated read: neither success nor
+       failure. */
+    if (aborted) {
+      ctx.emit(`${ctx.label}: cancelled after ${rows.length} notification${rows.length === 1 ? '' : 's'}`,
+        rows.length, rows.length);
+      return {
+        parts: [{
+          label: '',
+          rows,
+          error: null,
+          note: 'This read was cancelled part-way through, so it is not the whole picture. The next sweep starts again from where the last finished one left off.',
+        }],
+        /* The sanitised copy of what arrived, not `ctx.cursor` itself: a legacy
+           cursor (a bare string, an array, a `{etag}` from an older release)
+           already degraded to `{}` at the top of this function, and handing the
+           unreadable original back would keep it in the kv row forever. */
+        cursor,
+      };
+    }
+
     ctx.emit(`${ctx.label}: ${rows.length} notification${rows.length === 1 ? '' : 's'}`, rows.length, rows.length);
 
     return {
@@ -838,6 +987,31 @@ export default {
         accept: ACCEPT,
       });
     } catch (err) {
+      /* A RATE LIMIT IS NOT A BROKEN SETTING, and telling a rate-limited user to
+         check their network is worse than saying nothing: the machine can reach
+         GitHub — it just did — and the API address is right. Measured before
+         this arm existed: a 429 came back as `fail` with the action "Check that
+         this machine can reach GitHub, and that the API address in Settings →
+         Sources is right", and the detail printed the host twice because the
+         transport's message already names it.
+
+         `warn`, not `fail`. Nothing here needs the user to do anything and the
+         allowance rolls over on its own, so this must not set doctor's exit
+         code — but it is worth a line, because it also explains why the board
+         has been quiet. Both flavours land here and the error's own sentence
+         says which: GitHub's 429, and `ctx.http`'s own 120-an-hour cap being
+         spent before a socket exists. */
+      if (err instanceof RateLimitError) {
+        const mins = Math.ceil((Number(err.retryAfterMs) || 0) / 60_000);
+        const when = mins > 0
+          ? ` The allowance rolls over in about ${mins} minute${mins === 1 ? '' : 's'}.`
+          : ' The allowance rolls over on its own.';
+        return {
+          status: 'warn',
+          detail: `${err.message}, so Zelos could not ask it whose token this is.${when}`,
+          action: null,
+        };
+      }
       const explained = explainAuth(err);
       return {
         status: 'fail',
