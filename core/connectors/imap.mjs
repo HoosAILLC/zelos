@@ -33,6 +33,48 @@ export function mailboxesFor(account) {
   return out;
 }
 
+/**
+ * How this account signs in: `'password'`, `'xoauth2'`, or null for "decide from
+ * what was passed".
+ *
+ * Read off the account rather than inferred from whether an `oauth` block
+ * happens to be present, because those are different facts. A user who filled in
+ * a client ID, thought better of it and switched the picker back to a password
+ * has an `oauth` block and means to send a password; inferring from the block
+ * would sign them in the other way and there would be nothing on screen saying
+ * so. `resolveAuthMethod` in core/sources/imap.mjs makes the same distinction
+ * for the same reason.
+ */
+export function authFor(account) {
+  const stated = account?.auth;
+  return typeof stated === 'string' && stated ? stated : null;
+}
+
+/**
+ * The three things `accessTokenFor` needs, assembled from the two config keeps.
+ *
+ * `tokenRef` IS `account.keyRef` and is deliberately not a fourth stored field.
+ * The grant lives under the account's own ref — core/sources/imap.mjs:2001 says
+ * why: removing an account deletes exactly one secret, and a refresh token filed
+ * anywhere else survives the user believing they disconnected the mailbox. A
+ * `tokenRef` in config.json would be a second place for that to be wrong, and it
+ * would be wrong silently.
+ *
+ * Null when there is nothing to sign in with, so a caller can tell "this account
+ * is not an OAuth account" from "this account is one and is misconfigured" —
+ * `fetchRecent` spreads `...(oauth || {})` and `normalizeClientId` then produces
+ * the sentence about a missing registration.
+ */
+export function oauthFor(account) {
+  const block = account?.oauth;
+  if (!block || typeof block !== 'object') return null;
+  return {
+    clientId: typeof block.clientId === 'string' ? block.clientId.trim() : '',
+    tenantId: typeof block.tenantId === 'string' && block.tenantId.trim() ? block.tenantId.trim() : 'common',
+    tokenRef: account?.keyRef ?? '',
+  };
+}
+
 export function directionOf(message, mailbox, account, identityEmail) {
   // Compared against the trimmed name, because that is what mailboxesFor asked for.
   if (mailbox === String(account.sentMailbox ?? '').trim()) return 'out';
@@ -61,6 +103,16 @@ export function directionOf(message, mailbox, account, identityEmail) {
  * requirement back on a Proton Bridge the user has already excused. An account
  * saved before the field existed has no value at all, which is what `null`
  * means — the client then decides from the host, as it always has.
+ *
+ * `auth` and `oauth` are forwarded for a blunter reason: without them the sweep
+ * signed in with a password whatever the config said. `AUTHENTICATE XOAUTH2` and
+ * the device grant were implemented and tested in core/sources/imap.mjs, and
+ * `fetchRecent` grew both parameters — and this function, the only production
+ * caller, passed neither. `resolveAuthMethod(null, '')` is `'password'`, so a
+ * hand-edited `auth: 'xoauth2'` account validated cleanly, showed as configured,
+ * and then sent a password that Microsoft has not accepted since 16 September
+ * 2024. A half-wired contract that is already user-visible is worse than one
+ * nobody started.
  */
 export function read({ account, mailbox, pass, sinceDays, limit, onProgress, signal }) {
   return fetchRecent({
@@ -69,6 +121,8 @@ export function read({ account, mailbox, pass, sinceDays, limit, onProgress, sig
     secure: account.secure,
     user: account.user,
     pass,
+    auth: authFor(account),
+    oauth: oauthFor(account),
     requireTls: account.requireTls ?? null,
     mailbox,
     sinceDays,
@@ -86,9 +140,21 @@ export default {
   configKey: 'mail',
   sink: 'messages',
 
+  /* One credential per source is the interface, and for a mailbox it is whatever
+     is filed under `keyRef` — an app password on most providers, and on an
+     `auth: 'xoauth2'` account the token blob core/sources/imap.mjs §6 stores
+     under the same ref. `required: true` is true of both: a mailbox with nothing
+     behind its ref cannot be opened either way.
+
+     The help text no longer names Outlook among the app-password providers. It
+     did, and it had been wrong for eleven months: Microsoft ended basic auth for
+     personal Outlook, Hotmail, Live and MSN on 16 September 2024 and app
+     passwords went with it, so that sentence sent every one of those users to
+     generate a credential Microsoft refuses. */
   credential: {
     label: 'App password',
-    help: 'Gmail, iCloud and Outlook all want an app-specific password rather than the one you log in with.',
+    help: 'Gmail, iCloud, Yahoo and Fastmail all want an app-specific password rather than the one you log in with. '
+      + 'Personal Outlook, Hotmail, Live and MSN accounts take no password at all any more — those sign in with Microsoft instead.',
     url: '',
     required: true,
   },

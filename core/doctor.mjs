@@ -599,42 +599,125 @@ async function checkModelEndpoint(config, deps, { key, keyChecked, timeoutMs, si
   );
 }
 
+/**
+ * Is the string under this account's `keyRef` a Microsoft grant, or a password?
+ *
+ * Parsed here rather than by importing `loadOAuthTokens`, because that function
+ * reads core/secrets.mjs directly and this file reads secrets through
+ * `deps.getSecret` — a diagnosis that bypassed the injected reader would be
+ * testing a different machine's keychain than every other line in this report.
+ * The `kind` field is what tells the two apart: a password that happens to be
+ * valid JSON does not carry it, which is the case core/sources/imap.mjs:2032
+ * names.
+ */
+function storedGrant(raw) {
+  if (typeof raw !== 'string' || !raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' && parsed.kind === 'xoauth2' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * What an OAuth mailbox is missing, in the order a person can fix it, or null.
+ *
+ * Separate from the password path because none of its three failures has
+ * anything to do with a password, and the advice underneath used to say so
+ * anyway: "most sign-in failures here are a provider that refuses ordinary
+ * passwords" is a true and completely useless sentence to read about an account
+ * that is not sending one.
+ */
+function oauthTrouble(account, grant, name) {
+  const clientId = String(account.oauth?.clientId ?? '').trim();
+  if (!clientId) {
+    return {
+      detail: `${name} is set to sign in with Microsoft, but no application (client) ID is stored, so there is no app registration to sign in against.`,
+      action: 'Open Settings → Mail, edit this account and follow the steps under "Sign in with Microsoft" — '
+        + 'they end with an application (client) ID and a directory (tenant) ID to paste in. Zelos ships no registration of its own, by design.',
+    };
+  }
+  if (!grant) {
+    return {
+      detail: `${name} has an app registration but has never been signed in on this machine, so there is no token to open the mailbox with.`,
+      action: 'Open Settings → Mail, edit this account and press "Sign in with Microsoft". '
+        + 'Zelos shows a code, you type it at microsoft.com/devicelogin, and the panel finishes on its own.',
+    };
+  }
+  if (!grant.refreshToken) {
+    return {
+      detail: `${name} is signed in to Microsoft, but the stored grant has no refresh token, so it will stop working within the hour.`,
+      action: 'The app registration has to request the offline_access scope. Add it under API permissions, then sign in again from Settings → Mail.',
+    };
+  }
+  return null;
+}
+
 async function checkMailAccount(account, deps, { timeoutMs }) {
   const name = account.label || account.host || account.id;
   const id = `mail.${account.id}`;
   const label = `Mail · ${name}`;
   const guess = guessImapHost(account.user || '');
+  const oauth = account.auth === 'xoauth2';
 
   if (!account.host) {
     return check(id, label, 'fail', 'No IMAP server is set for this account.',
       `Open Settings → Mail and fill in the server.${guess.host ? ` For ${account.user || 'that address'} it is usually ${guess.host}, port ${guess.port}.` : ''}`);
   }
 
-  let pass = null;
+  let stored = null;
   try {
-    pass = account.keyRef ? await deps.getSecret(account.keyRef) : null;
+    stored = account.keyRef ? await deps.getSecret(account.keyRef) : null;
   } catch (err) {
-    return check(id, label, 'fail', `Zelos could not read the stored password: ${errorText(err)}`,
-      'See the secret store line above. Re-entering the password in Settings → Mail usually settles it.');
+    return check(id, label, 'fail', `Zelos could not read the stored ${oauth ? 'Microsoft sign-in' : 'password'}: ${errorText(err)}`,
+      `See the secret store line above. ${oauth ? 'Signing in again' : 'Re-entering the password'} in Settings → Mail usually settles it.`);
   }
-  if (!pass) {
+
+  const grant = storedGrant(stored);
+  if (oauth) {
+    const trouble = oauthTrouble(account, grant, name);
+    if (trouble) return check(id, label, 'fail', trouble.detail, trouble.action);
+  } else if (!stored) {
     return check(
       id, label, 'fail',
       `No password is stored for ${name}, so Zelos cannot sign in.`,
       `Open Settings → Mail and enter it. ${guess.note}`,
+    );
+  } else if (grant) {
+    /* A grant under an account that is set to send a password. It happens one
+       way: somebody connected the mailbox to Microsoft and then switched the
+       picker back. The sweep would send the whole JSON blob as a password —
+       which fails, with `LOGIN failed`, about a mailbox the user just watched
+       sign in successfully. */
+    return check(
+      id, label, 'fail',
+      `${name} holds a Microsoft sign-in but is set to send a password, so Zelos would offer the stored token as one.`,
+      'Open Settings → Mail and set "How Zelos signs in" to "Sign in with Microsoft", or enter a password to replace the stored sign-in.',
     );
   }
 
   // `requireTls` is forwarded so this connects under the same rule the sweep
   // will. A diagnosis that signs in where the real run would refuse to is not a
   // diagnosis, it is a second, more permissive client — and it would report an
-  // account as healthy on the morning its mail stops arriving.
+  // account as healthy on the morning its mail stops arriving. `auth` and the
+  // `oauth` block are forwarded for exactly the same reason, and were not: the
+  // doctor signed every account in with a password whatever the config said, so
+  // an OAuth mailbox came back "sign-in failed" no matter how healthy it was.
   const result = await deps.testImap({
     host: account.host,
     port: account.port ?? 993,
     secure: account.secure !== false,
     user: account.user,
-    pass,
+    pass: oauth ? '' : stored,
+    auth: oauth ? 'xoauth2' : 'password',
+    oauth: oauth
+      ? {
+        clientId: String(account.oauth?.clientId ?? '').trim(),
+        tenantId: String(account.oauth?.tenantId ?? '').trim() || 'common',
+        tokenRef: account.keyRef,
+      }
+      : null,
     requireTls: account.requireTls ?? null,
     timeoutMs,
   });
@@ -653,7 +736,27 @@ async function checkMailAccount(account, deps, { timeoutMs }) {
         `Zelos stopped before your password left this machine. Use the TLS port in Settings → Mail — ${guess.host ? `${guess.host}:${guess.port}` : 'usually 993'} — and if this host really is a local bridge that cannot do TLS, turn requireTls off for this account.`,
       );
     }
-    const authish = /auth|login|credential|password|invalid|denied/i.test(reason);
+    const authish = /auth|login|credential|password|invalid|denied|token|oauth/i.test(reason);
+    /* An OAuth account gets its own sentence, and the reason is that the one
+       below is actively misleading for it. "Most sign-in failures here are a
+       provider that refuses ordinary passwords" is what a user of a mailbox that
+       sends no password would read while their real problem — a revoked grant, a
+       scope the registration never asked for, an administrator who turned IMAP
+       off — went unnamed. `result.reconnect` is the flag core/sources/imap.mjs
+       sets for "this grant is dead and retrying will not revive it", which is the
+       one case worth telling somebody to do something about. */
+    if (oauth) {
+      return check(
+        id, label, 'fail',
+        `${account.host}: ${reason}`,
+        result?.reconnect
+          ? 'The Microsoft sign-in for this mailbox is no longer good — a changed password, a revoked consent, a new conditional access policy or 90 days of inactivity all do this. '
+            + 'Open Settings → Mail, edit this account and press "Sign in with Microsoft" again.'
+          : `If this says the server does not offer AUTH=XOAUTH2, the host is wrong — Microsoft's is ${guess.host || 'outlook.office365.com'}:993. `
+            + 'If it names a scope, the app registration is missing IMAP.AccessAsUser.All under API permissions. '
+            + 'Everything else is worth trying again: an unreachable sign-in endpoint is not a broken account.',
+      );
+    }
     return check(
       id, label, 'fail',
       `${account.host}: ${reason}`,
@@ -694,9 +797,13 @@ async function checkMailAccount(account, deps, { timeoutMs }) {
         : `Zelos will read nothing from ${missing.length === 1 ? 'that folder' : 'those folders'}. Pick from what the server actually has: ${[...names].slice(0, 8).join(', ')}${names.size > 8 ? ', …' : ''}`,
     );
   }
+  /* The method is named on the passing line, not only on the failing ones. This
+     whole check exists because a config can say one thing while the sweep does
+     another, and "Signed in" without saying HOW is the sentence that let that go
+     unnoticed for a release. */
   return check(
     id, label, 'pass',
-    `Signed in to ${account.host} · ${names.size} folder${names.size === 1 ? '' : 's'} · reading ${wanted.join(', ')}${sent ? '' : ' · no sent folder is set, so nothing you wrote is read'}`,
+    `Signed in to ${account.host}${oauth ? ' with Microsoft' : ''} · ${names.size} folder${names.size === 1 ? '' : 's'} · reading ${wanted.join(', ')}${sent ? '' : ' · no sent folder is set, so nothing you wrote is read'}`,
   );
 }
 

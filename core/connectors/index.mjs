@@ -35,6 +35,12 @@ import ics from './ics.mjs';
 import caldav from './caldav.mjs';
 import file from './file.mjs';
 import rss from './rss.mjs';
+import github from './github.mjs';
+import slack from './slack.mjs';
+import fireflies from './fireflies.mjs';
+import linear from './linear.mjs';
+import todoist from './todoist.mjs';
+import folder from './folder.mjs';
 
 /** Where a source's config entry lives on disk. */
 export const CONFIG_KEYS = Object.freeze(['mail', 'calendars', 'sources']);
@@ -181,7 +187,8 @@ export function assertShape(c, seen = new Set()) {
 }
 
 const seenTypes = new Set();
-const LIST = [imap, ics, caldav, file, rss].map((c) => deepFreeze(assertShape(c, seenTypes)));
+const LIST = [imap, ics, caldav, file, rss, github, slack, fireflies, linear, todoist, folder]
+  .map((c) => deepFreeze(assertShape(c, seenTypes)));
 const BY_TYPE = new Map(LIST.map((c) => [c.type, c]));
 
 /** The connector for a `kind`/`type` string, or null. Never throws. */

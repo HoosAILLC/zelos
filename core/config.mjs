@@ -32,10 +32,39 @@ import { log } from './log.mjs';
  */
 export const SECRET_KEYS = new Set([
   'pass', 'password', 'passwd', 'apikey', 'api_key', 'key', 'token', 'secret', 'credentials',
+  /* The XOAUTH2 grant, in both spellings it exists in.
+     `refreshToken` is the one that matters and it is not covered by `token`:
+     `stripSecrets` matches a WHOLE key name, lowercased, so `token` catches
+     `token` and `Token` and nothing else — `refreshToken` lowercases to
+     `refreshtoken`, which was not in this set, so a hand-edited or
+     mis-patched `mail[i].oauth.refreshToken` would have been written to
+     config.json in the clear and stayed there. That token is the whole mailbox
+     and it does not expire for 90 days. The snake_case spellings are here
+     because they are what Microsoft's token endpoint answers with, so a patch
+     that assigned a raw response object would carry those and not the
+     camelCase ones. `clientSecret` is never used — a device sign-in is a public
+     client and has none — which is exactly why a config carrying one is a
+     mistake worth swallowing rather than storing. */
+  'accesstoken', 'access_token', 'refreshtoken', 'refresh_token',
+  'clientsecret', 'client_secret', 'devicecode', 'device_code',
 ]);
 
 const PROTOCOLS = ['anthropic', 'openai'];
 const CALENDAR_KINDS = ['ics', 'caldav', 'file'];
+
+/**
+ * How a mail account signs in.
+ *
+ * `password` is a password or an app password over `LOGIN`/`AUTHENTICATE PLAIN`.
+ * `xoauth2` is a bearer token over `AUTHENTICATE XOAUTH2`, minted by the device
+ * authorization grant in core/sources/imap.mjs §6 against an app registration
+ * the USER owns — Zelos ships no client id of its own and never will, so there
+ * is no third value where Zelos signs in on anybody's behalf.
+ *
+ * An account written before this key existed has no `auth` at all, and that is
+ * read as `password`: it is what those accounts have always done.
+ */
+export const MAIL_AUTH_METHODS = Object.freeze(['password', 'xoauth2']);
 /* One theme (black). The only appearance choice is the accent, and it is
    validated as a six-digit hex because it is written straight into a CSS
    custom property — anything else must never reach the stylesheet. */
@@ -76,6 +105,17 @@ export const MAIL_ACCOUNT_DEFAULTS = deepFreeze({
   secure: true,
   requireTls: null,
   user: '',
+  /* See MAIL_AUTH_METHODS. Defaulted rather than left absent so `normalizeAccounts`
+     gives every account the full shape and no reader has to spell `?? 'password'`
+     for itself — there are four of them (the sweep's connector, the doctor, the
+     test route and the Settings form) and a default restated four times is a
+     default three of them can get wrong. */
+  auth: 'password',
+  /* `{clientId, tenantId}` from the user's own Entra app registration, or null.
+     The GRANT is not here and must never be: it lives in the secret store under
+     this account's own `keyRef`, which is why removing an account removes the
+     refresh token with it. See SECRET_KEYS. */
+  oauth: null,
   keyRef: '',
   mailboxes: ['INBOX'],
   sentMailbox: 'Sent',
@@ -458,6 +498,90 @@ function checkUrl(errors, at, value, { schemes, required }) {
   }
 }
 
+/**
+ * Microsoft's two identifiers, restated here rather than imported.
+ *
+ * core/sources/imap.mjs already owns `normalizeClientId` and `normalizeTenant`
+ * and they are the authority — but they THROW an `ImapOAuthError` on a bad
+ * value, and this function's whole contract is to collect `{path, message}` and
+ * never throw. Wrapping them in try/catch here would also make config.mjs
+ * import 2,500 lines of TLS and socket code, in the one module that resolves the
+ * home directory and that core/sources/caldav.mjs imports back — the same
+ * hazard core/connectors/index.mjs writes out at length for the registry.
+ *
+ * So the pattern is CALENDAR_KINDS's: state it twice, and let a cross-check test
+ * fail if the two ever disagree. test/mail-oauth.test.mjs drives both over a
+ * corpus of GUIDs, domains, aliases and the `..` that started all this.
+ *
+ * The tenant is checked at all — rather than passed through as a string —
+ * because it becomes a URL PATH SEGMENT at the token endpoint, and a tenant of
+ * `..` silently resolves `${origin}/${tenant}/oauth2/v2.0/token` to somewhere
+ * else on the same host. What goes to that address is the refresh token.
+ */
+const ENTRA_GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const ENTRA_DOMAIN_RE = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$/i;
+const TENANT_ALIASES = ['common', 'organizations', 'consumers'];
+
+/** True for every tenant core/sources/imap.mjs's `normalizeTenant` accepts. */
+export function isValidTenant(value) {
+  const raw = String(value ?? '').trim();
+  if (!raw) return true; // absent means `common`, which is the default there too
+  const lower = raw.toLowerCase();
+  return TENANT_ALIASES.includes(lower) || ENTRA_GUID_RE.test(raw) || ENTRA_DOMAIN_RE.test(raw);
+}
+
+/** True for the one shape Entra hands out as an application (client) ID. */
+export function isValidClientId(value) {
+  return typeof value === 'string' && ENTRA_GUID_RE.test(value.trim());
+}
+
+/**
+ * The `oauth` block on one mail account.
+ *
+ * PRESENCE is required only for an enabled account, the way `host` and `user`
+ * already are: an account somebody parked half-configured must not block every
+ * later save, including the one that finishes it. SHAPE is checked whenever
+ * there is something to check, enabled or not, because a malformed block is a
+ * typo either way and this is the only screen that will ever say so.
+ */
+function checkMailOAuth(errors, at, account, { method, enabled }) {
+  const block = account.oauth;
+  if (method !== 'xoauth2') {
+    if (block !== null && block !== undefined && !isPlainObject(block)) {
+      errors.push({ path: `${at}.oauth`, message: 'must be an object or null' });
+    }
+    return;
+  }
+  if (!isPlainObject(block)) {
+    if (enabled) {
+      errors.push({
+        path: `${at}.oauth`,
+        message: 'is required when auth is xoauth2 — it holds the application (client) ID and '
+          + 'directory (tenant) ID of the app registration you made in your own Microsoft account',
+      });
+    } else if (block !== null && block !== undefined) {
+      errors.push({ path: `${at}.oauth`, message: 'must be an object or null' });
+    }
+    return;
+  }
+  if (block.clientId !== undefined || enabled) {
+    if (!isValidClientId(block.clientId)) {
+      errors.push({
+        path: `${at}.oauth.clientId`,
+        message: 'must be the application (client) ID from your app registration\'s Overview page, which is a GUID',
+      });
+    }
+  }
+  if (block.tenantId !== undefined && !isStr(block.tenantId)) {
+    errors.push({ path: `${at}.oauth.tenantId`, message: 'must be a string' });
+  } else if (!isValidTenant(block.tenantId)) {
+    errors.push({
+      path: `${at}.oauth.tenantId`,
+      message: `must be ${TENANT_ALIASES.join(', ')}, the directory (tenant) ID from the same page, or your organisation's domain`,
+    });
+  }
+}
+
 function checkRef(errors, at, value, { allowNull = false } = {}) {
   if (value === null || value === undefined || value === '') {
     if (!allowNull) errors.push({ path: at, message: 'is required' });
@@ -520,6 +644,16 @@ export function validateConfig(cfg) {
       if (!isInt(a.port, 1, 65535)) errors.push({ path: `${at}.port`, message: 'must be a port number' });
       if (!isBool(a.secure)) errors.push({ path: `${at}.secure`, message: 'must be a boolean' });
       if (a.requireTls !== null && !isBool(a.requireTls)) errors.push({ path: `${at}.requireTls`, message: 'must be true, false, or null to decide from the host' });
+      /* Absent reads as `password`, because that is what every account written
+         before this key existed is doing. Anything else is refused rather than
+         coerced: an `auth: "oauth2"` or `auth: "XOAUTH2"` that quietly fell back
+         to a password is the exact defect this pass exists to close — a config
+         that says one thing while the sweep does another. */
+      const method = a.auth === undefined ? 'password' : a.auth;
+      if (!MAIL_AUTH_METHODS.includes(method)) {
+        errors.push({ path: `${at}.auth`, message: `must be one of ${MAIL_AUTH_METHODS.join(', ')}` });
+      }
+      checkMailOAuth(errors, at, a, { method, enabled: a.enabled === true });
       checkRef(errors, `${at}.keyRef`, a.keyRef, { allowNull: !a.enabled });
       if (!Array.isArray(a.mailboxes) || a.mailboxes.length === 0 || !a.mailboxes.every(isStr)) errors.push({ path: `${at}.mailboxes`, message: 'must be a non-empty array of mailbox names' });
       if (!isStr(a.sentMailbox)) errors.push({ path: `${at}.sentMailbox`, message: 'must be a string' });

@@ -835,7 +835,16 @@ test('describe() survives JSON and carries no functions', () => {
   for (const m of manifests) {
     for (const v of Object.values(m)) assert.notEqual(typeof v, 'function');
   }
-  assert.deepEqual(manifests.map((m) => m.type), ['imap', 'ics', 'caldav', 'file', 'rss']);
+  /* Asserted against the registry rather than against a list written here.
+     A second copy of the connector names would have to be edited every time one
+     is added — which is the thing the registry exists to stop, and it would have
+     drifted the first time somebody added six at once. What this still catches
+     is the real risk: `describe()` silently dropping a connector the app has, or
+     inventing one it does not, which would show as a Settings picker that
+     disagrees with what the sweep will actually read. */
+  assert.deepEqual(manifests.map((m) => m.type), registry.all().map((c) => c.type),
+    'describe() and the registry disagree about which connectors this build has');
+  assert.ok(manifests.length >= 5, 'describe() came back suspiciously short');
   assert.equal(manifests.find((m) => m.type === 'imap').credential.required, true);
   assert.equal(manifests.find((m) => m.type === 'file').credential, null,
     'a source with nothing to paste must not be described as needing something');

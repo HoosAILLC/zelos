@@ -43,10 +43,22 @@ const nextId = (prefix) => `${prefix}-${(uid += 1)}`;
  * client-side, this is a plain datalist of hostnames and the app-password note
  * those providers require, which users otherwise read as "Zelos is broken".
  */
-const IMAP_HINTS = [
+export const IMAP_HINTS = [
   { host: 'imap.gmail.com', label: 'Gmail', note: 'Gmail needs an app password, not your account password.' },
   { host: 'imap.mail.me.com', label: 'iCloud', note: 'iCloud needs an app-specific password.' },
-  { host: 'outlook.office365.com', label: 'Outlook / Microsoft 365' },
+  /* This preset shipped with no note at all, which read as "nothing special
+     here" — the one provider where that is furthest from true. Microsoft ended
+     password sign-in for personal Outlook, Hotmail, Live and MSN accounts on
+     16 September 2024, app passwords included, so the shipped path for one of
+     the two largest consumer mail providers was an authentication failure in the
+     middle of onboarding with nothing anywhere saying why. */
+  {
+    host: 'outlook.office365.com',
+    label: 'Outlook / Microsoft 365',
+    note: 'Microsoft stopped accepting passwords for personal Outlook, Hotmail, Live and MSN accounts on 16 September 2024, '
+      + 'and app passwords went with them. Set “How Zelos signs in” to “Sign in with Microsoft” below. '
+      + 'A work or school account may still take a password if your administrator has left IMAP switched on.',
+  },
   { host: 'imap.mail.yahoo.com', label: 'Yahoo', note: 'Yahoo needs an app password.' },
   { host: 'imap.fastmail.com', label: 'Fastmail', note: 'Fastmail wants an app password too.' },
   { host: '127.0.0.1', label: 'Proton Bridge', note: 'Proton Bridge listens on 127.0.0.1:1143 without TLS.' },
@@ -67,6 +79,20 @@ const IMAP_HINTS = [
  * configuring their mail should have to know what STARTTLS is to understand
  * that the third option lets a stranger on the café wifi read their password.
  */
+/**
+ * How a mail account signs in.
+ *
+ * Two, and the second exists because Microsoft removed the first for personal
+ * Outlook, Hotmail, Live and MSN on 16 September 2024 — app passwords included.
+ * The values are the ones core/config.mjs validates (`MAIL_AUTH_METHODS`) and
+ * core/connectors/imap.mjs reads off the account; a third option would need all
+ * three to agree, which is why they are not spelled out anywhere else in ui/.
+ */
+export const MAIL_AUTH_CHOICES = [
+  { value: 'password', label: 'A password (everything except personal Microsoft mail)' },
+  { value: 'xoauth2', label: 'Sign in with Microsoft' },
+];
+
 export const TLS_CHOICES = [
   { value: 'auto', label: 'Decide from the address (recommended)' },
   { value: 'require', label: 'Never send my password unencrypted' },
@@ -729,6 +755,147 @@ function mailForm(account, { onSaved, onCancel }) {
     passInput.value = '';
   }
 
+  /* ---------------------------------------------------------------- *
+   * "Sign in with Microsoft"
+   * ---------------------------------------------------------------- *
+   * Microsoft stopped accepting passwords for personal Outlook, Hotmail, Live
+   * and MSN on 16 September 2024, and app passwords went with them — so the
+   * preset in IMAP_HINTS above was, until this existed, an instruction to do
+   * something impossible, offered during onboarding.
+   *
+   * The client ID and tenant are the USER'S. Zelos ships neither, and cannot:
+   * an application id belonging to Zelos would need Microsoft publisher
+   * verification, which is a vendor approving a published app — the same wall
+   * that keeps Gmail out (docs/OAUTH.md). What a person registers in their own
+   * Entra tenant needs no approval from anybody, which is the whole reason this
+   * flow is reachable at all.
+   *
+   * No timing lives here. The server runs the RFC 8628 poll loop with its
+   * back-off; this asks "has anything changed" on a fixed two seconds, which is
+   * a UI refresh rate and not a protocol constant. If those two ever have to
+   * agree, the wrong one is this one.
+   */
+  const authSelect = select(MAIL_AUTH_CHOICES, { value: draft.auth === 'xoauth2' ? 'xoauth2' : 'password' });
+  const authMethod = () => (authSelect.value === 'xoauth2' ? 'xoauth2' : 'password');
+
+  const clientIdInput = input({ value: draft.oauth?.clientId || '', placeholder: '00000000-0000-0000-0000-000000000000', autocomplete: 'off' });
+  const tenantInput = input({ value: draft.oauth?.tenantId || 'common', placeholder: 'common', autocomplete: 'off' });
+
+  const signInStatus = statusLine();
+  const codeBox = el('div', { class: 'device-code' });
+  let poll = null;
+  let flowId = null;
+
+  const stopPolling = () => { if (poll) { clearInterval(poll); poll = null; } };
+
+  /* The panel is rebuilt whenever the account form is, and an interval that
+     outlives its node keeps calling a server about a sign-in nobody is watching
+     — and keeps a finished flow's verdict from ever being read. */
+  const landed = (flow) => {
+    stopPolling();
+    flowId = null;
+    codeBox.replaceChildren();
+    if (flow.state === 'connected') {
+      signInStatus.good('Signed in. The token is in your keychain; Zelos will refresh it on its own.');
+      draft.auth = 'xoauth2';
+    } else if (flow.state === 'cancelled') {
+      signInStatus.bad('Sign-in cancelled.');
+    } else {
+      signInStatus.bad(flow.error || flow.message || 'Microsoft refused the sign-in.');
+    }
+  };
+
+  const showCode = (flow) => {
+    codeBox.replaceChildren(
+      el('p', { class: 'quiet-note', text: 'Open the address below and type this code. Leave this panel open.' }),
+      el('p', { class: 'device-code-value', text: flow.userCode || '' }),
+      el('a', {
+        href: /^https:\/\//.test(flow.verificationUri || '') ? flow.verificationUri : '#',
+        target: '_blank',
+        rel: 'noopener noreferrer',
+        text: flow.verificationUri || '',
+      }),
+      button('Give up', {
+        class: 'btn quiet',
+        onClick: async () => {
+          const id = flowId;
+          stopPolling();
+          flowId = null;
+          codeBox.replaceChildren();
+          signInStatus.working('Sign-in cancelled.');
+          if (id) await api.cancelMailOAuth(id).catch(() => {});
+        },
+      }),
+    );
+  };
+
+  async function startMicrosoftSignIn() {
+    if (!draft.user) { signInStatus.bad('Fill in the username first — it is the mailbox being signed in to.'); return; }
+    if (!clientIdInput.value.trim()) { signInStatus.bad('The application (client) ID from your Entra app registration is required.'); return; }
+    draft.oauth = { clientId: clientIdInput.value.trim(), tenantId: tenantInput.value.trim() || 'common' };
+    stopPolling();
+    signInStatus.working('Asking Microsoft for a code…');
+    try {
+      const flow = await api.beginMailOAuth({
+        keyRef: draft.keyRef,
+        clientId: draft.oauth.clientId,
+        tenantId: draft.oauth.tenantId,
+      });
+      flowId = flow.id;
+      if (flow.state !== 'pending') { landed(flow); return; }
+      signInStatus.working('Waiting for you to finish in the browser…');
+      showCode(flow);
+      poll = setInterval(async () => {
+        try {
+          const now = await api.mailOAuthStatus(flowId);
+          if (now.state === 'pending') { showCode(now); return; }
+          landed(now);
+        } catch (err) {
+          // A 404 means the server restarted or the flow expired; either way
+          // there is nothing left to wait for, and silently spinning forever is
+          // the one outcome worse than saying so.
+          stopPolling();
+          codeBox.replaceChildren();
+          signInStatus.bad(err.message || 'The sign-in is no longer waiting.');
+        }
+      }, 2000);
+    } catch (err) {
+      signInStatus.bad(err.message || 'Could not start the sign-in.');
+    }
+  }
+
+  const microsoftBlock = el('div', { class: 'stack' }, [
+    field('Application (client) ID', clientIdInput, {
+      hint: 'From your own app registration in Microsoft Entra — Zelos ships no client ID, because one belonging to Zelos would need Microsoft to verify a published app, and this whole flow exists to avoid asking a vendor for permission. Register an app, switch on “Allow public client flows”, and paste its Application (client) ID here.',
+    }),
+    field('Directory (tenant) ID', tenantInput, {
+      hint: 'Leave it as “common” for a personal Outlook, Hotmail, Live or MSN account. A work or school mailbox needs the tenant its administrator gives you.',
+    }),
+    el('div', { class: 'row-inline' }, [
+      button('Sign in with Microsoft', { class: 'btn solid', onClick: startMicrosoftSignIn }),
+    ]),
+    signInStatus.node,
+    codeBox,
+  ]);
+
+  const passwordBlock = el('div', { class: 'stack' }, [
+    field('Password', passInput, {
+      hint: 'Goes straight to your OS keychain. It is never written to config.json, never passed on a command line, and never logged.',
+    }),
+  ]);
+
+  const credentialSlot = el('div', {});
+  const paintCredential = () => {
+    const xo = authMethod() === 'xoauth2';
+    credentialSlot.replaceChildren(xo ? microsoftBlock : passwordBlock);
+    tlsSelect.closest('.field')?.toggleAttribute('hidden', xo);
+    if (!xo) { stopPolling(); codeBox.replaceChildren(); }
+  };
+  authSelect.addEventListener('change', () => {
+    draft.auth = authMethod();
+    paintCredential();
+  });
+
   return el('div', { class: 'account-form' }, [
     hostList,
     field('Name it', labelInput),
@@ -742,9 +909,10 @@ function mailForm(account, { onSaved, onCancel }) {
       hint: 'Zelos will not send your password until the connection is encrypted. Left to decide, it insists on that everywhere except a server running on this machine — which is where Proton Bridge and its kind live, and the only reason an unencrypted connection is still offered at all. Allow one anywhere else and anyone sharing your network, or sitting anywhere between you and your mail server, can read the password and the mail.',
     }),
     field('Username', userInput),
-    field('Password', passInput, {
-      hint: 'Goes straight to your OS keychain. It is never written to config.json, never passed on a command line, and never logged.',
+    field('How Zelos signs in', authSelect, {
+      hint: 'Microsoft stopped accepting passwords for personal Outlook, Hotmail, Live and MSN mail on 16 September 2024, and app passwords stopped working with them. Everything else on this list still takes a password — Gmail and Yahoo want an app password rather than your account one.',
     }),
+    credentialSlot,
     el('div', { class: 'grid-2' }, [
       field('Mailboxes', mailboxInput, { hint: 'Comma separated.' }),
       field('Look back (days)', lookbackInput),
