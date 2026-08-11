@@ -263,7 +263,18 @@ test('refusals decided after the read — bad JSON, NUL bytes — are also said 
   assert.equal(second.note, null);
 });
 
-test('a filename that is markup is sanitised before it enters a sentence', async () => {
+/* Windows refuses `< > : " | ? *` in a filename outright — `mkdir` fails with
+   EINVAL before the connector is ever reached — so the name this test is about
+   cannot exist there, and neither can the threat. Skipped rather than softened
+   to a Windows-legal name, because a name without angle brackets would not be
+   testing the thing: it is specifically `<` and `>` reaching a sentence that
+   /api/state serves. The same reasoning as the POSIX-modes skips in
+   test/doctor.test.mjs and the SIGINT skip in test/repo.test.mjs. */
+test('a filename that is markup is sanitised before it enters a sentence', {
+  skip: process.platform === 'win32'
+    ? 'Windows forbids < and > in a filename, so this name — and this threat — cannot exist there'
+    : false,
+}, async () => {
   const dir = freshDir();
   fs.mkdirSync(path.join(dir, '<img src=x onerror=alert(1)>.json'));
   const part = await sweep(dir);
@@ -328,6 +339,18 @@ test('the per-sweep cap keeps its sentence, and reports the real backlog alongsi
 });
 
 test('a file that cannot be read is named with its reason, and never called "waiting"', async (t) => {
+  /* `chmod 000` is how this test makes a file unreadable, and Windows has no
+     POSIX modes: `fs.chmodSync` there sets only the read-only ATTRIBUTE, which
+     does not stop a read at all, so the file is read normally and there is no
+     EACCES to observe. The behaviour under test — that a refusal names the file
+     and its reason instead of borrowing the queue's sentence — is real on
+     Windows too, but it cannot be PROVOKED this way. Named rather than silently
+     passing, which is the house rule for a platform gap (see the POSIX-mode
+     skips in test/doctor.test.mjs). */
+  if (process.platform === 'win32') {
+    t.skip('Windows has no POSIX modes: chmod 000 leaves the file readable, so EACCES cannot be provoked');
+    return;
+  }
   if (typeof process.getuid === 'function' && process.getuid() === 0) {
     t.skip('running as root: mode 000 is readable, so there is nothing to observe');
     return;
