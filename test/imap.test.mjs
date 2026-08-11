@@ -436,6 +436,87 @@ test('REGRESSION: a flood of complete untagged responses is refused instead of e
   );
 });
 
+test('the byte cap on untagged responses refuses a flood of few but enormous ones', async () => {
+  /* The count cap above and this one are not the same guard, and the count cap
+     cannot stand in for it: 50,000 responses is a lot of small ones, and a
+     server that sends FIFTY of two megabytes each never approaches it while
+     handing the client a hundred megabytes to hold. `job.untaggedBytes` is the
+     only thing standing between that and the heap.
+
+     Neither direction of this branch had a test — the string it fails with
+     appeared in production code and nowhere else — which mattered because the
+     cap was added late and its threshold is the one number here that a real,
+     legitimate mailbox could conceivably reach.
+
+     2 MB x 49 stays under, and the 50th crosses; a tagged completion is never
+     sent, so the only two ways out are the cap and the idle timer, and the
+     assertion distinguishes them by message. */
+  const chunk = `* OK ${'x'.repeat(2 * 1024 * 1024)}\r\n`;
+
+  await withServer(
+    {
+      greeting: '* OK Zelos mock ready',
+      onCommand: ({ verb, send }) => {
+        if (verb === 'CAPABILITY') {
+          for (let i = 0; i < 50; i++) send(chunk);
+          return; // …and never a tagged completion
+        }
+        send('* BAD nothing else should be reached\r\n');
+      },
+    },
+    async ({ port, received }) => {
+      const client = new ImapClient({ host: '127.0.0.1', port, secure: false, user: 'u', pass: 'qqqqqqqq', timeoutMs: 20_000 });
+      await assert.rejects(
+        () => client.connect(),
+        (err) => {
+          assert.match(
+            err.message,
+            /untagged responses to one command exceeded the maximum size Zelos will buffer/,
+            `refused for its size, not by the idle timer or the count cap: ${err.message}`,
+          );
+          assert.match(err.message, /IMAP 127\.0\.0\.1:\d+/);
+          return true;
+        },
+      );
+      assert.ok(!received.some((line) => /LOGIN|AUTHENTICATE/i.test(line)),
+        'this happens before any credential');
+      await client.close();
+    },
+  );
+});
+
+test('a mailbox that is merely large does not trip the byte cap', async () => {
+  /* The other direction, and the one that would bite a real person rather than
+     an attacker. `fetch()` chunks at 100 UIDs and the sweep pulls a body part
+     for each, so a chunk of long messages is ordinary traffic — a cap set too
+     low turns a big but honest mailbox into a connection that fails every
+     sweep, with an error about buffering that names nothing the user can act
+     on. Twenty megabytes across ten responses is comfortably more than a real
+     hundred-message header fetch and must still go through. */
+  const chunk = `* OK ${'y'.repeat(2 * 1024 * 1024)}\r\n`;
+
+  await withServer(
+    {
+      greeting: '* OK Zelos mock ready',
+      onCommand: ({ tag, verb, send }) => {
+        if (verb === 'CAPABILITY') {
+          for (let i = 0; i < 10; i++) send(chunk);
+          send(`* CAPABILITY IMAP4rev1\r\n${tag} OK CAPABILITY completed\r\n`);
+          return;
+        }
+        send(`${tag} OK fine\r\n`);
+      },
+    },
+    async ({ port }) => {
+      const client = new ImapClient({ host: '127.0.0.1', port, secure: false, user: 'u', pass: 'qqqqqqqq', timeoutMs: 20_000 });
+      await client.connect();
+      const caps = await client.capabilities();
+      assert.ok(caps.has('IMAP4REV1'), 'the capability list survived twenty megabytes of chatter');
+      await client.close();
+    },
+  );
+});
+
 test('a command whose server is merely chatty still gets every untagged response', async () => {
   // The other half of the cap: it must not truncate. `select()` reads EXISTS
   // out of the untagged pile, so a cap that silently dropped responses would
