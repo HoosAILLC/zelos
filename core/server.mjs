@@ -879,13 +879,47 @@ async function handleHealth(ctx) {
   });
 }
 
+/**
+ * The first cell of the month grid that contains `key` — the Sunday on or before
+ * the 1st of that month.
+ *
+ * A mirror of `startOfWeekKey(…, 0)` in ui/lib/time.js, because the two ends of
+ * this contract have to agree about which days the calendar is going to draw and
+ * only one of them can be asked. Read as UTC deliberately: a day key has no
+ * offset, and `Date.UTC` is the one reading of it that is the same on every
+ * machine — `new Date('2026-08-01')` is midnight UTC, but `new Date(2026, 7, 1)`
+ * is midnight wherever the process happens to be, which is a different weekday
+ * either side of the date line.
+ */
+function monthGridStartKey(key) {
+  const first = `${key.slice(0, 7)}-01`;
+  const at = Date.parse(`${first}T00:00:00Z`);
+  if (Number.isNaN(at)) return first;
+  return addDaysToKey(first, -new Date(at).getUTCDay()) || first;
+}
+
 async function handleState(ctx) {
   const { db } = ctx;
   const cfg = ctx.config();
   const tz = cfg.identity.timezone || localTimezone();
   const now = Date.now();
-  // A window wide enough for "last week" and the month view, and no wider.
-  const from = toZonedISO(new Date(now - 7 * 86_400_000), tz);
+  /* A window wide enough for "last week" AND for the month view — which it was
+     not, and the comment that used to sit here said it was.
+
+     The month grid is whole weeks, so the grid for the current month starts on
+     the Sunday on or before the 1st: up to 36 days before "today" at the end of
+     a long month, against a backstop of seven. Measured 2026-08-10, with no
+     navigation involved at all: August's own grid begins 2026-07-26, and the
+     eight cells 07-26…08-02 fell before `from`, so the calendar drew eight fully
+     styled, confidently empty days for a week that was in the events table the
+     whole time. The month's own grid is the floor here; a reader who has paged
+     somewhere else is answered by `eventWindow` below.
+
+     Still a bounded window, and still one query: the widening is at most a month
+     of extra days at the back, and nothing about the forward edge moves. */
+  const back = toZonedISO(new Date(now - 7 * 86_400_000), tz);
+  const gridStart = `${monthGridStartKey(todayKey(tz))}T00:00:00`;
+  const from = gridStart < back ? gridStart : back;
   const to = toZonedISO(new Date(now + 60 * 86_400_000), tz);
   const nowZoned = nowISO(tz);
   const narrative = boardNarrative(db);
@@ -911,6 +945,16 @@ async function handleState(ctx) {
     runs: { last: lastRun(db) },
     notes: narrative.notes,
     first: narrative.first,
+    /* WHICH DAYS `events` IS AN ANSWER ABOUT — the contract that stops the
+       calendar drawing a month it was never sent as a month with nothing in it.
+       Day keys rather than the ISO bounds above, because every comparison on the
+       other side (ui/views/calendar.js) is against a `YYYY-MM-DD` cell key, and
+       handing it an offset-carrying timestamp would make each of those a string
+       comparison that is right by accident. Always present, so "the server did
+       not say" and "the window is empty" cannot be confused: the reader treats a
+       missing window as "no claim, draw it all", which is what every build
+       before this one did. */
+    eventWindow: { from: from.slice(0, 10), to: to.slice(0, 10) },
     // Omitted entirely when there is none, never sent as a zero.
     ...(tokens ? { tokens } : {}),
     now: nowZoned,
@@ -1009,8 +1053,38 @@ async function handleConfigGet(ctx) {
 
 async function handleConfigPut(ctx) {
   const patch = await readJSON(ctx.req);
-  const saved = saveConfig(stripSecretShaped(patch));
+  let saved;
+  try {
+    saved = saveConfig(stripSecretShaped(patch));
+  } catch (err) {
+    /* core/config.mjs refuses a patch that would write a config `loadConfig()`
+       could not read back, and it refuses it with a TypeError before the write.
+       That is the CALLER's mistake — `{"identity": 5}` is a malformed request
+       body, not a server that broke — and a 500 both mislabels it and hides the
+       reason, since the 500 branch below deliberately does not echo an
+       unexpected error's text. `readJSON` has already established the body is a
+       JSON object, so the only way here is a section this file was asked to
+       store as a scalar or an array. */
+    if (err instanceof TypeError) throw new HttpError(400, err.message);
+    throw err;
+  }
   ctx.setConfig(saved);
+  /* And the Scheduler gets it too, or a Settings change reaches nothing that
+     sweeps. `Scheduler` captures the config object it was constructed with, and
+     `ctx.setConfig` only replaces the route-facing copy — so on a default
+     install (`sweep.auto: true`) every sweep, including the one behind the
+     "Sweep now" button (SweepSupervisor routes through the Scheduler when there
+     is one), kept running against the snapshot taken at launch. Measured after a
+     PUT: disk and GET /api/config showed the new values while `scheduler.status()`
+     and the sweep that actually ran still carried `mail accounts = 0,
+     sendBodies = true, bodyChars = 4000` against a live config of one account
+     and `sendBodies: false`. Unticking "Send message bodies to the model" went
+     on sending 4,000-character bodies until the process was restarted, in a
+     product whose first promise is that the setting is not a label.
+
+     Optional-called on both halves because `scheduler` is a seam: tests pass
+     fakes, and a launcher that could not load the sweep engine passes none. */
+  ctx.scheduler?.reconfigure?.(saved);
   // The CalDAV client remembers where it found each account's collections, so
   // that a sweep costs one request instead of four. A calendar that has just
   // been edited is exactly the case that record must not survive: the password
@@ -1169,6 +1243,63 @@ async function readCapped(response, maxBytes) {
   return Buffer.concat(chunks).toString('utf8');
 }
 
+/**
+ * Read an `.ics` over http with the repo's redirect rule: ONE hop, and the
+ * credential is re-sent only when the hop stayed on the same origin.
+ *
+ * This is `fetchIcsText` in core/sweep.mjs, hand-rolled the same way and for the
+ * same reason, because `redirect: 'follow'` is not a policy — it is undici's,
+ * and undici's is twenty. Measured on Node 26.3.0 against a chain of redirects:
+ * a 6-origin chain returned 200 having contacted six hosts, and a 22-origin
+ * chain contacted twenty-one before giving up. So pressing "Test" on a calendar
+ * address opened connections to up to twenty hosts the user never typed — inside
+ * the same passage of docs/SECURITY.md that invites the reader to check with
+ * tcpdump and promises "one hop". No credential was leaking (undici strips
+ * `Authorization` across origins on its own, verified), but the count of hosts
+ * contacted was the claim, and the claim was false.
+ *
+ * `manual` rather than `error`, so the one hop the rule allows still works:
+ * Apple, Google and every calendar host that answers `webcal:` with a 301 to
+ * their real CDN would otherwise fail a test that the sweep then passes.
+ */
+async function fetchIcsOnce(href, headers) {
+  // `safeUrl` hands back an href string, not a URL, and `origin` is the whole
+  // decision below — so it is parsed once here rather than compared as text.
+  const url = new URL(href);
+  /* ONE deadline for the pair, not one per hop. A fresh `AbortSignal.timeout`
+     inside `request` reads as harmless and is not: a host that stalls for
+     twenty-nine seconds and then answers 302 hands the redirect target a whole
+     new thirty, so "Test it" could sit on a spinner for a minute against a
+     budget that says thirty seconds — and the stall is the hostile half of
+     that, freely chosen by the host. core/doctor.mjs holds one signal across
+     its two hops for the same reason. */
+  const deadline = AbortSignal.timeout(30_000);
+  const request = (target, withAuth) => fetch(target, {
+    headers: withAuth ? headers : { Accept: headers.Accept },
+    redirect: 'manual',
+    signal: deadline,
+  });
+
+  const first = await request(url, true);
+  if (first.status < 300 || first.status >= 400) return first;
+  const location = first.headers.get('location');
+  if (!location) throw new Error(`${url.host} redirected without a destination`);
+  const next = new URL(location, url);
+  if (!/^https?:$/.test(next.protocol)) throw new Error(`${url.host} redirected to ${next.protocol} — only http and https are followed`);
+  // The origin decides the credential, not the hop count: a redirect that stays
+  // on the host the user typed is the host they meant to authenticate to.
+  const second = await request(next, next.origin === url.origin);
+  /* A second 3xx is named rather than handed back as a response. Returned, it
+     reaches the caller's `!response.ok` arm and comes out as "<the address you
+     typed> answered 302 Found" — which is a true sentence about a host that did
+     no such thing, and sends the reader to look at the wrong end of the chain.
+     core/doctor.mjs says "redirects more than once (via …)"; so does this. */
+  if (second.status >= 300 && second.status < 400) {
+    throw new Error(`${url.host} redirected more than once (via ${next.origin}) — Zelos follows exactly one hop`);
+  }
+  return second;
+}
+
 async function handleCalendarTest(ctx) {
   const body = await readJSON(ctx.req);
   const kind = body.kind === undefined ? 'ics' : body.kind;
@@ -1211,7 +1342,7 @@ async function handleCalendarTest(ctx) {
     headers.Authorization = `Basic ${Buffer.from(`${body.user}:${pass}`).toString('base64')}`;
   }
   try {
-    const response = await fetch(url, { headers, redirect: 'follow', signal: AbortSignal.timeout(30_000) });
+    const response = await fetchIcsOnce(url, headers);
     if (!response.ok) {
       sendJSON(ctx.res, 200, { ok: false, calendars: [], error: `${url} answered ${response.status} ${response.statusText}` });
       return;
@@ -1326,6 +1457,62 @@ function askContext(db, question, privacy) {
   return { sources, context: blocks.join('\n\n---\n\n') };
 }
 
+/**
+ * The token counter, borrowed from the sweep engine.
+ *
+ * Dynamically imported and remembered, for the same reason SweepSupervisor
+ * loads `runSweep` that way: core/sweep.mjs is the heaviest module in the tree
+ * and a server that is only serving the first-run setup screens has no business
+ * paying for it. This is the one function of it Ask needs, and Ask has already
+ * decided to spend money by the time it is called.
+ *
+ * It is deliberately the SAME function the sweep calls rather than a second
+ * accumulator written here. There is one `sweep.tokens` row; two writers with
+ * two ideas of its shape is how a counter starts disagreeing with itself.
+ */
+let recordTokensFn = null;
+async function tokenRecorder() {
+  if (!recordTokensFn) {
+    const mod = await import('./sweep.mjs');
+    if (typeof mod.recordTokens !== 'function') throw new Error('core/sweep.mjs does not export recordTokens');
+    recordTokensFn = mod.recordTokens;
+  }
+  return recordTokensFn;
+}
+
+/**
+ * Book what one Ask cost, against the same counter a sweep books against.
+ *
+ * `sweep: false` keeps it out of `runs` and `modelRuns` — the two numbers that
+ * answer "how many sweeps happened today" — while `tokensIn`/`tokensOut` and
+ * their lifetime totals take it, which is the honest reading: a question typed
+ * into the Ask panel is spend, and it is not a sweep.
+ *
+ * Nothing here may take the answer away from the reader. The stream has already
+ * been written by this point; a `kv` table that will not take a write is a
+ * reason to lose a number and never a reason to fail a request that succeeded.
+ */
+async function recordAskSpend(db, usage, tz) {
+  const tokensIn = Number(usage?.input) || 0;
+  const tokensOut = Number(usage?.output) || 0;
+  if (!tokensIn && !tokensOut) return;
+  try {
+    const record = await tokenRecorder();
+    /* The zone is not decoration. `recordTokens` carries the running day
+       forward only while `stored.day === dayKey(now)`, and the sweep stamps its
+       row with `nowISO(tz)` — the configured zone. Defaulting this writer to
+       `nowISO()` reads the MACHINE zone instead, so for the hours when the two
+       are on different dates the keys disagree, the day is treated as new, and
+       the first question typed into Ask resets the counter the rail shows to
+       zero. Caught by test/sweep.test.mjs's non-sweep-spender test, which only
+       fails during that window: on a machine in EDT with the app configured for
+       UTC it is green until 20:00 and red after it. */
+    record(db, { tokensIn, tokensOut, thought: false, sweep: false, now: nowISO(tz) });
+  } catch (err) {
+    log.warn('server: could not record what Ask spent', { error: err.message });
+  }
+}
+
 async function handleAsk(ctx) {
   const body = await readJSON(ctx.req);
   const question = requireString(body, 'question', { max: MAX_QUESTION_CHARS });
@@ -1371,7 +1558,14 @@ async function handleAsk(ctx) {
     })) {
       if (!sse.open) break; // the client left; stop pulling tokens
       if (event.type === 'delta') sse.send('delta', { text: event.text });
-      else if (event.type === 'done') sse.send('done', { usage: event.usage, model: event.model, grounded: true });
+      else if (event.type === 'done') {
+        sse.send('done', { usage: event.usage, model: event.model, grounded: true });
+        // Reported to this one client, and now recorded for the counter every
+        // client reads. Both, not either: the SSE frame is what the Ask panel
+        // shows about this answer, and the counter is what the rail shows about
+        // the day. Until this line existed the second one had no writer at all.
+        await recordAskSpend(ctx.db, event.usage, cfg.identity.timezone || localTimezone());
+      }
     }
   } catch (err) {
     if (!sse.signal.aborted) {
@@ -1936,8 +2130,33 @@ export function createServer({
      test nobody runs. Production never passes this. */
   handoffTtlMs = HANDOFF_TTL_MS,
   logger = log,
+  /**
+   * Where `logger` actually writes, when it writes to a file at all.
+   *
+   * The 500 handler at the bottom of this file has to tell a stuck person where
+   * the reason went, and it used to name `<home>/logs/zelos.log` unconditionally.
+   * Nothing writes that file. The default logger (core/log.mjs) is built with
+   * `dir: null` and goes to stderr only; the one file logger in the tree belongs
+   * to the desktop shell and is named `desktop.log`. Reproduced: a 500 came back
+   * carrying `"detail":"see …/logs/zelos.log"` while the stack went to stderr
+   * and `readdirSync(logsDir)` was `[]` before and after — so the one string the
+   * product offers a person who has just hit an internal error sent them to an
+   * empty directory. `paths()` even creates and chmods that directory on every
+   * launch, which makes the wrong answer look right.
+   *
+   * So the launcher that OWNS the logger says where it went, and a launcher that
+   * has no file says nothing about one. Null is the honest default, because a
+   * server built with the default logger genuinely has no file.
+   */
+  logFile = null,
 } = {}) {
   if (!db) throw new TypeError('createServer needs an open database (core/db.mjs open())');
+
+  /* Resolved once: this string is written into a 500 body, and a 500 is not the
+     moment to be doing path arithmetic. */
+  const whereTheReasonWent = typeof logFile === 'string' && logFile
+    ? `the reason was written to ${logFile}`
+    : 'the reason was written to the terminal Zelos is running in — Zelos keeps no log file of its own';
 
   let current = config;
   let clock = scheduler;
@@ -2113,7 +2332,7 @@ export function createServer({
       // that nothing it holds leaks out of it — so it goes to the log, which
       // redacts, and the caller gets told where to look.
       if (expected) sendJSON(res, err.status, { error: err.message, ...(err.detail ? { detail: err.detail } : {}) });
-      else sendJSON(res, 500, { error: 'internal error', detail: `see ${path.join(paths().logsDir, 'zelos.log')}` });
+      else sendJSON(res, 500, { error: 'internal error', detail: whereTheReasonWent });
     }
   });
 

@@ -171,12 +171,33 @@ Every rule the prompt asks for is enforced again in code afterwards:
 - `sourceRefs` must match `msg:`/`evt:`/`cap:` plus a safe id, and are capped at
   12. (Checking that they point at rows which actually exist is the database's
   job, in `core/triage.mjs`.)
-- **A draft containing a bracketed placeholder — `[NAME]`, `[insert date]`,
-  `{{company}}` — is rejected and logged.** So is a draft with no valid
-  recipient, no body, or unsafe content. A rejected draft never costs you the
-  item it was attached to.
-- Duplicate keys are dropped; a missing key is derived deterministically from
-  the headline and person, so item identity still carries across runs.
+- **A draft that still reads as a template is rejected and logged.** What is
+  caught: anything in square brackets (`[NAME]`, `[insert date]`, and now
+  across a line break, which used to be a way through), `{{mustache}}`, the
+  words `TODO`, `TBD` and `FIXME` on a word boundary, and "insert … here". So
+  is a draft with no valid recipient, no body, or unsafe content. A rejected
+  draft never costs you the item it was attached to.
+
+  **Two spellings still get through, and this list is a blocklist like every
+  other one here.** Single braces — `{first_name}` — were never covered and
+  still are not. And the bracket rule spans at most 400 characters, so a
+  bracketed aside longer than that is not matched. Angle brackets are excluded
+  deliberately, because `Bob <bob@example.com>` is ordinary inside a real body.
+  Read the drafts before you send them; the gate catches the common failure,
+  not every possible one.
+- Duplicate keys are dropped. A missing key is derived from the headline and the
+  person — **deterministically per call, and only per call.** It is a SHA-256 of
+  `headline|person`, so it is stable exactly as long as the headline is
+  byte-stable, and headlines are prose the model rewrites: three phrasings of one
+  obligation give three keys, and an item finished on Monday can return on
+  Tuesday under a reworded headline. This document used to say identity "still
+  carries across runs", which is the sentence that made the defect invisible.
+  Anchoring on a `msg:`/`evt:` reference instead was tried and reverted, because
+  one email routinely yields two obligations citing the same id and a duplicate
+  key is dropped outright — which converts a visible duplicate into work that
+  silently never arrives. What is fixed is the silence: the derived key is
+  recorded by name in `errors`, so a board that grows a duplicate can be traced
+  to the run that minted it.
 
 `validateSweep` returns `{ok, value, errors}`. `value` is always a well-formed
 `{first, items, notes}` and is always safe to use. `errors` lists every repair,
@@ -277,12 +298,27 @@ stated: there is no transitive package that could phone home behind Zelos's
 back. You can verify it with `lsof -i` or Little Snitch or `tcpdump` and see
 exactly three conversations.
 
-Two footnotes, because "three destinations" is nearly true rather than exactly
-true. A server you configured can redirect, and Zelos will follow one hop — so
-a fourth host can appear in `tcpdump`. It will not be carrying a credential
-(section 7), but it is a connection you did not type. And the four
-connection-test routes in section 7 connect to whatever address the request
-names, which during setup is the point.
+Three footnotes, because "three destinations" is nearly true rather than exactly
+true.
+
+1. **A server you configured can redirect, and Zelos follows one hop** — so a
+   fourth host can appear in `tcpdump`. One hop is the rule everywhere it can
+   happen and it is hand-rolled in each place, because `redirect: 'follow'` is
+   not a policy, it is undici's, and undici's is twenty: the sweep's `.ics`
+   reader (`core/sweep.mjs`), the Settings **Test** button
+   (`fetchIcsOnce` in `core/server.mjs`), `zelos doctor` (`core/doctor.mjs`)
+   and the CalDAV client (`core/sources/caldav.mjs`) all cap at one and all
+   re-send a credential only when the hop stayed on the same origin. A second
+   3xx is an error naming the intermediate host, not a third connection.
+   `core/llm.mjs` refuses redirects outright. That hop will not be carrying a
+   credential (section 7), but it is a connection you did not type.
+2. **The four connection-test routes in section 7** connect to whatever address
+   the request names, which during setup is the point.
+3. **`GET /api/local/probe`** opens connections to a fixed list of loopback
+   ports — Ollama, LM Studio, llama.cpp, vLLM — to find out what is already
+   running before Settings offers you a paid provider. It sends no credential
+   and nothing but `127.0.0.1` is contacted, but it is traffic, and `lsof` will
+   show it.
 
 ### `privacy.sendBodies`
 
@@ -453,16 +489,64 @@ Three honest qualifications, because "no bodies" is easy to over-read:
 - **A draft quotes the message it replies to.** The `drafts` scope hands over
   draft text, and draft text is about a conversation.
 
-### Nothing here writes
+### Nothing here sends, deletes or reconfigures — and one tool does write
 
 Seven tools: `zelos_board`, `zelos_item`, `zelos_calendar`, `zelos_search`,
 `zelos_thread`, `zelos_drafts`, `zelos_people`. There is no send, no delete, no
-state change, no config change, and no way to trigger a sweep or a model call.
-That is checked three ways: the tool list is pinned, every descriptor is
-annotated `readOnlyHint`, and `core/mcp.mjs` is scanned for any `core/db.mjs`
-helper that can change a row — it names none, and the only table it writes to is
-its own audit log. Then every tool is run over HTTP against a seeded database
-with a per-table hash taken before and after.
+config change, and no way to trigger a sweep or a model call.
+
+This section used to say "Nothing here writes", flatly, and that was the largest
+false sentence in this document. **`zelos_board` writes.** Reading the board
+does exactly what opening the Zelos window does, because it is the same code:
+
+- a **snooze that has come due wakes up** — `WAKE_DUE_SNOOZES` in
+  `core/db.mjs`, run at the top of `listBoard`, which is also what `/api/state`
+  and the sweep call;
+- the **`now` bucket is held to four items** — `capNowBucket` in
+  `core/sweep.mjs`, which *demotes* the overflow to `today`. Its statement is
+  `UPDATE items SET …`; there is no `DELETE` in it, so an item that loses its
+  place moves, never disappears.
+
+That is the entire extent of it: no other table, no other column. The headline,
+the reasoning, the person, the due date, the severity, the link and the source
+references of every item are byte-identical before and after, and no item is
+created, deleted or finished.
+
+**The annotation says so.** MCP hosts read `readOnlyHint` to decide whether they
+may run a tool *without asking you*. Six tools carry `readOnlyHint: true`;
+`zelos_board` carries `readOnlyHint: false` (`BOARD_ANNOTATIONS` in
+`core/mcp.mjs`), so a host that respects the field will ask. All seven still
+carry `destructiveHint: false` and `openWorldHint: false`, and both are true of
+all seven.
+
+**How it is checked now — five ways, and the last one is the one that matters.**
+The old passage described three checks and the important one was blind: it
+scanned `core/mcp.mjs` for `core/db.mjs` helper names, while the demotion lives
+in `core/sweep.mjs` and was never in scope. In `test/mcp.test.mjs`:
+
+1. **The tool list is pinned** by name, and so is the read-only split — six
+   names on one side, `zelos_board` alone on the other. Adding a tool fails the
+   test rather than sliding in.
+2. **The name scan covers both modules.** Every export of `core/db.mjs` *and*
+   `core/sweep.mjs` is checked against an allowlist, and the allowlist names
+   exactly one writer: `capNowBucket`. The scan also asserts it can still find
+   names it certainly should, so a scan that has stopped working fails instead
+   of passing clean.
+3. **The SQL scan covers both ends.** Every `INSERT`/`UPDATE`/`DELETE` written
+   in `core/mcp.mjs` targets `ai_access_log`, its own audit table, and nothing
+   else — and the borrowed write is asserted where it actually lives, in
+   `core/sweep.mjs`: `UPDATE items`, with no `DELETE` anywhere in the statement.
+4. **Every tool is run against a real database**, on a fixture built so the
+   repair has work to do (five `now` items and one snooze past its wake-up
+   time — on the old fixture both writes were no-ops and the test proved
+   nothing). A per-table hash of `messages`, `events`, `drafts`, `captures`,
+   `kv` and `runs` is identical before and after, the search index is
+   unchanged, and `items` moves by exactly the two repairs above and no more.
+5. **The annotation is measured, not asserted.** Each tool is run and the
+   database is compared: the tools that changed a row must be exactly the tools
+   that do not claim `readOnlyHint`. This is the test that would have caught the
+   original — with `zelos_board` annotated `true` it goes red on the first tool
+   it tries.
 
 Every URL leaving this surface goes back through `safeUrl` on the way out, not
 only on the way in. A link in an item or an `.ics` `URL:` property was written
@@ -478,9 +562,18 @@ A call that fails argument validation is logged too, so "what did my AI do?"
 does not have holes in it. The rows are visible in Settings → AI access, and are
 the same rows whether the call arrived over stdio or over HTTP.
 
+Two details, because a log that is nearly right is worse than one you understand.
+**The row count is what actually went back**, after the size cap has dropped
+whole rows off the end — not what the query found before truncation, which is
+what it used to say. And **a row can carry no scope at all**: a `zelos_search`
+that searched nothing, because every kind it asked for belongs to a scope that
+is off, is logged with the scope empty and zero rows. The panel renders that as
+"no scope". A refused call — a tool name that does not exist — is the same
+shape.
+
 ### Limits, and why they are there
 
-A connected AI is a program, and programs loop. Three ceilings exist because
+A connected AI is a program, and programs loop. These ceilings exist because
 without them a single well-formed request could take the app out:
 
 - A JSON-RPC batch holds at most **8** requests. Unbounded, a 256 KB batch of
@@ -489,8 +582,13 @@ without them a single well-formed request could take the app out:
 - One result is capped at **1,000,000 characters**. Over that, whole rows are
   dropped off the end and the payload says so — half a message is worse than no
   message, and a client told it got 30 of 500 can ask for a narrower window.
-- One `stdin` message is capped at **4 MB**, and `config.ai.maxRows` (default
-  50, hard ceiling 500) caps every result set whatever the caller asks for.
+  The access log records the number that actually left, not the number the
+  query found.
+- One `stdin` message is capped at **4 MiB**, and one `POST /api/mcp` body at
+  **256 KiB** — a JSON-RPC envelope is small, and nothing legitimate on that
+  route is not.
+- `config.ai.maxRows` (default **50**, hard ceiling **500**) caps every result
+  set whatever the caller asks for.
 
 ### What this does not defend against
 
@@ -539,14 +637,18 @@ incapable of receiving one. Values travel on stdin.
 
 Credentials do not appear in logs either: `core/log.mjs` redacts by key name
 *and* by value shape on every line it writes. (Note that the CLI writes to
-stderr only — `~/.zelos/logs/` is written by the desktop shell.)
+stderr only — the one file logger in the tree belongs to the desktop shell and
+writes `~/.zelos/logs/desktop.log`. There is no `zelos.log`; `paths()` creates
+and chmods `logs/` on every launch, which is what made the wrong answer look
+right for so long.)
 
 | Platform    | Where the secret actually lives                                                             |
 | ----------- | -------------------------------------------------------------------------------------------- |
 | macOS       | Keychain, via `/usr/bin/security` generic passwords, service `com.zelos.app`. The value is written to `security`'s **stdin**, never passed as an argument. |
 | Windows     | DPAPI at CurrentUser scope, blob under `%LOCALAPPDATA%\Zelos\secrets`. Value goes in over stdin. |
 | Linux       | `secret-tool` (libsecret / GNOME Keyring), when it is installed.                              |
-| Any, fallback | `secrets.enc` in the Zelos home, mode `0600`: AES-256-GCM, key derived by scrypt from a random 32-byte machine seed in `.seed` (mode `0600`). |
+| Any, fallback | `secrets.enc` in the Zelos home, mode `0600`: AES-256-GCM, key derived by scrypt from a random 32-byte machine seed in `.seed` (mode `0600`, 64 hex characters). |
+| all of the above | Which one this home committed to is recorded in `secrets.backend.json` (mode `0600`) and is what later launches use — see below. |
 
 **The encrypted-file fallback is the weak one, and it is weak in a specific
 way.** The key that decrypts `secrets.enc` sits in `.seed` in the same
@@ -564,6 +666,29 @@ directory, readable by the same user. That means:
 display it verbatim rather than paraphrasing it into something comforting. If
 you are on a platform with a real keychain, use it; the fallback exists so that
 a headless Linux box without libsecret still works, not because it is as good.
+
+**A home commits to a store, and stays committed.** The first store to hold a
+secret is written to `secrets.backend.json` in the Zelos home, and later launches
+use the recorded backend rather than whatever the probe finds. So a machine that
+fell back once keeps using `secrets.enc` even after a keychain appears —
+deliberately, because moving would orphan the credentials already written.
+There is **no automated migration**; `zelos doctor` names the manual one — close
+Zelos, delete `secrets.enc`, `.seed` and `secrets.backend.json`, re-enter each
+password in Settings — and it tells you when the record and the probe disagree,
+distinguishing "the keychain is back and this folder is pinned anyway" from
+"this home moved to a machine whose store does not exist here".
+Two consequences worth stating plainly:
+
+- **"`secrets.enc` is only present if your system has no keychain" is false.**
+  It is present if this home ever had no keychain.
+- **Forcing `ZELOS_SECRETS_BACKEND` over a home that already has a record does
+  not fix that home.** It writes the credential where the next unforced run will
+  not look. It is a diagnostic switch, not an escape hatch.
+
+If the seed or the store is damaged, Zelos renames the pair aside rather than
+overwriting it — `.seed.unreadable-<ts>` and `secrets.enc.unreadable-<ts>`,
+sharing one timestamp — so recovery is real: put the 64 hex characters back in
+`.seed`, rename the store back to `secrets.enc`, and the secrets read again.
 
 There is no API route that reads a secret back. `POST /api/secrets` writes,
 `DELETE /api/secrets/:ref` removes, and `listRefs()` returns names only. No
@@ -645,8 +770,17 @@ Stated plainly, so nobody discovers these the hard way:
   default for that reason. Section 6a is the long version.
 - **A malicious or backdoored IMAP or CalDAV server.** Zelos parses whatever
   it is sent. The parsers are written defensively — byte-exact IMAP literal
-  handling, a hard cap on recurrence expansion so a malformed `RRULE` cannot
-  loop forever — but a server you connect to is a party you have chosen to
+  handling; a hard cap on recurrence expansion so a malformed `RRULE` cannot
+  loop forever; and an HTML-to-text conversion that is a single left-to-right
+  pass, capped at **512 KB per HTML part**. That last one was quadratic until
+  recently, and the difference is the whole argument for measuring rather than
+  asserting: 1 MB of `<!--` repeated took **122 seconds** through the old
+  regexes and takes **about 2 milliseconds** now, on the same machine. The
+  ceiling is a second fuse rather than the first — the algorithm is the first —
+  and it is product-visible: an HTML part over 512 KB contributes only its
+  first 512 KB to the stored body, the snippet and the search index. Everything
+  downstream caps far tighter anyway (4,000 characters to the model, 240 to the
+  snippet). But a server you connect to is a party you have chosen to
   trust with your mail already. Two specific things it cannot do, because both
   were possible and are now closed and regression-tested: it cannot harvest your
   password by redirecting you or by naming another host in an `href` (section 7),
@@ -682,10 +816,30 @@ model output pushed through the real merge path with `fetch` replaced by a
 tripwire, `privacy.sendBodies:false` on both the sweep and the ask path, and the
 supply-chain claims.
 
-Five of its assertions are regressions for holes that were open in an earlier
-revision of this program: the two CalDAV credential leaks, the two credential
-echoes, and the database file mode. They were each verified by reverting the fix
-and watching the test fail.
+**"Every route" now means every route, and that is a recent repair.** The list
+used to be typed out by hand next to the test, and it restated 19 of the
+router's 27 routes — the eight it omitted, including all three
+`/api/sample-data` handlers, arrived exempt from the adversarial pass the day
+they were written. Measured: gutting both sample-data write handlers, and
+separately adding an unauthenticated carve-out that returned the whole config,
+each left the suite green (1022 pass / 0 fail as it stood then; the whole suite
+is 1097 tests today, of which this file is 37 and `test/ai-security.test.mjs`
+is 54). The table is now **parsed out of
+`core/server.mjs`'s `ROUTES` array**, a route the parser cannot read is a
+failure rather than a silent omission, and a separate test proves every path the
+parser produced really reaches the router (with `OPTIONS`, which matches no route
+and runs no handler). The one path deliberately outside `ROUTES` is `/api/mcp`,
+which takes the AI token instead — `test/ai-security.test.mjs` is where that one
+is attacked.
+
+Six of its assertions are regressions for holes that were open in an earlier
+revision of this program: the two CalDAV credential leaks, the `.ics` credential
+leak, the two credential echoes, and the database file mode. They were each
+verified by reverting the fix and watching the test fail. The `.ics` one is the
+newest and was the last credential control in the repository with no regression
+test at all: the reader *was* exercised, four times, but always without a stored
+credential and never through a redirect — and the uncovered combination was
+exactly the dangerous one.
 
 The AI-access surface has its own adversarial pass, written from the connected
 client's side:
@@ -702,9 +856,15 @@ table before and after running every tool; feeds mail whose body is a JSON-RPC
 envelope through both transports; and pushes the batch, result-size, `kinds` and
 `stdin` limits until they refuse.
 
-Seven of its assertions are regressions for holes that were open in the first
-cut of this feature, each verified by reverting the fix and watching the test
-fail:
+**21 of its assertions are marked `REGRESSION`** — count them with
+`grep -ac "test('REGRESSION" test/ai-security.test.mjs`. The `-a` is not
+optional: this file carries a raw NUL byte as an attack payload (and
+`test/security.test.mjs` carries four), so `grep` calls them binary files and
+silently reports nothing without it. That is worth knowing before you conclude
+a claim here is unbacked. Each marked assertion was written for a hole that was open at
+some point in this feature's life and verified by reverting the fix and watching
+the test fail. Seven of them are from the first cut, and they are the ones worth
+reading as a list, because they are what an unbounded AI surface costs:
 
 | what was open | what it cost |
 |---|---|

@@ -33,8 +33,12 @@ const DEFAULT_GREETING = '* OK [CAPABILITY IMAP4rev1] Zelos mock ready';
 function startMockImap({ greeting = DEFAULT_GREETING, onCommand }) {
   const received = [];
   const sockets = new Set();
+  // Connections, not lines: "did the client dial this host at all" is a
+  // different question from "what did it say", and cancellation turns on it.
+  const connections = [];
 
   const server = net.createServer((socket) => {
+    connections.push(Date.now());
     sockets.add(socket);
     socket.setNoDelay(true);
     socket.on('error', () => {}); // a client that hangs up mid-test is not a failure
@@ -74,6 +78,7 @@ function startMockImap({ greeting = DEFAULT_GREETING, onCommand }) {
       resolve({
         port: server.address().port,
         received,
+        connections,
         async close() {
           for (const socket of sockets) socket.destroy();
           await new Promise((done) => server.close(done));
@@ -331,6 +336,221 @@ test('HEADER.FIELDS matching nothing comes back as {0} and pairs cleanly', async
   );
 });
 
+test('REGRESSION: a flood of zero-length literals is refused instead of eaten', async () => {
+  // A `{0}\r\n` marker costs six bytes on the wire and buys an entry in both
+  // of the assembler's arrays while leaving its byte counter at zero, so the
+  // 96 MB cap — which reads that counter — never saw this coming. A hostile
+  // server streaming nothing but markers took the real client to 464 MB rss
+  // and a fatal V8 out-of-memory in about a second and a half, during the
+  // pre-auth CAPABILITY, with no credentials involved. An OOM cannot be
+  // caught, so the only fix that counts is one that refuses the response.
+  //
+  // 80,000 markers is 480 KB on the wire and 160,000 pieces — past the cap,
+  // and small enough that the *unfixed* client survives long enough to fail
+  // this test by timing out rather than by killing the test runner.
+  const flood = Buffer.from('{0}\r\n'.repeat(80_000), 'latin1');
+
+  await withServer(
+    {
+      // No [CAPABILITY] in the greeting, so the client has to ask — which puts
+      // the flood inside connect(), before a password exists anywhere.
+      greeting: '* OK Zelos mock ready',
+      onCommand: ({ verb, send }) => {
+        if (verb === 'CAPABILITY') {
+          send(flood); // …and never a tagged completion
+          return;
+        }
+        send('* BAD nothing else should be reached\r\n');
+      },
+    },
+    async ({ port, received }) => {
+      // A password with no substring in common with the guard's own message —
+      // otherwise a redaction bug would fail this test under a literals name.
+      const client = new ImapClient({ host: '127.0.0.1', port, secure: false, user: 'u', pass: 'qqqqqqqq', timeoutMs: 1500 });
+      await assert.rejects(
+        () => client.connect(),
+        (err) => {
+          assert.match(err.message, /number of pieces/, 'refused for its shape, not by the idle timer');
+          assert.match(err.message, /IMAP 127\.0\.0\.1:\d+/);
+          return true;
+        },
+      );
+      assert.ok(!received.some((line) => /LOGIN|AUTHENTICATE/i.test(line)), 'this happens before any credential');
+      await client.close();
+    },
+  );
+});
+
+test('REGRESSION: a flood of complete untagged responses is refused instead of eaten', async () => {
+  // The sibling of the `{0}` flood above, and the one the assembler cannot see.
+  // Every path in the assembler that emits a complete response resets its
+  // segments, its literals and its byte counter, so a server sending nothing
+  // but well-formed untagged lines trips neither of its two caps — it hands
+  // them off one at a time to the in-flight job's `untagged` array, which had
+  // no cap at all and only empties when the tagged completion arrives. A
+  // hostile server never sends one.
+  //
+  // Measured against the real client with the real socket, at `--max-old-space
+  // -size=400`: a server answering the pre-auth CAPABILITY with
+  // `* OK <1 KB>\r\n` forever drove rss 231 -> 343 -> 452 -> 491 MB and then
+  // `FATAL ERROR: ... JavaScript heap out of memory` at 1.75 s. Same harm as
+  // the `{0}` flood, same absence of credentials, and an OOM is still not
+  // catchable. With the cap in place the same server is refused at 265 ms.
+  //
+  // Six bytes per response is the cheapest way to reach the 50,000 cap: 300 KB
+  // on the wire, and about 18 MB held by the client before it refuses (a
+  // parsed untagged response retains ~372 bytes however short its text is,
+  // which is exactly why the cap counts responses and not only their bytes).
+  const flood = Buffer.from('* OK\r\n'.repeat(50_001), 'latin1');
+
+  await withServer(
+    {
+      // As above: no [CAPABILITY] in the greeting puts the flood inside
+      // connect(), before a password exists anywhere.
+      greeting: '* OK Zelos mock ready',
+      onCommand: ({ verb, send }) => {
+        if (verb === 'CAPABILITY') {
+          send(flood); // …and never a tagged completion
+          return;
+        }
+        send('* BAD nothing else should be reached\r\n');
+      },
+    },
+    async ({ port, received }) => {
+      const client = new ImapClient({ host: '127.0.0.1', port, secure: false, user: 'u', pass: 'qqqqqqqq', timeoutMs: 1500 });
+      await assert.rejects(
+        () => client.connect(),
+        (err) => {
+          assert.match(
+            err.message,
+            /more untagged responses to one command than Zelos will buffer/,
+            'refused for its shape, not by the idle timer',
+          );
+          assert.match(err.message, /IMAP 127\.0\.0\.1:\d+/);
+          return true;
+        },
+      );
+      assert.ok(!received.some((line) => /LOGIN|AUTHENTICATE/i.test(line)), 'this happens before any credential');
+      await client.close();
+    },
+  );
+});
+
+test('the byte cap on untagged responses refuses a flood of few but enormous ones', async () => {
+  /* The count cap above and this one are not the same guard, and the count cap
+     cannot stand in for it: 50,000 responses is a lot of small ones, and a
+     server that sends FIFTY of two megabytes each never approaches it while
+     handing the client a hundred megabytes to hold. `job.untaggedBytes` is the
+     only thing standing between that and the heap.
+
+     Neither direction of this branch had a test — the string it fails with
+     appeared in production code and nowhere else — which mattered because the
+     cap was added late and its threshold is the one number here that a real,
+     legitimate mailbox could conceivably reach.
+
+     2 MB x 49 stays under, and the 50th crosses; a tagged completion is never
+     sent, so the only two ways out are the cap and the idle timer, and the
+     assertion distinguishes them by message. */
+  const chunk = `* OK ${'x'.repeat(2 * 1024 * 1024)}\r\n`;
+
+  await withServer(
+    {
+      greeting: '* OK Zelos mock ready',
+      onCommand: ({ verb, send }) => {
+        if (verb === 'CAPABILITY') {
+          for (let i = 0; i < 50; i++) send(chunk);
+          return; // …and never a tagged completion
+        }
+        send('* BAD nothing else should be reached\r\n');
+      },
+    },
+    async ({ port, received }) => {
+      const client = new ImapClient({ host: '127.0.0.1', port, secure: false, user: 'u', pass: 'qqqqqqqq', timeoutMs: 20_000 });
+      await assert.rejects(
+        () => client.connect(),
+        (err) => {
+          assert.match(
+            err.message,
+            /untagged responses to one command exceeded the maximum size Zelos will buffer/,
+            `refused for its size, not by the idle timer or the count cap: ${err.message}`,
+          );
+          assert.match(err.message, /IMAP 127\.0\.0\.1:\d+/);
+          return true;
+        },
+      );
+      assert.ok(!received.some((line) => /LOGIN|AUTHENTICATE/i.test(line)),
+        'this happens before any credential');
+      await client.close();
+    },
+  );
+});
+
+test('a mailbox that is merely large does not trip the byte cap', async () => {
+  /* The other direction, and the one that would bite a real person rather than
+     an attacker. `fetch()` chunks at 100 UIDs and the sweep pulls a body part
+     for each, so a chunk of long messages is ordinary traffic — a cap set too
+     low turns a big but honest mailbox into a connection that fails every
+     sweep, with an error about buffering that names nothing the user can act
+     on. Twenty megabytes across ten responses is comfortably more than a real
+     hundred-message header fetch and must still go through. */
+  const chunk = `* OK ${'y'.repeat(2 * 1024 * 1024)}\r\n`;
+
+  await withServer(
+    {
+      greeting: '* OK Zelos mock ready',
+      onCommand: ({ tag, verb, send }) => {
+        if (verb === 'CAPABILITY') {
+          for (let i = 0; i < 10; i++) send(chunk);
+          send(`* CAPABILITY IMAP4rev1\r\n${tag} OK CAPABILITY completed\r\n`);
+          return;
+        }
+        send(`${tag} OK fine\r\n`);
+      },
+    },
+    async ({ port }) => {
+      const client = new ImapClient({ host: '127.0.0.1', port, secure: false, user: 'u', pass: 'qqqqqqqq', timeoutMs: 20_000 });
+      await client.connect();
+      const caps = await client.capabilities();
+      assert.ok(caps.has('IMAP4REV1'), 'the capability list survived twenty megabytes of chatter');
+      await client.close();
+    },
+  );
+});
+
+test('a command whose server is merely chatty still gets every untagged response', async () => {
+  // The other half of the cap: it must not truncate. `select()` reads EXISTS
+  // out of the untagged pile, so a cap that silently dropped responses would
+  // hand the caller a mailbox with the wrong number of messages in it —
+  // quieter and worse than a connection that says why it stopped. 4,000
+  // untagged lines is an order of magnitude past any real command and an order
+  // of magnitude under the cap.
+  const chatter = '* OK [ALERT] the server would like a word\r\n'.repeat(4_000);
+
+  await withServer(
+    {
+      // Written out rather than via session(), whose EXAMINE case is ahead of
+      // its `extra` hook and would answer before the chatter could go out.
+      onCommand: ({ verb, tag, send }) => {
+        if (verb === 'LOGIN') { send(`${tag} OK LOGIN completed\r\n`); return; }
+        if (verb === 'EXAMINE') {
+          send(`${chatter}* 3 EXISTS\r\n* OK [UIDVALIDITY 7] ok\r\n${tag} OK [READ-ONLY] EXAMINE completed\r\n`);
+          return;
+        }
+        send(`${tag} BAD unexpected command in mock\r\n`);
+      },
+    },
+    async ({ port }) => {
+      const client = new ImapClient({ host: '127.0.0.1', port, secure: false, user: 'u', pass: 'qqqqqqqq', timeoutMs: 5000 });
+      await client.connect();
+      await client.login();
+      const box = await client.select('INBOX');
+      assert.equal(box.exists, 3, 'EXISTS survived 4,000 lines of chatter ahead of it');
+      assert.equal(box.uidValidity, 7);
+      await client.close();
+    },
+  );
+});
+
 test('an empty search result short-circuits without fetching anything', async () => {
   await withServer(
     {
@@ -581,6 +801,74 @@ test('a multipart message with no text/plain falls back to the html part', async
   );
 });
 
+test('REGRESSION: a signature part and an inline logo are not attachments', async () => {
+  // hasAttachments used to be "attachment disposition OR any filename OR any
+  // application/* part", and the last two clauses fired on machinery. Every
+  // S/MIME mail carries a pkcs7-signature; every templated newsletter carries
+  // a cid: logo with a NAME param. Both came out as `[unread, has attachment]`
+  // in front of the model, and both ship to MCP clients.
+  const TEXT = '("TEXT" "PLAIN" ("CHARSET" "UTF-8") NIL NIL "7BIT" 120 4 NIL NIL NIL NIL)';
+
+  // Outlook's shape: the signature is named and dispositioned like a file.
+  const signedOnly =
+    `(${TEXT}` +
+    '("APPLICATION" "PKCS7-SIGNATURE" ("NAME" "smime.p7s") NIL NIL "BASE64" 3210 NIL' +
+    ' ("attachment" ("FILENAME" "smime.p7s")) NIL NIL)' +
+    ' "SIGNED" ("BOUNDARY" "b7" "PROTOCOL" "application/pkcs7-signature") NIL NIL NIL)';
+
+  // A cid: logo: no disposition at all, a NAME param, a Content-ID the html draws.
+  const relatedLogo =
+    '(("TEXT" "HTML" ("CHARSET" "UTF-8") NIL NIL "7BIT" 300 6 NIL NIL NIL NIL)' +
+    '("IMAGE" "PNG" ("NAME" "logo.png") "<logo@aldervance.example>" NIL "BASE64" 4096 NIL NIL NIL NIL)' +
+    ' "RELATED" ("BOUNDARY" "b8" "TYPE" "text/html") NIL NIL NIL)';
+
+  // The same signed envelope, but with a real document inside it.
+  const signedWithPdf =
+    `((${TEXT}` +
+    '("APPLICATION" "PDF" ("NAME" "invoice.pdf") NIL NIL "BASE64" 40000 NIL' +
+    ' ("attachment" ("FILENAME" "invoice.pdf")) NIL NIL)' +
+    ' "MIXED" ("BOUNDARY" "b9") NIL NIL NIL)' +
+    '("APPLICATION" "PGP-SIGNATURE" ("NAME" "signature.asc") NIL NIL "7BIT" 833 NIL NIL NIL NIL)' +
+    ' "SIGNED" ("BOUNDARY" "b10" "PROTOCOL" "application/pgp-signature") NIL NIL NIL)';
+
+  const headers = (n) =>
+    `Subject: m${n}\r\nFrom: pm@aldervance.example\r\nDate: Fri, 08 Aug 2026 12:00:00 -0400\r\nMessage-ID: <m${n}@aldervance.example>\r\n\r\n`;
+
+  await withServer(
+    {
+      onCommand: session({
+        extra: mailbox([
+          {
+            uid: 401, internalDate: '08-Aug-2026 12:00:00 -0400', structure: signedOnly,
+            headers: headers(401), parts: { 1: 'Signed, nothing enclosed.\r\n' },
+          },
+          {
+            uid: 402, internalDate: '08-Aug-2026 11:00:00 -0400', structure: relatedLogo,
+            headers: headers(402), parts: { 1: '<html><body><p>Newsletter</p><img src="cid:logo@aldervance.example"></body></html>' },
+          },
+          {
+            uid: 403, internalDate: '08-Aug-2026 10:00:00 -0400', structure: signedWithPdf,
+            headers: headers(403), parts: { '1.1': 'Invoice attached and signed.\r\n' },
+          },
+        ]),
+      }),
+    },
+    async ({ port }) => {
+      const messages = await fetchRecent({ host: '127.0.0.1', port, secure: false, user: 'u', pass: 'p', timeoutMs: 5000 });
+      const byUid = new Map(messages.map((m) => [m.uid, m]));
+
+      assert.equal(byUid.get(401).hasAttachments, false, 'smime.p7s is machinery, not a document');
+      assert.equal(byUid.get(402).hasAttachments, false, 'a cid: logo is drawn by the body, not attached to it');
+      assert.equal(byUid.get(403).hasAttachments, true, 'the pdf inside the signed envelope still counts');
+
+      // The text still has to come out of the right part, or the flag is the
+      // least of the problems.
+      assert.equal(byUid.get(401).text, 'Signed, nothing enclosed.');
+      assert.equal(byUid.get(403).text, 'Invoice attached and signed.');
+    },
+  );
+});
+
 test('a message with no usable BODYSTRUCTURE falls back to the TEXT section', async () => {
   await withServer(
     {
@@ -711,6 +999,163 @@ test('testConnection reports the failure instead of throwing', async () => {
       assert.match(result.error, /127\.0\.0\.1/);
       assert.deepEqual(result.mailboxes, []);
     },
+  );
+});
+
+/** A server that quotes back the LOGIN line it just rejected. Real ones do. */
+function echoingLogin({ tag, verb, line, send }) {
+  if (verb === 'LOGIN') {
+    send(`${tag} NO [AUTHENTICATIONFAILED] rejected: ${line}\r\n`);
+    return;
+  }
+  send(`${tag} OK fine\r\n`);
+}
+
+test('REGRESSION: a password containing " and \\ is struck out of the echoed LOGIN line', async () => {
+  // quoted() backslash-escapes both characters before the password goes on the
+  // wire, so `pa"ss\word` leaves as `"pa\"ss\\word"`. The redaction list used
+  // to hold only the verbatim bytes, the base64 and the SASL PLAIN payload, so
+  // includes(pass) was false and the escaped form went straight through — into
+  // this very string, which /api/mail/test returns in its HTTP body the moment
+  // a user clicks "Test connection" with a mistyped password, and which the
+  // sweep writes to runs.stats_json and re-serves from /api/state forever.
+  const pass = 'pa"ss\\word';
+  const escaped = 'pa\\"ss\\\\word';
+
+  await withServer(
+    { onCommand: echoingLogin },
+    async ({ port, received }) => {
+      const result = await testConnection({
+        host: '127.0.0.1', port, secure: false, user: 'me@x.example', pass, timeoutMs: 5000,
+      });
+      assert.equal(result.ok, false);
+
+      // The escaped spelling is the one that is actually on the wire; assert
+      // the fixture really produced it before asserting it was struck.
+      assert.ok(
+        received.some((line) => line.includes(`"${escaped}"`)),
+        'the fixture must exercise the escaped wire form',
+      );
+      assert.ok(!result.error.includes(escaped), 'the escaped wire form is redacted');
+      assert.ok(!result.error.includes(pass), 'the verbatim form is redacted');
+      assert.match(result.error, /<password withheld>/);
+      assert.match(result.error, /AUTHENTICATIONFAILED/, 'the diagnosis survives the redaction');
+    },
+  );
+});
+
+test('REGRESSION: a one-character password is struck without shredding the sentence', async () => {
+  // withoutCredentials is a blind split/join, so a password of "e" used to
+  // replace every "e" in the server's own words — which destroys the message
+  // and, by the shape of the holes, spells the password out for whoever reads
+  // it. Short passwords are now struck only in the spellings they travel in.
+  await withServer(
+    { onCommand: echoingLogin },
+    async ({ port }) => {
+      const result = await testConnection({
+        host: '127.0.0.1', port, secure: false, user: 'u', pass: 'e', timeoutMs: 5000,
+      });
+      assert.equal(result.ok, false);
+      assert.match(result.error, /AUTHENTICATIONFAILED/, 'prose survives intact');
+      assert.match(result.error, /rejected: A\d+ LOGIN "u" <password withheld>/, 'the quoted argument still goes');
+      assert.ok(!result.error.includes('"e"'), 'nothing quoted-and-short is left behind');
+    },
+  );
+});
+
+test('REGRESSION: redaction runs once over the original text, never over its own marker', async () => {
+  // The fix for the escaped wire form added a second needle to a list that was
+  // substituted one form at a time, and two things went wrong at once.
+  //
+  // A password containing neither `"` nor `\` escapes to itself, so `pass` and
+  // `escaped` were the same string and the same scan ran twice. And the marker
+  // `<password withheld>` is not inert: it contains "pass", "word", "password"
+  // and "withheld", so every scan after the first ate the marker the previous
+  // one had just written. Measured through the real testConnection against a
+  // server that quotes back the LOGIN line it rejected:
+  //
+  //   pass="pass"      -> <<<password withheld>word withheld>word withheld>
+  //   pass="word"      -> <pass<pass<password withheld> withheld> withheld>
+  //   pass="withheld"  -> <password <password <password withheld>>>
+  //
+  // Nothing leaked — the cascade ate the marker, not the secret — but this
+  // string is the body of POST /api/mail/test, i.e. what the Settings "Test
+  // connection" button puts in front of a user at the exact moment they need
+  // to read "AUTHENTICATIONFAILED", and it is also what the sweep writes to
+  // runs.stats_json and re-serves from /api/state forever.
+  //
+  // Every one of these is a substring of the marker, which is the whole point.
+  for (const pass of ['pass', 'word', 'password', 'withheld', 'hunter2']) {
+    await withServer(
+      { onCommand: echoingLogin },
+      async ({ port, received }) => {
+        const result = await testConnection({
+          host: '127.0.0.1', port, secure: false, user: 'u', pass, timeoutMs: 5000,
+        });
+        assert.equal(result.ok, false);
+        assert.ok(
+          received.some((line) => line.includes(`"${pass}"`)),
+          `the fixture must put ${JSON.stringify(pass)} on the wire for the server to echo`,
+        );
+        assert.equal(
+          result.error.match(/withheld/g)?.length,
+          1,
+          `${JSON.stringify(pass)} produced a nested marker: ${result.error}`,
+        );
+        assert.match(
+          result.error,
+          /rejected: A\d+ LOGIN "u" <password withheld>$/,
+          `${JSON.stringify(pass)} shredded the sentence: ${result.error}`,
+        );
+        assert.match(result.error, /AUTHENTICATIONFAILED/, 'the diagnosis survives the redaction');
+      },
+    );
+  }
+});
+
+test('REGRESSION: redaction is linear in the reply, however many times the password appears', async () => {
+  /* The repair for the nested-marker cascade above replaced the per-form
+     split/join with a single left-to-right scan — and the obvious way to write
+     that scan re-runs `indexOf` for EVERY form from the cursor on EVERY hit,
+     which is quadratic in a string a hostile server controls the length and the
+     hit-count of. Measured through the real testConnection before this test
+     existed: 7 ms at 18 KB, 29 ms at 72 KB, 431 ms at 288 KB — 15x the time for
+     4x the input, against MAX_RESPONSE_BYTES of 96 MB.
+
+     So the assertion is a SHAPE, not a stopwatch reading: quadrupling the reply
+     must not multiply the time by anything like sixteen. A wall-clock budget
+     alone would be flaky on a loaded runner; a ratio survives a slow machine,
+     because a slow machine is slow at both sizes. */
+  const pass = 'hunter2!';
+  const timeFor = async (repeats) => {
+    let ms = 0;
+    await withServer(
+      {
+        onCommand: ({ tag, verb, send }) => {
+          if (verb === 'LOGIN') send(`${tag} NO [AUTHENTICATIONFAILED] rejected ${`${pass} `.repeat(repeats)}\r\n`);
+          else send(`${tag} OK fine\r\n`);
+        },
+      },
+      async ({ port }) => {
+        const started = performance.now();
+        const result = await testConnection({
+          host: '127.0.0.1', port, secure: false, user: 'u', pass, timeoutMs: 30_000,
+        });
+        ms = performance.now() - started;
+        assert.equal(result.ok, false);
+        assert.ok(!result.error.includes(pass), 'the password survived a reply that repeats it');
+      },
+    );
+    return ms;
+  };
+
+  // A floor keeps the ratio meaningful when both numbers round to nothing.
+  const small = Math.max(await timeFor(4_000), 1);
+  const large = Math.max(await timeFor(16_000), 1);
+  assert.ok(
+    large < small * 8,
+    `redaction is superlinear: 4,000 repeats took ${small.toFixed(0)}ms and 16,000 took ${large.toFixed(0)}ms `
+    + '(4x the input should cost about 4x, not 16x)',
   );
 });
 

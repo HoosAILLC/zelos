@@ -49,7 +49,20 @@ zelos/
 ## 2. Data at rest
 
 Home dir: `process.env.ZELOS_HOME || path.join(os.homedir(), '.zelos')`, mode `0700`.
-Contains `config.json` (mode 0600, **no secrets**), `zelos.db`, `logs/`, `cache/`.
+Contains `config.json` (mode 0600, **no secrets**), `zelos.db`, `logs/`, `cache/`, and:
+
+- `secrets.backend.json` (0600) — which secret store this home committed to, written on the first
+  store and honoured by later launches over whatever the probe finds.
+- `secrets.enc` + `.seed` (both 0600) — present when that store is the encrypted-file fallback.
+  `.seed` is the 64-hex key for `secrets.enc`, in the same directory: this is at-rest protection
+  only, and the docs must not describe it as more.
+- `zelos.lock` — one Zelos per home; a second one warns rather than refuses.
+- `window.json` — desktop shell only.
+
+`logs/` is created and chmodded on every launch but is **empty for CLI users**: the default logger
+(`core/log.mjs`) is built with `dir: null` and writes to stderr. The only file logger is the
+desktop shell's, and it writes `logs/desktop.log`. There is no `zelos.log`; do not print that name
+anywhere.
 
 ### Config shape (`core/config.mjs` owns this)
 
@@ -181,6 +194,13 @@ export function isLocalAddress(baseUrl)      // localhost/127.0.0.1/::1/*.local/
 
 `opts`: `{protocol, baseUrl, model, apiKey, system, messages:[{role,content}], maxTokens,
 temperature, json:boolean, timeoutMs=120000, signal, retries=3}`.
+
+**`timeoutMs` is an IDLE budget, not a total one.** A streaming answer resets it on every chunk
+that arrives, so a long reply is never killed for being long — only for going quiet for
+`timeoutMs`. For a non-streaming caller, which never kicks it, it is the total deadline and
+covers the body read as well as the headers. Do not document it as "requests time out after 120
+seconds"; the accurate sentence is "a request is abandoned after 120 seconds without progress".
+Server-sent comment keepalives and `{"type":"ping"}` frames count as progress, by design.
 
 Rules — these are load-bearing, they came from a previous build:
 - **A missing API key is only an error for non-local addresses.** Keyless local models must
@@ -316,6 +336,16 @@ export async function testConnection({url,user,pass})          // -> {ok, calend
 Hand-rolled minimal XML parsing is fine (namespace-agnostic: match on local names). Basic auth.
 Follow one redirect. iCloud/Fastmail/Nextcloud shapes are the targets.
 
+**Basic auth is pinned to the origin the user typed**, and iCloud is why that has a visible cost.
+Discovery is driven by the server's own answers — a `Location`, or an `href` naming the principal
+or the calendar home set — and iCloud partitions accounts across per-user hosts
+(`p43-caldav.icloud.com` and the like), so a walk from the generic address routinely lands on a
+host the user never typed. Zelos follows the hop **anonymously** and, if that host then demands a
+password, raises a named error telling the user to put that host's address in the calendar URL
+directly. So "iCloud is a target" is true, and "`caldav.icloud.com` works for every account" is
+not. The refusal must stay distinguishable from a wrong password, or the user retypes a password
+that was never the problem.
+
 ## 6. `core/safety.mjs`
 
 ```js
@@ -372,9 +402,15 @@ Hard rules, enforced in **code** after the model — not by asking nicely:
 - `sourceRefs` must resolve to rows that actually exist; drop the ones that don't.
 - `key` is what identity is carried on: an item whose `key` matches an existing open item keeps
   its `first_seen` and increments `seen_runs`. Items not returned this run are **not deleted** —
-  they keep their state, and the UI shows how long a thing has been carried.
-- Drafts are never auto-sent and never contain `[placeholders]` — a draft with a bracketed
-  placeholder is rejected as not-ready and logged.
+  they keep their state, and the UI shows how long a thing has been carried. A model that
+  supplies no key gets one derived as `sha256(headline|person)`, which is stable only while the
+  headline is byte-stable — a reworded headline is a new item. The derivation is recorded in
+  `errors` by name so a duplicate can be traced to the run that minted it.
+- Drafts are never auto-sent. A draft that still reads as a template is rejected as not-ready and
+  logged: `[anything]` (including across a newline), `{{mustache}}`, `TODO`/`TBD`/`FIXME` on a
+  word boundary, and "insert … here". **This is a blocklist, and two spellings are outside it:**
+  single braces (`{first_name}`) and a bracketed span longer than 400 characters. Do not restate
+  it as "never contains a placeholder".
 
 ```js
 // sweep.mjs
@@ -387,8 +423,12 @@ export class Scheduler { start(); stop(); status() }  // interval + active-hours
 
 Light vs full: a **light** run re-fetches sources and recomputes derived state (staleness,
 counts, ordering) **without** calling the model. A **full** run calls the model. Go full when
-there is new mail/events since the last full run, or when >4h have passed. `onProgress` emits
-`{phase, message, done, total}` for the SSE stream.
+there has never been a successful full run, when mail or events were **newly inserted** since the
+last one, when an untriaged capture is waiting, or when the last full run is `FULL_RUN_MAX_AGE_MS`
+old (**4 hours**). "Newly inserted" is counted as rows are stored, not by comparing `fetched_at`
+to the last run — every sweep re-touches `fetched_at` on every message it re-reads, so a timestamp
+comparison would make every run a full run and the distinction would quietly stop existing.
+`onProgress` emits `{phase, message, done, total}` for the SSE stream.
 
 ## 8. `core/server.mjs` + `zelos.mjs`
 
@@ -399,7 +439,11 @@ there is new mail/events since the last full run, or when >4h have passed. `onPr
 requests to `127.0.0.1`. So:
 - A random 32-byte hex `sessionToken` is minted per launch and printed in the launch URL as
   `?t=…`. The UI stores it and sends it as `X-Zelos-Token` on every API call.
-- Every `/api/*` request requires a matching token. Reject with 401 otherwise.
+- Every route in the `ROUTES` table below requires a matching token. Reject with 401 otherwise.
+  **`POST /api/mcp` is the one `/api/*` path that does not** — it is lifted out of the pipeline
+  before the session gate (after the `Host` and `Origin` checks, which it needs unchanged) and
+  takes an AI bearer token instead. Neither credential works on the other's routes: the session
+  gate 401s an AI token, and the MCP gate ignores `X-Zelos-Token`. See SPEC-v2 §1.
 - Reject any request whose `Origin` header is present and is not the server's own origin.
 - No CORS headers, ever. `Access-Control-Allow-Origin` must not appear anywhere.
 - Static file serving is path-traversal-proof (resolve, then assert the resolved path is inside
@@ -430,11 +474,31 @@ Routes (JSON in/out unless noted):
 | POST | `/api/ask` | `{question}` | **SSE** streamed answer grounded in FTS5 hits |
 | PUT | `/api/drafts/:id` | `{body,state}` | draft |
 | GET | `/api/search` | `?q` | FTS5 results |
+| GET | `/api/sample-data` | | `{installed, version, seededAt, counts, summary}` — SPEC-v2 §4 |
+| POST | `/api/sample-data` | | seeds the demo board; 201, or 200 + `alreadyInstalled` |
+| DELETE | `/api/sample-data` | | same status shape + `{cleared, removed}` |
+| GET | `/api/ai` | | AI-access state: switch, scopes, tokens, access log — SPEC-v2 §1 |
+| PUT | `/api/ai` | `{enabled?, scopes?}` | updated state; 400 if neither is sent |
+| POST | `/api/ai/tokens` | `{label}` | 201 + the token **value, shown once and never readable again** |
+| DELETE | `/api/ai/tokens/:id` | | updated state |
+| POST | `/api/ai/test` | `{token, …}` | runs the real tool layer the way a client would |
 
-`zelos.mjs`: flags `--port --home --no-open --sweep-now --version --help`. On start: migrate,
-print a clean banner with the URL, open the browser unless `--no-open` (macOS `open`, Windows
-`start`, Linux `xdg-open`), start the scheduler if `sweep.auto`, handle SIGINT cleanly.
-If the model is not configured, still start — the UI's job is to walk the user through setup.
+**That is 27 rows and it must stay exact.** `test/security.test.mjs` and
+`test/ai-security.test.mjs` no longer restate this list — they parse `ROUTES` out of
+`core/server.mjs` (`test/router-table.mjs`) and attack whatever is in it. This table drifting
+was the upstream cause of eight routes going unattacked, `/api/sample-data` among them; keeping
+it right is now documentation hygiene rather than test coverage. `POST /api/mcp` is served but
+is deliberately **not** in `ROUTES`, per the gate note above.
+
+`zelos.mjs`: subcommands `sweep`, `doctor`, `mcp`; flags `--port --home --no-open --sweep-now
+--mode --json --version --help`. On start: migrate, print a clean banner with the URL, open the
+browser unless `--no-open` (macOS `open`, Windows `start`, Linux `xdg-open`), handle SIGINT
+cleanly. **The scheduler is constructed and started unconditionally**, whatever `sweep.auto`
+says — gating construction on the setting left `handleConfigPut` with nothing to reconfigure, so
+turning the schedule on in Settings did nothing until the next launch. The off switch lives one
+level down, in `Scheduler#tick`, which advances and re-arms without sweeping while `auto` is
+false. If the model is not configured, still start — the UI's job is to walk the user through
+setup.
 
 ## 9. `ui/` — the face
 
@@ -456,7 +520,8 @@ as the marketing site.
   mono for numbers/times. No system-ui-only stack for the headline — it must have character.
 - Layout: left rail at ≥60rem showing every bucket's count inline (nothing needs a click to
   read); bottom tab bar under that. Content column caps at ~52rem; two columns only ≥80rem.
-- Views: **Now · Today · Owed · Calendar · Ask · Settings**.
+- Views: **Now · Today · Owed · Calendar · Search · Ask · Settings** — seven, not six; `Search`
+  is its own view (`ui/views/search.js`), not a control inside another one.
   - *Now*: the single `first` item as a hero, then ≤4 now items, then "Worth knowing" notes.
   - *Today*: dense rows sorted by severity/due, 8 visible, rest folded behind "show the other N"
     — nothing is ever silently dropped.
@@ -464,9 +529,16 @@ as the marketing site.
     auto-growing textareas with edit/discard/copy; edits persist to the server.
   - *Calendar*: a real time-grid week view. Chips absolutely positioned from wall-clock minutes
     read **off the ISO string**. Overlaps packed by cluster-then-greedy-column. Today marked, a
-    now-line. Day/Week/Month segmented control. Month cells sort conflicts first.
-  - *Ask*: streaming answer over your own indexed context, with the sources it used listed.
-  - *Settings*: model, mail, calendars, sweep, privacy, data (export/wipe), about.
+    now-line. Day/Week/Month segmented control. A month cell shows at most **three** entries and
+    sorts conflicts first, so the clashing entries themselves can still be below the fold on a
+    busy day — three all-day entries fill all three rows. What is guaranteed is the **flag**: the
+    `clash` badge is derived from the whole day, not from what fits. A cell the board carries no
+    answer about is marked unloaded, which is a different fact from "belongs to the neighbouring
+    month" and is rendered differently.
+  - *Ask*: streaming answer over your own indexed context, with the sources it used listed. Each
+    question is its own model call.
+  - *Settings*: **nine** panels — You, Model, Mail, Calendars, Sweeps, Privacy, AI access, Data
+    (export/wipe), About.
 - **First-run onboarding** is a real, designed flow, not a form dump: pick a model (local
   runtimes detected and offered first), paste a key, connect mail, connect a calendar, first
   sweep — with honest progress and an escape hatch at every step.

@@ -250,9 +250,25 @@ function startScreen(rerender, navigate) {
   const actions = el('div', { class: 'ob-actions' },
     button('Skip and look around', { class: 'btn solid', onClick: () => finish(navigate) }));
 
-  /** Rebuilt once, when both probes have answered, so nothing jumps twice. */
+  /**
+   * The action row, painted from whatever the probes have answered so far.
+   *
+   * This ran behind `if (!actions.isConnected) return;`, which was never true
+   * when it mattered. The synchronous call below happens twelve lines before
+   * `shell()` puts `actions` in a tree, so the first pass always bailed, and
+   * the two `.finally` callbacks that made up for it are gated on the
+   * module-level probe caches — so on the SECOND build of this screen, with
+   * both probes already answered, neither ran and the row kept its
+   * placeholder. What was lost: "Use Ollama and open the board", "Try it with
+   * sample data", "Choose a model", "Connect mail and a calendar", and the
+   * demo-week note. Sample data has no other way in anywhere in the app, and
+   * `watchBoard` rebuilds this screen every three minutes and on every
+   * tab-visibility change, so the row emptied itself while nobody touched it.
+   *
+   * There is nothing here that needs a live node — `replaceChildren` on a
+   * detached element is perfectly ordinary — so the guard is simply gone.
+   */
   const paintActions = () => {
-    if (!actions.isConnected) return;
     const found = localProbe?.found?.length ? localProbe.found[0] : null;
     const usable = found && found.models?.length;
     const sample = sampleState?.supported ? sampleState : null;

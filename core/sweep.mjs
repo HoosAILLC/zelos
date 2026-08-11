@@ -46,6 +46,7 @@ import {
   withTransaction,
 } from './db.mjs';
 import { buildSweepPrompt, mergeSweep, SWEEP_KV } from './triage.mjs';
+import { cap, screenContent, SafetyError } from './safety.mjs';
 import { SAMPLE_SOURCE_ID, SAMPLE_CALENDAR_ID, SAMPLE_MARK } from './sample-data.mjs';
 import {
   nowISO,
@@ -260,13 +261,53 @@ async function fetchIcsText(rawUrl, { user, pass, signal, timeoutMs = ICS_TIMEOU
   return text;
 }
 
+/**
+ * How many expanded instances one iCalendar document may contribute.
+ *
+ * The number is set HERE rather than left to `parseICS_toEvents`'s own default
+ * for one reason: this file is the only place that can tell the user a calendar
+ * was truncated, and it can only tell them if it knows what the ceiling was.
+ * `expand()` drops the overflow from the far end of the window and logs
+ * `ics.warn("more than max=… instances in the window; dropped …")` — a line that
+ * reaches a terminal nobody is reading and no screen at all. Passing the cap in
+ * and comparing the count out is what turns that into something a person sees.
+ */
+const ICS_MAX_INSTANCES = 1_500;
+
+/**
+ * True when a parse came back exactly at the ceiling.
+ *
+ * At the ceiling, not over it: the overflow is already gone by the time the
+ * array is returned, so "was anything dropped" is not answerable from here — and
+ * the wording chosen below is true either way. A document holding exactly 1,500
+ * instances and nothing more raises the same note, which costs a rare reader one
+ * sentence about a limit they are in fact standing on.
+ */
+const filledIcsBudget = (events) => (events?.length ?? 0) >= ICS_MAX_INSTANCES;
+
+/**
+ * Carry "this was truncated" back out with the events.
+ *
+ * A property on the array rather than a `{events, truncated}` wrapper, because
+ * the caller spreads and maps the result and both of those drop it silently —
+ * so the shape stays exactly what every existing caller, including an injected
+ * `deps.fetchEvents`, already returns. The reader is the calendar task below,
+ * which looks at it BEFORE the `.map`.
+ */
+function markTruncated(events) {
+  const list = Array.isArray(events) ? events : [];
+  list.truncated = true;
+  return list;
+}
+
 /** The default calendar reader: ics over http, CalDAV, or a local file. */
 async function defaultFetchEvents({ calendar, pass, from, to, timezone, email, signal }) {
-  const window = { from, to, tzid: timezone, email };
+  const window = { from, to, tzid: timezone, email, max: ICS_MAX_INSTANCES };
 
   if (calendar.kind === 'file') {
     const text = await fs.readFile(calendar.url, 'utf8');
-    return parseICS_toEvents(text, window);
+    const events = parseICS_toEvents(text, window);
+    return filledIcsBudget(events) ? markTruncated(events) : events;
   }
   if (calendar.kind === 'caldav') {
     const docs = await caldavFetchRange({
@@ -278,19 +319,33 @@ async function defaultFetchEvents({ calendar, pass, from, to, timezone, email, s
       signal,
     });
     const events = [];
-    for (const doc of docs) events.push(...parseICS_toEvents(doc, window));
-    return events;
+    // Each document is expanded and capped on its own, so the truncation is
+    // per-document: a collection of a hundred small VEVENT files cannot fill the
+    // budget between them, and one enormous recurring series can.
+    let truncated = false;
+    for (const doc of docs) {
+      const part = parseICS_toEvents(doc, window);
+      if (filledIcsBudget(part)) truncated = true;
+      events.push(...part);
+    }
+    return truncated ? markTruncated(events) : events;
   }
   const text = await fetchIcsText(calendar.url, { user: calendar.user, pass, signal });
-  return parseICS_toEvents(text, window);
+  const events = parseICS_toEvents(text, window);
+  return filledIcsBudget(events) ? markTruncated(events) : events;
 }
 
 /**
  * The default mail reader: one IMAP connection per mailbox.
  *
- * `fetchRecent` has no cancellation of its own, so `signal` is not forwarded;
- * the caller checks it between mailboxes instead, and an abandoned connection is
- * closed by `fetchRecent`'s own `finally`.
+ * `signal` is forwarded, and that is the half of Ctrl-C that used to be missing.
+ * The caller's check between mailboxes only ever caught a sweep between reads;
+ * a read already on the wire ran to its own end, so the first Ctrl-C did
+ * nothing a user could see and what actually ended the process was the
+ * launcher's 5 s escape timer — a force-exit, not a stop. `fetchRecent` now
+ * hands the signal to the client, which fails the command in flight and
+ * destroys the socket, so `abort()` below is reached with the connection
+ * already closed rather than still reading.
  *
  * `requireTls` is forwarded deliberately, and `?? null` rather than `|| null`,
  * because the setting is three-valued: `false` is a standing permission to talk
@@ -299,7 +354,7 @@ async function defaultFetchEvents({ calendar, pass, from, to, timezone, email, s
  * saved before the field existed has no value at all, which is what `null`
  * means — the client then decides from the host, as it always has.
  */
-function defaultFetchMail({ account, mailbox, pass, sinceDays, limit, onProgress }) {
+function defaultFetchMail({ account, mailbox, pass, sinceDays, limit, onProgress, signal }) {
   return fetchRecent({
     host: account.host,
     port: account.port,
@@ -311,6 +366,7 @@ function defaultFetchMail({ account, mailbox, pass, sinceDays, limit, onProgress
     sinceDays,
     limit,
     onProgress,
+    signal,
   });
 }
 
@@ -350,6 +406,70 @@ function errorText(err) {
   if (!err) return 'unknown error';
   if (err instanceof LLMError && err.address) return err.message;
   return err.message || String(err);
+}
+
+/**
+ * How much of a failure's own words survive into the run record.
+ *
+ * Every string in this file that describes a failure ends up in three places
+ * that are not this process: `runs.error` and `runs.stats_json` in SQLite,
+ * `/api/state` on every board read (and every three-minute heartbeat behind
+ * it), and the Settings export. IMAP is the source that makes that dangerous —
+ * `err.message` there is server-supplied text with no ceiling of its own, and a
+ * hostile or broken mail server can put an arbitrary amount of it in a tagged
+ * `NO` or a flushed `* BYE`. Measured against a mock that answered with 48 MiB:
+ * the stored `sources[0].error` was 50,331,713 characters and `GET /api/state`
+ * answered 200 with a 50,332,527-byte body, on every read, until the next
+ * successful sweep.
+ *
+ * 500 characters is chosen against the reader, not the writer: the banner in
+ * ui/views/now.js prints `label: error` in a list item, and a sentence longer
+ * than this is already past the point where anybody reads it. Nothing in the
+ * repo's own vocabulary of failures comes close to the ceiling — CalDAV's are
+ * fixed templates and the model adapter caps its own at 400 — so this only ever
+ * fires on text that came from a stranger's server.
+ */
+const ERROR_CHARS = 500;
+
+/** `errorText`, bounded. Every path that stores or serves a failure uses this. */
+function storedError(err) {
+  return cap(errorText(err), ERROR_CHARS);
+}
+
+/**
+ * The same ceiling for a sentence this file wrote AROUND a stranger's words.
+ *
+ * `finish(false, …)` messages are prose with `errorText` interpolated into
+ * them, so capping only the interpolation would still let the sentence carry an
+ * unbounded tail if one were ever added. Capping the finished sentence is the
+ * property that actually matters — `runs.error` is one column — and the prose
+ * is short enough that the budget is spent on the part that came from outside.
+ */
+function storedMessage(text) {
+  return cap(text, ERROR_CHARS);
+}
+
+/**
+ * A fragment of model output, safe to store beside an error.
+ *
+ * The "it began …" quotes below exist so a person can see WHY a reply was not a
+ * board, and they are already length-capped. Length is not the risk: the string
+ * is model output, it lands in `runs.error`, and `runs.error` is re-served by
+ * /api/state and copied into the settings export — so `<script>` reaching it is
+ * exactly the case docs/SECURITY.md says never happens ("a string trying to be
+ * markup never reaches storage, a log, a clipboard, or an export"). Screened
+ * rather than escaped: the sample is a courtesy, and dropping it costs the
+ * reader a hint, while keeping it costs the product a stated guarantee.
+ */
+function modelSample(text) {
+  const sample = String(text ?? '').slice(0, 200).replace(/\s+/g, ' ').trim();
+  if (!sample) return '';
+  try {
+    return screenContent(sample);
+  } catch (err) {
+    if (err instanceof SafetyError) return '';
+    throw err;
+  }
 }
 
 /* ------------------------------------------------------------------ *
@@ -456,7 +576,7 @@ export async function runSweep({
     try {
       pass = account.keyRef ? await getSecret(account.keyRef) : null;
     } catch (err) {
-      sources.push({ kind: 'mail', id: account.id, label, ok: false, count: 0, error: errorText(err) });
+      sources.push({ kind: 'mail', id: account.id, label, ok: false, count: 0, error: storedError(err) });
       return [];
     }
     if (!pass) {
@@ -503,14 +623,14 @@ export async function runSweep({
           error: null,
         });
       } catch (err) {
-        slog.warn(`mail source failed: ${label} / ${mailbox}`, { error: errorText(err) });
+        slog.warn(`mail source failed: ${label} / ${mailbox}`, { error: storedError(err) });
         sources.push({
           kind: 'mail',
           id: account.id,
           label: `${label} / ${mailbox}`,
           ok: false,
           count: 0,
-          error: errorText(err),
+          error: storedError(err),
         });
       }
     }
@@ -533,13 +653,36 @@ export async function runSweep({
         email: identityEmail || null,
         signal,
       });
+      // Read before the map, which drops it along with every other non-index
+      // property on the array. See markTruncated.
+      const truncated = events?.truncated === true;
       const rows = (events || []).map((e) => ({ ...e, calendarId: calendar.id }));
-      sources.push({ kind: 'calendar', id: calendar.id, label, ok: true, count: rows.length, error: null });
+      /* A truncated calendar is reported as a source that did NOT come back
+         whole, and `ok: false` is the deliberate half of that.
+         `ui/views/now.js` — the only screen that renders `sources[]` — filters
+         on `s.ok === false` and reads `s.error` off what survives, so a note
+         attached to an `ok: true` entry is a string with no reader, which is the
+         exact shape of the bug being fixed: `expand()` already logs this and the
+         log reaches nobody. The count still says how many entries were kept, and
+         the banner it lands in is headed "The last sweep could not read
+         everything" — which is precisely what happened. */
+      if (truncated) {
+        sources.push({
+          kind: 'calendar',
+          id: calendar.id,
+          label,
+          ok: false,
+          count: rows.length,
+          error: `This calendar filled Zelos's ceiling of ${ICS_MAX_INSTANCES.toLocaleString('en-US')} entries for the window, so anything past the ${ICS_MAX_INSTANCES.toLocaleString('en-US')}th was dropped from the far end of it. Narrow the subscription, or split it in two.`,
+        });
+      } else {
+        sources.push({ kind: 'calendar', id: calendar.id, label, ok: true, count: rows.length, error: null });
+      }
       emit('calendar', `${label}: ${rows.length} entries`, rows.length, rows.length);
       return rows;
     } catch (err) {
-      slog.warn(`calendar source failed: ${label}`, { error: errorText(err) });
-      sources.push({ kind: 'calendar', id: calendar.id, label, ok: false, count: 0, error: errorText(err) });
+      slog.warn(`calendar source failed: ${label}`, { error: storedError(err) });
+      sources.push({ kind: 'calendar', id: calendar.id, label, ok: false, count: 0, error: storedError(err) });
       return [];
     }
   });
@@ -569,8 +712,8 @@ export async function runSweep({
     stats.newEvents = e.inserted;
     bumpPendingNew(db, m.inserted + e.inserted);
   } catch (err) {
-    slog.error('could not store fetched sources', { error: errorText(err) });
-    return finish(false, `Could not store what was fetched: ${errorText(err)}`);
+    slog.error('could not store fetched sources', { error: storedError(err) });
+    return finish(false, storedMessage(`Could not store what was fetched: ${errorText(err)}`));
   }
 
   /* ---- 3. light or full ------------------------------------------- */
@@ -632,8 +775,8 @@ export async function runSweep({
       signal,
     });
   } catch (err) {
-    slog.error('model call failed', { error: errorText(err) });
-    return finish(false, errorText(err));
+    slog.error('model call failed', { error: storedError(err) });
+    return finish(false, storedError(err));
   }
 
   stats.tokensIn = Number(answer?.usage?.input) || 0;
@@ -651,20 +794,20 @@ export async function runSweep({
     parsed && typeof parsed === 'object' && !Array.isArray(parsed) &&
     ('items' in parsed || 'first' in parsed || 'notes' in parsed);
   if (!looksLikeBoard) {
-    const sample = String(answer?.text ?? '').slice(0, 200).replace(/\s+/g, ' ');
+    const sample = modelSample(answer?.text);
     if (answer?.stopReason === 'length') {
       // The reply was cut off at the token ceiling, so no model swap will fix
       // it — the same model with more room will.
       return finish(
         false,
-        `The model's reply was cut off at its token limit before the board was complete${sample ? ` — it began "${sample}"` : ''}. Raise model.maxTokens in Settings and sweep again.`,
+        storedMessage(`The model's reply was cut off at its token limit before the board was complete${sample ? ` — it began "${sample}"` : ''}. Raise model.maxTokens in Settings and sweep again.`),
       );
     }
     return finish(
       false,
       parsed
         ? 'The model replied with JSON, but not with a board — none of items, first or notes were in it. Try a larger model, or one that follows a format instruction.'
-        : `The model replied but not with JSON${sample ? ` — it began "${sample}"` : ''}. Try a larger model, or one that follows a format instruction.`,
+        : storedMessage(`The model replied but not with JSON${sample ? ` — it began "${sample}"` : ''}. Try a larger model, or one that follows a format instruction.`),
     );
   }
 
@@ -675,8 +818,8 @@ export async function runSweep({
   try {
     merged = mergeSweep(db, parsed, { runId, now });
   } catch (err) {
-    slog.error('could not merge the sweep', { error: errorText(err) });
-    return finish(false, `Could not store the board: ${errorText(err)}`);
+    slog.error('could not merge the sweep', { error: storedError(err) });
+    return finish(false, storedMessage(`Could not store the board: ${errorText(err)}`));
   }
 
   // ok:false from the merge means the reply was not usable as a sweep result at
@@ -696,12 +839,12 @@ export async function runSweep({
     if (answer?.stopReason === 'length') {
       return finish(
         false,
-        `The model's reply was cut off at its token limit before the board was usable (${why}). Raise model.maxTokens in Settings and sweep again.`,
+        storedMessage(`The model's reply was cut off at its token limit before the board was usable (${why}). Raise model.maxTokens in Settings and sweep again.`),
       );
     }
     return finish(
       false,
-      `The model's reply was not a usable board (${why}). Try a larger model, or one that follows a format instruction.`,
+      storedMessage(`The model's reply was not a usable board (${why}). Try a larger model, or one that follows a format instruction.`),
     );
   }
 
@@ -810,8 +953,27 @@ function recentlyResolved(db, now) {
  * the old totals and the write of the new ones are caught, because a `kv` table
  * that will not take a write is a reason to lose a number, never a reason to
  * throw away a board the user waited for.
+ *
+ * `sweep: false` is how a spender that is NOT a sweep books its tokens. The
+ * counter used to have exactly one caller — `finish` below — so every token the
+ * Ask panel spent was invisible: measured with a mock upstream, twenty
+ * `POST /api/ask` calls reporting 100,000 tokens over SSE left `sweep.tokens`
+ * null and `/api/state` carrying no `tokens` at all, while the line the user
+ * reads ("82k tokens in · 18k out") went on describing sweeps only. Ask is
+ * spend, so it moves `tokensIn`/`tokensOut`; it is not a sweep and produced no
+ * board, so it must move neither `runs` nor `modelRuns` — those two are what
+ * "Zelos asked the model N times today" is counted from, and a question typed
+ * into a panel is not a sweep that happened. Exported for the same reason it
+ * takes the flag: core/server.mjs's /api/ask handler is the second writer.
  */
-function recordTokens(db, { tokensIn = 0, tokensOut = 0, thought = false, ok = true, now = nowISO() } = {}) {
+export function recordTokens(db, {
+  tokensIn = 0,
+  tokensOut = 0,
+  thought = false,
+  ok = true,
+  sweep = true,
+  now = nowISO(),
+} = {}) {
   const today = dayKey(now) || '';
   let stored = null;
   try {
@@ -827,8 +989,8 @@ function recordTokens(db, { tokensIn = 0, tokensOut = 0, thought = false, ok = t
   const carried = stored.day === today ? stored : {};
   const num = (v) => Number(v) || 0;
 
-  const ranAsSweep = ok ? 1 : 0;
-  const ranAsModelSweep = ok && thought ? 1 : 0;
+  const ranAsSweep = sweep && ok ? 1 : 0;
+  const ranAsModelSweep = sweep && ok && thought ? 1 : 0;
 
   const totals = {
     day: today,
@@ -1138,8 +1300,8 @@ export class Scheduler {
       }
       return result;
     } catch (err) {
-      slog.error('scheduled sweep threw', { error: errorText(err) });
-      this.#lastResult = { ok: false, error: errorText(err) };
+      slog.error('scheduled sweep threw', { error: storedError(err) });
+      this.#lastResult = { ok: false, error: storedError(err) };
       return this.#lastResult;
     } finally {
       this.#busy = false;

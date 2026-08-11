@@ -9,16 +9,24 @@ a tray icon.
 | What you install | nothing permanent | Node.js | a `.dmg` or a `.exe` |
 | Third-party code | none | none | Electron (the window), and only in the shell |
 | Where the board opens | your own browser | your own browser | its own window |
-| Download | ~280 KB (plus Node, if you don't have it) | ~60 MB (Node) | ~120 MB, ~300 MB installed |
-| Runs in the background | while the terminal is open | while the terminal is open | yes, from the tray |
-| Warns on first open | no | no | **yes — see below.** These builds are not signed |
+| Download | ~720 KB (plus Node, if you don't have it) — **but see the warning below** | ~60 MB (Node) | ~120 MB, ~300 MB installed |
+| Runs in the background | while the terminal is open | while the terminal is open | yes, from the tray — **except on Linux**, where closing the window quits unless you set `ZELOS_TRAY_RESIDENT=1` |
+| Warns on first open | no | no | **yes — see below.** These builds are ad-hoc signed at best |
 
-**If you just want to see it: `npx zelos-app`.** One line, nothing installed
-permanently, and it is the same code as everything else here.
+> **The package is not published yet, so `npx zelos-app` does not work today.**
+> `npm view zelos-app` answers `404 Not Found`. Publishing is a deliberate,
+> manual step and nobody has taken it. Until somebody does, **Path 2 — run from
+> source — is the path that works**, and it is the same program. Path 1 is
+> written out below because it is what the command will do once the package is
+> up, not because you can run it right now.
 
 ---
 
 ## Path 1 — `npx zelos-app`
+
+**Not yet.** This section describes a command that 404s today: `zelos-app` has
+never been published to npm. Skip to [Path 2](#path-2--run-it-from-source)
+unless you are reading to find out what publishing would give you.
 
 You need **Node.js 22.16 or newer, or 24 or newer** — and not the Node 23 line,
 which is a real exclusion rather than a typo (the next section says why, and how
@@ -39,14 +47,29 @@ npm install -g zelos-app     # installs the `zelos` command
 zelos                        # …and this starts it
 ```
 
-**What that actually downloads.** One package, about 280 KB, and nothing else —
-Zelos has no dependencies, so there is no tree of other people's code behind it.
-It declares no install scripts either, so `npm` runs nothing on the way in:
+**What that would actually download.** One package and nothing else — Zelos has
+no dependencies, so there is no tree of other people's code behind it. It
+declares no install scripts either, so `npm` runs nothing on the way in:
 downloading it and running it are two separate decisions, and you make both.
 
-> The npm name is **`zelos-app`** (`zelos` was taken). Publishing a release is a
-> deliberate, manual step, so if `npx` tells you the package or the version you
-> want is not there, take Path 2 — the source is the same program.
+The size, measured rather than remembered — run it yourself in the repo:
+
+```
+npm pack --dry-run
+```
+
+**49 files, about 430 kB packed, 1.3 MB unpacked** at the time of writing — run
+the command rather than trusting the number, since editing these very documents
+moves it. Two things are deliberately *excluded*. `core/sources/oauth.mjs`, 989
+lines of OAuth that nothing in the app imports — see [OAUTH.md](OAUTH.md); the
+published tarball carries no OAuth code at all. And `assets/icon.png`, the
+1024px app icon, which is 290 kB and was briefly 40% of this download: it is
+read only by the desktop shell (`desktop/main.js`, and electron-builder), and
+`desktop/` is not in the package, so it was shipping to nobody. The web UI's
+icon is `assets/icon.svg`, which is 22 kB and does ship.
+
+> The npm name is **`zelos-app`** (`zelos` was taken), and as of this writing
+> nothing has been published under it.
 
 ### The four things you can type
 
@@ -169,16 +192,32 @@ Press `Ctrl-C` in the terminal to stop it.
 - A menu bar, so ⌘C and ⌘V work in the draft editors, and ⌘1…⌘6 jump between
   views.
 - It keeps running when you close the window, so scheduled sweeps keep
-  happening. (On macOS, always — that is how macOS apps work. On Windows and
-  Linux, only when automatic sweeps are switched on; with them off, closing the
-  window quits.)
+  happening. Exactly when, by platform:
+  - **macOS** — always. That is how macOS apps work; ⌘Q quits.
+  - **Windows** — when automatic sweeps are on *and* a tray icon was created.
+    With sweeps off, closing the window quits.
+  - **Linux** — closing the window **quits**, even with sweeps on and a tray
+    icon apparently made, **unless you set `ZELOS_TRAY_RESIDENT=1`**. A tray
+    icon there is a StatusNotifierItem published on the session bus, and
+    publishing succeeds whether or not any panel is watching — so `new Tray()`
+    returning an object proves nothing. Rather than hide the window into a tray
+    that may not exist, Zelos quits and makes you say out loud that your tray
+    works. Losing a background sweep costs one click; losing the way back into
+    the app does not.
 
 ### What it does not add
 
 - No account, no sign-in, no update check, no telemetry. The shell blocks every
-  outbound request from the window that is not the local board, denies every
-  browser permission except the one the "copy draft" buttons need, and turns
-  spellcheck off because Chromium fetches its dictionaries from a Google server.
+  outbound request from the window that is not the local board — **including
+  WebSockets**, which is the class it silently missed until the guard's match
+  pattern was widened from `*://*/*` to `<all_urls>` (`*` in a scheme position
+  means http and https and nothing else, so `new WebSocket('wss://…')` used to
+  sail past). It denies every browser permission except the one the "copy draft"
+  buttons need, and turns spellcheck off because Chromium fetches its
+  dictionaries from a Google server.
+- No hidden launch. **Open Zelos at login** puts Zelos in the OS login-items
+  list and nothing more: at login the window opens, in front of whatever you sat
+  down to do. It never launched hidden, and the code no longer implies it might.
 - No second copy of anything. The shell runs the Zelos core **inside its own
   process** — it does not launch a background Node.
 
@@ -242,10 +281,18 @@ the top-level `package.json`, which has no `dependencies` field at all.
 
 ## Installing on macOS — and what you will actually see
 
-**These builds are not signed and not notarized.** Nobody has paid Apple $99 to
-vouch for them, so macOS treats them the way it treats any unknown app. This is
-not a bug to work around quietly; it is the trade, and you should know exactly
-what you are agreeing to before you click past a security warning.
+**These builds are ad-hoc signed and not notarized**, and the difference between
+those two words is the whole of this section.
+
+`desktop/package.json` sets `"identity": "-"`, which is an *ad-hoc* signature:
+it satisfies the loader on Apple Silicon, and it identifies **nobody**. It also
+sets `"notarize": false` and `"hardenedRuntime": false`. So there is a signature
+on the bundle, and it vouches for no one — nobody has paid Apple the **$99 a
+year** the Developer Program costs, and nothing has been through Apple's
+notary service. macOS therefore treats these builds the way it treats any
+unknown app. This is not a bug to work around quietly; it is the trade, and you
+should know exactly what you are agreeing to before you click past a security
+warning.
 
 1. Open the `.dmg`, drag **Zelos** to **Applications**, eject the disk image.
 2. Double-click Zelos in Applications. macOS refuses:
@@ -292,16 +339,22 @@ unsigned build gets refused with that misleading message. Sign it locally:
 codesign --force --deep --sign - /Applications/Zelos.app
 ```
 
-`--sign -` is an *ad-hoc* signature: it identifies nobody, it just satisfies the
-loader. The build configuration asks for exactly this (`mac.identity: "-"`), so
-a build you made yourself should not hit this — the fix is here for a bundle
-that was modified after it was signed, which invalidates the signature.
+`--sign -` is the same *ad-hoc* signature the build already applies
+(`mac.identity: "-"` in `desktop/package.json`): it identifies nobody, it just
+satisfies the loader. So a build you made yourself should not hit this — the fix
+is here for a bundle that was modified after it was signed, which invalidates
+the signature.
 
 ---
 
 ## Installing on Windows — and what you will actually see
 
-**These builds are not code-signed.** A code-signing certificate is a bill that
+**These builds are not signed at all** — not even ad-hoc. There is no signing
+configuration in the `win` block of `desktop/package.json`, so nothing is
+applied. (The macOS builds do carry an ad-hoc signature; Windows carries none.
+The $99 figure in the macOS section is Apple's Developer Program and buys you
+nothing here — a Windows certificate is a separate purchase from a certificate
+authority at its own price.) A code-signing certificate is a bill that
 arrives every year, and this project does not pay it, so the installer reaches
 you with no publisher name attached and no reputation with Microsoft. Windows
 will say so, in a dialog designed to stop you, and it is right to. This is not a
@@ -377,9 +430,15 @@ solely administer, read it before you connect a mail account.
 |---|---|---|
 | Your data (database, config, logs) | `~/.zelos` | `C:\Users\<you>\.zelos` |
 | Window size and position | `~/.zelos/window.json` | same |
-| Logs | `~/.zelos/logs/` | same |
-| Secrets | your login Keychain, service `com.zelos.app` | `%LOCALAPPDATA%\Zelos\secrets`, DPAPI-encrypted |
+| Logs | `~/.zelos/logs/desktop.log` — **desktop app only** | same |
+| Secrets | your login Keychain, service `com.zelos.app` (or `secrets.enc` + `.seed` in `~/.zelos` if there is no keychain) | `%LOCALAPPDATA%\Zelos\secrets`, DPAPI-encrypted |
 | The shell's browser profile (your theme choice, nothing else) | `~/Library/Application Support/Zelos` | `%APPDATA%\Zelos` |
+
+**There is no `zelos.log`.** The `logs/` directory is created on every launch,
+but only the desktop shell ever writes to it, and the file it writes is
+`desktop.log`. Run Zelos from a terminal and the log is the terminal — nothing
+is written to disk. An empty `~/.zelos/logs/` after a CLI session is correct,
+not a fault.
 
 **Uninstalling never deletes `~/.zelos`.** Your mail cache, your board and
 your settings survive, on purpose, so that reinstalling does not lose your work.
@@ -393,12 +452,17 @@ server some stray web page can be pointed at.
    (Windows: delete `C:\Users\<you>\.zelos`). If you installed the command
    globally, remove it too: `npm uninstall -g zelos-app`. (`npx` leaves nothing
    behind but an npm cache entry, which npm clears on its own.)
-2. Your mail passwords and API keys are **not in that folder**. On macOS they
-   are in your login keychain under the service `com.zelos.app` — remove them
-   with Keychain Access. On Windows they are DPAPI-encrypted files in
+2. Your mail passwords and API keys are usually **not in that folder** — but
+   check, because there is one case where they are. On macOS they are in your
+   login keychain under the service `com.zelos.app` — remove them with Keychain
+   Access. On Windows they are DPAPI-encrypted files in
    `%LOCALAPPDATA%\Zelos\secrets` — delete that folder. On Linux they are in
-   your desktop keyring under the same service name. **Settings → About** tells
-   you which store your machine actually ended up using.
+   your desktop keyring under the same service name. **If no keychain was
+   available**, they are `secrets.enc` in `~/.zelos`, decrypted by `.seed` in
+   the same folder, and step 1 has already deleted both. **Settings → About**
+   tells you which store your machine actually ended up using, and so does
+   `zelos doctor`; the folder itself now records the answer in
+   `secrets.backend.json`.
 
 **Settings → Data** inside the app shows you the exact path, copies it to the
 clipboard, and can export a JSON snapshot of the database first. The
@@ -409,10 +473,10 @@ directly.
 
 ## Honest notes about these builds
 
-- **Not signed, not notarized.** Every warning above is macOS and Windows doing
-  their job. You are choosing to trust a build; the reason that is a reasonable
-  choice here is that you can read the source and, if you want, produce the
-  build yourself.
+- **macOS: ad-hoc signed, not notarized. Windows: not signed at all.** Every
+  warning above is macOS and Windows doing their job. You are choosing to trust
+  a build; the reason that is a reasonable choice here is that you can read the
+  source and, if you want, produce the build yourself.
 - **Windows is built and tested, but nobody has lived with it.** The suite runs
   on Windows as well as macOS and Linux, on four Node versions each, on every
   push to `main` and every pull request — and the installers are packaged on a

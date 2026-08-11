@@ -55,6 +55,11 @@ Options:
 Zelos listens on 127.0.0.1 only, and every request to its API needs the
 session token printed in the launch URL. That token is new on every launch,
 so the previous URL stops working when you restart.
+
+The one exception is /api/mcp, the read-only channel an AI client uses. It
+is off until you switch it on in Settings, and it carries the separate AI
+token you mint there rather than the session token — that one is meant to
+outlive a restart, and it lasts until you turn AI access off or revoke it.
 `.trimStart();
 
 /* ------------------------------------------------------------------ *
@@ -121,10 +126,39 @@ export function parseArgs(argv) {
         used.add('--port');
         break;
       }
-      case '--home':
-        out.home = valueOf();
+      case '--home': {
+        /* Junk is rejected here and nowhere else, because nothing downstream
+           can catch it. `core/config.mjs`'s `homeDir()` does guard the literal
+           strings "undefined" and "null" — but it guards `$ZELOS_HOME`, and by
+           the time it reads that variable `main()` has already run the value
+           through `path.resolve`, which turns "undefined" into an absolute path
+           to a real directory the guard no longer recognises. Measured before
+           this check existed: `zelos doctor --home=undefined` created
+           `drwx------ undefined/{cache,logs}` in the working directory and
+           exited 0. `.gitignore` still carries an `undefined/` line from the
+           first time that happened here.
+
+           The empty value is the worse half of the same defect. `--home=`
+           parsed to `""`, which is falsy, so it was dropped and the command
+           silently operated on the real `~/.zelos` — the one outcome somebody
+           separating a work home from a personal one must never get. It is a
+           mistyped flag, not a request for the default, so it stops the run.
+
+           `docs/INSTALL.md` recommends `zelos sweep` for cron, so `--home
+           ${VAR}` with VAR unset is the documented shape of the mistake.
+           desktop/main.js:104-110 has the same three cases and the same
+           reasoning; it drops them instead of throwing, because a shell
+           launched from Finder cannot show anyone an error message. */
+        const dir = valueOf();
+        const junk = dir.trim().toLowerCase();
+        if (!junk) throw new Error('--home needs a directory, and got an empty value. Leave it off to use ~/.zelos.');
+        if (junk === 'undefined' || junk === 'null') {
+          throw new Error(`--home got the literal string "${dir}", which is what an unset shell variable expands to. Leave --home off to use ~/.zelos.`);
+        }
+        out.home = dir;
         used.add('--home');
         break;
+      }
       case '--no-open':
         out.open = false;
         used.add('--no-open');
@@ -352,6 +386,45 @@ async function commandDoctor(flags) {
 }
 
 /* ------------------------------------------------------------------ *
+ * The lock on the data home
+ * ------------------------------------------------------------------ */
+
+/**
+ * Say something if this home already looks busy, and never let saying it stop
+ * the launcher.
+ *
+ * The exclusion itself lives in `core/home-lock.mjs`; this is the CLI half of
+ * it, and it is the half that makes it mean anything. The pairing people
+ * actually end up in is a `zelos` in a terminal and the app in the tray, both
+ * sweeping one WAL database on their own clocks — the same mail read twice and
+ * the same model calls paid for twice, with nothing crashing to tell them.
+ *
+ * It is a warning and never a refusal. The check reads a file on disk to guess
+ * whether another process is alive, and a guess that is occasionally wrong must
+ * not be able to stop somebody starting their own app.
+ *
+ * The load stays defensive for the same reason — a lock is a nicety and running
+ * is the product — but the catch now says so out loud, because a silent one is
+ * what let this feature ship dead. For a whole release the import here named
+ * `./desktop/runtime.js`, which `package.json` deliberately does not publish;
+ * every installed copy threw ERR_MODULE_NOT_FOUND into an empty `catch {}` and
+ * nobody heard a thing. Anything that swallows an error has to be able to
+ * explain itself, or the next silence lasts just as long.
+ */
+async function holdHomeQuietly({ home, kind, logger }) {
+  try {
+    const { holdHome } = await import('./core/home-lock.mjs');
+    return holdHome({ home, kind, logger });
+  } catch (err) {
+    logger?.warn?.('zelos: the home lock could not be taken, so a second Zelos on this home will not be reported', {
+      home,
+      error: err?.message ?? String(err),
+    });
+    return null;
+  }
+}
+
+/* ------------------------------------------------------------------ *
  * zelos sweep
  * ------------------------------------------------------------------ */
 
@@ -399,19 +472,87 @@ function sweepSummary(result) {
   return `${lines.join('\n')}\n`;
 }
 
+/**
+ * How long the first Ctrl-C waits for an aborted sweep to unwind before the
+ * process leaves anyway. The abort is only observed between sources, and the
+ * mail reader does not forward the signal into its socket at all, so the wait
+ * is bounded by whatever the current read is doing — which is bounded by IMAP's
+ * 30s silence deadline only while the server is actually silent. A server that
+ * keeps emitting bytes keeps the read alive indefinitely, and that is the case
+ * this timer exists for.
+ */
+const SWEEP_STOP_GRACE_MS = 5_000;
+
 async function commandSweep(flags) {
   const { loadConfig, paths } = await import('./core/config.mjs');
   const { open: openDb, migrate, close: closeDb } = await import('./core/db.mjs');
   const { runSweep } = await import('./core/sweep.mjs');
+  const { log } = await import('./core/log.mjs');
 
   const config = loadConfig();
-  const db = openDb(paths().db);
+  const where = paths();
+
+  /* The sweep takes the home lock too, and it is the half that meets the
+     problem most often: `docs/INSTALL.md` recommends `zelos sweep` for a
+     crontab, so the pairing is a scheduled sweep landing on a home the desktop
+     app in the tray is already sweeping on its own clock. Both then read the
+     same mail and pay for the same model calls. It warns and runs — see
+     core/home-lock.mjs on why this advises and never refuses. */
+  await holdHomeQuietly({ home: where.home, kind: 'cli', logger: log });
+
+  const db = openDb(where.db);
   migrate(db);
 
+  /* Attaching a SIGINT listener removes Node's default terminate-on-SIGINT, so
+     from here until the handler is removed, Ctrl-C does whatever this code says
+     and nothing else. What it used to say was `controller.abort()` and not a
+     word on screen — and abort is observed only *between* sources, while the
+     mail reader deliberately does not forward the signal into its socket. So
+     against a server that keeps emitting bytes, six SIGINTs and a SIGTERM all
+     set `aborted` and changed nothing: the process held the terminal for 27
+     seconds with no output, which reads as a freeze rather than as a stop.
+     Cron itself never sends SIGTERM, so the plain crontab case never saw it;
+     the ones that did are the wrappers — `timeout N zelos sweep`, systemd's
+     TimeoutStopSec, launchd.
+
+     Three things fix that, and none of them is "abort harder":
+       - Say so. The `run` path prints "Stopping (SIGINT)."; this one printed
+         nothing at all, which is the whole difference between waiting and
+         being stuck.
+       - Bound the wait. The exit timer is unref'd, so it can only fire while
+         something else is still holding the loop open — which is exactly the
+         stuck read. A sweep that unwinds normally exits before it comes due.
+       - Let the second one through. Someone who asks twice has decided, and a
+         handler that swallows every signal is worse than no handler. */
   const controller = new AbortController();
-  const cancel = () => controller.abort();
-  process.on('SIGINT', cancel);
-  process.on('SIGTERM', cancel);
+  let stopping = false;
+  let escape = null;
+  const leave = (code) => {
+    try { closeDb(db); } catch { /* the process is leaving either way */ }
+    process.exit(code);
+  };
+  const cancel = (signal) => {
+    // 128 + signal number, the shell convention for "died on this signal",
+    // which keeps `zelos sweep` non-zero for the cron job INSTALL.md describes.
+    const code = signal === 'SIGINT' ? 130 : 143;
+    if (stopping) {
+      process.stderr.write(`  Stopping now (${signal}).\n`);
+      leave(code);
+      return;
+    }
+    stopping = true;
+    process.stderr.write(`\n  Stopping (${signal}) — waiting for the source it is reading.\n`);
+    controller.abort();
+    escape = setTimeout(() => {
+      process.stderr.write('  That source will not let go; leaving anyway.\n');
+      leave(code);
+    }, SWEEP_STOP_GRACE_MS);
+    escape.unref();
+  };
+  const onSigint = () => cancel('SIGINT');
+  const onSigterm = () => cancel('SIGTERM');
+  process.on('SIGINT', onSigint);
+  process.on('SIGTERM', onSigterm);
 
   // Progress goes to stderr so `zelos sweep --json | jq` still works.
   let lastPhase = null;
@@ -433,8 +574,13 @@ async function commandSweep(flags) {
     closeDb(db);
     return 1;
   } finally {
-    process.off('SIGINT', cancel);
-    process.off('SIGTERM', cancel);
+    process.off('SIGINT', onSigint);
+    process.off('SIGTERM', onSigterm);
+    /* The sweep unwound, so the escape hatch has nothing left to escape from.
+       Leaving it armed would let a keep-alive socket that outlives the run by
+       five seconds print "that source will not let go" underneath a summary
+       that had already been written — a stale warning about work that finished. */
+    if (escape) clearTimeout(escape);
   }
 
   process.stdout.write(flags.json ? `${JSON.stringify(result, null, 2)}\n` : sweepSummary(result));
@@ -521,25 +667,9 @@ export async function main(argv = process.argv.slice(2)) {
   const config = loadConfig();
   const where = paths();
 
-  /* Say something if this home already looks busy. The exclusion lives in the
-     desktop shell's runtime because that is where it was needed first, but it
-     is the CLI half that makes it mean anything: the pairing people actually
-     end up in is a `zelos` in a terminal and the app in the tray, both sweeping
-     one database on their own clocks — the same mail read twice and the same
-     model calls paid for twice.
-
-     It is a warning and never a refusal. The check reads a file on disk to
-     guess whether another process is alive, and a guess that is occasionally
-     wrong must not be able to stop somebody starting their own app. The lock
-     module is loaded defensively for the same reason: a source checkout with no
-     desktop shell beside it is a supported way to run Zelos. */
-  let homeLock = null;
-  try {
-    const { holdHome } = await import('./desktop/runtime.js');
-    homeLock = holdHome({ home: where.home, kind: 'cli', logger: log });
-  } catch {
-    /* No shell in this copy, or it would not load. Running is what matters. */
-  }
+  // Before the database is opened, so a second scheduler is never armed against
+  // a home somebody is already sweeping without the person hearing about it.
+  const homeLock = await holdHomeQuietly({ home: where.home, kind: 'cli', logger: log });
 
   const db = openDb(where.db);
   migrate(db);
@@ -549,21 +679,27 @@ export async function main(argv = process.argv.slice(2)) {
   /* The scheduler is optional: if the sweep engine cannot be loaded, the board
      is still worth looking at and sweeps can still be run by hand. Its progress
      is relayed onto the same SSE stream a hand-started sweep uses, so a board
-     that changes on its own says why. */
+     that changes on its own says why.
+
+     It is built whatever `sweep.auto` says, and that is deliberate. Gating the
+     CONSTRUCTION on the setting made the setting unchangeable: with auto off
+     there was no scheduler for `handleConfigPut` to hand the new config to, so
+     ticking "Sweep on a schedule" wrote to disk and then did nothing until the
+     next launch. The off switch belongs one level down — `#tick` already
+     advances and re-arms without sweeping while `auto` is false — so an idle
+     scheduler costs one timer and is the thing that makes the setting live. */
   let scheduler = null;
-  if (config.sweep.auto) {
-    try {
-      const { Scheduler } = await import('./core/sweep.mjs');
-      scheduler = new Scheduler({
-        db,
-        config,
-        onProgress: (progress) => server.zelos.sweeps.relay('progress', progress),
-        onRun: (result) => server.zelos.sweeps.relay(result?.ok === false ? 'failed' : 'done', result),
-      });
-      server.zelos.useScheduler(scheduler);
-    } catch (err) {
-      log.error('zelos: the sweep scheduler could not start; run sweeps by hand', { error: err.message });
-    }
+  try {
+    const { Scheduler } = await import('./core/sweep.mjs');
+    scheduler = new Scheduler({
+      db,
+      config,
+      onProgress: (progress) => server.zelos.sweeps.relay('progress', progress),
+      onRun: (result) => server.zelos.sweeps.relay(result?.ok === false ? 'failed' : 'done', result),
+    });
+    server.zelos.useScheduler(scheduler);
+  } catch (err) {
+    log.error('zelos: the sweep scheduler could not start; run sweeps by hand', { error: err.message });
   }
 
   const { url: origin, tokenUrl } = await listen(server, { port: flags.port ?? undefined });
@@ -641,8 +777,47 @@ export async function main(argv = process.argv.slice(2)) {
   return 0;
 }
 
-const invokedDirectly = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
-if (invokedDirectly) {
+/**
+ * Whether this file is the program being run, rather than a module somebody
+ * imported for `parseArgs` or `browserLaunchPlan`.
+ *
+ * The obvious spelling — `path.resolve(process.argv[1]) === fileURLToPath(
+ * import.meta.url)` — is wrong through npm's bin, and wrong in the silent
+ * direction. `npm install` writes `node_modules/.bin/zelos` as a symlink to
+ * `../zelos-app/zelos.mjs` on macOS and Linux, and Node resolves the real path
+ * of the ESM main entry but leaves `argv[1]` exactly as the shell handed it
+ * over. So the two sides are the symlink and its target, they never match, and
+ * `main()` is never called: measured on a packed tarball installed three ways
+ * (local, `-g`, `npx`), `zelos --version`, `--help`, `doctor` and `sweep` each
+ * printed nothing, exited 0, and never created `$ZELOS_HOME`. Exit 0 is what
+ * makes it expensive — `docs/INSTALL.md` recommends `zelos sweep` for a cron
+ * job "because it exits non-zero if the sweep failed", and that cron job would
+ * have reported success forever while sweeping nothing. `node
+ * --preserve-symlinks-main` flipped the behaviour, which is what named the
+ * cause.
+ *
+ * Resolving both sides settles it either way round: through the symlink they
+ * meet at the target, and with `--preserve-symlinks-main` they meet at the
+ * link. The realpath is in a try/catch because it touches the filesystem and a
+ * missing or unreadable path must not be a crash at import time; the fallback
+ * is the old comparison, which is right whenever no symlink is involved.
+ * Windows is unaffected either way — npm writes a cmd shim carrying a real
+ * path there rather than a link — but it costs nothing to be correct on.
+ */
+function invokedDirectly() {
+  const argv1 = process.argv[1];
+  if (!argv1) return false; // `node --eval`, or an embedder with no script
+  const here = fileURLToPath(import.meta.url);
+  const asked = path.resolve(argv1);
+  if (asked === here) return true;
+  try {
+    return fs.realpathSync(asked) === fs.realpathSync(here);
+  } catch {
+    return false;
+  }
+}
+
+if (invokedDirectly()) {
   main().then(
     (code) => {
       process.exitCode = code || 0;

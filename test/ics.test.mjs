@@ -223,6 +223,81 @@ test('a zoned weekly series keeps its wall clock across fall-back', () => {
   assert.deepEqual(starts(events), ['2026-10-29T09:00:00-04:00', '2026-11-05T09:00:00-05:00']);
 });
 
+test('a start inside the spring-forward gap keeps its length instead of collapsing', () => {
+  // 02:30 does not exist in New York on 2027-03-14, so the reading is pushed
+  // into the hour that does. The regression: the end was resolved on its own
+  // and 03:30 landed on that same instant, so the meeting was emitted as
+  // "3:30 AM – 3:30 AM" — zero minutes, once a year, for any 02:00–02:59 start.
+  const gap = (uid, day, endLine) =>
+    vevent(uid, `DTSTART;TZID=America/New_York:${day}T023000`, endLine, 'SUMMARY:Early call');
+
+  const [shifted] = expandFixture(gap('UID:dst-gap', '20270314', 'DTEND;TZID=America/New_York:20270314T033000'));
+  assert.equal(shifted.startsAt, '2027-03-14T03:30:00-04:00', '02:30 does not exist; it becomes 03:30');
+  assert.equal(shifted.endsAt, '2027-03-14T04:30:00-04:00', 'and the end travels the same distance');
+
+  const [control] = expandFixture(gap('UID:dst-ctl', '20270315', 'DTEND;TZID=America/New_York:20270315T033000'));
+  assert.equal(control.startsAt, '2027-03-15T02:30:00-04:00', 'the control a day later is untouched');
+  assert.equal(control.endsAt, '2027-03-15T03:30:00-04:00');
+
+  const [withDuration] = expandFixture(gap('UID:dst-gap-dur', '20270314', 'DURATION:PT1H'));
+  assert.equal(withDuration.startsAt, '2027-03-14T03:30:00-04:00', 'DURATION takes the same path');
+  assert.equal(withDuration.endsAt, '2027-03-14T04:30:00-04:00');
+});
+
+test('the spring-forward gap resolves the same way in every zone', () => {
+  // London's gap is 01:00–01:59 on 2027-03-28. Its 01:30 used to be pulled
+  // *backward* to 00:30Z while New York's 02:30 was pushed forward, purely
+  // because the first offset guess fell on a different side — so a 00:30–01:30
+  // London meeting, whose start exists and whose end does not, also came out
+  // zero minutes long.
+  const events = parseICS_toEvents(
+    ics(
+      ...vevent(
+        'UID:ldn-end-in-gap',
+        'DTSTART;TZID=Europe/London:20270328T003000',
+        'DTEND;TZID=Europe/London:20270328T013000',
+        'SUMMARY:Ends in the gap',
+      ),
+      ...vevent(
+        'UID:ldn-start-in-gap',
+        'DTSTART;TZID=Europe/London:20270328T013000',
+        'DTEND;TZID=Europe/London:20270328T023000',
+        'SUMMARY:Starts in the gap',
+      ),
+    ),
+    { from: '2027-03-01', to: '2027-04-01', tzid: 'Europe/London' },
+  );
+  assertCarriesOffset(events);
+  assert.deepEqual(
+    events.map((e) => [e.startsAt, e.endsAt]),
+    [
+      ['2027-03-28T00:30:00+00:00', '2027-03-28T02:30:00+01:00'],
+      ['2027-03-28T02:30:00+01:00', '2027-03-28T03:30:00+01:00'],
+    ],
+  );
+  for (const ev of events) {
+    assert.equal(Date.parse(ev.endsAt) - Date.parse(ev.startsAt), 3_600_000, `${ev.uid} must stay an hour long`);
+  }
+});
+
+test('the fall-back fold keeps its stated wall clock, and its real two hours', () => {
+  // The counterweight to the gap fix: 01:00 is ambiguous rather than absent on
+  // 2026-11-01, both readings exist, and an event stated 01:00 -> 02:00 really
+  // does run for two hours. Deriving the end from start + length instead would
+  // emit "1:00 AM – 1:00 AM" and simply move the zero-length label to November.
+  const [ev] = expandFixture(
+    vevent(
+      'UID:dst-fold-span',
+      'DTSTART;TZID=America/New_York:20261101T010000',
+      'DTEND;TZID=America/New_York:20261101T020000',
+      'SUMMARY:Across the fold',
+    ),
+  );
+  assert.equal(ev.startsAt, '2026-11-01T01:00:00-04:00');
+  assert.equal(ev.endsAt, '2026-11-01T02:00:00-05:00');
+  assert.equal(Date.parse(ev.endsAt) - Date.parse(ev.startsAt), 2 * 3_600_000);
+});
+
 test('UTC instants land on the right side of a DST change', () => {
   const before = expandFixture(vevent('UID:z-before', 'DTSTART:20260305T140000Z', 'SUMMARY:Before'));
   const after = expandFixture(vevent('UID:z-after', 'DTSTART:20260312T140000Z', 'SUMMARY:After'));
@@ -738,6 +813,225 @@ test('an override with no matching instance is still emitted', () => {
   assert.equal(events[0].recurrenceId, '2026-08-18T14:00:00-04:00');
 });
 
+/* ------------------------------------------------------------------ *
+ * Floating values inside a zoned series
+ *
+ * The regression these guard: a value with no TZID and no trailing Z used to be
+ * read as the *viewer's* zone, not the series'. The exclusion set and the
+ * override map were then keyed on instants in a frame the calendar never named,
+ * while the instances they had to match were keyed on the master's — so a
+ * cancelled meeting came back and a moved one rendered twice, at a different
+ * count for every viewer.
+ * ------------------------------------------------------------------ */
+
+/** Expand the same fixture in four zones and return one number per zone. */
+function acrossZones(lines, project) {
+  const zones = [NY, 'Europe/London', 'UTC', 'Asia/Tokyo'];
+  return zones.map((tz) => [tz, project(expandFixture(lines, { tzid: tz }))]);
+}
+
+test('a floating EXDATE is read in the series zone, so it cancels for every viewer', () => {
+  const lines = vevent(
+    'UID:float-exdate',
+    'DTSTART;TZID=America/New_York:20260810T140000',
+    'DTEND;TZID=America/New_York:20260810T150000',
+    'RRULE:FREQ=DAILY;COUNT=3',
+    'EXDATE:20260811T140000', // no TZID: floating, but plainly the series' own 14:00
+    'SUMMARY:Daily',
+  );
+  for (const [tz, count] of acrossZones(lines, (evs) => evs.length)) {
+    assert.equal(count, 2, `${tz} must lose the 11th, same as the calendar's own zone`);
+  }
+  const inTokyo = expandFixture(lines, { tzid: 'Asia/Tokyo' });
+  assert.deepEqual(
+    starts(inTokyo).map((s) => s.slice(0, 10)),
+    ['2026-08-11', '2026-08-13'],
+    'the two survivors are the 10th and the 12th in New York, shown in Tokyo',
+  );
+});
+
+test('a floating RECURRENCE-ID replaces its instance rather than ghosting beside it', () => {
+  const lines = [
+    ...vevent(
+      'UID:float-rid',
+      'DTSTART;TZID=America/New_York:20260811T140000',
+      'DTEND;TZID=America/New_York:20260811T150000',
+      'RRULE:FREQ=WEEKLY;COUNT=3',
+      'SUMMARY:Weekly 1:1',
+    ),
+    ...vevent(
+      'UID:float-rid',
+      'RECURRENCE-ID:20260818T140000', // floating
+      'DTSTART;TZID=America/New_York:20260818T163000',
+      'DTEND;TZID=America/New_York:20260818T173000',
+      'SUMMARY:Weekly 1:1 (moved)',
+    ),
+  ];
+  for (const [tz, count] of acrossZones(lines, (evs) => evs.length)) {
+    assert.equal(count, 3, `${tz} must show three instances, not the moved one plus its ghost`);
+  }
+  const inLondon = expandFixture(lines, { tzid: 'Europe/London' });
+  assert.deepEqual(starts(inLondon), [
+    '2026-08-11T19:00:00+01:00',
+    '2026-08-18T21:30:00+01:00',
+    '2026-08-25T19:00:00+01:00',
+  ]);
+  assert.equal(inLondon[1].title, 'Weekly 1:1 (moved)');
+  assert.equal(inLondon[1].recurrenceId, '2026-08-18T19:00:00+01:00', 'identity stays with the original slot');
+});
+
+test('a UTC master with a floating RECURRENCE-ID matches, in its own zone included', () => {
+  // This variant needs no timezone mismatch at all: the floating value was
+  // anchored to the viewer while the instances were anchored to UTC, so it
+  // ghosted everywhere.
+  const lines = [
+    ...vevent(
+      'UID:float-rid-utc',
+      'DTSTART:20260811T180000Z',
+      'DTEND:20260811T190000Z',
+      'RRULE:FREQ=WEEKLY;COUNT=3',
+      'SUMMARY:Sync',
+    ),
+    ...vevent(
+      'UID:float-rid-utc',
+      'RECURRENCE-ID:20260818T180000',
+      'DTSTART:20260818T203000Z',
+      'DTEND:20260818T213000Z',
+      'SUMMARY:Sync (moved)',
+    ),
+  ];
+  for (const [tz, count] of acrossZones(lines, (evs) => evs.length)) {
+    assert.equal(count, 3, `${tz} must show three instances`);
+  }
+  const inUtc = expandFixture(lines, { tzid: 'UTC' });
+  assert.equal(inUtc[1].startsAt, '2026-08-18T20:30:00+00:00');
+  assert.equal(inUtc[1].title, 'Sync (moved)');
+});
+
+test('a floating UNTIL ends the series on the same day for every viewer', () => {
+  // UNTIL is an RRULE part and can never carry a TZID, so a value with no
+  // trailing Z is floating by construction — a spelling real exporters emit.
+  const lines = vevent(
+    'UID:float-until',
+    'DTSTART;TZID=America/New_York:20260803T090000',
+    'RRULE:FREQ=WEEKLY;UNTIL=20260831T090000',
+    'SUMMARY:Mondays',
+  );
+  for (const [tz, days] of acrossZones(lines, (evs) => starts(evs).map((s) => s.slice(0, 10)))) {
+    assert.equal(days.length, 5, `${tz} must keep all five Mondays, the last one included`);
+  }
+  assert.deepEqual(
+    starts(expandFixture(lines, { tzid: 'Europe/Berlin' })).map((s) => s.slice(0, 10)),
+    ['2026-08-03', '2026-08-10', '2026-08-17', '2026-08-24', '2026-08-31'],
+  );
+});
+
+/* ------------------------------------------------------------------ *
+ * RANGE=THISANDFUTURE
+ * ------------------------------------------------------------------ */
+
+test('RANGE=THISANDFUTURE moves the instance it names and every one after it', () => {
+  // "This and all following events": the override states the new shape once and
+  // the tail of the series takes both its displacement and its properties. It
+  // used to be parsed as an ordinary single-instance override, so exactly one
+  // occurrence moved and every later one kept a time that no longer existed —
+  // indistinguishable, on the board, from a correct row.
+  const events = expandFixture([
+    ...vevent(
+      'UID:taf-1',
+      'DTSTART;TZID=America/New_York:20260819T150000',
+      'DTEND;TZID=America/New_York:20260819T160000',
+      'RRULE:FREQ=WEEKLY;COUNT=5',
+      'LOCATION:Room A',
+      'SUMMARY:Weekly',
+    ),
+    ...vevent(
+      'UID:taf-1',
+      'RECURRENCE-ID;TZID=America/New_York;RANGE=THISANDFUTURE:20260902T150000',
+      'DTSTART;TZID=America/New_York:20260902T170000',
+      'DTEND;TZID=America/New_York:20260902T180000',
+      'LOCATION:Room B',
+      'SUMMARY:Weekly (moved)',
+    ),
+  ]);
+
+  assert.equal(events.length, 5, 'the range replaces instances, it does not add any');
+  assert.deepEqual(starts(events), [
+    '2026-08-19T15:00:00-04:00',
+    '2026-08-26T15:00:00-04:00',
+    '2026-09-02T17:00:00-04:00',
+    '2026-09-09T17:00:00-04:00',
+    '2026-09-16T17:00:00-04:00',
+  ]);
+  assert.deepEqual(
+    events.map((e) => e.location),
+    ['Room A', 'Room A', 'Room B', 'Room B', 'Room B'],
+    'a permanent room change lands on the whole tail, not on one instance',
+  );
+  assert.deepEqual(
+    events.map((e) => e.endsAt.slice(11, 16)),
+    ['16:00', '16:00', '18:00', '18:00', '18:00'],
+  );
+  assert.deepEqual(
+    events.map((e) => e.recurrenceId),
+    [
+      '2026-08-19T15:00:00-04:00',
+      '2026-08-26T15:00:00-04:00',
+      '2026-09-02T15:00:00-04:00',
+      '2026-09-09T15:00:00-04:00',
+      '2026-09-16T15:00:00-04:00',
+    ],
+    'identity stays with the original slots so rows are updated, not duplicated',
+  );
+});
+
+test('an override without RANGE still moves exactly one instance', () => {
+  // The counterweight: RANGE defaults to the single instance, and the three
+  // shipped calendar services never emit it at all.
+  const events = expandFixture([
+    ...vevent(
+      'UID:taf-2',
+      'DTSTART;TZID=America/New_York:20260819T150000',
+      'RRULE:FREQ=WEEKLY;COUNT=4',
+      'SUMMARY:Weekly',
+    ),
+    ...vevent(
+      'UID:taf-2',
+      'RECURRENCE-ID;TZID=America/New_York:20260902T150000',
+      'DTSTART;TZID=America/New_York:20260902T170000',
+      'SUMMARY:Weekly (this one only)',
+    ),
+  ]);
+  assert.deepEqual(
+    starts(events).map((s) => s.slice(11, 16)),
+    ['15:00', '15:00', '17:00', '15:00'],
+  );
+});
+
+test('a THISANDFUTURE displacement is a wall-clock move, so it survives a DST change', () => {
+  // The series is New York's, the viewer is London's, and US and UK DST end on
+  // different weekends — an instant-shaped shift would drift by an hour.
+  const events = expandFixture(
+    [
+      ...vevent(
+        'UID:taf-3',
+        'DTSTART;TZID=America/New_York:20261020T090000',
+        'RRULE:FREQ=WEEKLY;COUNT=4',
+        'SUMMARY:Standup',
+      ),
+      ...vevent(
+        'UID:taf-3',
+        'RECURRENCE-ID;TZID=America/New_York;RANGE=THISANDFUTURE:20261027T090000',
+        'DTSTART;TZID=America/New_York:20261027T100000',
+        'SUMMARY:Standup (an hour later)',
+      ),
+    ],
+    { tzid: 'Europe/London' },
+  );
+  const inNewYork = events.map((e) => new Date(e.startsAt).toLocaleTimeString('en-GB', { timeZone: NY, hour12: false }));
+  assert.deepEqual(inNewYork, ['09:00:00', '10:00:00', '10:00:00', '10:00:00'], 'the New York wall clock is what moved');
+});
+
 test('a non-recurring event has a null recurrenceId', () => {
   const [ev] = expandFixture(
     vevent('UID:single-1', 'DTSTART;TZID=America/New_York:20260811T140000', 'SUMMARY:One-off'),
@@ -804,7 +1098,7 @@ test('garbage in does not throw', () => {
   assert.deepEqual(vevents, [], 'an event with no usable DTSTART is dropped, not half-built');
 });
 
-test('max caps the total across several events', () => {
+test('max caps the total across several events, cutting the window and not a calendar', () => {
   const events = parseICS_toEvents(
     ics(
       ...vevent('UID:cap-a', 'DTSTART;VALUE=DATE:20260101', 'RRULE:FREQ=DAILY;COUNT=100', 'SUMMARY:A'),
@@ -813,6 +1107,49 @@ test('max caps the total across several events', () => {
     { from: '2026-01-01', to: '2027-01-01', tzid: NY, max: 30 },
   );
   assert.equal(events.length, 30);
+  // This used to assert only the total, which is also what the starvation bug
+  // produced: A took all thirty and B was absent from the calendar entirely.
+  assert.deepEqual(
+    ['cap-a', 'cap-b'].map((uid) => events.filter((e) => e.uid === uid).length),
+    [15, 15],
+    'both series survive; the budget buys fewer days, not fewer meetings',
+  );
+  assert.deepEqual(starts(events).at(-1), '2026-01-15', 'what is missing is the far end of the window');
+});
+
+test('max keeps the earliest instances, not whichever meetings the file lists first', () => {
+  // Reproduces the shared-calendar case: `expandOne` returned the moment the
+  // shared array reached `max`, groups were walked in document order, and the
+  // sort ran afterwards — so on a file of 40 weekday-recurring meetings the
+  // first 31 UIDs took the whole 1500 and meetings 31–40 vanished outright,
+  // deterministically, the same UIDs every sweep. Twelve daily meetings at
+  // distinct hours and a cap of 24 is the same shape: the honest answer is
+  // every meeting on the first two days.
+  const lines = [];
+  for (let i = 0; i < 12; i++) {
+    lines.push(
+      ...vevent(
+        `UID:starve-${i}`,
+        `DTSTART;TZID=America/New_York:20260105T${String(8 + i).padStart(2, '0')}0000`,
+        'RRULE:FREQ=DAILY;COUNT=40',
+        `SUMMARY:Meeting ${i}`,
+      ),
+    );
+  }
+  const events = parseICS_toEvents(ics(...lines), {
+    from: '2026-01-05T00:00:00-05:00',
+    to: '2026-03-01T00:00:00-05:00',
+    tzid: NY,
+    max: 24,
+  });
+  assertCarriesOffset(events);
+  assert.equal(events.length, 24);
+  assert.equal(new Set(events.map((e) => e.uid)).size, 12, 'every meeting is represented, none starved');
+  assert.deepEqual(
+    [...new Set(starts(events).map((s) => s.slice(0, 10)))],
+    ['2026-01-05', '2026-01-06'],
+    'the cut falls at the end of the window, so what is shown is the next two days in full',
+  );
 });
 
 /* ------------------------------------------------------------------ *

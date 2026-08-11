@@ -90,13 +90,36 @@ Work and school accounts additionally need an admin to grant consent in many ten
 
 ## What Zelos does about it now
 
-`core/sources/oauth.mjs` implements **OAuth 2.0 Authorization Code with PKCE and a loopback
-redirect** — the correct flow for a desktop app, and the one that needs **no client secret**, which
-matters because a client secret shipped inside a downloadable app is not a secret.
+Nothing. Read that literally before you spend ten days on a Google verification.
 
-It is wired for Google Calendar and Microsoft Graph Calendar, with the client IDs blank and the
-whole path inert until an app registration exists. Refresh tokens go to the OS keychain, never to
-`config.json`. **Gmail is deliberately not wired.**
+`core/sources/oauth.mjs` — 989 lines — implements **OAuth 2.0 Authorization Code with PKCE and a
+loopback redirect**, the correct flow for a desktop app and the one that needs **no client secret**,
+which matters because a client secret shipped inside a downloadable app is not a secret. It knows
+Google Calendar and Microsoft Graph Calendar (`PROVIDERS`), it builds and verifies the URLs, it
+exchanges and refreshes, and `saveTokens` puts the token blob in the OS keychain rather than in
+`config.json`. **Gmail is deliberately not wired.** All of that is real and tested
+(`test/oauth.test.mjs`).
+
+It is also **not connected to the application**, and a blank client ID is the least of it. Four
+things are missing, and none of them is a registration:
+
+1. **No importer.** Nothing under `core/`, `ui/`, `desktop/` or `zelos.mjs` imports the module. The
+   only importer in the repo is its own test.
+2. **No config.** `DEFAULTS` in `core/config.mjs` has no `oauth` key. `OAUTH_DEFAULTS` is exported
+   from `oauth.mjs` and merged by nobody.
+3. **No Settings surface.** `grep -rin oauth ui/` returns nothing. There is no button to press.
+4. **No reader.** `CALENDAR_KINDS` in `core/config.mjs` is `['ics', 'caldav', 'file']`. There is no
+   `google` or `microsoft` branch, so even a valid access token sitting in your keychain would have
+   nothing to read a calendar with.
+
+Since it ships in no release, the module is excluded from the published package:
+`"!core/sources/oauth.mjs"` in `package.json`'s `files`. `npm pack --dry-run` lists 50 files and
+that is not one of them. What a user installs contains this document and no OAuth code at all.
+
+So the order of work below is right, but step 1 is not the first thing to buy. Wiring the four
+points above is a real change to `core/config.mjs`, `core/sweep.mjs`, `ui/views/settings.js` and
+`package.json`, and it is worth doing **before** a domain purchase and a ten-day review queue,
+because until it exists there is nothing for a verified client ID to plug into.
 
 ## The recommendation
 

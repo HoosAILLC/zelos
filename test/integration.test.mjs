@@ -451,6 +451,99 @@ const apiGet = async (p) => {
   return { status: res.status, body: await res.json() };
 };
 
+const apiPut = async (p, payload) => {
+  const res = await fetch(base + p, {
+    method: 'PUT',
+    headers: { 'X-Zelos-Token': token, 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return { status: res.status, body: await res.json().catch(() => null) };
+};
+
+/* ================================================================== *
+ * Enough browser to run a view
+ *
+ * The point of this file is that no seam is faked, and "the view reads what the
+ * server wrote" is a seam. ui/lib/dom.js builds real elements, so running a view
+ * here needs a `document` — but only the handful of behaviours `el()` uses, and
+ * a stub of exactly those is honest in a way a whole DOM library would not be:
+ * anything the view starts relying on that is not here fails loudly instead of
+ * being quietly emulated.
+ * ================================================================== */
+
+/** ui/lib/dom.js's `append` asks `children instanceof Node`, so there has to be one. */
+class FakeNode {}
+
+function fakeNode(tag) {
+  const self = Object.assign(new FakeNode(), {
+    tagName: String(tag).toUpperCase(),
+    children: [],
+    parentNode: null,
+    attributes: {},
+    dataset: {},
+    listeners: {},
+    textContent: '',
+    hidden: false,
+    isConnected: false,
+    style: { setProperty(name, value) { this[name] = String(value); } },
+    setAttribute(k, v) { self.attributes[k] = String(v); },
+    getAttribute(k) { return Object.hasOwn(self.attributes, k) ? self.attributes[k] : null; },
+    addEventListener(type, fn) { (self.listeners[type] ||= []).push(fn); },
+    appendChild(child) { child.parentNode = self; self.children.push(child); return child; },
+    replaceChildren(...kids) { self.children = kids; },
+    after(node) {
+      const kids = self.parentNode?.children;
+      if (kids) kids.splice(kids.indexOf(self) + 1, 0, node);
+    },
+    querySelectorAll() { return []; },
+    classList: { add() {}, remove() {} },
+  });
+  return self;
+}
+
+function installBrowserGlobals() {
+  if (!globalThis.Node) globalThis.Node = FakeNode;
+  if (!globalThis.localStorage) {
+    globalThis.localStorage = { getItem: () => null, setItem() {}, removeItem() {} };
+  }
+  if (!globalThis.requestAnimationFrame) globalThis.requestAnimationFrame = () => 0;
+  if (!globalThis.getComputedStyle) {
+    globalThis.getComputedStyle = () => ({ lineHeight: '16px', getPropertyValue: () => '0.8' });
+  }
+  if (!globalThis.document) {
+    globalThis.document = {
+      documentElement: { style: { setProperty() {} } },
+      visibilityState: 'visible',
+      addEventListener() {},
+      removeEventListener() {},
+      querySelectorAll: () => [],
+      createElement: (tag) => fakeNode(tag),
+      createTextNode: (text) => {
+        const node = fakeNode('#text');
+        node.textContent = String(text);
+        return node;
+      },
+    };
+  }
+}
+
+/** Every node in a built tree that a predicate likes. */
+function collect(node, predicate, out = []) {
+  if (!node || typeof node !== 'object') return out;
+  if (predicate(node)) out.push(node);
+  for (const child of node.children || []) collect(child, predicate, out);
+  return out;
+}
+
+/** All the text under a node, in document order. */
+function textOf(node) {
+  if (!node || typeof node !== 'object') return '';
+  return `${node.textContent || ''}${(node.children || []).map(textOf).join('')}`;
+}
+
+const addDays = (key, n) =>
+  new Date(Date.parse(`${key}T00:00:00Z`) + n * 86_400_000).toISOString().slice(0, 10);
+
 /* ================================================================== *
  * Tests
  * ================================================================== */
@@ -649,7 +742,7 @@ describe('the board the browser is served', () => {
   test('/api/state carries every key ui/lib/store.js reads', async () => {
     const { status, body } = await apiGet('/api/state');
     assert.equal(status, 200);
-    for (const key of ['items', 'events', 'drafts', 'runs', 'counts', 'notes', 'first']) {
+    for (const key of ['items', 'events', 'drafts', 'runs', 'counts', 'notes', 'first', 'eventWindow']) {
       assert.ok(key in body, `/api/state is missing ${key}`);
     }
     assert.ok(Array.isArray(body.items) && Array.isArray(body.events) && Array.isArray(body.drafts));
@@ -677,6 +770,129 @@ describe('the board the browser is served', () => {
   test('/api/search finds a message the sweep indexed', async () => {
     const { body } = await apiGet('/api/search?q=Riverstone');
     assert.ok(body.results.length > 0, 'FTS5 should have indexed the fetched mail');
+  });
+
+  /**
+   * REGRESSION (#27), and the whole seam in one test: the server declares which
+   * days its `events` answers for, ui/lib/store.js keeps that declaration, and
+   * ui/views/calendar.js stops its ‹ and › at it.
+   *
+   * Before this contract existed the calendar had no way to tell "no events on
+   * that day" from "that day was never in the question", so it drew fully styled
+   * empty grids for months it had simply not been sent — measured 2026-08-10:
+   * November, 35 empty cells; October, 22; August's own grid, eight. Both ends
+   * are asserted against the real modules, because the failure mode this wave
+   * exists for is a payload nobody reads and a reader nobody sends to.
+   */
+  test('the served event window reaches the store and stops the calendar arrows', async () => {
+    const { body } = await apiGet('/api/state');
+    assert.ok(body.eventWindow, '/api/state must declare the window');
+
+    installBrowserGlobals();
+    const store = await import('../ui/lib/store.js');
+    const cal = await import('../ui/views/calendar.js');
+
+    // The store keeps what the server said, exactly as loadBoard would.
+    store.state.board = { ...store.state.board, ...body };
+    assert.deepEqual(store.eventWindow(), body.eventWindow,
+      'the store must carry the window the server declared');
+    assert.equal(store.dayIsLoaded(body.eventWindow.from), true);
+    assert.equal(store.dayIsLoaded(body.eventWindow.to), true);
+    // A day past the far edge is not "free", it is unanswered.
+    const pastTheEdge = `${Number(body.eventWindow.to.slice(0, 4)) + 2}-01-15`;
+    assert.equal(store.dayIsLoaded(pastTheEdge), false);
+
+    // And the calendar refuses to walk there. Month mode from two years out:
+    // every cell of that grid is past the edge, so the arrow is dead.
+    const window = store.eventWindow();
+    assert.equal(cal.rangeIsReachable(cal.keysForAnchor('month', pastTheEdge), window), false);
+    // ...while the month the board opens on is reachable, INCLUDING the leading
+    // cells its grid borrows from the previous month — the exact eight days that
+    // used to fall outside the served window.
+    const grid = cal.keysForAnchor('month', body.now.slice(0, 10));
+    assert.equal(cal.rangeIsReachable(grid, window), true);
+    for (const key of grid.filter((k) => k.slice(0, 7) === body.now.slice(0, 7))) {
+      assert.equal(store.dayIsLoaded(key), true,
+        `${key} is a cell of this month's own grid and must have been served`);
+    }
+    assert.equal(store.dayIsLoaded(grid[0]), true,
+      `the grid's first cell (${grid[0]}) is drawn on screen today and must have been served`);
+
+    // With no declaration at all — an older server — nothing is refused and
+    // nothing is marked, which is what every build before this one did.
+    store.state.board = { ...store.state.board, eventWindow: null };
+    assert.equal(store.eventWindow(), null);
+    assert.equal(store.dayIsLoaded(pastTheEdge), true);
+    assert.equal(cal.rangeIsReachable(cal.keysForAnchor('month', pastTheEdge), store.eventWindow()), true);
+  });
+
+  /**
+   * ...and the grid the reader actually sees.
+   *
+   * The test above proves the decision is right; this one proves the grid asks
+   * it. That distinction is the whole reason this file exists — a helper that is
+   * correct and a renderer that never calls it is the shape of every dead
+   * feature in this repo, and it passes any test written against the helper.
+   *
+   * A one-day window, set on the store directly, so the assertion is arithmetic
+   * and not a guess about which weekday the far edge lands on today.
+   */
+  test('a day the window does not cover is drawn as unserved, not as free', async () => {
+    installBrowserGlobals();
+    const store = await import('../ui/lib/store.js');
+    const cal = await import('../ui/views/calendar.js');
+
+    const today = new Date().toISOString().slice(0, 10);
+    store.state.config = { calendars: [{ id: 'c_1', kind: 'ics', url: 'https://example.test/c.ics' }] };
+    store.state.board = {
+      ...store.state.board,
+      events: [],
+      now: `${today}T12:00:00+00:00`,
+      eventWindow: { from: today, to: today },
+    };
+    store.state.boardAt = Date.now();
+
+    // Week mode (the default when matchMedia says nothing), anchored at today
+    // through the route — which is how the search view sends somebody to a day.
+    const view = cal.renderCalendar({ sub: today, rerender() {}, navigate() {} });
+    const heads = collect(view, (n) => (n.attributes.class || '').includes('cal-head-cell'));
+    assert.equal(heads.length, 7, 'a week has seven columns');
+
+    const marked = heads.filter((n) => textOf(n).includes('not loaded'));
+    assert.equal(marked.length, 6,
+      'six of the seven days are outside a one-day window and none of them may be drawn as merely empty');
+    const unmarked = heads.filter((n) => !textOf(n).includes('not loaded'));
+    assert.equal(unmarked.length, 1);
+
+    // The columns carry the state too, so the grid below the header is not
+    // making the opposite claim to the header above it.
+    const cols = collect(view, (n) => (n.attributes.class || '').split(' ').includes('cal-col'));
+    assert.equal(cols.filter((n) => (n.attributes.class || '').includes('is-unloaded')).length, 6);
+
+    // The line under the toolbar counts them rather than waving at them.
+    assert.ok(textOf(view).includes('6 days here are outside what Zelos has loaded'),
+      `the view should say how much of it is unanswered, got: ${textOf(view).slice(0, 400)}`);
+
+    // And both arrows are dead, because no neighbouring week holds a served day.
+    const arrows = collect(view, (n) => n.tagName === 'BUTTON' && ['‹', '›'].includes(textOf(n)));
+    assert.equal(arrows.length, 2);
+    for (const arrow of arrows) {
+      assert.equal(arrow.attributes.disabled, '',
+        'an arrow that can only ever reach an empty grid must not be pressable');
+    }
+
+    // With the window widened to cover the whole week, every mark goes away and
+    // the arrows come back — the marking is a claim about data, not decoration.
+    store.state.board = {
+      ...store.state.board,
+      eventWindow: { from: addDays(today, -30), to: addDays(today, 30) },
+    };
+    const wide = cal.renderCalendar({ sub: today, rerender() {}, navigate() {} });
+    assert.equal(textOf(wide).includes('not loaded'), false);
+    assert.equal(textOf(wide).includes('outside what Zelos has loaded'), false);
+    for (const arrow of collect(wide, (n) => n.tagName === 'BUTTON' && ['‹', '›'].includes(textOf(n)))) {
+      assert.equal(arrow.attributes.disabled, undefined);
+    }
   });
 });
 
@@ -733,6 +949,50 @@ describe('SSE: core/server.mjs writes frames ui/lib/api.js can read', () => {
     const sources = events.find(([n]) => n === 'sources')[1];
     assert.ok(Array.isArray(sources));
   });
+
+  /**
+   * REGRESSION (#51). Ask computed its usage, reported it over SSE, and both
+   * ends dropped it: `recordTokens` had one caller, inside `runSweep`'s
+   * `finish`. Reproduced with a mock upstream — twenty `POST /api/ask` calls,
+   * twenty real completions, 100,000 tokens reported over SSE, and afterwards
+   * `sweep.tokens` was null and `/api/state` carried no `tokens` at all.
+   *
+   * The three hops are all here, in the order they have to hold: the sweep
+   * engine writes the counter, /api/state carries the field, and ui/app.js's
+   * rail renders it through ui/lib/format.js's `tokenLine`. A test that only
+   * checked the SSE frame would have passed on the broken code.
+   */
+  test('what Ask spends reaches the counter the rail reads', async () => {
+    const before = (await apiGet('/api/state')).body.tokens ?? { tokensIn: 0, tokensOut: 0, runs: 0, modelRuns: 0 };
+
+    const events = [];
+    await openStream(`${base}/api/ask`, {
+      method: 'POST',
+      body: { question: 'What do I owe Riverstone?' },
+      onEvent: (name, data) => events.push([name, data]),
+    });
+    const done = events.find(([n]) => n === 'done')[1];
+    const spent = (Number(done.usage?.input) || 0) + (Number(done.usage?.output) || 0);
+    assert.ok(spent > 0, 'the mock upstream reports usage, so there is something to count');
+
+    const after = (await apiGet('/api/state')).body.tokens;
+    assert.ok(after, '/api/state must carry the counter, or the rail has nothing to render');
+    assert.equal(after.tokensIn, before.tokensIn + (Number(done.usage.input) || 0),
+      'Ask is spend and the counter is a spend counter');
+    assert.equal(after.tokensOut, before.tokensOut + (Number(done.usage.output) || 0));
+    // ...and it is NOT a sweep. These two are what "asked the model N times
+    // today" is counted from.
+    assert.equal(after.runs, before.runs, 'an Ask is not a sweep that happened');
+    assert.equal(after.modelRuns, before.modelRuns);
+
+    // The third hop: the line the rail actually paints, built by the real
+    // formatter from the real payload.
+    const fmt = await import('../ui/lib/format.js');
+    const line = fmt.tokenLine(after, after.day);
+    assert.match(line, /tokens in · .* out$/, `the rail should render the counter, got ${JSON.stringify(line)}`);
+    assert.notEqual(line, '');
+  });
+
 
   test('an unauthenticated stream is refused before any frame is written', async () => {
     const res = await fetch(`${base}/api/sweep/stream`, { headers: { Accept: 'text/event-stream' } });

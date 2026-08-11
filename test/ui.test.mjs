@@ -37,6 +37,28 @@ const UI = path.join(ROOT, 'ui');
  */
 const fileUrl = (...parts) => pathToFileURL(path.join(...parts)).href;
 
+/**
+ * How many rows a month cell paints, read out of the view that owns it.
+ *
+ * It is not exported — it is a private layout constant of ui/views/calendar.js
+ * and has no business being one — so the boundary test below used to keep its
+ * own copy. A constant restated in a second file is a constant that can drift,
+ * and this one is load-bearing prose: conflictsFirst's docstring in
+ * ui/lib/format.js says a day with "three or more" all-day entries buries a
+ * clash, which is only true while this number is 3. A parser that cannot find
+ * it fails loudly rather than falling back to a guess, for the same reason
+ * test/router-table.mjs does: a silent default is how the copy got stale.
+ */
+function monthVisible() {
+  const src = fs.readFileSync(path.join(UI, 'views/calendar.js'), 'utf8');
+  const m = /\nconst MONTH_VISIBLE = (\d+);/.exec(src);
+  if (!m) {
+    throw new Error('ui/views/calendar.js no longer declares MONTH_VISIBLE where this reader looks — '
+      + 'fix the reader, do not restate the number');
+  }
+  return Number(m[1]);
+}
+
 const core = await import(fileUrl(ROOT, 'core/time.mjs'));
 const ui = await import(fileUrl(UI, 'lib/time.js'));
 const fmt = await import(fileUrl(UI, 'lib/format.js'));
@@ -250,6 +272,78 @@ test('conflictsFirst leaves a quiet day in time order', () => {
   assert.deepEqual(ordered.map((e) => e.id), ['a', 'b', 'c']);
 });
 
+test('an all-day event is not a clash with the day it fills', () => {
+  // eventSpanOnDay hands an all-day event minutes 0–1440, so in the overlap
+  // pass it overlapped everything: one birthday flagged every event on the day
+  // and the month cell painted "clash" over a day where nothing clashes.
+  const ordered = fmt.conflictsFirst([
+    { start: 0, end: 1440, allDay: true, id: 'holiday' },
+    { start: 540, end: 555, id: 'standup' },
+  ]);
+  assert.deepEqual(ordered.map((e) => e.conflict), [false, false]);
+  assert.equal(ordered.some((e) => e.conflict), false, 'nothing overlaps; the cell must not flag one');
+});
+
+test('a holiday does not bury the double booking underneath it', () => {
+  // The harm is the inverse of the obvious one. When the 0–1440 span made
+  // every entry conflict:true the tiebreak went to zero, the sort collapsed to
+  // plain start order, and the genuine clash fell behind "+N more". Measured
+  // on the shipped code: the three visible rows were HOLIDAY, 8am, 9am.
+  const day = [
+    { start: 0, end: 1440, allDay: true, id: 'holiday' },
+    { start: 480, end: 540, id: '8am' },
+    { start: 540, end: 600, id: '9am' },
+    { start: 660, end: 720, id: 'clash-a' },
+    { start: 670, end: 700, id: 'clash-b' },
+  ];
+  const ordered = fmt.conflictsFirst(day);
+  assert.deepEqual(ordered.slice(0, 3).map((e) => e.id), ['holiday', 'clash-a', 'clash-b']);
+  // ...and the all-day entry keeps the top of the cell, where a day-long thing
+  // belongs, without claiming to collide with anything.
+  assert.equal(ordered[0].allDay, true);
+  assert.equal(ordered[0].conflict, false);
+});
+
+test('three all-day banners do bury the clash, and the cell badge is what stops it going quiet', () => {
+  // The boundary of what conflictsFirst promises, pinned so the docstring above
+  // it cannot drift back into promising more. All-day entries sort above
+  // everything and MONTH_VISIBLE is 3, so a birthday, a holiday and a PTO day
+  // fill the cell and the double booking really is behind "+N more". The
+  // sentence that used to sit here — "a conflict cannot hide behind +4" — was
+  // false for exactly this day.
+  //
+  // What keeps that honest is monthCell deriving `has-conflict` from
+  // `spans.some(s => s.conflict)` over the WHOLE day rather than the visible
+  // slice (ui/views/calendar.js:572), which is the reader this flag is for. If
+  // that ever narrows to the visible three, this day goes silent, and the
+  // second half of this test is what says so.
+  const day = [
+    { start: 0, end: 1440, allDay: true, id: 'birthday' },
+    { start: 0, end: 1440, allDay: true, id: 'holiday' },
+    { start: 0, end: 1440, allDay: true, id: 'pto' },
+    { start: 480, end: 510, id: '8am' },
+    { start: 540, end: 600, id: 'clash-a' },
+    { start: 570, end: 630, id: 'clash-b' },
+  ];
+  const ordered = fmt.conflictsFirst(day);
+  // Read, not restated. This line was `const MONTH_VISIBLE = 3;` with
+  // `// ui/views/calendar.js:564` beside it — a number owned by another file,
+  // copied here next to a line reference that had already drifted two lines.
+  // Widening the cell to four rows would have left this test green while the
+  // sentence it exists to protect — "three or more", in ui/lib/format.js's
+  // docstring for conflictsFirst — became false.
+  const MONTH_VISIBLE = monthVisible();
+  assert.deepEqual(ordered.slice(0, MONTH_VISIBLE).map((e) => e.id), ['birthday', 'holiday', 'pto'],
+    `the month cell shows ${MONTH_VISIBLE} rows, so three banners no longer fill it — `
+    + 'conflictsFirst\'s docstring says "three or more" in as many words and now needs rewriting with it');
+  assert.equal(ordered.slice(0, MONTH_VISIBLE).some((e) => e.conflict), false,
+    'neither half of the clash is visible — which is the thing the docstring must not deny');
+  assert.deepEqual(ordered.filter((e) => e.conflict).map((e) => e.id), ['clash-a', 'clash-b'],
+    'the flags are still right; it is only the truncation that hides them');
+  assert.equal(ordered.some((e) => e.conflict), true,
+    'the expression monthCell uses for its badge still fires, so the day is marked even when the pair is not shown');
+});
+
 /* ----------------------------------------------------- items and wording */
 
 test('carriedFor says nothing until a thing is genuinely stale', () => {
@@ -418,6 +512,29 @@ test('a clipped calendar chip title is marked as clipped, not cut mid-word', () 
     'the line budget must be measured per chip, not copied out of the stylesheet');
 });
 
+test('the phone week calendar has exactly one horizontal scroller', () => {
+  const css = fs.readFileSync(path.join(UI, 'app.css'), 'utf8');
+  const narrow = /@media \(max-width: 47\.99rem\) \{\s*\n\s*\.cal-grid\.mode-week \{[\s\S]*?\n\}/m.exec(css);
+  assert.ok(narrow, 'the narrow week-grid media block is missing');
+
+  // `.cal-scroll` carries `overflow-y: auto` for the 1440-minute body, and CSS
+  // Overflow 3 coerces a `visible` on the other axis to `auto` beside it. So
+  // `overflow-x: visible` here did not opt the box out of the outer scroller,
+  // it made a SECOND one — on a box still at min-width 0 inside a 584px body.
+  // Measured in a live Blink at 375px: clientWidth 344 against scrollWidth
+  // 584, and dragging the inner scroller to 220 left `.cal-grid` at 0, i.e.
+  // 220px of drift between the date header and the time body beneath it.
+  assert.ok(!/\.cal-scroll[^{}]*\{[^{}]*overflow-x/.test(narrow[0]),
+    '.cal-scroll must not set overflow-x here — next to overflow-y it can only ever be a scroller');
+
+  const sized = /\.cal-grid\.mode-week \.cal-head,[\s\S]*?\{[^{}]*min-width[^{}]*\}/m.exec(narrow[0]);
+  assert.ok(sized, 'the min-width group is missing');
+  for (const part of ['.cal-head', '.cal-allday', '.cal-scroll', '.cal-body']) {
+    assert.ok(sized[0].includes(`.cal-grid.mode-week ${part},`) || sized[0].includes(`.cal-grid.mode-week ${part} {`),
+      `${part} must be sized with its siblings, or it drifts out of register with them`);
+  }
+});
+
 test('the sticky rail re-measures the header instead of trusting the last paint', () => {
   const app = fs.readFileSync(path.join(UI, 'app.js'), 'utf8');
   const css = fs.readFileSync(path.join(UI, 'app.css'), 'utf8');
@@ -523,6 +640,36 @@ test('itemsInBucket keeps snoozed rows off the panes; snoozedItems carries them'
   assert.deepEqual(store.itemsInBucket('now').map((i) => i.id), ['a']);
   assert.deepEqual(store.itemsInBucket('today').map((i) => i.id), []);
   assert.deepEqual(store.snoozedItems().map((i) => i.id), ['b', 'd']);
+});
+
+test('"Worth knowing" is one number, in the rail and in the section it opens', async () => {
+  stubBrowserGlobals();
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  store.state.board = {
+    ...store.state.board,
+    counts: { now: 0, today: 0, soon: 0, waiting: 0, promised: 0, note: 1, money: 0 },
+    // The model is instructed to report a quiet day in `notes`, which no
+    // bucket count has ever included — so the rail read "Worth knowing 0"
+    // beside a section headed "Worth knowing 3", on the ordinary day.
+    notes: ['The invoice went out.', 'Nothing else needs you today.', '   ', 7, null],
+    items: [{ id: 'n1', bucket: 'note', state: 'open' }],
+    drafts: [],
+    events: [],
+    now: null,
+  };
+  assert.equal(store.boardNotes().length, 2, 'blank and non-string notes are not notes');
+  // The invariant, in the same terms ui/views/now.js builds its heading from.
+  assert.equal(
+    store.railCounts().note,
+    store.boardNotes().length + store.itemsInBucket('note').length,
+  );
+  assert.equal(store.railCounts().note, 3);
+
+  const now = fs.readFileSync(path.join(UI, 'views/now.js'), 'utf8');
+  assert.match(now, /boardNotes\(\)/,
+    'the section must count through the same store export the rail does');
+  assert.ok(!/state\.board\.notes/.test(now),
+    'a second copy of the filter in the view is how the two numbers drifted apart');
 });
 
 test('setItemState carries the snooze deadline, and only when one was chosen', async (t) => {
@@ -710,6 +857,121 @@ test('the clash flag cannot escape its month cell', () => {
   const row = /^\.month-num-row \{([^}]*)\}/m.exec(css);
   assert.ok(row, '.month-num-row rule is missing');
   assert.match(row[1], /min-width:\s*0/);
+});
+
+test('a sweep that lost one source says so, and does not call the run failed', () => {
+  const src = fs.readFileSync(path.join(UI, 'views/now.js'), 'utf8');
+  // A run that lost ONE source comes back ok:true. The banner returned null
+  // unless the WHOLE run had failed, so a revoked app password, a 404'd .ics
+  // or a Sent folder that is not called Sent rendered as "Nothing needs you."
+  // and nothing else — the board simply got quieter while the app reassured.
+  assert.ok(!/if \(!live && !\(last && last\.ok === false\)\) return null;/.test(src),
+    'the banner must not be gated on the whole run having failed');
+  const trouble = /function sweepTrouble\(\)[\s\S]*?\n\}/m.exec(src);
+  assert.ok(trouble, 'sweepTrouble is missing');
+  assert.match(trouble[0], /sourcesFailed/, 'the count every sweep writes must have a reader');
+  assert.match(trouble[0], /'partial'/);
+
+  const banner = /function failureBanner\(trouble\)[\s\S]*?\n\}/m.exec(src);
+  assert.ok(banner, 'failureBanner is missing');
+  // Its own tone and its own sentence. "The last sweep failed" over a run that
+  // read four sources out of five is a lie in the alarming direction, and it
+  // sends the reader looking for a broken app instead of a dead password.
+  assert.match(banner[0], /The last sweep could not read everything/);
+  assert.match(banner[0], /banner-warn/);
+  assert.match(banner[0], /The last sweep failed/);
+
+  const render = /export function renderNow\(ctx\)[\s\S]*?\n\}/m.exec(src);
+  assert.ok(render, 'renderNow is missing');
+  assert.match(render[0], /sweepTrouble\(\)/, 'the view has to actually ask');
+
+  // The empty state under the banner has to branch its TITLE, not only its
+  // detail. Branching the detail alone left "Nothing on the board yet." as the
+  // largest text on the screen after a partial failure, and "yet" is exactly
+  // the reassurance the banner exists to withdraw: it tells the reader the
+  // board is merely between sweeps. The detail line underneath does not undo a
+  // headline.
+  const emptyUnderBanner = /body\.appendChild\(banner[\s\S]*?: emptyForContext\(navigate\)\);/m.exec(render[0]);
+  assert.ok(emptyUnderBanner, 'the banner/empty-state branch in renderNow is missing');
+  const titles = [...emptyUnderBanner[0].matchAll(/title: '([^']*)'/g)].map((m) => m[1]);
+  assert.equal(titles.length, 2, 'the two failures must get two titles');
+  assert.notEqual(titles[0], titles[1], 'both failures are still using the same headline');
+  assert.ok(titles.some((t) => /yet/.test(t)), 'the whole-failure case keeps "yet" — a sweep really is still to come');
+  assert.ok(
+    titles.filter((t) => /yet/.test(t)).length === 1,
+    'the partial-failure title must not say "yet": that sweep finished, and what is missing is what could not be read',
+  );
+  /* The two assertions above are order-blind, and swapping the two objects
+     leaves them both green while putting the reassurance back on exactly the
+     case this test exists for. `titles[0]` is the `trouble === 'partial'` arm —
+     the first branch of the ternary matched below — so tie the title to its
+     arm, not to the pair. */
+  assert.ok(
+    !/yet/.test(titles[0]),
+    `the partial arm is the first ternary branch and it must not be the one that says "yet" (got ${JSON.stringify(titles[0])})`,
+  );
+  assert.match(emptyUnderBanner[0], /trouble === 'partial'/, 'the branch has to be on the trouble kind');
+});
+
+test('the first screen paints its action row whether or not it is in the document', () => {
+  const src = fs.readFileSync(path.join(UI, 'views/onboarding.js'), 'utf8');
+  const paint = /const paintActions = \(\) => \{[\s\S]*?\n  \};/m.exec(src);
+  assert.ok(paint, 'paintActions is missing');
+  // It is called synchronously twelve lines before shell() puts `actions` in a
+  // tree, so a live-node guard is always false on the pass that matters — and
+  // the two probe .finally callbacks that covered for it are gated on
+  // module-level caches, so the SECOND build of this screen got neither. The
+  // row kept its placeholder: no "Use Ollama and open the board", no "Try it
+  // with sample data" (the only way into the sample data anywhere in ui/), no
+  // "Choose a model", no demo-week note. watchBoard rebuilds this screen every
+  // three minutes, so it emptied itself with nobody touching it.
+  assert.ok(!/isConnected/.test(paint[0]),
+    'paintActions must not gate on the row being in the document');
+  assert.match(src, /Try it with sample data/);
+  const start = /function startScreen\(rerender, navigate\)[\s\S]*?\n\}/m.exec(src);
+  assert.ok(start, 'startScreen is missing');
+  assert.match(start[0], /\n {2}paintActions\(\);\n/,
+    'the row must be painted on the way out, not only when a probe lands');
+});
+
+test('a settings sub-tab change moves focus instead of dropping it on <body>', () => {
+  const app = fs.readFileSync(path.join(UI, 'app.js'), 'utf8');
+  const onRoute = /function onRoute\(\)[\s\S]*?\n\}/m.exec(app);
+  assert.ok(onRoute, 'onRoute is missing');
+  // A sub-route change still forces replace(main, currentView()), so the
+  // .subtab button that was pressed is detached and focus falls to <body> —
+  // with aria-selected written onto freshly built nodes nobody is focused on,
+  // announced to no one, on all eight panels. Comparing only route.view left
+  // it there.
+  assert.match(onRoute[0], /beforeSub !== route\.sub/,
+    'onRoute must notice a sub-route change, not only a view change');
+  assert.match(onRoute[0], /refocusSelectedTab\(\)/);
+  assert.ok(onRoute[0].indexOf('render({ force: true })') < onRoute[0].indexOf('refocusSelectedTab()'),
+    'focus has to be restored after the rebuild, not before it');
+
+  const refocus = /function refocusSelectedTab\(\)[\s\S]*?\n\}/m.exec(app);
+  assert.ok(refocus, 'refocusSelectedTab is missing');
+  assert.match(refocus[0], /\[role="tab"\]\[aria-selected="true"\]/);
+  assert.match(refocus[0], /focusQuietly/);
+  // A sub-route with no tablist behind it — #/calendar/2026-08-11 — must be
+  // left alone. Yanking focus to the top of the page on a date change is this
+  // same bug pointed the other way.
+  assert.match(refocus[0], /if \(selected\)/);
+
+  // The same-hash branch of navigate() rebuilds the view without a hashchange,
+  // so activating the tab you are already on loses focus by the same route
+  // while onRoute never runs at all.
+  const nav = /function navigate\(hash\)[\s\S]*?\n\}/m.exec(app);
+  assert.ok(nav, 'navigate is missing');
+  assert.match(nav[0], /refocusSelectedTab\(\)/);
+  /* And it has to come second. This assertion used to be presence alone, which
+     is order-blind about a defect that is entirely an ordering: refocus reads
+     the tab out of the tree render() has just built, so hoisting it above the
+     render — a plausible tidy-up, since both lines are about the same view —
+     focuses the button that is one line away from being detached and puts the
+     orphaning back exactly as it was, with the guard still green. */
+  assert.ok(nav[0].indexOf('render({ force: true })') < nav[0].indexOf('refocusSelectedTab()'),
+    'focus has to be restored after the rebuild, not before it');
 });
 
 /* ------------------------------------------- 6. the overnight window, and
@@ -1379,15 +1641,198 @@ test('the mail editor can set requireTls, and the test connects under the same r
   assert.ok(probe, 'the testMail call is missing');
   assert.match(probe[0], /requireTls: requireTls\(\)/,
     'the connection test omits requireTls and so tests different rules than the sweep');
-  const save = /saveConfig\(\{ mail: \[[\s\S]*?\] \}\)/m.exec(form[0]);
-  assert.ok(save, 'the save call is missing');
+  // The account literal the save sends. It moved into a `patch` object when the
+  // form learned to adopt identity.email, so this reads the literal rather than
+  // the shape of the saveConfig call — the assertion is about what is in the
+  // account, not about how many keys travel beside it.
+  const save = /mail: \[\.\.\.others, \{[\s\S]*?\}\]/m.exec(form[0]);
+  assert.ok(save, 'the saved account literal is missing');
   assert.match(save[0], /requireTls: requireTls\(\)/, 'the save drops what the editor chose');
+  assert.match(form[0], /await saveConfig\(patch\)/, 'the assembled patch must actually be saved');
 
   // The blank a new account opens on is the config module's blank. A literal
   // `false` here would excuse cleartext for a host nobody has named yet.
   const blank = /editor\.replaceChildren\(mailForm\(\{[\s\S]*?\}, \{/m.exec(src);
   assert.ok(blank, 'the new-account literal is missing');
   assert.match(blank[0], /requireTls: null/, 'a new account must start on "decide from the address"');
+});
+
+/**
+ * `identity.name` and `identity.email` had a schema, a validator, and readers in
+ * the scorer and the prompt — and nothing a user could reach ever set them.
+ * `grep identity ui/` returned one hit and it read `timezone`. No panel, no
+ * onboarding step, no CLI flag; only a hand-crafted PUT or an edit to
+ * config.json.
+ *
+ * Verified on a fresh home: `identity.email` stayed `''`, `sameEmail(a, '')` is
+ * false for every message, and the +6 To: and −2 Cc: branches at
+ * core/triage.mjs:434-435 never fired once. At the item cap that is not
+ * cosmetic — a message written straight to the user was cut from the sweep
+ * prompt entirely while newer Cc-only rollups survived. `identity.name` stayed
+ * `''` too, so every prompt read "name: (not set — do not invent one)" and
+ * every draft came back unsigned with nothing on screen to say why.
+ *
+ * Both ends are named here on purpose. WRITER: the You panel's
+ * `saveConfig({ identity: … })`, and the mail form adopting the first account's
+ * address. READER: `core/triage.mjs` `buildSweepPrompt`, whose behaviour is
+ * asserted in test/triage.test.mjs, and `core/sweep.mjs` `directionOf`.
+ */
+test('Settings can set who you are, and the value has a reader on the other end', async () => {
+  stubBrowserGlobals();
+  const settings = await import(fileUrl(UI, 'views/settings.js'));
+  const src = fs.readFileSync(path.join(UI, 'views/settings.js'), 'utf8');
+
+  // The panel is reachable, not merely defined.
+  const panels = /const PANELS = \[[\s\S]*?\];/m.exec(src);
+  assert.ok(panels, 'PANELS is missing');
+  assert.match(panels[0], /id: 'you'/, 'the You panel is not in the tab strip');
+  assert.match(src, /if \(panel === 'you'\) body = youPanel\(\)/,
+    'the tab exists but renderSettings never builds the panel');
+
+  // It writes the two keys the readers read, and nothing else.
+  const panel = /function youPanel\(\)[\s\S]*?\n\}/m.exec(src);
+  assert.ok(panel, 'youPanel is missing');
+  assert.match(panel[0], /saveConfig\(\{ identity: \{ name: nameInput\.value\.trim\(\), email \} \}\)/,
+    'the You panel does not persist name and email');
+  // The timezone is resolved from the machine on every load, so writing it back
+  // would freeze the zone the user was in the day they typed it.
+  assert.ok(!/timezone:/.test(panel[0].replace(/'[^']*'|`[^`]*`/g, '')),
+    'the panel persists a timezone, which core/config.mjs resolves at read time');
+
+  // The default for an install that predates the panel.
+  assert.equal(settings.defaultIdentityEmail({ mail: [{ enabled: true, user: 'me@example.com' }] }), 'me@example.com');
+  assert.equal(
+    settings.defaultIdentityEmail({ mail: [{ enabled: false, user: 'old@example.com' }, { enabled: true, user: 'me@example.com' }] }),
+    'me@example.com',
+    'a disabled account is not who you are',
+  );
+  assert.equal(settings.defaultIdentityEmail({ mail: [{ enabled: true, user: 'not-an-address' }] }), '',
+    'a username that is not an address must not be offered as one — core/config.mjs would reject it');
+  for (const empty of [null, undefined, {}, { mail: [] }, { mail: 'nope' }, { mail: [null] }]) {
+    assert.equal(settings.defaultIdentityEmail(empty), '', JSON.stringify(empty));
+  }
+
+  // The second writer: saving a mailbox adopts its address when nothing is set,
+  // so an install that has been running for months stops being wrong without
+  // anyone having to find a new tab.
+  const form = /function mailForm\(account, \{ onSaved, onCancel \}\)[\s\S]*?\n\}/m.exec(src);
+  assert.ok(form, 'mailForm is missing');
+  assert.match(form[0], /state\.config\?\.identity\?\.email/, 'the mail form never looks at what is already set');
+  assert.match(form[0], /patch\.identity = \{ email: adopted \}/, 'the mail form does not adopt the address');
+  assert.match(form[0], /!known &&/, 'an address the user already chose must not be overwritten');
+  assert.match(form[0], /Zelos will also treat \$\{adopted\}/, 'adopting it silently is how this became invisible in the first place');
+
+  // The readers, named rather than assumed.
+  const triage = fs.readFileSync(path.join(ROOT, 'core/triage.mjs'), 'utf8');
+  assert.match(triage, /const userEmail = str\(identity\.email\)/, 'core/triage.mjs no longer reads identity.email');
+  assert.match(triage, /sameEmail\(a\?\.email, ctx\.userEmail\)\)\) score \+= 6/, 'the To: branch this feeds is gone');
+  const sweep = fs.readFileSync(path.join(ROOT, 'core/sweep.mjs'), 'utf8');
+  assert.match(sweep, /config\?\.identity\?\.email/, 'core/sweep.mjs no longer reads identity.email');
+});
+
+/**
+ * `sentMailbox` is appended to every fetch by core/sweep.mjs's `mailboxesFor()`
+ * and had no writer anywhere in `ui/` — the string appeared exactly once, in a
+ * blank-account literal. The stored default is the bare word "Sent", which is
+ * wrong for Gmail, Microsoft 365 and iCloud: three of the eight providers this
+ * app hardcodes and the three largest. Reproduced against a Microsoft 365
+ * folder set: `{label:"Work / Sent", ok:false, error:"Mailbox doesn't exist:
+ * Sent"}` on every sweep forever, run still `ok:true`, doctor still "pass".
+ *
+ * WRITER: the field below, into `saveConfig({ mail: [...] })`. READER:
+ * `mailboxesFor()` and `directionOf()` in core/sweep.mjs, plus the mail check in
+ * core/doctor.mjs — pinned in test/doctor.test.mjs. The prefill's own source is
+ * the SPECIAL-USE flag `listMailboxes()` has computed since the client was
+ * written and which nothing outside a test had ever read.
+ */
+test('the mail editor can set the sent folder, and takes it from the server when asked', async () => {
+  stubBrowserGlobals();
+  const settings = await import(fileUrl(UI, 'views/settings.js'));
+  const src = fs.readFileSync(path.join(UI, 'views/settings.js'), 'utf8');
+  const form = /function mailForm\(account, \{ onSaved, onCancel \}\)[\s\S]*?\n\}/m.exec(src);
+  assert.ok(form, 'mailForm is missing');
+
+  // A control, actually in the returned form, and actually saved.
+  assert.match(form[0], /field\('Sent folder', sentInput/, 'the control is built but never placed');
+  assert.match(form[0], /sentMailbox: sentInput\.value\.trim\(\)/, 'the save drops what the editor chose');
+  // The three provider spellings, so nobody has to already know theirs.
+  for (const spelling of ['\\[Gmail\\]/Sent Mail', 'Sent Items', 'Sent Messages']) {
+    assert.match(form[0], new RegExp(spelling), `the hint does not name ${spelling}`);
+  }
+
+  // The prefill reads the flag off the test response.
+  assert.match(form[0], /sentMailboxFromTest\(result\.mailboxes, sentInput\.value\)/,
+    'the SPECIAL-USE flag is on the wire and in the response object with nowhere to land');
+
+  const M365 = [
+    { name: 'INBOX', specialUse: 'inbox' },
+    { name: 'Sent Items', specialUse: 'sent' },
+    { name: 'Drafts', specialUse: 'drafts' },
+  ];
+  assert.equal(settings.sentMailboxFromTest(M365, 'Sent'), 'Sent Items',
+    'the default "Sent" is not on this server, so the flag has to win');
+  assert.equal(settings.sentMailboxFromTest(M365, ''), 'Sent Items');
+  // What the user typed wins — but only when the server actually has it. A name
+  // the server does not have is a typo, and keeping it is how the whole defect
+  // looked like nothing at all.
+  assert.equal(settings.sentMailboxFromTest([...M365, { name: 'Archive/Sent', specialUse: null }], 'Archive/Sent'), 'Archive/Sent');
+  assert.equal(settings.sentMailboxFromTest([{ name: 'INBOX' }, { name: 'Sent' }], 'Sent'), 'Sent',
+    'a server with no SPECIAL-USE flags at all must not have the choice taken away');
+  // Nothing to say is said with nothing: no flag and no typed name leaves it be.
+  assert.equal(settings.sentMailboxFromTest([{ name: 'INBOX' }], ''), '');
+  assert.equal(settings.sentMailboxFromTest([{ name: 'INBOX' }], 'Sent'), 'Sent');
+  for (const junk of [null, undefined, 'not-an-array', 42]) {
+    assert.equal(settings.sentMailboxFromTest(junk, 'Sent'), 'Sent', JSON.stringify(junk));
+  }
+
+  // The reader, named.
+  const sweep = fs.readFileSync(path.join(ROOT, 'core/sweep.mjs'), 'utf8');
+  assert.match(sweep, /account\.sentMailbox === 'string' \? account\.sentMailbox\.trim\(\)/,
+    'core/sweep.mjs no longer reads sentMailbox, so this field writes to nothing');
+});
+
+/**
+ * The tab strip set `role="tablist"`, `role="tab"` and `aria-selected` while the
+ * panel had no `role="tabpanel"`, no `aria-labelledby`, and the tabs had no
+ * `id` and no `aria-controls`. A control that announces "tab, selected" while
+ * pointing at nothing is worse than a plain button: the user is told there are
+ * eight tabs and given no way to find out what any of them controls.
+ *
+ * Finished rather than dropped, because `refocusSelectedTab()` in ui/app.js now
+ * finds the pressed tab again through `[role="tab"][aria-selected="true"]` —
+ * the roles carry the focus fix as well.
+ */
+test('the Settings tab strip is a whole tablist, not half of one', () => {
+  const src = fs.readFileSync(path.join(UI, 'views/settings.js'), 'utf8');
+  const render = /export function renderSettings\(ctx\)[\s\S]*?\n\}/m.exec(src);
+  assert.ok(render, 'renderSettings is missing');
+
+  // Ids that survive a rebuild. `nextId()` ticks on every render, which would
+  // leave aria-labelledby pointing at the id the tab had one paint ago.
+  assert.match(src, /const tabId = \(id\) => `settings-tab-\$\{id\}`/);
+  assert.match(src, /const panelId = \(id\) => `settings-panel-\$\{id\}`/);
+
+  assert.match(render[0], /id: tabId\(p\.id\)/, 'a tab with no id cannot be pointed at');
+  assert.match(render[0], /'aria-selected': selected \? 'true' : 'false'/);
+  // Only the live panel is in the document, so only the selected tab may claim
+  // to control one: seven dangling references read as empty relationships.
+  assert.match(render[0], /'aria-controls': selected \? panelId\(p\.id\) : null/);
+  // Roving tabindex, so the strip is one tab stop with arrows inside it.
+  assert.match(render[0], /tabindex: selected \? '0' : '-1'/);
+  assert.match(render[0], /onkeydown: onTabKey/);
+  for (const key of ['ArrowRight', 'ArrowLeft', 'Home', 'End']) {
+    assert.match(render[0], new RegExp(`'${key}'`), `${key} does nothing in the tablist`);
+  }
+
+  // The other half of the relationship.
+  assert.match(render[0], /body\.setAttribute\('role', 'tabpanel'\)/);
+  assert.match(render[0], /body\.setAttribute\('id', panelId\(panel\)\)/);
+  assert.match(render[0], /body\.setAttribute\('aria-labelledby', tabId\(panel\)\)/);
+
+  // The ids the two halves use have to be the same ids, which is only true if
+  // both go through the helpers rather than spelling the string out.
+  assert.equal((src.match(/settings-tab-/g) ?? []).length, 1, 'the tab id is spelled out in more than one place');
+  assert.equal((src.match(/settings-panel-/g) ?? []).length, 1, 'the panel id is spelled out in more than one place');
 });
 
 /**

@@ -16,8 +16,10 @@
  *     able to load inside a window that holds the session token.
  *   - The renderer has no privileges: context isolation on, node integration
  *     off, sandbox on, `<webview>` off, and a preload that exposes four strings.
- *   - The session cancels every outbound request that is not the board itself,
- *     and denies every permission but the one the Owed view's copy buttons use.
+ *   - The session cancels every outbound request that is not the board itself —
+ *     on every scheme Chromium will put on the network, WebSockets included,
+ *     and not only the http(s) a scheme wildcard would have shown it — and
+ *     denies every permission but the one the Owed view's copy buttons use.
  *     Spellcheck is off because Chromium fetches its dictionaries from Google,
  *     and this app does not talk to anyone the user did not configure.
  *   - Nothing here assumes it succeeded. There may be no tray icon, so closing
@@ -41,7 +43,7 @@ import {
 import { classifyTarget, guardWebContents } from './guard.js';
 import { buildAppMenuTemplate, buildTrayMenuTemplate, VIEWS } from './menus.js';
 import { startCore } from './runtime.js';
-import { WindowState } from './window-state.js';
+import { clampToDisplays, WindowState } from './window-state.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
@@ -332,6 +334,51 @@ function createWindow() {
   return win;
 }
 
+/**
+ * Put a window back on a display that exists, before anyone is shown it.
+ *
+ * `WindowState.initial()` clamps the remembered rectangle, and for a long time
+ * that was the only place it happened — which covers a window that is created
+ * and then lives until the app ends. A tray-resident Zelos is not that one:
+ * `close` hides the window instead of destroying it (see
+ * `shouldStayResidentOnClose` — Windows with a tray, or Linux with
+ * `ZELOS_TRAY_RESIDENT=1`), so it can sit hidden for hours holding a rectangle
+ * on a monitor that gets unplugged in the meantime. `show()` honours that
+ * rectangle exactly, and the board reappears at x:2600 on a machine whose only
+ * work area now ends at 1680 — the failure `window-state.js:6-11` exists to
+ * prevent, one `show()` away from the clamp that prevents it.
+ *
+ * macOS is not the platform this is written for: Electron does not set
+ * `enableLargerThanScreen`, so AppKit constrains the frame onto a real screen
+ * on `makeKeyAndOrderFront:` whether or not anybody asked. There the clamp
+ * agrees with what the OS was going to do anyway, which is exactly why nothing
+ * is set when the rectangle comes back unchanged — this must not turn into a
+ * move event on every ⌘Tab back into an app that was never lost.
+ */
+function fitToDisplays(win) {
+  // A maximised or full-screen window is wearing the OS's rectangle, not ours.
+  // Setting bounds under one is how a window nobody asked to restore gets
+  // restored, and the size to keep is already saved by WindowState.
+  if (win.isMaximized?.() === true || win.isFullScreen?.() === true) return;
+  const bounds = win.getNormalBounds?.() ?? win.getBounds?.();
+  if (!bounds) return;
+
+  const fitted = clampToDisplays(bounds, screen.getAllDisplays().map((display) => display.workArea));
+  if (typeof fitted.x !== 'number') {
+    // Nothing that exists overlaps it any more, so there is no corrected
+    // position to move to — only a screen to start over on. Same answer
+    // `initial()` gives by returning a size with no position and letting the
+    // window manager place it.
+    zelos?.logger.info('desktop: the window was on a display that is gone; centring it', { bounds });
+    win.center?.();
+    return;
+  }
+  if (fitted.x === bounds.x && fitted.y === bounds.y
+      && fitted.width === bounds.width && fitted.height === bounds.height) return;
+  zelos?.logger.info('desktop: pulled the window back onto a display that exists', { from: bounds, to: fitted });
+  win.setBounds?.(fitted);
+}
+
 function showWindow() {
   setBadge(0);
   if (!mainWindow || mainWindow.isDestroyed()) {
@@ -339,7 +386,10 @@ function showWindow() {
     return;
   }
   if (mainWindow.isMinimized()) mainWindow.restore();
-  if (!mainWindow.isVisible()) mainWindow.show();
+  if (!mainWindow.isVisible()) {
+    fitToDisplays(mainWindow); // it may have been hidden on a monitor that left
+    mainWindow.show();
+  }
   mainWindow.focus();
 }
 
@@ -371,8 +421,18 @@ function hardenSession(ses) {
 
   // The renderer's CSP already says `default-src 'self'`. This is the same rule
   // enforced a second time, one layer down, where a CSP bypass would not reach:
-  // no http(s) request leaves this window for anywhere but the board.
-  ses.webRequest.onBeforeRequest({ urls: ['*://*/*'] }, (details, callback) => {
+  // no request leaves this window for anywhere but the board.
+  //
+  // The pattern is `<all_urls>` and not the `*://*/*` that reads like it means
+  // the same thing. It does not: `*` in a match pattern's scheme position is
+  // http and https and nothing else, so a `new WebSocket('wss://…')` sailed
+  // straight past the layer this comment sells as the one a CSP bypass cannot
+  // reach. Measured against the pinned Electron 43.3.0 with five requests on
+  // five schemes: `*://*/*` delivered three, `<all_urls>` delivered five, and
+  // the two it had been missing were `ws:` and `wss:`. (`file:`, `data:` and
+  // `blob:` are not part of that difference — Chromium refuses those in the
+  // renderer before they ever become network requests.)
+  ses.webRequest.onBeforeRequest({ urls: ['<all_urls>'] }, (details, callback) => {
     const verdict = classifyTarget(details.url, { port: zelos?.port ?? 0 });
     if (verdict.action !== 'internal') {
       zelos?.logger.warn('desktop: cancelled an outbound request from the board', { url: verdict.url });
@@ -450,10 +510,19 @@ function buildActions() {
     setOpenAtLogin: (want) => {
       const openAtLogin = want === true;
       try {
-        // openAsHidden on macOS: a Zelos that opened at login to sweep in the
-        // background should not put a window in front of whatever the person
-        // sat down to do.
-        app.setLoginItemSettings({ openAtLogin, openAsHidden: openAtLogin });
+        // Only `openAtLogin`, and deliberately. This used to pass
+        // `openAsHidden` too, under a comment promising that a Zelos launched
+        // at login would sweep without putting a window in front of whatever
+        // the person sat down to do — a promise nothing here could keep.
+        // Electron 43 marks the flag deprecated and does not implement it on
+        // macOS 13 and up; it does not exist on Windows, where menus.js offers
+        // the same checkbox; and the counterpart it is supposed to set,
+        // `getLoginItemSettings().wasOpenedAsHidden`, is read nowhere in this
+        // repo, so even where the OS answered true the window would still be
+        // created and shown at its full size. An argument that changes nothing
+        // is cheap; the sentence above it, which a reader would have believed,
+        // is not.
+        app.setLoginItemSettings({ openAtLogin });
         zelos?.logger.info('desktop: login item changed', { openAtLogin });
       } catch (err) {
         zelos?.logger.warn('desktop: this platform would not set the login item', { error: err.message });

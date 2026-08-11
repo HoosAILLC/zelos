@@ -270,6 +270,86 @@ test('an unparseable config is moved aside rather than silently obeyed', () => {
   assert.match(fs.readFileSync(path.join(home, aside[0]), 'utf8'), /trunc/);
 });
 
+/**
+ * REGRESSION. `saveConfig` wrote first and asked whether the result loaded
+ * second — its own `loadConfig()` on the last line. `PUT /api/config` with
+ * `{"identity": null}` therefore returned 500 having already put `"identity":
+ * null` in config.json, the running process went on serving its in-memory
+ * snapshot as if nothing had happened, and the next launch died on
+ * `cfg.identity.timezone` with a raw stack trace.
+ *
+ * All four of these do it and all four are checked: `null` dies on the
+ * dereference, and `5`, `"Nemo"` and `false` die on the assignment, because a
+ * property write to a primitive throws under strict mode. `deepMerge` lets a
+ * scalar replace an object on purpose (a patch has to be able to set a `keyRef`
+ * to null), so nothing upstream stops any of them.
+ */
+const NOT_OBJECTS = [null, 5, 'Nemo', false];
+const SECTIONS = ['identity', 'model', 'sweep', 'ui', 'privacy'];
+
+test('a save that could not be loaded back is refused before it touches the disk', () => {
+  const home = freshHome('unloadable-save');
+  const file = path.join(home, 'config.json');
+  saveConfig({ identity: { name: 'Nemo' }, model: { model: 'claude-x' } });
+  const before = fs.readFileSync(file, 'utf8');
+
+  for (const section of SECTIONS) {
+    for (const junk of NOT_OBJECTS) {
+      const where = `${section} = ${JSON.stringify(junk)}`;
+      assert.throws(() => saveConfig({ [section]: junk }), new RegExp(`${section} must be an object`), where);
+      assert.equal(fs.readFileSync(file, 'utf8'), before, `${where}: config.json must be untouched`);
+      assert.equal(loadConfig().identity.name, 'Nemo', `${where}: the old config still loads`);
+      assert.deepEqual(fs.readdirSync(home).filter((f) => f.endsWith('.tmp')), [], where);
+    }
+  }
+
+  // The patch itself has to be an object too: an array or a scalar merged
+  // straight over the whole config and then threw somewhere further in.
+  for (const junk of [null, 5, 'Nemo', false, []]) {
+    assert.throws(() => saveConfig(junk), /patch must be an object/, JSON.stringify(junk));
+    assert.equal(fs.readFileSync(file, 'utf8'), before, JSON.stringify(junk));
+  }
+
+  // And a good save still goes through afterwards.
+  assert.equal(saveConfig({ identity: { name: 'Still works' } }).identity.name, 'Still works');
+});
+
+test('a config hand-edited into nonsense loads with defaults instead of killing the launch', () => {
+  const home = freshHome('unloadable-file');
+  const file = path.join(home, 'config.json');
+  paths(); // the directory itself, which nothing has had reason to create yet
+
+  for (const section of SECTIONS) {
+    for (const junk of NOT_OBJECTS) {
+      const where = `${section} = ${JSON.stringify(junk)}`;
+      // Written past saveConfig, the way `zelos doctor` tells the user to:
+      // "edit <configFile> directly".
+      fs.writeFileSync(file, `${JSON.stringify({ version: 1, [section]: junk }, null, 2)}\n`);
+
+      const cfg = loadConfig();
+      assert.deepEqual(malformed(cfg), [], where);
+      assert.ok(cfg.identity.timezone.length > 0, `${where}: the timezone still resolves`);
+      assert.equal(cfg.model.protocol, 'anthropic', where);
+      assert.equal(cfg.ui.accent, DEFAULTS.ui.accent, where);
+      assert.equal(cfg.privacy.sendBodies, true, where);
+      assert.deepEqual(cfg.sweep, DEFAULTS.sweep, where);
+
+      // The next save repairs the file rather than being blocked by it — the
+      // user's way out is the Settings panel, which is a save.
+      const saved = saveConfig({ identity: { name: 'Rescued' } });
+      assert.equal(saved.identity.name, 'Rescued', where);
+      const onDisk = JSON.parse(fs.readFileSync(file, 'utf8'));
+      assert.deepEqual(malformed(onDisk), [], `${where}: the section is repaired on disk`);
+      assert.equal(validateConfig(saved).ok, true, `${where}: ${JSON.stringify(validateConfig(saved).errors)}`);
+    }
+  }
+});
+
+/** The sections whose value is not an object — the ones nothing can read through. */
+function malformed(cfg) {
+  return SECTIONS.filter((s) => cfg[s] === null || typeof cfg[s] !== 'object' || Array.isArray(cfg[s]));
+}
+
 test('validateConfig() passes a real config and names every bad field', () => {
   freshHome('validate');
   const good = saveConfig({

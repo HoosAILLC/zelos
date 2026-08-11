@@ -214,6 +214,39 @@ export function newId(prefix) {
   return `${p}_${crypto.randomBytes(3).toString('hex')}`;
 }
 
+/* ------------------------------------------------------------------ shape */
+
+/**
+ * The five sections whose value has to BE an object for the rest of the program
+ * to read the config at all. `loadConfig` dereferences `identity.timezone` on
+ * its last line, and zelos.mjs, the server and the UI go straight at `model.*`,
+ * `sweep.*`, `ui.accent` and `privacy.*` the moment they have a config in hand.
+ *
+ * `deepMerge` lets a scalar replace an object on purpose — that is how a patch
+ * sets a `keyRef` to null — so `{"identity": 5}` merges cleanly, serialises
+ * cleanly, and then kills the next launch with a raw stack trace before
+ * `validateConfig` ever gets to say "identity must be an object". `5`, `"Nemo"`,
+ * `false` and `null` all do it: under strict mode the assignment to a primitive
+ * throws just as the dereference of null does.
+ *
+ * Both halves of that are handled, and deliberately not in the same direction:
+ *
+ *  - a SAVE that would produce one is refused before anything reaches the disk,
+ *    because the caller is sending nonsense and should be told so;
+ *  - a FILE that already holds one is repaired on the way in, because
+ *    `zelos doctor` tells the user to edit config.json by hand and a typo there
+ *    must not brick the app that is supposed to report the typo.
+ *
+ * `mail` and `calendars` need no entry here: `normalizeAccounts` already
+ * replaces a non-array with an empty one.
+ */
+const SECTIONS = ['identity', 'model', 'sweep', 'ui', 'privacy'];
+
+/** Which of the five sections are not objects. Names only — never values. */
+function malformedSections(cfg) {
+  return SECTIONS.filter((key) => !isPlainObject(cfg[key]));
+}
+
 /* ------------------------------------------------------------------ load */
 
 function readRaw(configFile) {
@@ -265,6 +298,16 @@ function normalizeAccounts(cfg) {
 export function loadConfig() {
   const { configFile } = paths();
   const cfg = normalizeAccounts(deepMerge(structuredClone(DEFAULTS), stripSecrets(readRaw(configFile))));
+  // A section somebody hand-edited into a scalar is put back before anything
+  // reads through it. Loud, because the values in it are gone: this is the one
+  // place that notices, and the alternative was a stack trace at launch.
+  for (const key of malformedSections(cfg)) {
+    log.warn('config: section is not an object, using its defaults', {
+      section: key,
+      found: cfg[key] === null ? 'null' : typeof cfg[key],
+    });
+    cfg[key] = structuredClone(DEFAULTS[key]);
+  }
   // Resolved at read time, not persisted: a machine that moves should follow.
   if (!cfg.identity.timezone) cfg.identity.timezone = localTimezone();
   return cfg;
@@ -304,13 +347,39 @@ export function writeFileAtomic(file, contents, mode = 0o600) {
 }
 
 export function saveConfig(patch = {}) {
+  // Checked before paths() so a caller that hands over a scalar or an array
+  // does not even create the directory: `deepMerge` would return that value as
+  // the whole config, and the first thing to touch it would throw from
+  // somewhere further in with no clue whose fault it was.
+  if (!isPlainObject(patch)) {
+    throw new TypeError(`saveConfig: patch must be an object, got ${patch === null ? 'null' : typeof patch}`);
+  }
   const { configFile } = paths();
   // Merge over what is ON DISK, not over the resolved config, so runtime-filled
   // values (a timezone inferred from Intl) never get frozen into the file.
   const raw = stripSecrets(readRaw(configFile));
+  // A section the FILE already got wrong is dropped rather than merged, so the
+  // DEFAULTS underneath show through and this save quietly repairs it. Refusing
+  // on it instead would leave a hand-edited typo blocking every later save —
+  // including the one the user makes in Settings to correct it.
+  for (const key of SECTIONS) {
+    if (!Object.hasOwn(raw, key) || isPlainObject(raw[key])) continue;
+    log.warn('config: dropping a malformed section from the file on disk', { section: key });
+    delete raw[key];
+  }
   const merged = normalizeAccounts(
     deepMerge(deepMerge(structuredClone(DEFAULTS), raw), stripSecrets(patch)),
   );
+  // Anything still malformed came from the PATCH, so refuse it here — before
+  // the write, not after. This used to persist first and only find out on the
+  // last line, when its own loadConfig() threw: the caller got a 500, the
+  // running process kept serving its in-memory snapshot as if nothing had
+  // happened, and config.json was left holding a value no later launch could
+  // read. A save that cannot be loaded back is not a save.
+  const broken = malformedSections(merged);
+  if (broken.length) {
+    throw new TypeError(`config: ${broken.join(', ')} must be ${broken.length > 1 ? 'objects' : 'an object'} — nothing was written`);
+  }
   writeFileAtomic(configFile, `${JSON.stringify(merged, null, 2)}\n`, 0o600);
   return loadConfig();
 }

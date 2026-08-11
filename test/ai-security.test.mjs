@@ -45,6 +45,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { PassThrough } from 'node:stream';
 import { fileURLToPath } from 'node:url';
+import { readRouterTable } from './router-table.mjs';
 
 /* The environment has to be set before anything that reads it is evaluated. */
 const SANDBOX = fs.mkdtempSync(path.join(os.tmpdir(), 'zelos-aisec-'));
@@ -166,6 +167,47 @@ function seeded() {
   dbm.insertCapture(db, `${C.captureText}: ask the bank about the retainage`);
 
   return { db, msgId, itemId };
+}
+
+/**
+ * `seeded()` plus a board `zelos_board`'s repair actually has work to do on.
+ *
+ * The write-surface test below drives every tool over HTTP and asserts the
+ * database did not move. On the plain `seeded()` fixture that assertion is
+ * vacuous: `capNowBucket` returns 0 below five `now` items and the due-snooze
+ * wake updates nothing when nothing is asleep, so both of `zelos_board`'s
+ * writes are no-ops and every table hash holds still whatever the tool does.
+ * A suite written to be adversarial was reporting "not one byte" about the one
+ * tool in the registry that is annotated as writing.
+ *
+ * Five open `now` items and one snooze past its wake-up time is the smallest
+ * board on which both fire — the wake is what turns five into six, and the
+ * demotion is what takes it back to four.
+ */
+function boardTheRepairWillTouch() {
+  const s = seeded();
+  for (let i = 0; i < 4; i += 1) {
+    dbm.upsertItem(s.db, {
+      key: `filler-now-${i}`,
+      kind: 'money',
+      bucket: 'now',
+      headline: `Filler now item ${i}`,
+      why: 'it is already on the board',
+      severity: 3,
+      sourceRefs: [],
+    }, { runId: 'run_1' });
+  }
+  const asleep = dbm.upsertItem(s.db, {
+    key: 'asleep-and-due',
+    kind: 'money',
+    bucket: 'now',
+    headline: 'The one that was asleep',
+    why: 'it was snoozed until this morning',
+    severity: 1,
+    sourceRefs: [],
+  }, { runId: 'run_1' }).id;
+  dbm.setItemState(s.db, asleep, 'snoozed', { snoozedUntil: '2020-01-01T09:00:00-05:00' });
+  return { ...s, asleep };
 }
 
 const scopeMap = (on) => Object.fromEntries(mcp.SCOPES.map((s) => [s, on.includes(s)]));
@@ -332,15 +374,26 @@ describe('a disabled scope is absent and refused, both', () => {
  * 3. Auth
  * ================================================================== */
 
-const ROUTES_THAT_ARE_NOT_MCP = [
-  ['GET', '/api/health'], ['GET', '/api/state'], ['GET', '/api/config'], ['PUT', '/api/config'],
-  ['POST', '/api/sweep'], ['GET', '/api/sweep/stream'], ['GET', '/api/search?q=a'],
-  ['POST', '/api/capture'], ['POST', '/api/secrets'], ['DELETE', '/api/secrets/model.default'],
-  ['GET', '/api/model/presets'], ['GET', '/api/model/list'], ['GET', '/api/local/probe'],
-  ['POST', '/api/model/test'], ['POST', '/api/mail/test'], ['POST', '/api/calendar/test'],
-  ['POST', '/api/ask'], ['PUT', '/api/drafts/d_1'], ['POST', '/api/items/i_1/state'],
-  ['GET', '/api/ai'], ['PUT', '/api/ai'], ['POST', '/api/ai/tokens'], ['DELETE', '/api/ai/tokens/t_1'],
-];
+/**
+ * Every route an AI token must NOT open, read out of the router rather than
+ * restated here.
+ *
+ * This was a hand-written literal, and it named 23 of the router's 27 routes:
+ * all three `/api/sample-data` handlers — which seed and destroy board rows —
+ * and `POST /api/ai/test` were missing, so the test below never presented an AI
+ * token to any of them. A route added to core/server.mjs arrived exempt from
+ * this pass, silently. See test/router-table.mjs for the measurement that
+ * closed the same hole in test/security.test.mjs's copy of the same literal.
+ *
+ * The derivation is exactly right for this test's name, and by construction
+ * rather than by luck: `/api/mcp` is the one route deliberately kept out of
+ * `ROUTES` (core/server.mjs:2045), because it is lifted out of the pipeline
+ * before the session gate to answer the other credential. The guard below
+ * asserts that rather than trusting it — a table that ever DID contain
+ * `/api/mcp` would have this test demanding 401 from the one route the AI token
+ * is supposed to open.
+ */
+const ROUTES_THAT_ARE_NOT_MCP = readRouterTable();
 
 /** A server on its own home, so token minting cannot disturb another test. */
 async function rig({ scopes = mcp.SCOPES, enabled = true, tokens = 1, seed = seeded() } = {}) {
@@ -387,6 +440,49 @@ async function rig({ scopes = mcp.SCOPES, enabled = true, tokens = 1, seed = see
 }
 
 describe('auth: the two credentials are not interchangeable', () => {
+  /**
+   * The derivation is only worth having if what it produces reaches the router.
+   * A parser that quietly emitted "/api/heXlth" would leave the test below
+   * asserting 401 on a path that does not exist — which every path answers,
+   * because the session gate runs before routing. That is a green test proving
+   * nothing, and it is the same failure as the literal it replaced.
+   *
+   * OPTIONS is the probe on purpose: it matches no route, so the router answers
+   * out of the table alone — 404 for a path it does not have, 405 plus
+   * `allowed` for one it does — and no handler runs. Nothing is swept, no model
+   * is called, and nothing is seeded. The session token is used here because
+   * this is a question about the routing table, not about the AI gate.
+   */
+  test('every route the derived table names is one the router really serves', async () => {
+    const r = await rig();
+    try {
+      const unknown = [];
+      for (const [method, route] of ROUTES_THAT_ARE_NOT_MCP) {
+        const res = await fetch(r.base + route.split('?')[0], {
+          method: 'OPTIONS',
+          headers: { 'X-Zelos-Token': r.session },
+        });
+        const body = await res.json().catch(() => ({}));
+        const allowed = new Set(body.allowed || []);
+        if (res.status !== 405 || !allowed.has(method)) {
+          unknown.push(`${method} ${route} — OPTIONS answered ${res.status}, allowing ${[...allowed].join(', ') || 'nothing'}`);
+        }
+      }
+      assert.deepEqual(unknown, [], `the derived table names routes the server does not serve:\n  ${unknown.join('\n  ')}`);
+
+      // The four routes the hand-written literal left out, named so a table that
+      // silently loses them again fails here rather than going quiet.
+      const paths = new Set(ROUTES_THAT_ARE_NOT_MCP.map(([m, p]) => `${m} ${p}`));
+      for (const missed of ['GET /api/sample-data', 'POST /api/sample-data',
+        'DELETE /api/sample-data', 'POST /api/ai/test']) {
+        assert.ok(paths.has(missed), `${missed} is not in the table the AI-token test iterates`);
+      }
+      // And /api/mcp must not be: it is the route this credential DOES open.
+      assert.equal([...paths].some((p) => p.endsWith(' /api/mcp')), false,
+        '/api/mcp is in the router table, so the test below now demands 401 from the one route an AI token is for');
+    } finally { r.restoreHome(); }
+  });
+
   test('the browser session token authorises nothing on /api/mcp', async () => {
     const r = await rig();
     try {
@@ -772,7 +868,6 @@ describe('the write surface: there is not one', () => {
     ]);
     const writeWords = /(send|deliver|reply|forward|delete|remove|purge|write|create|update|patch|set|move|archive|mark|sweep|sync|config|revoke|mint|export|wipe|run|exec)/i;
     for (const tool of mcp.TOOLS) {
-      assert.equal(tool.annotations.readOnlyHint, true);
       assert.equal(tool.annotations.destructiveHint, false);
       assert.equal(tool.annotations.openWorldHint, false);
       for (const arg of Object.keys(tool.inputSchema.properties ?? {})) {
@@ -781,10 +876,42 @@ describe('the write surface: there is not one', () => {
       assert.equal(tool.inputSchema.additionalProperties, false,
         `${tool.name} accepts arguments nobody declared`);
     }
+
+    /* `readOnlyHint` is asserted by name rather than "true for all seven", which
+       is the assertion that let the false one through a suite written to be
+       adversarial. It is not a label — it is the field an MCP host reads to
+       decide it may run a tool without asking the owner first — and
+       `zelos_board` holds the four-item `now` bar on the way past, so it is the
+       one tool that may not claim it. test/mcp.test.mjs re-derives this same
+       split from the database, by calling every tool and seeing which moved a
+       row. */
+    assert.deepEqual(
+      mcp.TOOLS.filter((t) => t.annotations.readOnlyHint !== true).map((t) => t.name),
+      ['zelos_board'],
+      'the set of tools that decline readOnlyHint changed — did something start writing, or stop?',
+    );
   });
 
-  test('every tool, over HTTP, with every argument shape, changes not one byte', async () => {
-    const r = await rig();
+  /**
+   * REGRESSION (in the test, not the product): this used to be titled "changes
+   * not one byte" and it ran on the plain `seeded()` fixture — one `now` item
+   * and nothing asleep, so `capNowBucket` returned 0 and the due-snooze wake
+   * matched no rows. Every table hash held still because there was nothing for
+   * `zelos_board` to write, and the assertion certified as byte-clean the one
+   * tool in the registry that is annotated as writing. It would have passed
+   * just as green on a tool that rewrote the whole board.
+   *
+   * `rig()` already takes its fixture as an argument, so nothing else in this
+   * file is disturbed by handing this one a board with work on it.
+   *
+   * The claim it can honestly make is narrower and worth more: over HTTP, with
+   * every argument shape, the six read-only tools write nothing at all, and
+   * `zelos_board` writes nothing except the two moves the four-item bar is
+   * allowed — a due snooze woken, an overflow item demoted. No text, no
+   * deletion, no new row, and nothing outside `items`.
+   */
+  test('every tool, over HTTP, with every argument shape, writes nothing but the board bar', async () => {
+    const r = await rig({ seed: boardTheRepairWillTouch() });
     try {
       const tables = r.db.prepare(
         "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
@@ -798,26 +925,64 @@ describe('the write surface: there is not one', () => {
             .update(JSON.stringify(r.db.prepare(`SELECT * FROM "${table}"`).all()))
             .digest('hex');
         }
-        return JSON.stringify(out);
+        return out;
       };
       const configBefore = fs.readFileSync(path.join(r.home, 'config.json'), 'utf8');
       const before = snapshot();
+      const itemsBefore = r.db.prepare('SELECT * FROM items ORDER BY id').all();
 
-      for (const tool of mcp.TOOLS) {
-        for (const args of [
-          {}, { limit: 50 }, { id: r.itemId }, { query: 'invoice' },
-          { thread: 'thread-invoice' }, { messageId: r.msgId },
-          { from: '2026-01-01', to: '2027-01-01' }, { state: 'open' }, { bucket: 'now' },
-        ]) {
-          await r.mcpCall(callRpc(tool.name, args));
-        }
+      const everyShape = [
+        {}, { limit: 50 }, { id: r.itemId }, { query: 'invoice' },
+        { thread: 'thread-invoice' }, { messageId: r.msgId },
+        { from: '2026-01-01', to: '2027-01-01' }, { state: 'open' }, { bucket: 'now' },
+      ];
+
+      // The six read-only tools first, and on their own: if one of them wrote,
+      // the board repair running later would give it somewhere to hide.
+      for (const tool of mcp.TOOLS.filter((t) => t.annotations.readOnlyHint === true)) {
+        for (const args of everyShape) await r.mcpCall(callRpc(tool.name, args));
       }
       // …and the protocol methods, in case one of those writes.
       for (const method of ['initialize', 'ping', 'tools/list', 'resources/list', 'prompts/list']) {
         await r.mcpCall(rpc(method, {}));
       }
+      const afterReads = snapshot();
+      for (const table of tables) {
+        assert.equal(afterReads[table], before[table], `a read-only tool changed the ${table} table`);
+      }
 
-      assert.equal(snapshot(), before, 'a read changed a row');
+      // Now the one that is allowed to move a row.
+      const writers = mcp.TOOLS.filter((t) => t.annotations.readOnlyHint !== true).map((t) => t.name);
+      assert.deepEqual(writers, ['zelos_board'], 'a second writing tool appeared — this test only accounts for one');
+      for (const args of everyShape) await r.mcpCall(callRpc('zelos_board', args));
+
+      const after = snapshot();
+      for (const table of tables) {
+        if (table === 'items') continue;
+        assert.equal(after[table], before[table], `the board read changed the ${table} table`);
+      }
+
+      const itemsAfter = r.db.prepare('SELECT * FROM items ORDER BY id').all();
+      assert.notEqual(JSON.stringify(itemsAfter), JSON.stringify(itemsBefore),
+        'the fixture is back to being one the repair has nothing to do on — this test proves nothing again');
+      assert.equal(itemsAfter.length, itemsBefore.length, 'a read deleted or invented an item');
+      const was = new Map(itemsBefore.map((row) => [row.id, row]));
+      for (const row of itemsAfter) {
+        const prior = was.get(row.id);
+        assert.ok(prior, 'a read invented an item');
+        for (const col of ['headline', 'why', 'person', 'person_email', 'due_at', 'severity',
+          'kind', 'source_refs_json', 'payload_json', 'first_seen', 'link']) {
+          assert.equal(row[col], prior[col], `a read rewrote items.${col}`);
+        }
+        assert.ok(['open', 'snoozed'].includes(row.state), `a read moved an item to ${row.state}`);
+        assert.ok(row.bucket === prior.bucket || row.bucket === 'today',
+          `a read moved an item to ${row.bucket}, which is not the demotion the bar performs`);
+      }
+      assert.equal(r.db.prepare("SELECT COUNT(*) AS n FROM items WHERE state = 'open' AND bucket = 'now'").get().n, 4,
+        'the bar the repair exists to hold');
+      assert.equal(dbm.getItem(r.db, r.asleep).state, 'open',
+        'the due snooze woke, which is what makes a fifth appear');
+
       const configAfter = fs.readFileSync(path.join(r.home, 'config.json'), 'utf8');
       const ignoreStamp = (s) => s.replace(/"lastUsedAt": (?:"[^"]*"|null)/g, '"lastUsedAt": <stamp>');
       assert.equal(ignoreStamp(configAfter), ignoreStamp(configBefore),

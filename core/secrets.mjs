@@ -18,6 +18,11 @@
  * Backend order per SPEC §2: macOS keychain, Windows DPAPI, libsecret, then the
  * encrypted-file fallback. Set ZELOS_SECRETS_BACKEND to force one (used by the
  * tests to exercise the fallback on a machine that has a keychain).
+ *
+ * Detection runs once and is then *pinned*: the first successful write records
+ * the store in `secrets.backend.json`, and from then on that record beats the
+ * probe — see "the backend on record" below for why a probe that changes its
+ * mind is how a user's credentials end up in two places at once.
  */
 
 import fs from 'node:fs';
@@ -256,8 +261,19 @@ async function probeMacKeychain() {
   }
   try {
     const { code } = await run('/usr/bin/security', ['find-generic-password', '-s', SERVICE, '-a', 'zelos.probe'], { timeoutMs: 8000 });
-    // 0 = an item is there, 44 = reachable and empty. Anything else (locked
-    // keychain, no keychain in a headless session) means we should not rely on it.
+    // 0 = an item is there, 44 = reachable and empty. Anything else means we
+    // should not rely on it.
+    //
+    // This form omits -g, so it asks for attributes and never for the item's
+    // data — the branch that prompts, and the branch a locked keychain refuses.
+    // A locked keychain therefore probably answers 44 here and passes. An
+    // earlier version of this comment named a locked keychain and a headless
+    // session as the reasons for a non-zero exit; that was asserted rather than
+    // measured, and settling it means running `security` against whatever login
+    // keychain the machine has, which this module's tests are not allowed to
+    // do. The honest half is narrow: a code other than 0 or 44 is an answer we
+    // do not understand. The ways we know of to get one are the 8s timeout, a
+    // refused spawn, and a sandbox denial.
     return code === 0 || code === NOT_FOUND_EXIT;
   } catch {
     return false;
@@ -285,16 +301,136 @@ async function probeSecretTool() {
   }
 }
 
+async function probeBackend() {
+  if (process.platform === 'darwin' && (await probeMacKeychain())) return 'macos-keychain';
+  if (process.platform === 'win32' && (await probePowershell())) return 'windows-dpapi';
+  if (process.platform === 'linux' && (await probeSecretTool())) return 'libsecret';
+  return 'encrypted-file';
+}
+
+/* -------------------------------------------------- the backend on record
+ * A probe is a guess about this instant, and it decided where every credential
+ * for the rest of the process went — `backend()` caches under
+ * `platform|env|home`, with no probe result in the key, so nothing could revise
+ * it. One 8-second timeout, one spawn refused by a sandbox, one secret-tool
+ * losing its race with the keyring daemon at session start, and a password
+ * typed that afternoon landed in `secrets.enc` — a file the docs tell users is
+ * "only present if your system has no keychain". The next launch probed
+ * successfully, went back to the keychain, and read the OLD value out of it:
+ * a rotated password silently ignored, authentication failing for a reason
+ * nothing on screen could explain.
+ *
+ * So the store a home actually committed to is written down at the first
+ * successful setSecret, and from then on the record beats the probe. A
+ * disagreement now surfaces as a real error from the tool that is missing
+ * ("could not read model.default from macos-keychain") instead of a quiet move
+ * to a second store. Two deliberate exceptions:
+ *
+ *  - ZELOS_SECRETS_BACKEND still wins outright. That is a person saying it on
+ *    purpose, and it is how the tests reach the fallback on a machine with a
+ *    keychain. It does NOT move the record: `recordBackend` leaves a usable
+ *    record alone, so a forced run over a home that has already committed puts
+ *    the value somewhere a later unforced run will not look. That is the price
+ *    of "the first store to hold a secret wins", and it is deliberate — an
+ *    override is not evidence about where the rest of this home's credentials
+ *    are. It is not left silent either: `core/doctor.mjs:405-414` reads this
+ *    same record, notices the override, and says in as many words that
+ *    anything saved while it is set lands elsewhere and will not be found
+ *    without it. (An earlier version of this comment claimed the record *was*
+ *    updated. It never was, and doctor's text was the honest one.)
+ *  - A record naming a backend that cannot exist on this platform is ignored:
+ *    that is a home copied from another machine, which is a migration rather
+ *    than a flaky probe.
+ */
+
+function backendRecordFile() {
+  return path.join(paths().home, 'secrets.backend.json');
+}
+
+/** Which platform each backend needs. null means "works anywhere". */
+const BACKEND_PLATFORM = {
+  'macos-keychain': 'darwin',
+  'windows-dpapi': 'win32',
+  libsecret: 'linux',
+  'encrypted-file': null,
+};
+
+function readBackendRecord() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(backendRecordFile(), 'utf8'));
+    return BACKEND_NAMES.includes(parsed?.backend) ? parsed.backend : null;
+  } catch {
+    return null;
+  }
+}
+
+function usableHere(name) {
+  const needs = BACKEND_PLATFORM[name];
+  return needs === null || needs === process.platform;
+}
+
+/**
+ * Called only after a value really landed somewhere. The first store to hold a
+ * secret wins; later calls leave the record alone, because the whole point is
+ * that it does not move under a home that has credentials in it. The one
+ * rewrite is a record naming a backend this platform does not have — the home
+ * has moved machines, and the old name is now unreachable.
+ */
+function recordBackend(name) {
+  const recorded = readBackendRecord();
+  if (recorded === name) return;
+  if (recorded && usableHere(recorded)) return;
+  try {
+    writeFileAtomic(backendRecordFile(), `${JSON.stringify({ backend: name }, null, 2)}\n`, 0o600);
+  } catch (err) {
+    // Losing the record costs the protection above, not the secret that was
+    // just stored — so this is a warning, not a failed write.
+    log.warn('secrets: could not record which store this home uses', { error: err.message });
+  }
+}
+
+/**
+ * Reconcile a probe with the record. Exported for the same reason
+ * `describeCommand` is: it is the whole of the decision, it is pure, and a test
+ * can put every combination through it on any platform without going anywhere
+ * near a real credential store — which no test of `detect()` itself can do.
+ */
+export function chooseBackend({ probed, recorded, platform = process.platform }) {
+  if (!recorded || recorded === probed) return probed;
+  const needs = BACKEND_PLATFORM[recorded];
+  if (needs && needs !== platform) return probed;
+  return recorded;
+}
+
 async function detect() {
   const forced = process.env.ZELOS_SECRETS_BACKEND;
   if (forced) {
     if (!BACKEND_NAMES.includes(forced)) throw new Error(`ZELOS_SECRETS_BACKEND must be one of ${BACKEND_NAMES.join(', ')}`);
     return forced;
   }
-  if (process.platform === 'darwin' && (await probeMacKeychain())) return 'macos-keychain';
-  if (process.platform === 'win32' && (await probePowershell())) return 'windows-dpapi';
-  if (process.platform === 'linux' && (await probeSecretTool())) return 'libsecret';
-  return 'encrypted-file';
+  const probed = await probeBackend();
+  const recorded = readBackendRecord();
+  const chosen = chooseBackend({ probed, recorded });
+  if (recorded && recorded !== probed) {
+    // Three distinct situations, and they must not share a sentence. The
+    // record-wins case has two shapes, because `probeBackend` only ever names
+    // encrypted-file as a *fallback*: if the record is an OS store then the
+    // probe failed, and if the record is encrypted-file then the probe
+    // succeeded and the OS store is back. Saying "it did not answer just now"
+    // about encrypted-file — which is a file on disk and always answers — is
+    // the opposite of what happened, and it is the more common of the two,
+    // since it is what every home that ever fell back looks like from then on.
+    let message;
+    if (chosen !== recorded) {
+      message = `secrets: this folder last used ${recorded}, which does not exist on ${process.platform} — using ${probed}, and anything held by ${recorded} will need re-entering`;
+    } else if (recorded === 'encrypted-file') {
+      message = `secrets: ${probed} is available again, but this folder's secrets are in secrets.enc — staying there, because a keychain this home has never written to would answer with stale items or nothing at all`;
+    } else {
+      message = `secrets: ${recorded} is where this folder's secrets were stored, but it did not answer just now — staying with it rather than starting a second store in ${probed}`;
+    }
+    log.warn(message, { recorded, probed, chosen });
+  }
+  return chosen;
 }
 
 /** -> {name, writable, note} */
@@ -368,19 +504,87 @@ function storeFile() {
   return path.join(paths().home, 'secrets.enc');
 }
 
-/** 32 random bytes, generated once per machine, mode 0600. */
-function machineSeed() {
-  const file = seedFile();
+/**
+ * Move a file out of the way instead of writing over it.
+ *
+ * `writeFileAtomic()` renames the replacement into place, so the bytes that
+ * were there are unlinked the instant it returns. That is fine for a config
+ * file and fatal for a key: the old `machineSeed()` minted and wrote a
+ * replacement as a side effect of being *asked to read* `.seed`, and the
+ * ciphertext was then set aside three lines later under the comment "if the
+ * seed turns up, it is still recoverable" — with the seed it needed already
+ * destroyed. A rename costs nothing and keeps both halves on disk.
+ *
+ * Callers pass a shared stamp so a seed and the store it keys land as
+ * `.seed.unreadable-1754800000000` / `secrets.enc.unreadable-1754800000000` and
+ * are obviously a pair to whoever has to put them back together.
+ */
+function setAside(file, stamp) {
+  const aside = `${file}.unreadable-${stamp}`;
   try {
-    const hex = fs.readFileSync(file, 'utf8').trim();
-    if (/^[0-9a-f]{64}$/.test(hex)) return Buffer.from(hex, 'hex');
-    log.warn('secrets: .seed was malformed, generating a new one — existing encrypted secrets will need re-entering');
-  } catch (err) {
-    if (err.code !== 'ENOENT') throw err;
+    fs.renameSync(file, aside);
+    return aside;
+  } catch {
+    return null; // nothing more we can do
   }
-  const seed = crypto.randomBytes(32);
-  writeFileAtomic(file, `${seed.toString('hex')}\n`, 0o600);
-  return seed;
+}
+
+/**
+ * The seed if there is a usable one, and NOTHING written either way.
+ *
+ * Reading is split from minting because the two used to be the same function,
+ * and every caller that only wanted to look — `getSecret()`, which the
+ * background sweep and `zelos doctor` both call — could destroy the key. The
+ * damage needed no deliberate act: a sync client appending a conflict line, a
+ * stray leading byte, a duplicated line, a truncation of a few characters.
+ * All of those leave the original 64 hex characters sitting on disk, and all of
+ * them used to be answered by overwriting them.
+ *
+ * `state` is 'ok' | 'absent' | 'malformed'. Nothing tries to salvage a seed out
+ * of a malformed file: a file holding two different 64-hex tokens would have us
+ * guessing which one keys the store, and guessing wrong writes a fresh store
+ * over a recoverable one. The file is kept instead, so a person can pick the
+ * right characters out of it by hand — which is exactly how the audit that
+ * found this recovered a secret it had proved was still intact.
+ */
+function readSeed() {
+  const file = seedFile();
+  let text;
+  try {
+    text = fs.readFileSync(file, 'utf8');
+  } catch (err) {
+    if (err.code === 'ENOENT') return { seed: null, state: 'absent' };
+    throw err;
+  }
+  const hex = text.trim();
+  if (/^[0-9a-f]{64}$/.test(hex)) return { seed: Buffer.from(hex, 'hex'), state: 'ok' };
+  return { seed: null, state: 'malformed' };
+}
+
+/**
+ * 32 random bytes, generated once per machine, mode 0600 — minted only when
+ * there is nothing a new seed would strand.
+ *
+ * Anything still on disk that the new seed cannot open is moved aside first,
+ * under one shared timestamp. In practice `readEncryptedStore()` has already
+ * done that by the time a write gets here; the check stays because it is the
+ * invariant that makes minting safe at all, and a future caller that reaches
+ * this without reading first must not be the one that breaks it.
+ */
+function ensureSeed() {
+  const { seed, state } = readSeed();
+  if (seed) return seed;
+
+  const stamp = Date.now();
+  const asideSeed = state === 'malformed' ? setAside(seedFile(), stamp) : null;
+  const asideStore = fs.existsSync(storeFile()) ? setAside(storeFile(), stamp) : null;
+  if (asideSeed || asideStore) {
+    log.warn('secrets: no usable .seed, so a new one was generated — anything it could not open was moved aside and those secrets must be re-entered',
+      { seed: asideSeed, store: asideStore });
+  }
+  const fresh = crypto.randomBytes(32);
+  writeFileAtomic(seedFile(), `${fresh.toString('hex')}\n`, 0o600);
+  return fresh;
 }
 
 function deriveKey(seed, saltHex) {
@@ -408,9 +612,24 @@ function readEncryptedStore() {
     if (err.code === 'ENOENT') return {};
     throw err;
   }
+  // Reading never mints. There is ciphertext in front of us, so a seed created
+  // here would be a seed created *for a store it cannot open* — and the write
+  // that created it would take the real key with it.
+  const { seed, state } = readSeed();
+  if (!seed) {
+    const stamp = Date.now();
+    const asideSeed = state === 'malformed' ? setAside(seedFile(), stamp) : null;
+    const asideStore = setAside(file, stamp);
+    log.error(state === 'malformed'
+      ? 'secrets: .seed is damaged, so the encrypted store cannot be opened; both were moved aside under one timestamp and are recoverable together if the 64 hex characters can be salvaged. Secrets must be re-entered.'
+      : 'secrets: .seed is missing, so the encrypted store cannot be opened; the ciphertext was moved aside. Secrets must be re-entered.',
+      { seed: asideSeed, store: asideStore });
+    return {};
+  }
+
   try {
     const env = JSON.parse(raw);
-    const key = deriveKey(machineSeed(), env.kdf.salt);
+    const key = deriveKey(seed, env.kdf.salt);
     const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(env.iv, 'hex'));
     decipher.setAAD(AAD);
     decipher.setAuthTag(Buffer.from(env.tag, 'hex'));
@@ -418,10 +637,11 @@ function readEncryptedStore() {
     const parsed = JSON.parse(plain.toString('utf8'));
     return parsed && typeof parsed === 'object' ? parsed : {};
   } catch (err) {
-    // Wrong seed or a damaged file. Keep the ciphertext — if the seed turns up,
-    // it is still recoverable — but let the user carry on with a fresh store.
-    const aside = `${file}.unreadable-${Date.now()}`;
-    try { fs.renameSync(file, aside); } catch { /* nothing more we can do */ }
+    // A well-formed seed that is the wrong one, or a damaged file. Keep the
+    // ciphertext — if the right seed turns up, it is still recoverable — and
+    // keep the seed on disk too: it is valid, it is what the next store will be
+    // keyed by, and it costs nothing to leave where it is.
+    const aside = setAside(file, Date.now());
     log.error('secrets: encrypted store could not be decrypted; moved aside, secrets must be re-entered', { aside, error: err.message });
     return {};
   }
@@ -429,7 +649,7 @@ function readEncryptedStore() {
 
 function writeEncryptedStore(store) {
   const salt = crypto.randomBytes(16);
-  const key = deriveKey(machineSeed(), salt.toString('hex'));
+  const key = deriveKey(ensureSeed(), salt.toString('hex'));
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
   cipher.setAAD(AAD);
@@ -469,10 +689,14 @@ export async function setSecret(ref, value) {
   const { name } = await backend();
   assertValue(name, value);
 
+  // Each path records the backend only after the value is really in it: the
+  // record exists to say "this home's credentials are HERE", and a failed write
+  // has not put anything anywhere.
   if (name === 'encrypted-file') {
     const store = readEncryptedStore();
     store[ref] = value;
     writeEncryptedStore(store);
+    recordBackend(name);
     return { ok: true, backend: name };
   }
 
@@ -481,6 +705,7 @@ export async function setSecret(ref, value) {
     const { code, stderr } = await run(desc.file, desc.args, { input: stdinFor(desc, value), env: desc.env });
     if (code !== 0) throw new Error(`secrets: DPAPI write failed for ${ref} (exit ${code}) ${stderr.trim()}`);
     rememberRef(ref);
+    recordBackend(name);
     return { ok: true, backend: name };
   }
 
@@ -492,6 +717,7 @@ export async function setSecret(ref, value) {
     throw new Error(`secrets: keychain rejected the value for ${ref} (prompt mismatch); nothing usable was stored`);
   }
   rememberRef(ref);
+  recordBackend(name);
   return { ok: true, backend: name };
 }
 
@@ -565,14 +791,48 @@ export async function deleteSecret(ref) {
   return { ok: true, deleted: true };
 }
 
+/**
+ * Three answers, not two: 'yes', 'no', and 'unknown' for a probe that could not
+ * be run or would not say.
+ *
+ * The boolean version could not tell "the user deleted it" from "the keyring
+ * did not answer", and `listRefs()` wrote the shrunken list back — so one
+ * locked keyring, one unlock prompt answered slower than the 15-second timeout,
+ * one D-Bus hiccup, and `secrets.index.json` was permanently emptied. The
+ * values themselves survived in the keychain, which is what made it so quiet:
+ * mail kept syncing, while Ask started answering "no model is configured yet"
+ * and Settings showed placeholders until every password was re-entered.
+ */
 async function hasSecret(name, ref) {
-  if (name === 'windows-dpapi') return fs.existsSync(dpapiFile(ref));
+  if (name === 'windows-dpapi') {
+    const blob = dpapiFile(ref);
+    if (fs.existsSync(blob)) return 'yes';
+    // The blob lives under %LOCALAPPDATA%, and dpapiFile() falls back to the
+    // Zelos home when that variable is missing — so a relaunch without it looks
+    // in a directory Zelos has never written to, where every ref reads as
+    // deleted. A missing directory is not an empty store; it is the wrong
+    // address.
+    return fs.existsSync(path.dirname(blob)) ? 'no' : 'unknown';
+  }
+
   const desc = describeCommand({ name, action: 'has', ref });
   try {
-    const { code } = await run(desc.file, desc.args, { env: desc.env });
-    return code === 0;
+    const { code, stderr } = await run(desc.file, desc.args, { env: desc.env });
+    if (code === 0) return 'yes';
+    if (name === 'libsecret' && code === 1) {
+      // secret-tool spends exit 1 on both "no such item" and "the keyring did
+      // not answer" — probeSecretTool() above already knows this and reads
+      // stderr to tell them apart. Not-found is exit 1 with nothing on stderr,
+      // so anything printed there means we could not ask.
+      return stderr.trim() ? 'unknown' : 'no';
+    }
+    if (code === NOT_FOUND_EXIT) return 'no';
+    return 'unknown';
   } catch {
-    return false;
+    // Spawn refused, or run()'s timeout fired and SIGKILLed the tool. Both mean
+    // the question was never answered, which is the one thing this must not
+    // report as an answer.
+    return 'unknown';
   }
 }
 
@@ -586,10 +846,20 @@ export async function listRefs() {
 
   const known = readIndex();
   const alive = [];
+  let answered = true;
   for (const ref of known) {
-    if (await hasSecret(name, ref)) alive.push(ref);
+    const state = await hasSecret(name, ref);
+    // A ref we could not ask about stays in the list. Zelos wrote it, nothing
+    // has said it is gone, and the caller's next getSecret() will find out for
+    // real — whereas dropping it turns a five-second keyring stall into a UI
+    // that says the account was never set up.
+    if (state !== 'no') alive.push(ref);
+    if (state === 'unknown') answered = false;
   }
-  // Something deleted outside Zelos (Keychain Access, say) should not linger.
-  if (alive.length !== known.length) writeIndex(alive);
+  // Something deleted outside Zelos (Keychain Access, say) should not linger —
+  // but only prune when every probe actually answered. Pruning on a partial
+  // answer is what made a transient failure permanent: the index is the only
+  // record that a keychain item is ours, and there is no way to rebuild it.
+  if (answered && alive.length !== known.length) writeIndex(alive);
   return alive;
 }

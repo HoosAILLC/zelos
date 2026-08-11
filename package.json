@@ -9,8 +9,10 @@
   "main": "./core/server.mjs",
   "files": [
     "core/",
+    "!core/sources/oauth.mjs",
     "ui/",
     "assets/",
+    "!assets/icon.png",
     "docs/*.md",
     "zelos.mjs",
     "README.md",

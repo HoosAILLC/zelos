@@ -123,12 +123,25 @@ function sendJson(res, status, value) {
   res.end(payload);
 }
 
-function sendChunks(res, canned) {
+function sendChunks(res, canned, state) {
   res.writeHead(canned.status ?? 200, canned.headers ?? SSE_HEADERS);
+  // writeHead only stages the headers — node flushes them with the first body
+  // write. A real SSE server sends them straight away, and without this a
+  // "headers then silence" plan would be indistinguishable to the client from
+  // "no response at all", which is a different bug with a different bound.
+  res.flushHeaders();
   const delay = canned.delayMs ?? 0;
   let i = 0;
   const next = () => {
     if (i >= canned.chunks.length) {
+      // `thenHang` is the wedged-upstream shape: a healthy 200, optionally some
+      // chunks, and then a socket that stays open saying nothing. Ending the
+      // response instead would test the happy path.
+      if (canned.thenHang) {
+        state.hung.add(res);
+        res.on('close', () => state.hung.delete(res));
+        return;
+      }
       res.end();
       return;
     }
@@ -179,7 +192,7 @@ async function startMock() {
           res.write(typeof canned.body === 'string' ? canned.body : '{"choices":[');
           return;
         }
-        if (canned.chunks) return sendChunks(res, canned);
+        if (canned.chunks) return sendChunks(res, canned, state);
         const payload = typeof canned.body === 'string' ? canned.body : JSON.stringify(canned.body ?? {});
         res.writeHead(canned.status ?? 200, {
           'content-type': 'application/json',
@@ -191,11 +204,11 @@ async function startMock() {
 
       // Default behaviour: act like a correct server for both protocols.
       if (req.method === 'POST' && url.pathname === '/chat/completions') {
-        if (body?.stream) return sendChunks(res, { chunks: OPENAI_SSE });
+        if (body?.stream) return sendChunks(res, { chunks: OPENAI_SSE }, state);
         return sendJson(res, 200, OPENAI_COMPLETION);
       }
       if (req.method === 'POST' && url.pathname === '/v1/messages') {
-        if (body?.stream) return sendChunks(res, { chunks: ANTHROPIC_SSE });
+        if (body?.stream) return sendChunks(res, { chunks: ANTHROPIC_SSE }, state);
         return sendJson(res, 200, ANTHROPIC_MESSAGE);
       }
       if (req.method === 'GET' && url.pathname === '/models') return sendJson(res, 200, OPENAI_MODELS);
@@ -756,6 +769,139 @@ test('stream() surfaces a mid-stream anthropic error event', async () => {
 });
 
 /* ------------------------------------------------------------------ *
+ * Streaming: the idle deadline
+ *
+ * The bound on a stream cannot be a total one — a long answer is allowed to
+ * take a long time — so it is a silence detector instead. These three tests
+ * pin the whole contract: silence from the start ends it, silence after
+ * keepalives ends it, and keepalives themselves hold it open.
+ * ------------------------------------------------------------------ */
+
+test('a stream that never sends a byte is bounded, not waited on forever', { timeout: 8000 }, async () => {
+  // 200, SSE headers, then nothing. Clearing the request timer on response
+  // headers left this to undici's bodyTimeout, which fired at a measured
+  // 301,028 ms — five minutes of "Thinking…" for a wedged proxy.
+  mock.plan.push({ chunks: [], thenHang: true });
+  const started = Date.now();
+  await assert.rejects(
+    async () => {
+      for await (const _event of stream({
+        protocol: 'openai',
+        baseUrl: mock.origin,
+        model: 'llama3.2',
+        messages: [{ role: 'user', content: 'hi' }],
+        timeoutMs: 400,
+        retries: 0,
+      })) {
+        /* nothing should arrive */
+      }
+    },
+    (err) => {
+      assert.ok(err instanceof LLMError);
+      assert.match(err.message, /did not respond in time/);
+      assert.match(err.message, /127\.0\.0\.1/, 'the error must name the address');
+      return true;
+    },
+  );
+  assert.ok(Date.now() - started < 3000, 'the deadline must cover the first byte too');
+});
+
+test('keepalives hold a stream open, and the silence after them ends it', { timeout: 8000 }, async () => {
+  // Four SSE comments 250 ms apart under a 400 ms deadline, then silence. Both
+  // halves matter. The comments must reset the clock — proxies inject them and
+  // anthropic sends {"type":"ping"} by design, so a reader that only counted
+  // frames it understood would abort healthy streams. And the silence after
+  // them must still bite: this exact server, pinging every 2 s, previously kept
+  // stream({timeoutMs:1500}) running past 45 s with no bound at all.
+  mock.plan.push({
+    chunks: [': ping\n\n', ': ping\n\n', ': ping\n\n', 'data: {"type":"ping"}\n\n'],
+    delayMs: 250,
+    thenHang: true,
+  });
+  const started = Date.now();
+  await assert.rejects(
+    async () => {
+      for await (const _event of stream({
+        protocol: 'openai',
+        baseUrl: mock.origin,
+        model: 'llama3.2',
+        messages: [{ role: 'user', content: 'hi' }],
+        timeoutMs: 400,
+        retries: 0,
+      })) {
+        /* a ping is not a token; nothing should arrive */
+      }
+    },
+    (err) => {
+      assert.ok(err instanceof LLMError);
+      assert.match(err.message, /did not respond in time/);
+      return true;
+    },
+  );
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed >= 700, `the keepalives must reset the deadline (gave up after ${elapsed}ms)`);
+  assert.ok(elapsed < 5000, `and the silence after them must end it (took ${elapsed}ms)`);
+});
+
+test('a stream that keeps delivering outlives the deadline it keeps resetting', async () => {
+  // Ten chunks 100 ms apart: a second of wall clock under a 500 ms deadline. A
+  // total timeout would kill this mid-answer, which is why the bound is idle.
+  const chunks = [];
+  for (let i = 0; i < 4; i++) {
+    chunks.push(': ping\n\n', `data: {"choices":[{"delta":{"content":"${i}"}}]}\n\n`);
+  }
+  chunks.push(': ping\n\n', 'data: [DONE]\n\n');
+  mock.plan.push({ chunks, delayMs: 100 });
+
+  const started = Date.now();
+  const events = await collect(
+    stream({
+      protocol: 'openai',
+      baseUrl: mock.origin,
+      model: 'llama3.2',
+      messages: [{ role: 'user', content: 'hi' }],
+      timeoutMs: 500,
+      retries: 0,
+    }),
+  );
+  const elapsed = Date.now() - started;
+  assert.equal(events.at(-1).type, 'done');
+  assert.equal(events.at(-1).text, '0123', 'every token survived');
+  assert.ok(elapsed > 500, `the stream really did outlast its deadline (${elapsed}ms)`);
+});
+
+test('the Stop button still reaches a stream that is mid-flight', async () => {
+  // The idle deadline shares one AbortController with the caller's signal, so
+  // this is the test that catches a fix that wired the timer and unwired Stop.
+  mock.plan.push({ chunks: [': ping\n\n'], delayMs: 50, thenHang: true });
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), 100);
+  const started = Date.now();
+  await assert.rejects(
+    async () => {
+      for await (const _event of stream({
+        protocol: 'openai',
+        baseUrl: mock.origin,
+        model: 'llama3.2',
+        messages: [{ role: 'user', content: 'hi' }],
+        timeoutMs: 30_000,
+        retries: 0,
+        signal: controller.signal,
+      })) {
+        /* nothing to collect */
+      }
+    },
+    (err) => {
+      assert.ok(err instanceof LLMError);
+      assert.match(err.message, /cancelled/i);
+      assert.match(err.message, /127\.0\.0\.1/);
+      return true;
+    },
+  );
+  assert.ok(Date.now() - started < 3000, 'Stop must not wait out the idle deadline');
+});
+
+/* ------------------------------------------------------------------ *
  * Retry policy
  * ------------------------------------------------------------------ */
 
@@ -1105,6 +1251,160 @@ test('an HTML response (wrong base URL) produces a legible error', async () => {
 });
 
 /* ------------------------------------------------------------------ *
+ * A failure that arrives with a success status
+ * ------------------------------------------------------------------ */
+
+test('a 200 carrying an error body is a failure, not an empty answer', async () => {
+  // OpenRouter's shape for a billing problem: HTTP 200, the refusal inside the
+  // envelope, no `choices` at all. Read as a success this is text:'' — which
+  // painted Settings' "Test the connection" green on a dead endpoint, and then
+  // had the sweep tell the user to buy a larger model to fix an empty account.
+  mock.plan.push({ status: 200, body: { error: { message: '402: insufficient credits', code: 402 } } });
+  await assert.rejects(
+    () =>
+      complete({
+        protocol: 'openai',
+        baseUrl: mock.origin,
+        model: 'llama3.2',
+        messages: [{ role: 'user', content: 'hi' }],
+        retries: 0,
+      }),
+    (err) => {
+      assert.ok(err instanceof LLMError);
+      assert.match(err.message, /insufficient credits/, 'the provider detail must survive');
+      assert.match(err.message, /127\.0\.0\.1/, 'the error must name the address');
+      assert.equal(err.retriable, false, 'a rejected request does not get better on a retry');
+      return true;
+    },
+  );
+  assert.equal(mock.requests.length, 1, 'and it must not be retried');
+
+  // anthropic's own envelope, which stream() has always thrown on.
+  mock.plan.push({
+    status: 200,
+    body: { type: 'error', error: { type: 'overloaded_error', message: 'upstream is busy' } },
+  });
+  await assert.rejects(
+    () =>
+      complete({
+        protocol: 'anthropic',
+        baseUrl: mock.origin,
+        model: 'claude-opus-5',
+        apiKey: 'k',
+        messages: [{ role: 'user', content: 'hi' }],
+        retries: 0,
+      }),
+    (err) => {
+      assert.ok(err instanceof LLMError);
+      assert.match(err.message, /upstream is busy/);
+      return true;
+    },
+  );
+
+  // A bare string error, which some aggregators send instead of an object.
+  mock.plan.push({ status: 200, body: { error: 'model not found on this account' } });
+  await assert.rejects(
+    () =>
+      complete({
+        protocol: 'openai',
+        baseUrl: mock.origin,
+        model: 'llama3.2',
+        messages: [{ role: 'user', content: 'hi' }],
+        retries: 0,
+      }),
+    (err) => {
+      assert.match(err.message, /model not found on this account/);
+      return true;
+    },
+  );
+});
+
+test('an error body that quotes the request back does not quote the key back', async () => {
+  // Same reasoning as readErrorDetail: this text is written by a third party,
+  // it is shown in Settings, and a sweep writes it into runs.stats_json on disk.
+  mock.plan.push({
+    status: 200,
+    body: { error: { message: 'rejected request with Authorization: Bearer sk-live-do-not-log' } },
+  });
+  await assert.rejects(
+    () =>
+      complete({
+        protocol: 'openai',
+        baseUrl: mock.origin,
+        model: 'llama3.2',
+        apiKey: 'sk-live-do-not-log',
+        messages: [{ role: 'user', content: 'hi' }],
+        retries: 0,
+      }),
+    (err) => {
+      assert.ok(!err.message.includes('sk-live-do-not-log'), `key leaked: ${err.message}`);
+      assert.match(err.message, /key withheld/);
+      return true;
+    },
+  );
+});
+
+test('a mid-stream error frame that quotes the request back does not quote the key back', async () => {
+  /* REGRESSION. `complete()`, `readErrorDetail` and `listModels()` all scrubbed
+     the key out of provider-written text; `stream()` was the fourth path and
+     did not, and it was the worst one to miss. An Ask failure goes two places
+     at once (core/server.mjs): onto the SSE channel, where ui/views/ask.js
+     writes it into the answer body a person is reading, and through `log.warn`,
+     which appends it to ~/.zelos/logs and leaves it there. Measured against a
+     loopback endpoint that echoes the rejected request:
+
+       failed mid-stream: rejected upstream request with
+                          Authorization: Bearer sk-live-DO-NOT-LOG-9f3a
+
+     Both protocols are covered because they take different branches — anthropic
+     through the `event: error` case, openai through the `event?.error` test. */
+  const KEY = 'sk-live-do-not-log-9f3a';
+  const cases = [
+    {
+      protocol: 'openai',
+      chunks: [`data: ${JSON.stringify({ error: { message: `rejected with Authorization: Bearer ${KEY}` } })}\n\n`],
+    },
+    {
+      protocol: 'anthropic',
+      chunks: [`event: error\ndata: ${JSON.stringify({ type: 'error', error: { message: `rejected x-api-key ${KEY}` } })}\n\n`],
+    },
+  ];
+  for (const { protocol, chunks } of cases) {
+    mock.plan.push({ status: 200, headers: SSE_HEADERS, chunks });
+    await assert.rejects(
+      () => collect(stream({
+        protocol,
+        baseUrl: mock.origin,
+        model: 'llama3.2',
+        apiKey: KEY,
+        messages: [{ role: 'user', content: 'hi' }],
+        retries: 0,
+      })),
+      (err) => {
+        assert.ok(!err.message.includes(KEY), `${protocol} leaked the key mid-stream: ${err.message}`);
+        assert.match(err.message, /key withheld/, `${protocol} did not scrub`);
+        assert.match(err.message, /failed mid-stream/, `${protocol} lost the diagnosis`);
+        return true;
+      },
+    );
+  }
+});
+
+test('a healthy reply carrying "error": null is still a success', async () => {
+  // Several providers include the field on the happy path. Treating a present
+  // key as a failure would break every one of them.
+  mock.plan.push({ status: 200, body: { ...OPENAI_COMPLETION, error: null } });
+  const result = await complete({
+    protocol: 'openai',
+    baseUrl: mock.origin,
+    model: 'llama3.2',
+    messages: [{ role: 'user', content: 'hi' }],
+    retries: 0,
+  });
+  assert.equal(result.text, 'pong');
+});
+
+/* ------------------------------------------------------------------ *
  * Argument validation
  * ------------------------------------------------------------------ */
 
@@ -1198,6 +1498,61 @@ test('listModels refuses a remote address with no key, and reports server errors
       assert.match(err.message, /check the base URL/);
       return true;
     },
+  );
+});
+
+test('REGRESSION: a 200 catalogue carrying an error body is a failure, not an empty catalogue', async () => {
+  // The same blind spot as complete()'s, on the same helper, and it was left
+  // behind when that one was fixed. A GET /models answering 200 with the
+  // refusal in the envelope has no `data` and no `models`, so modelRows() found
+  // nothing and this returned []. Settings then renders "0 models available."
+  // beside an empty dropdown (ui/views/settings.js:278) — the endpoint is
+  // reported as having no models when what it actually did was refuse to say,
+  // and the provider's own sentence, which is the only thing that tells the
+  // reader whether to top up an account or fix a key, is thrown away.
+  mock.plan.push({ status: 200, body: { error: { message: '402: insufficient credits', code: 402 } } });
+  await assert.rejects(
+    () => listModels({ protocol: 'openai', baseUrl: mock.origin, apiKey: 'sk-list', retries: 0 }),
+    (err) => {
+      assert.ok(err instanceof LLMError);
+      assert.match(err.message, /insufficient credits/, 'the provider detail must survive');
+      assert.match(err.message, /127\.0\.0\.1/, 'the error must name the address');
+      assert.equal(err.retriable, false, 'a rejected request does not get better on a retry');
+      return true;
+    },
+  );
+  assert.equal(mock.requests.length, 1, 'and it must not be retried');
+
+  // anthropic's envelope, over the anthropic path.
+  mock.plan.push({ status: 200, body: { type: 'error', error: { type: 'authentication_error', message: 'invalid x-api-key' } } });
+  await assert.rejects(
+    () => listModels({ protocol: 'anthropic', baseUrl: mock.origin, apiKey: 'sk-ant-list', retries: 0 }),
+    (err) => {
+      assert.match(err.message, /invalid x-api-key/);
+      return true;
+    },
+  );
+
+  // The key must not come back out in the message, for the same reason it must
+  // not in complete()'s: this string reaches Settings and a doctor report.
+  mock.plan.push({
+    status: 200,
+    body: { error: { message: 'rejected: Authorization: Bearer sk-live-do-not-log' } },
+  });
+  await assert.rejects(
+    () => listModels({ protocol: 'openai', baseUrl: mock.origin, apiKey: 'sk-live-do-not-log', retries: 0 }),
+    (err) => {
+      assert.equal(err.message.includes('sk-live-do-not-log'), false, 'the key came back in the catalogue error');
+      return true;
+    },
+  );
+
+  // And the other direction: `"error": null` is what several providers send on
+  // a perfectly good catalogue, and it must not read as a failure.
+  mock.plan.push({ status: 200, body: { error: null, data: [{ id: 'llama3.2' }] } });
+  assert.deepEqual(
+    await listModels({ protocol: 'openai', baseUrl: mock.origin, apiKey: 'sk-list', retries: 0 }),
+    [{ id: 'llama3.2', label: 'llama3.2' }],
   );
 });
 

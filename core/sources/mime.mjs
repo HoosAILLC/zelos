@@ -98,7 +98,6 @@ const CHARSET_ALIASES = new Map([
   ['iso-2022-jp-2', 'iso-2022-jp'],
 ]);
 
-/** Bytes -> string. Unknown charsets fall back to lossy utf-8 rather than failing. */
 /**
  * windows-1252, decoded here rather than by the runtime.
  *
@@ -109,9 +108,16 @@ const CHARSET_ALIASES = new Map([
  * mojibake; v22.23 and v26 get it right. That is not a difference anyone
  * downloading this should have to know about, and the table is sixteen lines.
  *
+ * It runs for every label that resolves to windows-1252, not for the one that
+ * is spelled that way — see `decodeCharset`. That is most of the non-UTF-8
+ * mail there is, iso-8859-1 above all.
+ *
  * Only 0x80–0x9F needs saying: below it cp1252 is ASCII, above it Latin-1,
  * and both of those map to the same code point as the byte itself. The five
- * holes are the positions cp1252 leaves undefined, which become U+FFFD.
+ * holes are the positions cp1252 leaves undefined, which become U+FFFD. A
+ * correct runtime hands back the C1 control at that code point instead
+ * (0x81 -> U+0081); U+FFFD is the deliberate difference, because a visible
+ * replacement character beats an invisible control travelling downstream.
  */
 const CP1252_HIGH = [
   0x20ac, 0xfffd, 0x201a, 0x0192, 0x201e, 0x2026, 0x2020, 0x2021,
@@ -130,6 +136,7 @@ function decodeCp1252(buf) {
   return out;
 }
 
+/** Bytes -> string. Unknown charsets fall back to lossy utf-8 rather than failing. */
 export function decodeCharset(input, charset) {
   const buf = toBuffer(input);
   const raw = String(charset ?? '')
@@ -138,13 +145,23 @@ export function decodeCharset(input, charset) {
     .replace(/^["']|["']$/g, '')
     .replace(/\*.*$/, ''); // RFC 2231 language suffix: "utf-8*en"
   const label = CHARSET_ALIASES.get(raw) ?? (raw || 'utf-8');
-  if (label === 'windows-1252') return decodeCp1252(buf);
+
+  let decoder;
   try {
-    return new TextDecoder(label).decode(buf);
+    decoder = new TextDecoder(label);
   } catch {
-    // Non-fatal decoders never throw, so this only fires on an unknown label.
-    return new TextDecoder('utf-8').decode(buf);
+    // Only an unknown label throws; decoding itself is non-fatal and never does.
+    decoder = new TextDecoder('utf-8');
   }
+  // Ask the runtime what the label resolved to rather than matching the string.
+  // Every one of "iso-8859-1", "latin1", "us-ascii", "ascii", "l1", "iso_8859-1"
+  // and "x-cp1252" is a label for windows-1252 in the WHATWG set, so a match on
+  // the spelling covered one message in the wild and missed the rest — and
+  // iso-8859-1, the commonest non-UTF-8 label there is, was being aliased
+  // *away* from the fix two lines above. Asking the decoder catches all of
+  // them, including labels nobody thought to list.
+  if (decoder.encoding === 'windows-1252') return decodeCp1252(buf);
+  return decoder.decode(buf);
 }
 
 /* ------------------------------------------------------------------ *
@@ -411,8 +428,30 @@ function cleanEmail(raw) {
  * HTML -> text
  * ------------------------------------------------------------------ */
 
-const BLOCK_TAG =
-  /<\/?(?:p|div|br|tr|li|ul|ol|h[1-6]|table|thead|tbody|tfoot|blockquote|section|article|header|footer|hr|pre|address|form|figure|figcaption|dl|dt|dd|nav|main|aside|center)\b[^>]*>/gi;
+/** Tags whose boundary is a line break in the plain-text rendering. */
+const BLOCK_TAGS = new Set([
+  'p', 'div', 'br', 'tr', 'li', 'ul', 'ol', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+  'table', 'thead', 'tbody', 'tfoot', 'blockquote', 'section', 'article', 'header',
+  'footer', 'hr', 'pre', 'address', 'form', 'figure', 'figcaption', 'dl', 'dt', 'dd',
+  'nav', 'main', 'aside', 'center',
+]);
+
+/** Tags whose *content* is not text and is dropped along with the tag. */
+const RAW_TEXT_TAGS = new Set(['script', 'style', 'head', 'noscript', 'template']);
+
+/**
+ * The most HTML one part is allowed to contribute, in characters.
+ *
+ * The scanner below is linear, so this is the second fuse rather than the
+ * first. It exists because the only other ceiling on a body part is IMAP's
+ * MAX_LITERAL_BYTES — 64 MB — and everything after the scan (the entity
+ * decode, the per-line whitespace collapse, the split/join) allocates another
+ * copy of whatever it is handed. 512 KB of HTML is a very large newsletter;
+ * what survives it is still far more text than the 4,000 characters the model
+ * is shown or the 240 the snippet keeps, and it bounds the whole function at a
+ * few milliseconds for any input a stranger can choose.
+ */
+const MAX_HTML_CHARS = 512 * 1024;
 
 const NAMED_ENTITIES = new Map(Object.entries({
   amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ',
@@ -431,15 +470,30 @@ const NAMED_ENTITIES = new Map(Object.entries({
   shy: '', zwnj: '', zwj: '', lrm: '', rlm: '',
 }));
 
-/** Best-effort plain text from an HTML part. Never returns markup. */
+/**
+ * Best-effort plain text from an HTML part. Never returns a tag.
+ *
+ * This used to be a stack of six regexes, and four of them were quadratic in
+ * the length of the body: a lazy `[\s\S]*?` restarts its scan of the whole
+ * remainder at every `<` it could have started from, and a greedy `[^>]*`
+ * inside a tag pattern does the same at every position a tag name matches.
+ * Measured on Node 26.3.0 with 256 KB of input: benign HTML 5 ms, against
+ * `'<script>'` repeated 575 ms, `'<head>'` repeated 863 ms, `'<!--'` repeated
+ * 6.8 s, a bare `'<'` repeated 20.2 s and `'<p'` repeated 21.1 s. At 64 MB —
+ * the IMAP literal ceiling — those are hours, and core runs in Electron's main
+ * process, so it is the window and the tray that stop, every 30 minutes for as
+ * long as the message stays in the last 14 days.
+ *
+ * So the tags are removed by one left-to-right pass that visits each character
+ * once, and the input is capped before it starts. The pass also fixes what the
+ * regexes got wrong: `<[^>]*>` ends a tag at the first `>`, including one
+ * inside `alt="Shop Now >"`, which leaked the rest of that tag into the text
+ * and could swallow real prose after it.
+ */
 export function htmlToText(input) {
   let s = String(input ?? '');
-  s = s.replace(/<!--[\s\S]*?-->/g, ' ');
-  s = s.replace(/<(script|style|head|noscript|template)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, ' ');
-  s = s.replace(/<(script|style)\b[^>]*>[\s\S]*$/gi, ' '); // unterminated: drop the rest
-  s = s.replace(/<\/(?:td|th)\s*>/gi, ' ');
-  s = s.replace(BLOCK_TAG, '\n');
-  s = s.replace(/<[^>]*>/g, '');
+  if (s.length > MAX_HTML_CHARS) s = s.slice(0, MAX_HTML_CHARS);
+  s = stripTags(s);
   s = decodeEntities(s);
   s = s.replace(/\r\n?/g, '\n');
   s = s
@@ -448,6 +502,148 @@ export function htmlToText(input) {
     .join('\n');
   s = s.replace(/\n{3,}/g, '\n\n');
   return s.trim();
+}
+
+/**
+ * Remove the markup, keep the text, in one pass.
+ *
+ * The rules are the ones a browser uses, because the sender wrote the message
+ * for a browser:
+ *  - `<` only opens markup when a letter, `/`, `!` or `?` follows it. "a < b"
+ *    in prose is text; the old `<[^>]*>` ate it and everything up to the next
+ *    `>`, which in a wide table was the rest of the row.
+ *  - a quote only opens an attribute value directly after `=`. Honouring
+ *    quotes anywhere inside a tag would let one stray `"` in a generated
+ *    template swallow the paragraph that follows it.
+ *  - anything unterminated runs to the end of the input, which is where a
+ *    browser's tokenizer also gives up. There is nothing after it to lose:
+ *    an unterminated tag or quoted value means there is no later `>` at all.
+ */
+function stripTags(html) {
+  const n = html.length;
+  let out = '';
+  let plain = 0; // start of the literal text not yet emitted
+  let i = 0;
+  // Names already known to have no closing tag left in the input. Without it,
+  // "<head>" repeated searches the whole remainder for a "</head" that is not
+  // there, once per copy — 4.9 s for 256 KB, the same quadratic in a different
+  // coat. A search that failed from here fails from anywhere later.
+  const unclosed = new Set();
+
+  while (i < n) {
+    const lt = html.indexOf('<', i);
+    if (lt < 0) break;
+
+    // Comments. An unterminated one takes the rest of the document, as a
+    // browser does — and as leaving it in the text emphatically did not.
+    if (html.startsWith('<!--', lt)) {
+      out += `${html.slice(plain, lt)} `;
+      const close = html.indexOf('-->', lt + 4);
+      if (close < 0) return out;
+      i = plain = close + 3;
+      continue;
+    }
+
+    const second = html[lt + 1];
+    const closing = second === '/';
+
+    // "<!DOCTYPE html>", "<?xml ... ?>", "</ ": not elements, but still markup
+    // — a browser calls the last two bogus comments and drops them too.
+    if (second === '!' || second === '?' || (closing && !isAsciiLetter(html.charCodeAt(lt + 2)))) {
+      out += html.slice(plain, lt);
+      const gt = html.indexOf('>', lt + 2);
+      if (gt < 0) return out;
+      i = plain = gt + 1;
+      continue;
+    }
+
+    const nameStart = lt + (closing ? 2 : 1);
+    if (!isAsciiLetter(html.charCodeAt(nameStart))) {
+      i = lt + 1; // a lone "<" in prose: leave it in the text run
+      continue;
+    }
+    let nameEnd = nameStart + 1;
+    while (nameEnd < n && isTagNameChar(html.charCodeAt(nameEnd))) nameEnd++;
+    const name = html.slice(nameStart, nameEnd).toLowerCase();
+
+    if (!closing && RAW_TEXT_TAGS.has(name)) {
+      out += `${html.slice(plain, lt)} `;
+      const close = unclosed.has(name) ? -1 : findClosingTag(html, name, nameEnd);
+      if (close >= 0) {
+        const gt = findTagEnd(html, close + 2 + name.length);
+        if (gt < 0) return out;
+        i = plain = gt + 1;
+        continue;
+      }
+      // No closer. script and style hold code and never prose, so they take
+      // the rest with them; head, noscript and template can hold text a person
+      // wrote, so only the tag goes and the content stays as text. That split
+      // is what the regex version did, and it is the safer half of each guess.
+      if (name === 'script' || name === 'style') return out;
+      unclosed.add(name);
+      const gt = findTagEnd(html, nameEnd);
+      if (gt < 0) return out;
+      i = plain = gt + 1;
+      continue;
+    }
+
+    out += html.slice(plain, lt);
+    const gt = findTagEnd(html, nameEnd);
+    if (gt < 0) return out;
+    if (BLOCK_TAGS.has(name)) out += '\n';
+    else if (closing && (name === 'td' || name === 'th')) out += ' ';
+    i = plain = gt + 1;
+  }
+
+  return out + html.slice(plain);
+}
+
+/** Index of the `>` that ends a tag whose name ended at `from`, or -1. */
+function findTagEnd(html, from) {
+  let afterEquals = false;
+  for (let i = from; i < html.length; i++) {
+    const c = html[i];
+    if (c === '>') return i;
+    if (c === '=') { afterEquals = true; continue; }
+    if (c === ' ' || c === '\t' || c === '\n' || c === '\r' || c === '\f') continue;
+    if (afterEquals && (c === '"' || c === "'")) {
+      const close = html.indexOf(c, i + 1);
+      if (close < 0) return -1; // the value never ends, so neither does the tag
+      i = close;
+    }
+    afterEquals = false;
+  }
+  return -1;
+}
+
+/** Index of the `<` of `</name`, searching from `from`, or -1. */
+function findClosingTag(html, name, from) {
+  let i = from;
+  while (i < html.length) {
+    const lt = html.indexOf('</', i);
+    if (lt < 0) return -1;
+    const after = lt + 2;
+    if (html.slice(after, after + name.length).toLowerCase() === name) {
+      const c = html.charCodeAt(after + name.length);
+      // 62 ">", 47 "/", NaN end-of-input — anything else and this is a
+      // different tag that merely starts with the same letters.
+      if (c === 62 || c === 47 || Number.isNaN(c) || isHtmlSpace(c)) return lt;
+    }
+    i = after;
+  }
+  return -1;
+}
+
+function isAsciiLetter(code) {
+  return (code >= 97 && code <= 122) || (code >= 65 && code <= 90);
+}
+
+function isTagNameChar(code) {
+  return isAsciiLetter(code) || (code >= 48 && code <= 57) || code === 45 || code === 95 || code === 58;
+}
+
+function isHtmlSpace(code) {
+  return code === 32 || code === 9 || code === 10 || code === 13 || code === 12;
 }
 
 function decodeEntities(s) {

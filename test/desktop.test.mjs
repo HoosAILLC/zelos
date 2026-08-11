@@ -23,7 +23,14 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { classifyTarget, guardWebContents } from '../desktop/guard.js';
 import { clampToDisplays, DEFAULT_BOUNDS, MIN_SIZE, WindowState } from '../desktop/window-state.js';
 import { buildAppMenuTemplate, buildTrayMenuTemplate, supportsLoginItem, VIEWS } from '../desktop/menus.js';
-import { acquireHomeLock, holdHome, lockHolderState, readHomeLock, startCore } from '../desktop/runtime.js';
+import { startCore } from '../desktop/runtime.js';
+/* The lock used to be defined in desktop/runtime.js and is now in core/, which
+   is what made it reachable from the published package at all — `desktop/` is
+   deliberately not shipped, so a lock living there was a lock only a git
+   checkout had. It is still exercised here rather than in a file of its own,
+   because the shell is one of its two callers and every case below was written
+   against that caller. See core/home-lock.mjs for the whole story. */
+import { acquireHomeLock, holdHome, lockHolderState, readHomeLock } from '../core/home-lock.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, '..');
@@ -480,6 +487,8 @@ export class BrowserWindow {
       width: options.width,
       height: options.height,
     };
+    this.boundsSets = 0;
+    this.centred = 0;
     recorded.windows.push(this);
     // Electron announces every webContents on the app object; the shell's
     // navigation guard is attached from there, so the stub must do it too.
@@ -506,6 +515,25 @@ export class BrowserWindow {
   isDestroyed() { return this.destroyed; }
   getBounds() { return Object.assign({}, this.bounds); }
   getNormalBounds() { return Object.assign({}, this.bounds); }
+  // Electron emits move and resize from setBounds, and WindowState is listening
+  // to both — so a corrected position is a position that gets remembered.
+  setBounds(bounds) {
+    this.boundsSets += 1;
+    Object.assign(this.bounds, bounds);
+    this.emit('move');
+    this.emit('resize');
+    return this;
+  }
+  // The real one places the window on the display it is on, or the primary one
+  // when that answer is nowhere; the stub has a single display to place it on.
+  center() {
+    this.centred += 1;
+    const area = screen.getAllDisplays()[0].workArea;
+    this.bounds.x = Math.round(area.x + (area.width - this.bounds.width) / 2);
+    this.bounds.y = Math.round(area.y + (area.height - this.bounds.height) / 2);
+    this.emit('move');
+    return this;
+  }
 }
 BrowserWindow.getAllWindows = () => recorded.windows;
 
@@ -716,14 +744,35 @@ describe('the shell, booted against a stub Electron', () => {
     assert.deepEqual(contents.windowOpenHandler({ url: 'https://example.com/' }), { action: 'deny' });
   });
 
-  it('cancels any request from the board that is not the board', () => {
+  it('cancels any request from the board that is not the board, on every scheme', () => {
     const { filter, handler } = recorded.beforeRequest;
-    assert.deepEqual(filter.urls, ['*://*/*']);
+    // Not `*://*/*`. That pattern reads as "any scheme" and means http and
+    // https: `*` in the scheme position of a match pattern is those two only.
+    // Measured against the pinned Electron 43.3.0 with five requests on five
+    // schemes, `*://*/*` delivered three to this handler and `<all_urls>`
+    // delivered five — the two it had been swallowing were ws: and wss:. The
+    // filter is the whole of the bug, and it cannot be caught from the handler
+    // side: a handler that is never called cancels nothing and looks perfect.
+    assert.deepEqual(filter.urls, ['<all_urls>'],
+      'a backstop sold as the layer a CSP bypass cannot reach must see every scheme');
 
     const verdicts = [];
-    handler({ url: 'https://telemetry.example/collect' }, (r) => verdicts.push(r.cancel));
+    for (const url of [
+      'https://telemetry.example/collect',
+      'ws://telemetry.example/socket',
+      'wss://telemetry.example/socket',
+      // The board's own port, still not the board: it speaks SSE over fetch and
+      // opens no socket, so a WebSocket to loopback is somebody else's idea.
+      `ws://127.0.0.1:${booted.zelos.port}/`,
+    ]) {
+      handler({ url }, (r) => verdicts.push(r.cancel));
+    }
+    assert.deepEqual(verdicts, [true, true, true, true]);
+
+    // And the board's own files still load — the half that makes this a
+    // backstop rather than a wall.
     handler({ url: `${booted.zelos.url}app.css` }, (r) => verdicts.push(r.cancel));
-    assert.deepEqual(verdicts, [true, false]);
+    assert.equal(verdicts.at(-1), false);
   });
 
   it('denies every browser permission but the one the copy buttons need', () => {
@@ -811,7 +860,17 @@ describe('the shell, booted against a stub Electron', () => {
 
     booted.actions.setOpenAtLogin(true);
     assert.equal(recorded.loginItem.openAtLogin, true);
-    assert.equal(recorded.loginItem.openAsHidden, true, 'a login launch must not steal the screen');
+    /* openAtLogin and nothing else. This used to also assert `openAsHidden`,
+       under the message "a login launch must not steal the screen" — a claim
+       no code path in this repo delivers. Electron 43 marks the flag
+       deprecated and does not implement it on macOS 13 and up, it does not
+       exist on Windows where menus.js offers the same checkbox, and its
+       counterpart `wasOpenedAsHidden` is read nowhere here, so createWindow()
+       shows the window at 1180×820 whatever the OS answers. Passing it again
+       would restore the promise without restoring any behaviour, which is what
+       this pins against. */
+    assert.deepEqual(Object.keys(recorded.loginItem), ['openAtLogin'],
+      'the shell must ask the OS only for what it can actually deliver');
     assert.equal(booted.actions.openAtLogin(), true);
 
     booted.actions.setOpenAtLogin(false);
@@ -899,6 +958,48 @@ describe('the shell, booted against a stub Electron', () => {
     const state = JSON.parse(fs.readFileSync(path.join(home, 'window.json'), 'utf8'));
     assert.equal(state.bounds.width, win.options.width);
     assert.equal(state.bounds.height, win.options.height);
+  });
+
+  it('re-fits a hidden window to the displays that are left, before showing it', () => {
+    /* The tray-resident path is the one that can lose a window: `close` hides
+       it instead of destroying it, so it can sit for hours holding a rectangle
+       on a monitor that is unplugged in the meantime, and `show()` honours that
+       rectangle exactly. Live on Windows, and on Linux with
+       ZELOS_TRAY_RESIDENT=1; not on macOS, where AppKit constrains the frame
+       onto a real screen by itself — there the code runs and finds nothing to
+       do, which is what the last case below asserts.
+
+       The stub screen has one work area: 1680×1020 at the origin. */
+    const win = recorded.windows[0];
+
+    // Hidden at x:1500 with a second monitor to the right of it; the laptop
+    // came off the desk, and 180px of the window is all that is still on a
+    // screen — enough to count as visible, not enough to leave where it is.
+    win.hide();
+    win.bounds = { x: 1500, y: 960, width: 1180, height: 820 };
+    booted.actions.openBoard();
+    assert.equal(win.visible, true);
+    assert.deepEqual(win.getBounds(), { x: 500, y: 200, width: 1180, height: 820 },
+      'a window shown where its monitor used to be is a window the user cannot find');
+
+    // The harder half: nothing that exists overlaps it at all, so there is no
+    // corrected position to slide to — only a screen to start over on.
+    win.hide();
+    win.bounds = { x: 2600, y: 300, width: 1180, height: 820 };
+    const centred = win.centred;
+    booted.actions.openBoard();
+    assert.equal(win.centred, centred + 1, 'a window whose display is gone must be re-placed, not shown at x:2600');
+    assert.equal(win.visible, true);
+
+    // And a window that never went anywhere is left alone — not re-set to the
+    // same numbers. Every tray click and every ⌘Tab comes through here, and a
+    // setBounds per visit is a move event per visit for no reason at all.
+    win.hide();
+    win.bounds = { x: 120, y: 90, width: 1180, height: 820 };
+    const sets = win.boundsSets;
+    booted.actions.openBoard();
+    assert.equal(win.boundsSets, sets, 'a window that is where it says it is must not be moved');
+    assert.deepEqual(win.getBounds(), { x: 120, y: 90, width: 1180, height: 820 });
   });
 
   it('holds the data home while it runs, with the pid and the port in it', () => {
@@ -1091,19 +1192,49 @@ describe('the lock on the data home', () => {
     }
   });
 
-  it('the launcher really takes it — the half that makes the lock mean anything', () => {
-    // For a long time only the Electron shell took the lock, so the pairing it
-    // was written for (a `zelos` in a terminal plus the app in the tray) was
-    // exactly the pairing it could not see. This asserts the CLI entry point
-    // holds the home, by reading zelos.mjs rather than by starting a server:
-    // booting one here would bind a socket and fight the rest of the suite.
+  it('the launcher reaches the lock through a path the package actually ships', () => {
+    /* REGRESSION, and the reason this test is not the one that used to be here.
+       The old version grepped zelos.mjs for the string `holdHome` and passed —
+       while the feature was completely dead in every installed copy. The
+       launcher was importing it from `./desktop/runtime.js`, `package.json`'s
+       `files` list deliberately omits `desktop/` (the Electron shell is a
+       separate artefact, and the test two files over asserts the tarball is
+       free of it), and the ERR_MODULE_NOT_FOUND went into a bare `catch {}`.
+       Measured on the packed tarball: no zelos.lock was ever written and a
+       second process on a busy home started silently. A grep for a function
+       name cannot see any of that, because the name was right; the *import
+       target* was the defect.
+
+       So this asserts the shape that broke: the launcher may only reach the
+       lock through a specifier the published `files` list covers. The
+       behavioural half — that a `zelos` run out of the real tarball warns about
+       a home somebody else holds — is in test/cli.test.mjs, which has an
+       extracted tarball to run from. */
     const source = fs.readFileSync(path.join(REPO, 'zelos.mjs'), 'utf8');
-    assert.match(source, /holdHome/, 'zelos.mjs must take the home lock');
-    assert.match(source, /kind: 'cli'/, 'and identify itself as the terminal one');
-    // And it must not be able to take the app down with it: the import is
-    // defensive because a source checkout may have no desktop shell beside it.
-    const call = source.slice(source.indexOf('holdHome') - 400, source.indexOf('holdHome') + 200);
+    const shipped = JSON.parse(fs.readFileSync(path.join(REPO, 'package.json'), 'utf8')).files;
+
+    const specifiers = [...source.matchAll(/(?:^|[^\w])import\(\s*'([^']+)'/g)].map((m) => m[1])
+      .concat([...source.matchAll(/from\s+'([^']+)'/g)].map((m) => m[1]))
+      .filter((s) => s.startsWith('.'));
+    const lockImport = specifiers.find((s) => s.includes('home-lock'));
+    assert.ok(lockImport, 'zelos.mjs must import the home lock — it is the CLI half of the exclusion');
+    assert.ok(!specifiers.some((s) => s.startsWith('./desktop/')),
+      `zelos.mjs imports ${specifiers.filter((s) => s.startsWith('./desktop/')).join(', ')}, which npm does not publish`);
+
+    // And the directory it does import from has to be one `files` carries.
+    const dir = `${lockImport.replace(/^\.\//, '').split('/')[0]}/`;
+    assert.ok(shipped.includes(dir), `zelos.mjs takes the lock from ${dir}, which is not in package.json files`);
+    assert.ok(!shipped.some((f) => f.startsWith('desktop')), 'the Electron shell is a separate artefact and must stay out of the tarball');
+
+    assert.match(source, /kind: 'cli'/, 'the launcher must identify itself as the terminal one');
+    // It must still never be able to take the launcher down with it — but a
+    // silent catch is what hid the dead import for a whole release, so the
+    // failure has to reach the log on its way past.
+    const at = source.indexOf(`import('${lockImport}')`);
+    assert.notEqual(at, -1, 'the lock has to be loaded at the point of use, after --home has been settled');
+    const call = source.slice(at - 200, at + 600);
     assert.match(call, /try\s*{/, 'the lock must never be able to stop the launcher');
+    assert.match(call, /catch\s*\(\s*err\s*\)[\s\S]{0,200}warn/, 'and a swallowed failure has to say so');
   });
 });
 

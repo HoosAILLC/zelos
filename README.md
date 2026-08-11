@@ -12,8 +12,10 @@ whatever model you choose — including one running on your own desk.
 
 ## Zero dependencies
 
-Not "few" — zero. There is no `dependencies` block, no `node_modules`, no postinstall script,
-nothing to audit but the code itself.
+Not "few" — zero. There is no `dependencies` block, no top-level `node_modules`, no postinstall
+script, nothing to audit but the code itself. (`desktop/` has its own `package.json` with Electron
+and electron-builder as `devDependencies` — they build a window and never reach the core, and none
+of them ships in the published package.)
 
 That is not asceticism. It is the product's central claim: an app that reads your mail should not
 ask you to trust a supply chain you cannot see. Everything is Node built-ins — `node:sqlite`
@@ -21,7 +23,13 @@ ask you to trust a supply chain you cannot see. Everything is Node built-ins —
 
 The consequence is that the IMAP client, the MIME and RFC 2047 decoders, the RFC 5545 parser with
 RRULE expansion, the CalDAV client and the model adapter are all written here, from the RFCs.
-About 23,000 lines, and a test suite that is a substantial fraction of it.
+About **27,800 lines** of JavaScript in `core/`, `ui/` and `zelos.mjs`, and a test suite that is
+**larger than the code it tests** — 28,858 lines in `test/`. Count them yourself:
+
+```bash
+{ find core ui -name '*.mjs' -o -name '*.js'; echo zelos.mjs; } | xargs wc -l | tail -1
+wc -l test/*.mjs | tail -1
+```
 
 ## Run it
 
@@ -39,8 +47,18 @@ It opens in your browser at `127.0.0.1` and stays there. Nothing to install, no 
 zelos              # run it — this is the one you want
 zelos sweep        # read your sources once, think, print what changed, stop
 zelos doctor       # check every part of the setup and say what to do about what is wrong
-zelos mcp          # serve read-only MCP tools so another AI client can read your board
+zelos mcp          # serve the MCP read tools over stdio so another AI client can read your board
 ```
+
+**The `zelos` command needs an install that does not exist yet.** `zelos-app` has never been
+published to npm — `npm view zelos-app` answers 404 — so `npx zelos-app` and `npm i -g zelos-app`
+both fail today. Run it from source (`node zelos.mjs sweep`, `node zelos.mjs doctor`, and so on)
+until somebody publishes. [docs/INSTALL.md](docs/INSTALL.md) has the details.
+
+Seven MCP tools, none of which sends, deletes or reconfigures anything. Six declare `readOnlyHint`;
+`zelos_board` does not, because reading the board does what opening the window does — wakes a snooze
+that has come due, and holds the `now` bucket to four items. [docs/SECURITY.md § 6a](docs/SECURITY.md)
+has the exact extent of it.
 
 ## What leaves your machine
 
@@ -48,12 +66,24 @@ Exactly three things, and you chose all three: your mail provider, your calendar
 model endpoint. Point it at a local model and that becomes none. No telemetry, no analytics, no
 update pings, no crash reports.
 
-Your keys live in your operating system's keychain. On macOS and Linux the database is `0600` inside
-a `0700` home; on Windows there are no POSIX modes to set, so the protection is the ACL on your user
-profile — see [docs/SECURITY.md](docs/SECURITY.md#5-what-leaves-your-machine) for what that does and
-does not buy you.
-The local server binds `127.0.0.1` only, mints a new session token every launch, requires it on
-every `/api/*` request, and rejects foreign origins.
+Your keys live in your operating system's keychain — **when there is one**. With no keychain
+available (a headless Linux box, or a desktop without `secret-tool`), they go to `secrets.enc` in
+`~/.zelos`, encrypted with a key held in `.seed` **in the same folder**. That protects a copied disk
+or a stray backup and nothing else; anything running as you can read both files. Zelos says so in
+the app, and `zelos doctor` says which backend this home is actually on.
+
+On macOS and Linux the database is `0600` inside a `0700` home; on Windows there are no POSIX modes
+to set, so the protection is the ACL on your user profile — see
+[docs/SECURITY.md](docs/SECURITY.md#5-what-leaves-your-machine) for what that does and does not buy
+you.
+
+The local server binds `127.0.0.1` only, mints a new session token every launch, and rejects foreign
+origins. Every one of the 27 routes in the router's table needs that token. **One path is not in
+that table:** `POST /api/mcp`, the channel an AI client uses. It is lifted out of the pipeline
+*before* the session gate because it takes the separate AI token you mint in Settings, and the two
+credentials work in neither direction — the session gate returns 401 for an AI token, and the MCP
+gate ignores `X-Zelos-Token` entirely. The loopback bind, the `Host` check and the `Origin` check
+apply to it unchanged, so a web page cannot reach it even holding a stolen bearer token.
 
 **One thing said plainly:** your mail is written by other people, so a message can contain text
 aimed at the model. Zelos never acts on what the model says — it renders, and you click. That is a

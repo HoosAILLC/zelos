@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 
 process.env.ZELOS_LOG_LEVEL = 'silent';
 const HOME_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'zelos-secrets-'));
@@ -12,7 +13,7 @@ process.env.ZELOS_HOME = path.join(HOME_ROOT, 'home');
 const secrets = await import('../core/secrets.mjs');
 const {
   backend, setSecret, getSecret, deleteSecret, listRefs,
-  describeCommand, resetBackendCache, SERVICE,
+  describeCommand, resetBackendCache, chooseBackend, SERVICE,
 } = secrets;
 
 const mode = (p) => fs.statSync(p).mode & 0o777;
@@ -231,6 +232,205 @@ test('encrypted-file fallback: a lost seed cannot be brute-forced from the file'
   assert.equal(fs.readFileSync(path.join(home, aside), 'utf8'), before, 'the old ciphertext is kept as-is');
 });
 
+/**
+ * The trap this catches: minting a seed was a side effect of reading one.
+ * `machineSeed()` wrote a replacement over a `.seed` it could not parse, and it
+ * ran from inside `readEncryptedStore()` — so a plain `getSecret()` destroyed
+ * the key, and the ciphertext was then filed away under the comment "if the
+ * seed turns up, it is still recoverable". The seed was never turning up again.
+ *
+ * Nothing deliberate is needed to get there. This test uses a sync client's
+ * conflict append, which leaves all 64 hex characters intact on the first line;
+ * a stray leading byte, an appended NUL or a duplicated line do the same. And
+ * the callers are the worst possible ones: the background sweep reads a
+ * credential every cycle, and so does `zelos doctor` — the thing a user runs
+ * when they suspect something is wrong.
+ */
+test('encrypted-file fallback: a damaged .seed is set aside, never written over', async () => {
+  forceFallback('damaged-seed');
+  const home = process.env.ZELOS_HOME;
+  const value = 'value-behind-a-damaged-seed';
+  await setSecret('model.default', value);
+
+  const seedPath = path.join(home, '.seed');
+  const storePath = path.join(home, 'secrets.enc');
+  const originalSeed = fs.readFileSync(seedPath, 'utf8');
+  const originalStore = fs.readFileSync(storePath, 'utf8');
+
+  fs.writeFileSync(seedPath, `${originalSeed}<<<<<<< conflicted copy\n${'f'.repeat(64)}\n`);
+
+  // One ordinary read. This is a sweep, or a doctor run, not a user decision.
+  assert.equal(await getSecret('model.default'), null, 'a seed that cannot be parsed cannot decrypt anything');
+
+  const asideSeed = fs.readdirSync(home).filter((f) => f.startsWith('.seed.unreadable-'));
+  assert.equal(asideSeed.length, 1,
+    'the damaged .seed must be kept — the 64 hex characters in it are the only key the ciphertext beside it has');
+  assert.equal(fs.readFileSync(path.join(home, asideSeed[0]), 'utf8').split('\n')[0], originalSeed.trim(),
+    'and kept byte for byte, so the real seed can be picked out of it');
+  assert.equal(fs.existsSync(seedPath), false, 'reading must not mint a replacement seed');
+
+  const asideStore = fs.readdirSync(home).filter((f) => f.startsWith('secrets.enc.unreadable-'));
+  assert.equal(asideStore.length, 1);
+  assert.equal(fs.readFileSync(path.join(home, asideStore[0]), 'utf8'), originalStore);
+  assert.equal(asideSeed[0].slice('.seed'.length), asideStore[0].slice('secrets.enc'.length),
+    'the two carry one timestamp, so whoever has to recover them can see they are a pair');
+
+  // The proof that nothing was lost: salvage the hex, put the ciphertext back,
+  // and the secret reads. This is the recovery the old code made impossible.
+  fs.writeFileSync(seedPath, originalSeed);
+  fs.renameSync(path.join(home, asideStore[0]), storePath);
+  assert.equal(await getSecret('model.default'), value);
+});
+
+/**
+ * #25: detection is a probe, and a probe is a guess about this instant. Before
+ * the record, one wrong guess sent every credential written for the rest of the
+ * process into `secrets.enc`, the next launch guessed right, and the keychain
+ * item it read was the OLD one — a rotated password ignored with nothing on
+ * screen to explain it.
+ *
+ * `chooseBackend` is exercised directly because `detect()` cannot be: an
+ * unforced probe on this machine is the operator's own login keychain, which
+ * the gate further down exists to keep the suite away from. The decision is
+ * pure and takes its platform as an argument, so every combination is reachable
+ * from any OS without going near a real store.
+ */
+test('encrypted-file fallback: the store a home committed to is recorded, and a probe cannot move it', async () => {
+  forceFallback('backend-record');
+  const home = process.env.ZELOS_HOME;
+  await setSecret('model.default', 'sk-ant-api03-committed');
+
+  const recordFile = path.join(home, 'secrets.backend.json');
+  const text = fs.readFileSync(recordFile, 'utf8');
+  assert.deepEqual(JSON.parse(text), { backend: 'encrypted-file' }, 'the first successful write commits the home to a store');
+  assert.ok(!text.includes('sk-ant'), 'the record holds a backend name and nothing else');
+
+  assert.equal(chooseBackend({ probed: 'encrypted-file', recorded: null, platform: 'darwin' }), 'encrypted-file',
+    'a home with no history follows the probe');
+  assert.equal(chooseBackend({ probed: 'macos-keychain', recorded: 'macos-keychain', platform: 'darwin' }), 'macos-keychain');
+
+  // The downgrade: `security` times out once, or a sandbox refuses the spawn.
+  assert.equal(chooseBackend({ probed: 'encrypted-file', recorded: 'macos-keychain', platform: 'darwin' }), 'macos-keychain',
+    'a probe that failed for a moment must not start a second store in secrets.enc');
+  // The same defect pointing the other way, and the worse of the two: a home
+  // whose secrets are in secrets.enc must not silently start reading a keychain
+  // it has never written to, where a stale item would answer in their place.
+  assert.equal(chooseBackend({ probed: 'macos-keychain', recorded: 'encrypted-file', platform: 'darwin' }), 'encrypted-file');
+  assert.equal(chooseBackend({ probed: 'libsecret', recorded: 'encrypted-file', platform: 'linux' }), 'encrypted-file');
+
+  // A record naming a store this platform does not have is a home that moved
+  // machines — a migration, not a flaky probe.
+  assert.equal(chooseBackend({ probed: 'libsecret', recorded: 'macos-keychain', platform: 'linux' }), 'libsecret');
+  assert.equal(chooseBackend({ probed: 'encrypted-file', recorded: 'windows-dpapi', platform: 'darwin' }), 'encrypted-file');
+  // encrypted-file exists everywhere, so it is never discarded as foreign.
+  assert.equal(chooseBackend({ probed: 'macos-keychain', recorded: 'encrypted-file', platform: 'win32' }), 'encrypted-file');
+});
+
+/**
+ * The other half of #25, and the half nothing was holding down: `chooseBackend`
+ * is pure and thoroughly checked above, and `detect()` is what has to CALL it.
+ * Removing the record lookup from `detect()` — `return probed`, three lines
+ * gone — left all 1025 tests green on every platform, because every test that
+ * exercises the reconciliation goes in through `chooseBackend` directly and no
+ * test ever plants a record that disagrees with a probe.
+ *
+ * There are three shapes below and not one, because the expression has two
+ * halves and a test that pins only "the record wins" pins only one of them.
+ * Measured on this suite: `const chosen = probed` fails the first assertion,
+ * and `const chosen = recorded ?? probed` — the record winning even where it
+ * cannot possibly be right — passed all 21 tests until the third was added. A
+ * home carried from a Mac to a Linux box records `macos-keychain`, and under
+ * that mutation every credential read on the new machine spawns
+ * /usr/bin/security, which is not there.
+ *
+ * `detect()` cannot be reached in-process, and that is not an accident: an
+ * unforced probe on this machine is the operator's own login keychain, which
+ * the guard in test/repo.test.mjs exists to keep the suite away from. So the
+ * probe runs in a child, where three things can be arranged that cannot be
+ * arranged here:
+ *
+ *   - `process.platform` is pinned to 'linux' before core/secrets.mjs is
+ *     loaded, so `probeBackend` takes the secret-tool branch on every host.
+ *     /usr/bin/security and powershell.exe are unreachable from that branch,
+ *     which is what makes this safe to run on a developer's Mac.
+ *   - PATH is a directory with nothing in it, so `secret-tool` is not found and
+ *     the probe lands on 'encrypted-file' for a reason this test chose.
+ *   - the environment is BUILT without ZELOS_SECRETS_BACKEND rather than having
+ *     it deleted, so no process that could reach a real store is ever unforced.
+ *
+ * What is left is exactly the disagreement: a home that says one thing and a
+ * probe that says another.
+ */
+const SECRETS_URL = new URL('../core/secrets.mjs', import.meta.url).href;
+
+function detectInChild({ home, pathDir }) {
+  const script = [
+    "Object.defineProperty(process, 'platform', { value: 'linux' });",
+    `const { backend } = await import(${JSON.stringify(SECRETS_URL)});`,
+    'process.stdout.write(JSON.stringify(await backend()));',
+  ].join('\n');
+
+  const { ZELOS_SECRETS_BACKEND: _, ...inherited } = process.env;
+  const env = { ...inherited, ZELOS_HOME: home, ZELOS_LOG_LEVEL: 'silent' };
+  // Windows keeps this variable under the name `Path`, and writing a second
+  // one called `PATH` into a child's block is asking for trouble. It does not
+  // need scrubbing there anyway: `secret-tool` is a Linux binary and the child
+  // only pretends to be Linux.
+  if (process.platform !== 'win32') env.PATH = pathDir;
+
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e', script], { env, encoding: 'utf8' });
+  assert.equal(child.status, 0, `the probe child failed: ${child.stderr}`);
+  return JSON.parse(child.stdout).name;
+}
+
+test('detect() honours the store a home is committed to, even when the probe disagrees', async (t) => {
+  const nowhere = path.join(HOME_ROOT, 'nothing-on-path');
+  fs.mkdirSync(nowhere, { recursive: true });
+
+  const committed = path.join(HOME_ROOT, 'reconcile-keyring');
+  fs.mkdirSync(committed, { recursive: true });
+  fs.writeFileSync(path.join(committed, 'secrets.backend.json'), JSON.stringify({ backend: 'libsecret' }));
+
+  assert.equal(detectInChild({ home: committed, pathDir: nowhere }), 'libsecret',
+    'the probe found no keyring and the record says the secrets are in one; starting a second store in '
+    + 'secrets.enc is how a password typed this afternoon disappears behind the one typed last month');
+
+  // The same disagreement pointing the other way, which is the worse of the
+  // two: a home whose secrets are in secrets.enc must not begin reading a
+  // keyring it has never written to, where a stale item answers in their place.
+  // This one needs a probe that SUCCEEDS, so a stub stands in for secret-tool.
+  await t.test('and a probe that succeeds does not move a home off its file store', { skip: NEEDS_A_SHELL_STUB }, () => {
+    const binDir = path.join(HOME_ROOT, 'reconcile-stub-bin');
+    installSecretToolStub(binDir);
+    const home = path.join(HOME_ROOT, 'reconcile-file');
+    fs.mkdirSync(home, { recursive: true });
+    fs.writeFileSync(path.join(home, 'secrets.backend.json'), JSON.stringify({ backend: 'encrypted-file' }));
+
+    // Proof the stub is what the child will find, before anything is concluded
+    // from the answer: without this, "encrypted-file" would also be what a
+    // child that found no secret-tool at all would say.
+    assert.equal(detectInChild({ home: path.join(HOME_ROOT, 'reconcile-probe-only'), pathDir: binDir }), 'libsecret',
+      'the stub was not on the child\'s PATH, so the assertion below would prove nothing');
+
+    assert.equal(detectInChild({ home, pathDir: binDir }), 'encrypted-file');
+  });
+
+  // The third shape, and the one that says `detect()` consults the whole of
+  // `chooseBackend` rather than just "a record beats a probe": a record naming a
+  // store this platform does not have is a home that moved machines. The child
+  // is pinned to Linux, so a `macos-keychain` record is unreachable from it, and
+  // honouring it would send every read of every credential to a
+  // /usr/bin/security that is not on this machine — a dead app, where following
+  // the probe costs one re-entered password.
+  const migrated = path.join(HOME_ROOT, 'reconcile-migrated');
+  fs.mkdirSync(migrated, { recursive: true });
+  fs.writeFileSync(path.join(migrated, 'secrets.backend.json'), JSON.stringify({ backend: 'macos-keychain' }));
+
+  assert.equal(detectInChild({ home: migrated, pathDir: nowhere }), 'encrypted-file',
+    'a record naming a store that cannot exist on this platform is a migration, not a flaky probe — '
+    + 'pinning the home to it makes every credential read spawn a binary that is not there');
+});
+
 test('refs and values are validated before anything is spawned', async () => {
   forceFallback('validation');
   await assert.rejects(() => setSecret('../etc/passwd', 'x'), TypeError);
@@ -240,6 +440,98 @@ test('refs and values are validated before anything is spawned', async () => {
   await assert.rejects(() => setSecret('model.default', 'has\0nul'), TypeError);
   await assert.rejects(() => getSecret('nope!'), TypeError);
   await assert.rejects(() => deleteSecret('nope!'), TypeError);
+});
+
+/* ------------------------------------------ a keyring that will not answer */
+
+/**
+ * libsecret is the one external backend a test can drive without touching
+ * anything real: `secret-tool` is resolved through PATH, so a stub in front of
+ * it answers every call, and forcing the backend means detection never runs
+ * either. macOS and Linux both execute a `#!/bin/sh` script; Windows does not,
+ * and would not find an extensionless file on PATH to begin with.
+ */
+const NEEDS_A_SHELL_STUB = process.platform === 'win32'
+  ? 'this test puts a #!/bin/sh stub for secret-tool on PATH, which Windows cannot execute'
+  : false;
+
+function installSecretToolStub(dir) {
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, 'secret-tool');
+  fs.writeFileSync(file, `${[
+    '#!/bin/sh',
+    '# Stands in for secret-tool. ZELOS_STUB_MODE picks what the keyring says.',
+    'if [ "$1" = "--zelos-stub" ]; then echo zelos-stub; exit 0; fi',
+    'case "${ZELOS_STUB_MODE:-found}" in',
+    '  found)   echo found-a-value; exit 0 ;;',
+    '  missing) exit 1 ;;',
+    '  dbus)    echo "Cannot autolaunch D-Bus without X11" >&2; exit 1 ;;',
+    '  crash)   echo boom >&2; exit 3 ;;',
+    'esac',
+  ].join('\n')}\n`, { mode: 0o755 });
+  return file;
+}
+
+/**
+ * #24: `hasSecret` was a boolean, so "the keyring did not answer" and "the user
+ * deleted it" were the same answer, and `listRefs()` wrote the shrunken list
+ * back. One locked keyring, one unlock prompt answered slower than the 15s
+ * timeout, one D-Bus hiccup, and `secrets.index.json` was emptied permanently.
+ *
+ * What made it so quiet is that nothing appeared to break: the values are still
+ * in the keyring and mail keeps syncing, while Ask starts answering "no model
+ * is configured yet" and Settings shows placeholders — until every password is
+ * re-entered, for a reason nothing on screen ever gives.
+ */
+test('a keyring that will not answer must not erase the index', { skip: NEEDS_A_SHELL_STUB }, async () => {
+  useHome('probe-unanswered');
+  const home = process.env.ZELOS_HOME;
+  const binDir = path.join(HOME_ROOT, 'stub-bin');
+  const realPath = process.env.PATH;
+  installSecretToolStub(binDir);
+  process.env.PATH = `${binDir}${path.delimiter}${realPath}`;
+  // Forced, so detection never runs and nothing here can reach this machine's
+  // own store. Both halves are proved below before a single value is stored.
+  process.env.ZELOS_SECRETS_BACKEND = 'libsecret';
+  resetBackendCache();
+
+  try {
+    const proof = spawnSync('secret-tool', ['--zelos-stub'], { encoding: 'utf8' });
+    assert.equal(proof.stdout?.trim(), 'zelos-stub',
+      'the stub has to be what "secret-tool" resolves to — if it is not, everything below would be talking to a real keyring');
+    assert.equal((await backend()).name, 'libsecret');
+
+    process.env.ZELOS_STUB_MODE = 'found';
+    await setSecret('model.default', 'stored-in-a-keyring');
+    const indexFile = path.join(home, 'secrets.index.json');
+    assert.deepEqual(JSON.parse(fs.readFileSync(indexFile, 'utf8')), { refs: ['model.default'] });
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(home, 'secrets.backend.json'), 'utf8')), { backend: 'libsecret' },
+      'the store that took the value is the one this home is now committed to');
+    assert.deepEqual(await listRefs(), ['model.default']);
+
+    for (const [mode, shape] of [
+      ['dbus', 'exit 1 with a D-Bus complaint on stderr, which is how secret-tool reports a keyring it cannot reach'],
+      ['crash', 'an exit code with no documented meaning'],
+    ]) {
+      process.env.ZELOS_STUB_MODE = mode;
+      assert.deepEqual(await listRefs(), ['model.default'],
+        `${shape}: a ref nobody has said is gone is still ours`);
+      assert.deepEqual(JSON.parse(fs.readFileSync(indexFile, 'utf8')), { refs: ['model.default'] },
+        `${shape}: the index is the only record that these keyring items are Zelos's, and nothing can rebuild it — so a probe that failed to ask must not prune it`);
+    }
+
+    // The other half of the contract, which the tri-state has to keep: a
+    // straight not-found (exit 1, nothing on stderr) is a real answer, and a
+    // ref deleted in seahorse or Keychain Access should not linger.
+    process.env.ZELOS_STUB_MODE = 'missing';
+    assert.deepEqual(await listRefs(), []);
+    assert.deepEqual(JSON.parse(fs.readFileSync(indexFile, 'utf8')), { refs: [] });
+  } finally {
+    delete process.env.ZELOS_STUB_MODE;
+    process.env.PATH = realPath;
+    process.env.ZELOS_SECRETS_BACKEND = 'encrypted-file';
+    resetBackendCache();
+  }
 });
 
 /* --------------------------------------------- the backend this machine uses */
@@ -511,4 +803,122 @@ test('the DPAPI scripts state their own encoding rather than inheriting it', () 
   const getScript = Buffer.from(get.args.at(-1), 'base64').toString('utf16le');
   assert.match(getScript, /UTF8\.GetBytes/);
   assert.ok(!/\[Console\]::Out\b/.test(getScript));
+});
+
+/* --------------------------------------- the live Linux libsecret backend */
+
+/**
+ * The Linux counterpart of the DPAPI gate above, and it exists for the same
+ * reason: until now, no leg of CI had ever executed the libsecret backend.
+ *
+ * `ubuntu-latest` ships neither `libsecret-tools` nor a keyring daemon, so
+ * detection there lands on 'encrypted-file', the two "real backend" tests see
+ * that and return quietly, and a green Ubuntu run was equally consistent with
+ * libsecret working and with libsecret never having been reached. The argv
+ * shape is checked at the top of this file, but a shape is not a conversation:
+ * what stays unverified without a real binary is whether `secret-tool` ACCEPTS
+ * that argv, whether a missing item really is exit 1 rather than some other
+ * code, and whether the value survives the newline `getSecret` strips off it.
+ *
+ * The gate is `linux` AND `CI` AND `ZELOS_LIBSECRET_LIVE`, and the third is
+ * what the .github/workflows/ci.yml `libsecret` job sets. `CI` alone would turn
+ * every existing Ubuntu leg red for want of a keyring that is not installed
+ * there; the extra variable names the one leg that installs one and runs under
+ * `dbus-run-session`. Letting detection run is the deliberate exception to the
+ * force-the-file-backend rule that test/repo.test.mjs enforces, and it is safe
+ * only because of that gate: a throwaway runner whose keyring dies with the
+ * job. test/repo.test.mjs asserts the workflow and this constant still name
+ * each other, so the gate cannot quietly become permanently-off.
+ */
+const LIBSECRET_LIVE_ONLY = process.platform === 'linux' && process.env.CI && process.env.ZELOS_LIBSECRET_LIVE
+  ? false
+  : 'the live libsecret round-trip runs only on the CI leg that installs a real Secret Service, because '
+    + "letting the backend auto-detect writes into the running account's keyring "
+    + `(platform=${process.platform}, CI=${process.env.CI ? 'set' : 'unset'}, `
+    + `ZELOS_LIBSECRET_LIVE=${process.env.ZELOS_LIBSECRET_LIVE ? 'set' : 'unset'})`;
+
+/** The same throwaway shape the DPAPI ref uses: litter, identifiable at a glance. */
+const LIBSECRET_REF = `zelos-ci-throwaway.libsecret-live.${crypto.randomBytes(6).toString('hex')}`;
+
+/**
+ * Everything a naive implementation gets wrong that this backend is allowed to
+ * carry, on ONE line — and one line is not a shortcut, it is the contract.
+ * `assertValue` in core/secrets.mjs refuses a line break outright for
+ * libsecret, because the tool reads the value as a line from stdin and a
+ * newline would truncate it. The rejection is asserted below rather than worked
+ * around, since this is the only place a real `secret-tool` ever runs.
+ *
+ * The tail is several kilobytes so the value could not have fitted on a command
+ * line even if someone tried to put it there, and it ends in a printable
+ * character: `getSecret` strips ONE trailing newline, which is the one
+ * secret-tool adds, so a value that genuinely ended in a newline could not
+ * round-trip. That is a limit of the backend and asserting it would be writing
+ * it down as correct.
+ */
+const LIBSECRET_VALUE = 'sk-ant-api03-"double" and \'single\' quotes, a $variable, a --lookalike-flag, '
+  + 'a \\backslash\\ and a 100% percent, accents ü é ñ, a check mark outside every single-byte page ✓, '
+  + `and a long tail: ${'zelos-'.repeat(600)}end`;
+
+test('Linux CI: libsecret is the detected backend and really round-trips a secret', { skip: LIBSECRET_LIVE_ONLY }, async (t) => {
+  useHome('libsecret-live');
+  unforce();
+
+  // Registered before anything is written: a keyring item outlives the temp
+  // home that test.after removes, so nothing else would ever clear it.
+  t.after(async () => { await deleteSecret(LIBSECRET_REF).catch(() => {}); });
+
+  const b = await backend();
+  assert.equal(b.name, 'libsecret',
+    `Linux detection chose ${b.name}. If secret-tool cannot be reached on this machine, Zelos silently `
+    + 'stores keys in the encrypted file while the UI note says the desktop keyring is holding them. '
+    + 'That mismatch is the defect, not this assertion — and this leg installs the keyring precisely so '
+    + 'that "it fell back" cannot be the answer.');
+  assert.match(b.note, /keyring/i);
+
+  await setSecret(LIBSECRET_REF, LIBSECRET_VALUE);
+
+  // The whole point of a keyring is that the value is not in the Zelos home.
+  const home = process.env.ZELOS_HOME;
+  assert.equal(fs.existsSync(path.join(home, 'secrets.enc')), false,
+    'a keyring backend must not also be writing the encrypted file');
+  for (const entry of fs.readdirSync(home, { withFileTypes: true })) {
+    if (!entry.isFile()) continue; // paths() makes logs/ and cache/ beside them
+    const body = fs.readFileSync(path.join(home, entry.name), 'utf8');
+    assert.ok(!body.includes('sk-ant-api03'), `${entry.name} in the Zelos home holds the secret in the clear`);
+  }
+
+  assert.equal(await getSecret(LIBSECRET_REF), LIBSECRET_VALUE,
+    'secret-tool did not hand back what it was given — the usual causes are the trailing-newline strip '
+    + 'taking more than the one newline it added, and a value being split across argv rather than stdin');
+
+  // The documented limit, against the real tool: a line break is refused before
+  // anything is spawned, because secret-tool reads one line from stdin and the
+  // rest of the password would be silently dropped.
+  await assert.rejects(() => setSecret(LIBSECRET_REF, 'first line\nsecond line'), TypeError);
+  assert.equal(await getSecret(LIBSECRET_REF), LIBSECRET_VALUE, 'the refused write disturbed the stored value');
+
+  // The convention `getSecret` depends on: not-found is exit 1, and exit 1 is
+  // not an error. If secret-tool ever changed this, every missing password
+  // would start reading as a failure instead of "nothing stored yet".
+  assert.equal(await getSecret(`${LIBSECRET_REF}-absent`), null);
+
+  await setSecret(LIBSECRET_REF, 'second-value');
+  assert.equal(await getSecret(LIBSECRET_REF), 'second-value', 'store must overwrite, not duplicate');
+
+  const refs = await listRefs();
+  assert.ok(refs.includes(LIBSECRET_REF));
+  for (const r of refs) assert.notEqual(r, LIBSECRET_VALUE, 'listRefs returns refs, never values');
+
+  assert.deepEqual(await deleteSecret(LIBSECRET_REF), { ok: true, deleted: true });
+  assert.equal(await getSecret(LIBSECRET_REF), null, 'a deleted secret must read back as absent');
+  assert.ok(!(await listRefs()).includes(LIBSECRET_REF), 'a deleted ref must leave the index');
+
+  // `secret-tool clear` is not documented to distinguish "removed one" from
+  // "there was nothing to remove", and core/secrets.mjs reads either exit as a
+  // success. Which of the two it reports on a second delete is therefore not a
+  // claim this test should pin down — what has to hold under both conventions
+  // is that deleting twice is not an error and the ref stays gone.
+  const second = await deleteSecret(LIBSECRET_REF);
+  assert.equal(second.ok, true, 'deleting twice must not be an error');
+  assert.equal(await getSecret(LIBSECRET_REF), null);
 });

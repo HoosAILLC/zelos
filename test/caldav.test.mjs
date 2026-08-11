@@ -947,6 +947,166 @@ test('a rejected credential is still a credential answer, cache or no cache', as
   );
 });
 
+/* ------------------------------------------------------------------ *
+ * Partitioned accounts — one account, two origins
+ * ------------------------------------------------------------------ */
+
+/**
+ * Apple splits an account across hosts: an unauthenticated PROPFIND to
+ * caldav.icloud.com comes back with `x-apple-user-partition: 64` and an
+ * `X-Responding-Instance` naming a p64 box, so the hrefs a front host hands out
+ * can point at an origin the person never typed. The pin sends those hops
+ * anonymously — that is the whole point of it, since a hostile href and a
+ * partition href are the same thing until somebody answers — and a host that
+ * wanted a password answers 401.
+ *
+ * That 401 is not a verdict on the password. Reading it as one used to end the
+ * walk on the spot, before `base` — the URL the person actually typed — had had
+ * its Depth:1 listing, which on this layout is the one call that works.
+ *
+ * Two origins here means two servers on 127.0.0.1 with a port apiece: URL.origin
+ * and the pin both count the port, so this is a genuine cross-origin hop on
+ * every OS, with no second loopback address to alias.
+ */
+const partitionPrincipal = (href) => `<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:">
+ <d:response><d:href>/</d:href>
+  <d:propstat>
+   <d:prop><d:current-user-principal><d:href>${href}</d:href></d:current-user-principal></d:prop>
+   <d:status>HTTP/1.1 200 OK</d:status>
+  </d:propstat>
+ </d:response>
+</d:multistatus>`;
+
+const NO_COLLECTIONS = `<?xml version="1.0"?><d:multistatus xmlns:d="DAV:"></d:multistatus>`;
+
+/**
+ * The other origin. Its route is unreachable by design — every request arrives
+ * without Authorization and is 401'd before routing — so if the pin ever leaks
+ * the password here the calendar called LEAKED turns up in the results and the
+ * name assertions fail, not just the header ones.
+ */
+const startPartitionHost = () =>
+  startServer({ 'PROPFIND *': listingDoc('/p64/calendars/leaked/', 'LEAKED', 'p64/1') });
+
+const hostPart = (origin) => origin.slice('http://'.length);
+
+test('a home set on a second origin does not cost the typed URL its Depth:1 listing', async (t) => {
+  const partition = await startPartitionHost();
+  t.after(() => partition.close());
+
+  const front = await startServer({
+    // Depth:0 asks who I am, Depth:1 asks what is here. Same path, so the body
+    // is what tells them apart.
+    'PROPFIND /': ({ body }) =>
+      (body.includes('current-user-principal')
+        ? partitionPrincipal('/dav/principals/nemo/')
+        : listingDoc('/dav/calendars/home/', 'Home', 'front/1')),
+    'PROPFIND /dav/principals/nemo/': () => homeSetDoc(`${partition.origin}/1472538/calendars/`),
+    'REPORT /dav/calendars/home/': () => reportBody([EVENT_ICS]),
+  });
+  t.after(() => front.close());
+
+  const probe = await testConnection({ url: front.origin, user: USER, pass: PASS });
+  assert.equal(probe.ok, true, 'the anonymous 401 ended the walk before the typed URL was listed');
+  assert.deepEqual(probe.calendars.map((c) => c.name), ['Home']);
+
+  assert.equal(
+    (await fetchRange({ url: front.origin, user: USER, pass: PASS })).length,
+    1,
+    'and the sweep collects events instead of throwing',
+  );
+
+  assert.ok(partition.requests.length >= 1, 'the cross-origin home set was followed at all');
+  for (const r of partition.requests) {
+    assert.equal(r.auth, null, 'the pin still spends the password on exactly one origin');
+  }
+  assert.ok(
+    front.requests.some((r) => r.method === 'PROPFIND' && r.path === '/' && r.depth === '1'),
+    'the URL the user typed was listed at Depth:1',
+  );
+});
+
+test('a principal on a second origin fails loudly instead of sweeping empty for ever', async (t) => {
+  const partition = await startPartitionHost();
+  t.after(() => partition.close());
+
+  const front = await startServer({
+    'PROPFIND /': ({ body }) =>
+      (body.includes('current-user-principal')
+        ? partitionPrincipal(`${partition.origin}/1472538/principal/`)
+        : NO_COLLECTIONS),
+  });
+  t.after(() => front.close());
+
+  // The worse of the two shapes, because it used to raise nothing at all: the
+  // home-set hop was swallowed, the front host listed no calendars, and
+  // discovery returned an empty list as if that were an answer. A calendar
+  // configured this way contributed nothing to every sweep for ever and never
+  // said why.
+  await assert.rejects(
+    () => fetchRange({ url: front.origin, user: USER, pass: PASS }),
+    (err) => {
+      assert.match(err.message, /asked for a password/);
+      assert.ok(err.message.includes(hostPart(partition.origin)), 'the message names the host to paste');
+      assert.match(err.message, /put its address in the calendar URL directly/);
+      return true;
+    },
+    'the sweep came back empty and silent instead of reporting the host it was refused by',
+  );
+
+  const probe = await testConnection({ url: front.origin, user: USER, pass: PASS });
+  assert.equal(probe.ok, false);
+  assert.match(
+    probe.error,
+    /put its address in the calendar URL directly/,
+    'the message carries the remedy, rather than "found no calendars"',
+  );
+
+  for (const r of partition.requests) {
+    assert.equal(r.auth, null, 'the pin still spends the password on exactly one origin');
+  }
+});
+
+test('a remembered home set on the other origin does not end the sweep either', async (t) => {
+  const partition = await startPartitionHost();
+  t.after(() => partition.close());
+
+  let listAtOne = true;
+  let homeSet = `${partition.origin}/1472538/calendars/`;
+
+  const front = await startServer({
+    'PROPFIND /dav/one/': ({ body }) => {
+      if (body.includes('current-user-principal')) return MOVED_PRINCIPAL;
+      return listAtOne ? listingDoc('/dav/one/', 'The one calendar', 'one/1') : GONE;
+    },
+    'PROPFIND /dav/principals/nemo/': () => homeSetDoc(homeSet),
+    'PROPFIND /dav/home/nemo/': () => listingDoc('/dav/home/nemo/personal/', 'Personal', 'home/1'),
+    'REPORT *': () => reportBody([EVENT_ICS]),
+  });
+  t.after(() => front.close());
+
+  const sweep = () => fetchRange({ url: `${front.origin}/dav/one/`, user: USER, pass: PASS });
+
+  // The home set is on the other origin and will not talk to an anonymous
+  // caller, so discovery settles on the collection itself — and remembers a
+  // record whose home set is a host it may never authenticate to.
+  assert.equal((await sweep()).length, 1);
+
+  // Then the provider empties that collection and moves the home set back onto
+  // the front host. The remembered rungs are walked in order: the listing root
+  // 404s, the remembered home set 401s anonymously — which must not end the
+  // sweep — and the principal names the home set that answers.
+  listAtOne = false;
+  homeSet = '/dav/home/nemo/';
+  front.requests.length = 0;
+  assert.equal((await sweep()).length, 1, 'the anonymous 401 on the remembered home set ended the sweep');
+  assert.deepEqual(propfinds(front), ['/dav/one/', '/dav/principals/nemo/', '/dav/home/nemo/']);
+  for (const r of partition.requests) {
+    assert.equal(r.auth, null, 'the pin still spends the password on exactly one origin');
+  }
+});
+
 test('the layout cache holds no credentials', async (t) => {
   const mock = await startServer(NEXTCLOUD_ROUTES);
   t.after(() => mock.close());

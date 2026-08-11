@@ -192,22 +192,58 @@ export function packColumns(entries) {
 }
 
 /**
- * Order a day's events so a conflict cannot hide behind "+4". Anything that
- * overlaps another entry sorts first — the whole reason a month cell truncates
- * is that most days are dull, and the day that is not must say so in the three
- * rows it gets.
+ * Order a day's events so a real conflict comes ahead of every other TIMED
+ * entry — the whole reason a month cell truncates is that most days are dull,
+ * and the day that is not must say so in the three rows it gets.
+ *
+ * All-day entries are held OUT of the overlap pass and merged back at the top
+ * for display. eventSpanOnDay gives an all-day event minutes 0–1440, so in the
+ * pass it overlapped literally everything: one birthday flagged every event on
+ * the day, the month cell painted a "clash" badge over a day where nothing
+ * clashes — and, worse, the tiebreak collapsed to a constant and the sort
+ * degraded to plain start order. Measured on a day holding a real double
+ * booking: the three visible rows went from `REAL-CLASH-A, REAL-CLASH-B, 8am`
+ * to `HOLIDAY, 8am, 9am`, so adding a holiday silently disabled the one thing
+ * this function exists to do. A thing that runs all day is not a conflict with
+ * anything; it is the day.
+ *
+ * Where the guarantee stops, said plainly, because an earlier version of this
+ * comment promised more than the code does: all-day entries sort above
+ * everything, and the month cell paints `MONTH_VISIBLE` rows —
+ * `ui/views/calendar.js:566`, three of them — so a day carrying three or more
+ * of them pushes the clashing pair behind "+N more" whatever their flags say.
+ * Measured with a birthday, a holiday and a PTO day plus a 9:00/9:30 double
+ * booking — visible rows `BIRTHDAY, HOLIDAY, PTO`.
+ *
+ * That "three" is the one number in this paragraph that belongs to another
+ * file, so it is not left on trust. The test behind this boundary reads
+ * MONTH_VISIBLE out of calendar.js rather than restating it — it used to carry
+ * its own `const MONTH_VISIBLE = 3` beside a line number that had already
+ * moved — so widening the cell to four rows turns that test red instead of
+ * leaving this sentence quietly false.
+ *
+ * What the day does NOT do is go quiet: `monthCell` derives its `has-conflict`
+ * badge from `spans.some(s => s.conflict)` over the whole day rather than over
+ * the visible slice (`ui/views/calendar.js:572`), so the cell is still marked
+ * and the count still invites the click. Banners at the top of a day is what
+ * every calendar does, and the badge is what keeps that honest.
  */
 export function conflictsFirst(entries) {
   const flagged = entries.map((e) => ({ ...e, conflict: false }));
-  for (let i = 0; i < flagged.length; i += 1) {
-    for (let j = i + 1; j < flagged.length; j += 1) {
-      if (flagged[i].start < flagged[j].end && flagged[j].start < flagged[i].end) {
-        flagged[i].conflict = true;
-        flagged[j].conflict = true;
+  // filter() keeps the same objects, so flagging through `timed` flags `flagged`.
+  const timed = flagged.filter((e) => !e.allDay);
+  for (let i = 0; i < timed.length; i += 1) {
+    for (let j = i + 1; j < timed.length; j += 1) {
+      if (timed[i].start < timed[j].end && timed[j].start < timed[i].end) {
+        timed[i].conflict = true;
+        timed[j].conflict = true;
       }
     }
   }
-  return flagged.sort((a, b) => (b.conflict - a.conflict) || (a.start - b.start));
+  return flagged.sort((a, b) =>
+    ((b.allDay ? 1 : 0) - (a.allDay ? 1 : 0))
+    || (b.conflict - a.conflict)
+    || (a.start - b.start));
 }
 
 /** "3 messages · 2 events" — the sweep's own numbers, in a readable line. */

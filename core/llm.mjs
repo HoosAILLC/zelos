@@ -23,6 +23,11 @@ import { log } from './log.mjs';
 
 const llog = log.child('[llm]');
 
+/**
+ * How long a request may go without progress. This is an IDLE budget, not a
+ * total one: a streaming answer resets it on every chunk that arrives, so a
+ * long reply is never killed for being long, only for going quiet.
+ */
 const DEFAULT_TIMEOUT_MS = 120_000;
 const DEFAULT_MAX_TOKENS = 4096;
 const DEFAULT_RETRIES = 3;
@@ -627,10 +632,15 @@ function sleep(ms, signal) {
 }
 
 /**
- * A per-attempt AbortSignal that folds in the caller's signal and a timeout.
- * `settle()` drops only the timeout — a stream that has started delivering
- * bytes should not be killed by the request timeout, but must still respond to
- * the caller cancelling.
+ * A per-attempt AbortSignal that folds in the caller's signal and a deadline.
+ *
+ * The deadline is an IDLE deadline. `kick()` restarts it, and a caller reading
+ * a token stream kicks it on every chunk the socket delivers, so a long answer
+ * is allowed to take as long as it takes while silence still ends the attempt.
+ * An earlier version dropped the timer outright once response *headers* landed,
+ * on the reasoning that a live stream should outlive the request timeout — but
+ * that threw away the bound instead of moving it, and the streams that need a
+ * bound most are exactly the ones that never stop making noise.
  */
 function attemptController(callerSignal, timeoutMs) {
   const controller = new AbortController();
@@ -639,14 +649,16 @@ function attemptController(callerSignal, timeoutMs) {
     if (callerSignal.aborted) onAbort();
     else callerSignal.addEventListener('abort', onAbort, { once: true });
   }
-  let timer = setTimeout(() => {
+  const expire = () => {
     controller.abort(new DOMException(`timed out after ${timeoutMs}ms`, 'TimeoutError'));
-  }, timeoutMs);
+  };
+  let timer = setTimeout(expire, timeoutMs);
   return {
     signal: controller.signal,
-    settle() {
-      if (timer) clearTimeout(timer);
-      timer = null;
+    kick() {
+      if (!timer) return; // already disposed; nothing left to reset
+      clearTimeout(timer);
+      timer = setTimeout(expire, timeoutMs);
     },
     dispose() {
       if (timer) clearTimeout(timer);
@@ -770,9 +782,10 @@ function transportError(err, address) {
 
 /**
  * Perform the request, retrying only where the spec allows. Returns the live
- * Response plus a `release()` the caller must invoke once the body is done.
+ * Response, a `release()` the caller must invoke once the body is done, and a
+ * `keepAlive()` a streaming caller invokes for every chunk that arrives.
  */
-async function requestWithRetry(req, opts, { streaming = false } = {}) {
+async function requestWithRetry(req, opts) {
   const retries = Number.isInteger(opts.retries) && opts.retries >= 0 ? opts.retries : DEFAULT_RETRIES;
   const timeoutMs =
     Number.isFinite(opts.timeoutMs) && opts.timeoutMs > 0 ? opts.timeoutMs : DEFAULT_TIMEOUT_MS;
@@ -809,12 +822,19 @@ async function requestWithRetry(req, opts, { streaming = false } = {}) {
       // Headers are not a response — the body still has to arrive, and a 200
       // whose body trickles forever would otherwise hang with no timeout and no
       // way to cancel, because dropping the controller here severs both. So the
-      // timeout and the caller's signal stay wired until release(), which every
-      // caller invokes once the body is fully read. Streaming relaxes only the
-      // timer: a live token stream is allowed to outlast the request timeout,
-      // but a non-streaming body read is not.
-      if (streaming) control.settle();
-      return { res, release: () => control.dispose() };
+      // deadline and the caller's signal stay wired until release(), which every
+      // caller invokes once the body is fully read.
+      //
+      // A non-streaming caller never kicks, so for it this stays a hard total
+      // deadline covering the body read. A streaming caller kicks on every
+      // chunk, which turns it into a silence detector. The version that cleared
+      // the timer here instead had no bound at all past the headers: measured,
+      // a server writing `: ping` every two seconds held stream({timeoutMs:1500})
+      // open past 45 s with the UI still saying "Thinking…". Proxies inject
+      // comment keepalives and anthropic sends {"type":"ping"} by design, so
+      // those bytes have to count as liveness — the bug was never that they
+      // reset a clock, it was that they were the reason there was no clock.
+      return { res, release: () => control.dispose(), keepAlive: () => control.kick() };
     }
 
     const detail = await readErrorDetail(res, credentialsIn(req.headers));
@@ -884,6 +904,24 @@ function normalizeStopReason(protocol, raw) {
 }
 
 /**
+ * The failure a 200 can be hiding. Both protocols have a shape for it: openai's
+ * is a top-level `error` object where `choices` should be, anthropic's is the
+ * `{"type":"error","error":{…}}` envelope. Both are checked whatever the
+ * configured protocol says, because an aggregator can hand back either.
+ *
+ * Returns null for a healthy body — including one carrying `"error": null`,
+ * which several providers send on success and which must not read as a failure.
+ */
+function errorInBody(raw) {
+  const detail = raw?.error;
+  if (!detail && raw?.type !== 'error') return null;
+  if (typeof detail === 'string' && detail) return detail;
+  if (typeof detail?.message === 'string' && detail.message) return detail.message;
+  if (typeof raw?.message === 'string' && raw.message) return raw.message;
+  return 'no message given';
+}
+
+/**
  * One round trip. -> {text, usage:{input,output}, model, stopReason, raw}
  */
 export async function complete(opts = {}) {
@@ -895,6 +933,27 @@ export async function complete(opts = {}) {
     raw = await readJson(res, req.address);
   } finally {
     release();
+  }
+
+  // Not every failure comes with a failing status. OpenRouter answers a billing
+  // problem with 200 and "402: insufficient credits" in the envelope; read as a
+  // success that is an empty string, and an empty string is not obviously wrong
+  // to anyone downstream. It cost us twice: Settings' "Test the connection"
+  // painted the broken endpoint green, and the sweep then told the user their
+  // model was too small and to go buy a bigger one, for what was a topped-out
+  // account. stream() has always thrown on the identical body ("failed
+  // mid-stream" below); which half you happened to call must not decide
+  // whether you are told.
+  const bodyError = errorInBody(raw);
+  if (bodyError) {
+    // Marked non-retriable, unlike the mid-stream case: an error that replaces
+    // the whole response is a rejected request (credits, model id, key), where
+    // one that interrupts a stream in flight is usually a transient overload.
+    const detail = withoutCredentials(bodyError, credentialsIn(req.headers));
+    throw new LLMError(
+      `Model at ${req.address} returned a success status with an error body: ${detail.slice(0, ERROR_DETAIL_CHARS)}`,
+      { address: req.address, retriable: false },
+    );
   }
 
   if (req.protocol === 'anthropic') {
@@ -940,8 +999,17 @@ function dataOf(block) {
   return parts.length ? parts.join('\n') : null;
 }
 
-/** Yield each SSE event's data payload from a web ReadableStream of bytes. */
-async function* sseFrames(webStream) {
+/**
+ * Yield each SSE event's data payload from a web ReadableStream of bytes.
+ *
+ * `onChunk` fires for every read that carries bytes, before any of them are
+ * parsed — including SSE comment keepalives and frames this reader goes on to
+ * discard. That is deliberate: the idle deadline is a question about the
+ * socket, not about the events, and a proxy that says `: ping` is telling the
+ * truth about being alive. Kicking only on frames we understood would abort
+ * healthy anthropic streams, which ping by design.
+ */
+async function* sseFrames(webStream, onChunk) {
   const reader = webStream.getReader();
   const decoder = new TextDecoder('utf-8');
   let buf = '';
@@ -949,6 +1017,7 @@ async function* sseFrames(webStream) {
     for (;;) {
       const { value, done } = await reader.read();
       if (done) break;
+      onChunk?.();
       buf += decoder.decode(value, { stream: true });
       let match;
       while ((match = SSE_SEPARATOR.exec(buf)) !== null) {
@@ -971,13 +1040,30 @@ async function* sseFrames(webStream) {
 }
 
 /**
+ * The text of a mid-stream `error` frame, made safe to show and to store.
+ *
+ * A frame like this is written by the provider, and providers quote the request
+ * back in them — measured against a loopback endpoint, an upstream that echoes
+ * the rejected request handed back `…with Authorization: Bearer sk-live-…`, and
+ * `stream()` was the one of this file's four error paths that did not scrub.
+ * That mattered more than the others: `core/server.mjs` puts an Ask failure on
+ * the SSE channel, where `ui/views/ask.js` writes it into the answer body, AND
+ * through `log.warn`, which appends it to `~/.zelos/logs` for good. `complete()`
+ * and `listModels()` already went through here; now every path does.
+ */
+function midStreamDetail(req, raw) {
+  const text = typeof raw === 'string' && raw ? raw : 'unknown error';
+  return withoutCredentials(text, credentialsIn(req.headers)).slice(0, ERROR_DETAIL_CHARS);
+}
+
+/**
  * Token stream. Yields {type:'delta', text} then a final
  * {type:'done', usage, model, text}.
  */
 export async function* stream(opts = {}) {
   const req = buildChatRequest(opts, { stream: true });
   llog.debug('stream', { address: req.address, protocol: req.protocol, model: req.model });
-  const { res, release } = await requestWithRetry(req, opts, { streaming: true });
+  const { res, release, keepAlive } = await requestWithRetry(req, opts);
   if (!res.body) {
     release();
     throw new LLMError(`Model at ${req.address} returned an empty stream`, {
@@ -991,7 +1077,7 @@ export async function* stream(opts = {}) {
   let text = '';
 
   try {
-    for await (const data of sseFrames(res.body)) {
+    for await (const data of sseFrames(res.body, keepAlive)) {
       if (data === '[DONE]') break;
       let event;
       try {
@@ -1021,7 +1107,7 @@ export async function* stream(opts = {}) {
             break;
           case 'error':
             throw new LLMError(
-              `Model at ${req.address} failed mid-stream: ${event.error?.message || 'unknown error'}`,
+              `Model at ${req.address} failed mid-stream: ${midStreamDetail(req, event.error?.message)}`,
               { address: req.address, retriable: true },
             );
           default:
@@ -1032,7 +1118,7 @@ export async function* stream(opts = {}) {
 
       if (event?.error) {
         throw new LLMError(
-          `Model at ${req.address} failed mid-stream: ${event.error?.message || 'unknown error'}`,
+          `Model at ${req.address} failed mid-stream: ${midStreamDetail(req, event.error?.message)}`,
           { address: req.address, retriable: true },
         );
       }
@@ -1109,6 +1195,27 @@ export async function listModels({
     raw = await readJson(res, address);
   } finally {
     release();
+  }
+
+  // The same blind spot complete() had, on the same helper. A GET /models that
+  // answers 200 with `{"error":{…}}` — a key that is not entitled to the
+  // catalogue, an account with no credit, an aggregator refusing the route —
+  // carries no `data` and no `models`, so modelRows() finds nothing and this
+  // returns []. Downstream, `ui/views/settings.js:278` renders that as
+  // "0 models available." beside an empty dropdown: the reason the provider
+  // gave is discarded on the way past, and the reader is told the endpoint has
+  // no models rather than that it refused to say. Every caller of this function
+  // already handles a throw and shows the message — Settings at
+  // `ui/views/settings.js:285`, doctor at `core/doctor.mjs:531`, and
+  // `probeLocal` deliberately swallows it, which is correct there because
+  // "nothing on this port" is its normal answer.
+  const bodyError = errorInBody(raw);
+  if (bodyError) {
+    const detail = withoutCredentials(bodyError, credentialsIn(req.headers));
+    throw new LLMError(
+      `Model catalogue at ${address} returned a success status with an error body: ${detail.slice(0, ERROR_DETAIL_CHARS)}`,
+      { address, retriable: false },
+    );
   }
 
   const seen = new Set();

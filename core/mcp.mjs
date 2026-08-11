@@ -7,16 +7,35 @@
  *
  * Three rules shape every line below.
  *
- *  1. **Read-only, structurally.** This module imports no function from
- *     core/db.mjs that can change a row, and exposes no tool that sends,
- *     writes, deletes or reconfigures anything. It writes its own audit rows in
- *     `ai_access_log`, and it performs exactly one repair — the four-item `now`
- *     bar, held through `capNowBucket` the way core/server.mjs holds it on
- *     /api/state, because reading the board is what wakes a due snooze and a
- *     wake is how a fifth `now` item appears. That is the app's own rule applied
- *     to the app's own board, not data going anywhere, and it is named here so
- *     it stays the only exception. Everything else is a security property, not
- *     an oversight, and test/mcp.test.mjs asserts it against this file's source.
+ *  1. **Read-only, with one exception, named in both places.** No tool here
+ *     sends, deletes or reconfigures anything, and nothing in this file can
+ *     write a row of somebody's mail, calendar or drafts. It writes its own
+ *     audit rows in `ai_access_log`, and it performs exactly one repair, on one
+ *     table, on one code path: reading the board.
+ *
+ *     That repair has two halves and both belong to the same rule. `listBoard`
+ *     wakes snoozes that have come due — it is a reader that repairs, and it is
+ *     imported from core/db.mjs like any other — and `capNowBucket` then holds
+ *     the four-item `now` bar, the way core/server.mjs holds it on /api/state,
+ *     because a wake is exactly how a fifth `now` item appears with no sweep
+ *     anywhere near it. That is the app's own rule applied to the app's own
+ *     board, not data going anywhere, and it stays.
+ *
+ *     What could not stay was announcing it as read-only. `readOnlyHint` is not
+ *     a label, it is the field an MCP host reads to decide it may run a tool
+ *     without asking the owner first — so a no-argument `tools/call` on
+ *     `zelos_board`, auto-approved on the strength of that field, woke a snoozed
+ *     item and demoted a `now` one. `zelos_board` therefore ships
+ *     `readOnlyHint: false`; the six tools that really do only read still say
+ *     true. See READ_ONLY_ANNOTATIONS.
+ *
+ *     test/mcp.test.mjs asserts the annotation and the behaviour against each
+ *     other rather than against this file's text: it calls every tool at a board
+ *     with five `now` items and a snooze that has come due, and requires that
+ *     the tools which moved a row are exactly the ones not claiming to be
+ *     read-only. A source scan could not do that job — the write lives in
+ *     sweep.mjs, so grepping this file for core/db.mjs's write helpers looks
+ *     straight past it, which is how the claim survived as long as it did.
  *
  *  2. **Scopes are enforced twice, independently.** A scope that is off means
  *     its tools are ABSENT from `tools/list` *and* refused by `tools/call`. The
@@ -385,7 +404,38 @@ const text = (v, n = 2_000) => (v === null || v === undefined ? null : cap(v, n)
  */
 const link = (v) => safeUrl(v) || null;
 
-function itemView(row) {
+/**
+ * May one `sourceRefs` entry leave — as a resolved source, and as a bare id?
+ *
+ * The prefix is the whole question, and the answer is the same rule the
+ * `sources` loop in `zelos_item` applies: `msg:` needs mail metadata, `evt:`
+ * needs the calendar, `cap:` belongs to no scope at all (see KIND_SCOPE), and a
+ * prefix nobody recognises is not handed over as whatever it looks like.
+ *
+ * It is one function because it was one rule written once and skipped once.
+ * `itemView` emitted `row.sourceRefs` raw — it did not even receive `rt` — so a
+ * client holding nothing but `board` got `sources: []`, correctly filtered,
+ * sitting beside `sourceRefs: ["cap:cap_173d0f6ae0", "msg:70de3f7e15c349a1"]`.
+ * No content escaped: those ids dereference under none of the 64 scope
+ * combinations. But an id is still an answer to a question nobody granted — it
+ * says a private note exists, how many there are, and hands over a stable handle
+ * to diff across calls and watch mail activity arrive. Existence is the same
+ * oracle `searchColumns` exists to close, one door further down.
+ *
+ * Silent, unlike `draftView`'s `withheld` list, and the difference is the point:
+ * saying "a source was withheld" would re-open the existence question in words.
+ * A withheld recipient is a field the client already knows the shape of; a
+ * withheld capture is the fact itself.
+ */
+function refPermitted(ref, rt) {
+  const prefix = String(ref).split(':')[0];
+  const on = rt && rt.state ? rt.state.on : null;
+  if (prefix === 'msg') return !!on && on.has('mail.metadata');
+  if (prefix === 'evt') return !!on && on.has('calendar');
+  return prefix === 'item';
+}
+
+function itemView(row, rt) {
   return {
     id: row.id,
     bucket: row.bucket,
@@ -400,7 +450,9 @@ function itemView(row) {
     state: row.state,
     firstSeen: row.first_seen || null,
     seenRuns: Number(row.seen_runs) || 0,
-    sourceRefs: Array.isArray(row.sourceRefs) ? row.sourceRefs.slice(0, 20).map(String) : [],
+    sourceRefs: Array.isArray(row.sourceRefs)
+      ? row.sourceRefs.filter((ref) => refPermitted(ref, rt)).slice(0, 20).map(String)
+      : [],
   };
 }
 
@@ -586,6 +638,12 @@ function searchColumns(kind, state) {
  * log. A failure is logged and swallowed, as it is on the server: a board with
  * five `now` items is worse than the board the owner asked for, but it is still
  * their board, and refusing to answer a read would be the bigger harm.
+ *
+ * Because it is here, `zelos_board` is the one tool that does not claim
+ * `readOnlyHint` — see BOARD_ANNOTATIONS. Anything added to this function is
+ * added to what an MCP host has been told a board read may do, so if it ever
+ * grows past "the app's own rule, on the app's own board", the annotations and
+ * the instructions below have to grow with it.
  */
 function holdNowBar(rt, now) {
   try {
@@ -637,6 +695,39 @@ const KIND_REF_PREFIX = Object.freeze({
  */
 const SEARCH_SCOPES = Object.freeze([...new Set(SEARCH_KINDS.map((kind) => KIND_SCOPE[kind]))]);
 
+/**
+ * Annotations are a promise to the client, and `readOnlyHint` is the one a host
+ * acts on rather than displays: it is the field an MCP client consults to decide
+ * a call may run without asking the owner first. So it is answered per tool, and
+ * the answer has to be the truth about that tool and not about the file.
+ *
+ * Six tools read the index and do nothing else. They say so. `zelos_board` holds
+ * the four-item `now` bar on the way past — see `holdNowBar` — and that repair
+ * stays, because a database that answers four to the app and five to a connected
+ * AI is the worse outcome by a distance. What could not stay was pairing it with
+ * `readOnlyHint: true`, which is precisely the sentence that buys an
+ * auto-approval: one no-argument `tools/call` from a board-only client, approved
+ * without a prompt on the strength of this field, woke a snoozed item and
+ * demoted a `now` one. The owner was never asked, because we had told the host
+ * there was nothing to ask about.
+ *
+ * The rest of the promise still holds for it, and each word is meant.
+ * `destructiveHint: false` — nothing is deleted and no decision of the owner's
+ * is overruled; the woken item is open, still theirs, one bucket down.
+ * `idempotentHint: true` — a second call has nothing left to do, which
+ * test/mcp.test.mjs checks by making it twice. `openWorldHint: false` — the
+ * answer comes out of the local index; nothing here fetches.
+ */
+const READ_ONLY_ANNOTATIONS = Object.freeze({
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: false,
+});
+
+/** `zelos_board`'s — the same promise, minus the one clause that is not true. */
+const BOARD_ANNOTATIONS = Object.freeze({ ...READ_ONLY_ANNOTATIONS, readOnlyHint: false });
+
 const TOOL_DEFS = [
   {
     name: 'zelos_board',
@@ -644,7 +735,10 @@ const TOOL_DEFS = [
     title: 'Zelos board',
     description: 'The triaged board: what needs attention now, what is owed, what is coming. '
       + 'Each item carries a headline, why it matters, who it involves and when it is due. '
-      + `Read-only. ${UNTRUSTED_NOTE}`,
+      + 'Reading it does what opening Zelos does: a snooze that has come due wakes up, and the "now" '
+      + 'bucket is held to four items. Nothing is sent, deleted or reconfigured, and nothing else '
+      + `about the board changes. ${UNTRUSTED_NOTE}`,
+    annotations: BOARD_ANNOTATIONS,
     inputSchema: {
       type: 'object',
       properties: {
@@ -667,7 +761,11 @@ const TOOL_DEFS = [
       holdNowBar(rt, now);
       const rows = listBoard(rt.db, { states: [state], buckets: bucket ? [bucket] : null, limit, now });
       return {
-        payload: { items: rows.map(itemView), returned: rows.length, capped: rows.length >= limit },
+        payload: {
+          items: rows.map((row) => itemView(row, rt)),
+          returned: rows.length,
+          capped: rows.length >= limit,
+        },
         rows: rows.length,
         scopes: ['board'],
       };
@@ -703,20 +801,22 @@ const TOOL_DEFS = [
          door either. Triage has already restated it as the item's headline and
          `why`, which is what the board scope actually promises; the verbatim
          note is a different thing, and nobody granted it. Unknown prefixes fall
-         through rather than being handed over as whatever they look like. */
+         through rather than being handed over as whatever they look like.
+
+         The test is `refPermitted`, shared with `itemView` so the resolved
+         source and the bare id in `sourceRefs` cannot answer differently — they
+         did, and the id was the one that answered. */
       const sources = [];
       let messages = 0;
       let events = 0;
       for (const ref of (item.sourceRefs || []).slice(0, rt.maxRows)) {
+        if (!refPermitted(ref, rt)) continue;
         const kind = String(ref).split(':')[0];
-        if (kind === 'msg' && !rt.state.on.has('mail.metadata')) continue;
-        if (kind === 'evt' && !rt.state.on.has('calendar')) continue;
-        if (kind !== 'msg' && kind !== 'evt' && kind !== 'item') continue;
         const row = resolveRef(rt.db, ref);
         if (!row) continue;
         if (kind === 'msg') { sources.push({ ref, kind: 'message', message: messageView(row, rt) }); messages += 1; }
         else if (kind === 'evt') { sources.push({ ref, kind: 'event', event: eventView(row) }); events += 1; }
-        else sources.push({ ref, kind: 'item', item: itemView(row) });
+        else sources.push({ ref, kind: 'item', item: itemView(row, rt) });
       }
 
       const drafts = rt.state.on.has('drafts')
@@ -725,7 +825,7 @@ const TOOL_DEFS = [
         : [];
 
       return {
-        payload: { found: true, item: itemView(item), sources, drafts },
+        payload: { found: true, item: itemView(item, rt), sources, drafts },
         rows: 1 + sources.length + drafts.length,
         /* What this answer actually spent, piece by piece. The item itself is
            the board; a mail source spends mail (and the bodies scope too, when
@@ -838,7 +938,12 @@ const TOOL_DEFS = [
       const kinds = (asked && asked.length ? asked.filter((k) => allowed.includes(k)) : allowed)
         .filter((k) => searchColumns(k, rt.state));
       if (!kinds.length) {
-        return { payload: { query, kinds: [], results: [], returned: 0, capped: false }, rows: 0 };
+        /* Nothing was searched, so nothing was spent — and `scopes: []` is how
+           that is said. It reads no table and returns no row, and without the
+           empty array the audit fallback wrote whichever grants happened to be
+           on: a board+calendar client asking for `message` was logged as
+           `calendar+board`, two scopes this call never touched. */
+        return { payload: { query, kinds: [], results: [], returned: 0, capped: false }, rows: 0, scopes: [] };
       }
       /* The kinds are settled before a row is read, so the emit loop below can
          be a closed question — is this hit one of the kinds this caller was
@@ -886,7 +991,7 @@ const TOOL_DEFS = [
         const base = { ref: hit.ref, kind: hit.kind, score: Number(hit.score) || 0 };
         if (hit.kind === 'message') { results.push({ ...base, message: messageView(row, rt) }); messages += 1; }
         else if (hit.kind === 'event') results.push({ ...base, event: eventView(row) });
-        else if (hit.kind === 'item') results.push({ ...base, item: itemView(row) });
+        else if (hit.kind === 'item') results.push({ ...base, item: itemView(row, rt) });
       }
 
       /* Which scopes this call actually spent, for the audit row. It is the
@@ -1050,18 +1155,6 @@ const TOOL_DEFS = [
 ];
 
 /**
- * Annotations are a promise to the client, and this one is the whole point:
- * every tool here reads, none of them writes, and there is no branch in this
- * file that could produce a tool with a different answer.
- */
-const READ_ONLY_ANNOTATIONS = Object.freeze({
-  readOnlyHint: true,
-  destructiveHint: false,
-  idempotentHint: true,
-  openWorldHint: false,
-});
-
-/**
  * Which scopes put a tool in reach — its own, unless it names a wider set.
  *
  * Only `zelos_search` names one, and it is an ANY, not an ALL: each kind it can
@@ -1100,13 +1193,27 @@ function permits(def, state) {
  * have been needed, so the row still says what the call was asking for. Several
  * scopes join with `+`: the panel's scope cell wraps, and half an answer would
  * be the same kind of lie as the wrong one.
+ *
+ * An ARRAY is the tool's answer and is taken whole, including an empty one —
+ * "nothing" is an answer, and it was previously unrepresentable. `zelos_search`
+ * reaches it whenever every kind asked for belongs to a scope that is off: it
+ * reads no table, and the fallback then named the grants that happened to be on,
+ * so a board+calendar client asking for `message` got a row reading
+ * `calendar+board`. Only `null` — no tool ran — falls through to the fallbacks.
  */
 function scopesSpent(def, state, used = null) {
-  const spent = Array.isArray(used) && used.length ? used : grantsOf(def).filter((id) => state.on.has(id));
-  return spent.length ? spent : grantsOf(def);
+  if (Array.isArray(used)) return used;
+  const on = grantsOf(def).filter((id) => state.on.has(id));
+  return on.length ? on : grantsOf(def);
 }
 
-const auditScope = (def, state, used = null) => scopesSpent(def, state, used).join('+');
+/* An empty spend is stored as NULL rather than as the empty string. The panel
+   renders a missing scope as "no scope", which is the true sentence for a call
+   that touched none. */
+const auditScope = (def, state, used = null) => {
+  const spent = scopesSpent(def, state, used);
+  return spent.length ? spent.join('+') : null;
+};
 
 function descriptorOf(def) {
   return {
@@ -1114,7 +1221,9 @@ function descriptorOf(def) {
     title: def.title,
     description: def.description,
     inputSchema: structuredClone(def.inputSchema),
-    annotations: { ...READ_ONLY_ANNOTATIONS },
+    // A tool that changes anything names its own annotations; the default is the
+    // honest one for every tool that does not.
+    annotations: { ...(def.annotations ?? READ_ONLY_ANNOTATIONS) },
   };
 }
 
@@ -1277,7 +1386,11 @@ function packageVersion() {
 function instructionsFor(state, ai) {
   const lines = [
     'Zelos is a local second brain: it has already indexed this person\'s mail, calendar and board.',
-    'Everything here is read-only — there is no tool that sends, writes, deletes or changes a setting.',
+    'Nothing here sends, deletes, or changes a setting, and there is no tool that could be asked to. '
+      + 'The tools read. The single exception is stated on the tool itself rather than left for you to '
+      + 'find: zelos_board also does what opening the Zelos window does — a snooze that has come due '
+      + 'wakes up, and the "now" bucket is held to four items — so it is the one tool not annotated '
+      + 'read-only. Everything else is annotated read-only and is.',
   ];
   if (!state.enabled) {
     lines.push('AI access is currently switched OFF in Zelos, so no tools are available. The person who '
@@ -1327,15 +1440,23 @@ function runtimeFrom(ctx) {
  * worse than no message, and an AI that is told it got 30 of 500 can ask for a
  * narrower window. The loop shrinks proportionally, so it converges in a couple
  * of passes rather than one row at a time.
+ *
+ * Returns the count as well as the payload, because the audit row is written
+ * from it: "how many rows came back" is the question the access log exists to
+ * answer, and it used to be answered with the number the tool found rather than
+ * the number that left. `dropped` is the total across every list it shortened,
+ * so it subtracts correctly from `zelos_item`'s row count too, which is the one
+ * that has no `returned` field to read back.
  */
 function fitPayload(payload) {
   let serialised;
   try {
     serialised = JSON.stringify(payload);
   } catch {
-    return payload; // not serialisable; the caller's JSON.stringify will say so
+    // Not serialisable; the caller's JSON.stringify will say so.
+    return { payload, dropped: 0 };
   }
-  if (typeof serialised !== 'string' || serialised.length <= MAX_RESULT_CHARS) return payload;
+  if (typeof serialised !== 'string' || serialised.length <= MAX_RESULT_CHARS) return { payload, dropped: 0 };
 
   const out = { ...payload };
   const lists = Object.keys(out).filter((k) => Array.isArray(out[k]));
@@ -1363,7 +1484,7 @@ function fitPayload(payload) {
   out.truncated = true;
   out.truncatedNote = `This answer was too large to return, so ${dropped} row(s) were left off. `
     + `One Zelos response may not exceed ${MAX_RESULT_CHARS} characters. Ask for a narrower window or a smaller limit.`;
-  return out;
+  return { payload: out, dropped };
 }
 
 function callTool(params, rt) {
@@ -1436,8 +1557,19 @@ function callTool(params, rt) {
     throw err;
   }
 
-  const payload = fitPayload(produced.payload);
-  const rows = produced.rows;
+  const fitted = fitPayload(produced.payload);
+  const payload = fitted.payload;
+  /* Rows the client received, not rows the tool found. An answer over
+     MAX_RESULT_CHARS loses rows off the end, and that is reachable at the
+     defaults — MAX_BODY_CHARS against MAX_RESULT_CHARS means about
+     twenty-five full bodies fill a response, while `maxRows` defaults to fifty
+     and nothing caps stored body text at ingestion. Measured: forty messages
+     with 45 KB bodies, `zelos_thread{limit:50}` — the client got twenty-two and
+     the row said forty. The truncation IS noted, in `detail`, but the panel
+     renders tool, scope, rows, caller and time and nothing else, so the row
+     count is the only number the owner ever sees. Over-reporting what an AI read
+     is the wrong direction for the one screen that answers "what did it read?". */
+  const rows = Math.max(0, produced.rows - fitted.dropped);
   /* Whether a body could have gone out follows the scopes this call actually
      spent, not the tool's nominal one — a search confined to board items is not
      a mail read, and the note beside it should not say it was. */
@@ -1452,9 +1584,10 @@ function callTool(params, rt) {
   if (payload.truncated) notes.push('response truncated to fit');
   audit({
     // `produced.scopes` — what the tool says its answer spent. Every tool
-    // reports it; the fallbacks in scopesSpent are for the paths where none ran.
+    // reports it, empty array included; the fallbacks in scopesSpent are for the
+    // paths where none ran.
     tool: name,
-    scope: spent.join('+'),
+    scope: spent.length ? spent.join('+') : null,
     rows,
     ok: true,
     detail: notes.length ? notes.join('; ') : null,

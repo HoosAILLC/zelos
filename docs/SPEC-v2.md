@@ -71,8 +71,21 @@ Config shape:
 ```
 Token *values* live in the secret store like every other credential — `config.json` holds refs.
 
-**Never expose a tool that writes.** No send, no delete, no config change. This surface is
-read-only, and that is a security property, not an oversight.
+**Never expose a tool that sends, deletes or reconfigures.** That held and still holds.
+
+**"Read-only" did not, and the spec was wrong to state it flatly.** `zelos_board` performs the
+same board repair opening the app performs — a due snooze wakes (`WAKE_DUE_SNOOZES` in
+`core/db.mjs`) and the `now` bucket is held to four items (`capNowBucket` in `core/sweep.mjs`,
+which demotes, never deletes). A board read that skipped it would hand an AI a different board
+from the one on the user's screen, which is worse than the write. So the requirement is:
+
+- Six tools carry `readOnlyHint: true`. `zelos_board` carries `readOnlyHint: false`, because that
+  is the field an MCP host reads to decide it may run a tool without asking the owner.
+- The write is confined to `items`, to the columns those two rules own — `state`,
+  `snoozed_until`, `bucket`, plus the `state_at`/`updated_at` stamps — and to nothing else. No
+  other table moves, the search index does not move, and nothing is created, deleted or finished.
+- The split is **measured**, not asserted: run every tool against a real database and the set that
+  changed a row must equal the set that does not claim `readOnlyHint`.
 
 ### `ui/views/settings.js` — an "AI access" panel
 
@@ -85,12 +98,19 @@ Claude Desktop / a generic MCP client with the real path filled in.
 
 ## 2. `npx zelos-app`
 
-The npm name `zelos` is taken; **`zelos-app` is registered to us**. Publishing is the operator's
-call — prepare it, do not publish.
+The npm name `zelos` is taken, so the package is `zelos-app`. **It is not registered and not
+published** — `npm view zelos-app` answers 404, so `npx zelos-app` does not work today. Publishing
+is the operator's call — prepare it, do not publish. Any document that prints the `npx` line
+without saying this is sending a reader to an error.
 
 - `package.json`: `name: "zelos-app"`, `bin: { "zelos": "./zelos.mjs" }`, `files` allowlisting
-  exactly what ships, `engines.node >= 22.5.0`, and **still no dependencies**.
+  exactly what ships (including the negation `"!core/sources/oauth.mjs"` — see §3), and **still no
+  dependencies**. `engines.node` is **`">=22.16.0 <23 || >=24"`**, not the `>= 22.5.0` this spec
+  first asked for: the board's index needs SQLite FTS5, and Node's bundled SQLite is built without
+  it before 22.16 and throughout the whole Node 23 line. The exclusion of 23 is deliberate.
 - `npx zelos-app` must start the app. `npm i -g zelos-app && zelos` must work too.
+- `npm pack --dry-run` currently reports **49 files, ~430 kB packed, 1.3 MB unpacked**. Editing
+  `docs/*.md` moves that number, since they ship — measure, don't quote.
 - Subcommands, parsed in `zelos.mjs`: bare (run), `mcp` (stdio MCP), `sweep` (one sweep, print a
   summary, exit), `doctor` (check Node version, home dir perms, model reachability, source
   connectivity — and print what is wrong in words a non-programmer can act on).
@@ -110,10 +130,17 @@ Researched and settled — do not re-litigate:
   verified domain). No CASA equivalent.
 
 So: build `core/sources/oauth.mjs` implementing **OAuth 2.0 + PKCE with a loopback redirect** —
-the correct flow for a desktop app, and the one that needs no client secret. Wire Google Calendar
-and Microsoft Graph Calendar behind a config flag, with the client id blank by default and a clear
-note in Settings that it stays inert until an app registration exists. Refresh tokens go in the
-secret store. **Do not wire Gmail.** IMAP stays the supported mail path.
+the correct flow for a desktop app, and the one that needs no client secret. Refresh tokens go in
+the secret store. **Do not wire Gmail.** IMAP stays the supported mail path.
+
+**Status: the module exists (989 lines, tested) and none of the wiring does.** Nothing in `core/`,
+`ui/`, `desktop/` or `zelos.mjs` imports it; `DEFAULTS` in `core/config.mjs` has no `oauth` key;
+there is no Settings surface (`grep -rin oauth ui/` returns nothing) and therefore no note in it;
+and `CALENDAR_KINDS` is `['ics','caldav','file']`, so there is no reader a token could feed. It is
+excluded from the published tarball for that reason. The remaining "config flag with a blank client
+id" framing is what this section *asked for*, not what is there — see `docs/OAUTH.md`, which states
+the gap plainly so that nobody buys a domain and waits out a ten-day review expecting a working
+button at the end.
 
 ---
 
@@ -126,14 +153,30 @@ Cut the first run to the shortest honest path.
 - `zelos doctor` output should be reachable from the UI when something is wrong.
 - The app-password step is where people fall off. Give the exact per-provider link, say plainly
   that the normal password will not work and why, and validate the connection before moving on.
-- A **"Try it with sample data"** button that loads the demo dataset into a scratch home, so
-  someone can see the board before connecting anything. It must be obvious that it is sample data
-  and one click to clear.
+- A **"Try it with sample data"** button so someone can see the board before connecting anything.
+  It must be obvious that it is sample data and one click to clear. **Implemented not as a scratch
+  home but as an exactly reversible seed into the real database**: `POST /api/sample-data` writes a
+  manifest into `kv` listing every row it created, `DELETE` removes exactly those rows and nothing
+  else, and `GET` reports `{installed, version, seededAt, counts, summary}`. A scratch home would
+  have needed a second database and a way to swap between them; a manifest is one row and is
+  auditable.
 
 ## 5. Tests
 
 Everything above ships with tests in `test/`, run with `node --test "test/*.test.mjs"`.
 Required: scope enforcement (a disabled scope's tool is absent from `tools/list` **and** refused by
 `tools/call`); `mail.bodies` off means no body text in any response; token auth required and
-revocation effective; no write-capable tool exists; JSON-RPC error shapes; `npm pack` extract runs;
-`doctor` exits non-zero when something is genuinely wrong.
+revocation effective; JSON-RPC error shapes; `npm pack` extract runs; `doctor` exits non-zero when
+something is genuinely wrong.
+
+"No write-capable tool exists" is replaced by the measured version in §1: **run every tool against
+a seeded database and assert that the set of tools that changed a row is exactly the set that does
+not claim `readOnlyHint`.** The old wording was satisfiable by a test that looked at the source and
+found nothing — which is what happened, for months, while `zelos_board` wrote. The fixture matters
+as much as the assertion: it needs five `now` items and a snooze already past its wake-up time, or
+both writes are no-ops and the test passes by proving nothing.
+
+Two more that exist because their absence hid a real hole: **the route lists these suites iterate
+must be parsed out of `core/server.mjs`'s `ROUTES`**, never restated by hand, and any probe of a
+derived path must prove the path reaches the router. Note that `test/security.test.mjs` and
+`test/ai-security.test.mjs` contain raw NUL bytes as payloads, so `grep` needs `-a` on them.
