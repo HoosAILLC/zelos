@@ -53,7 +53,11 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
-import { loadConfig, saveConfig, validateConfig, paths, isValidRef } from './config.mjs';
+import { CALENDAR_DEFAULTS, loadConfig, saveConfig, validateConfig, paths, isValidRef } from './config.mjs';
+/* The registry, so the two places below that used to name source kinds by hand
+   ask it instead. It costs this process nothing new: every module it pulls in —
+   core/sources/imap.mjs, caldav.mjs, ics.mjs — is already imported below. */
+import { describe as describeConnectors, typesFor } from './connectors/index.mjs';
 import { getSecret, setSecret, deleteSecret, listRefs, backend } from './secrets.mjs';
 import {
   listBoard, bucketCounts, listEvents, listDrafts, updateDraft, lastRun,
@@ -1176,6 +1180,26 @@ function handlePresets(ctx) {
   sendJSON(ctx.res, 200, PRESETS);
 }
 
+/**
+ * Every connector this build has, as the JSON-safe half of its manifest.
+ *
+ * This route exists because the Settings screen has to render a picker, a set of
+ * fields and a credential prompt for a source type it has never heard of, and
+ * `ui/` reaches `core/` only over HTTP — test/repo.test.mjs asserts the UI is
+ * standalone, so importing the registry there is not available and would not be
+ * wanted. `describe()` is deliberately not the manifest: no functions, no
+ * `collect`, no `check`, nothing a connector could use to smuggle markup into a
+ * page.
+ *
+ * It reads nothing from disk and answers with no user data at all — it is a
+ * description of the build — but it stays behind the session token like every
+ * other /api route, because a route that opts out of the gate is the beginning
+ * of an argument about which other ones could.
+ */
+function handleConnectors(ctx) {
+  sendJSON(ctx.res, 200, { connectors: describeConnectors() });
+}
+
 async function handleLocalProbe(ctx) {
   sendJSON(ctx.res, 200, await probeLocal({}));
 }
@@ -1300,10 +1324,26 @@ async function fetchIcsOnce(href, headers) {
   return second;
 }
 
+/** "ics, caldav or file" — a list a person reads, from a list the code holds. */
+function orList(items) {
+  if (items.length <= 1) return items[0] ?? '';
+  return `${items.slice(0, -1).join(', ')} or ${items[items.length - 1]}`;
+}
+
 async function handleCalendarTest(ctx) {
   const body = await readJSON(ctx.req);
-  const kind = body.kind === undefined ? 'ics' : body.kind;
-  if (!['ics', 'caldav', 'file'].includes(kind)) throw new HttpError(400, 'kind must be ics, caldav or file');
+  /* The default is the blank a new calendar is created with, read off
+     core/config.mjs rather than restated as 'ics' here. Restating it is how a
+     default drifts: the two would disagree the day somebody changed one, and the
+     symptom would be a Test button that probes a different kind from the one the
+     form is about to save. */
+  const kind = body.kind === undefined ? CALENDAR_DEFAULTS.kind : body.kind;
+  /* Asked of the registry, not of a hardcoded array. This was
+     `['ics', 'caldav', 'file']`, which meant a new calendar connector was
+     unreachable from the Test button until somebody remembered to edit an HTTP
+     handler — in a file that knows nothing about calendars. */
+  const kinds = typesFor('calendars');
+  if (!kinds.includes(kind)) throw new HttpError(400, `kind must be ${orList(kinds)}`);
 
   if (kind === 'caldav') {
     const url = requireString(body, 'url', { max: 2_048 });
@@ -1331,7 +1371,12 @@ async function handleCalendarTest(ctx) {
     return;
   }
 
-  // webcal: is how Apple and friends publish an https .ics.
+  /* Everything else is read as a subscribed .ics — the same fallback
+     `enabledSources` makes for a calendar kind no connector claims, and the same
+     one core/doctor.mjs makes for a calendar connector with no `check` of its
+     own. Three readers, one decision about what an unremarkable calendar address
+     is; a fourth answer here would be the one that surprises somebody.
+     webcal: is how Apple and friends publish an https .ics. */
   const raw = requireString(body, 'url', { max: 2_048 }).replace(/^webcal:/i, 'https:');
   const url = safeUrl(raw);
   if (!url || !/^https?:/.test(url)) throw new HttpError(400, 'url must be an http, https or webcal address');
@@ -2059,6 +2104,7 @@ const ROUTES = [
   ['GET', /^\/api\/model\/list$/, handleModelList],
   ['GET', /^\/api\/model\/presets$/, handlePresets],
   ['GET', /^\/api\/local\/probe$/, handleLocalProbe],
+  ['GET', /^\/api\/connectors$/, handleConnectors],
   ['POST', /^\/api\/mail\/test$/, handleMailTest],
   ['POST', /^\/api\/calendar\/test$/, handleCalendarTest],
   ['POST', /^\/api\/ask$/, handleAsk],

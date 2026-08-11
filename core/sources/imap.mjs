@@ -17,6 +17,13 @@
  *     `fetch()` refuses to send one.
  *  3. UIDs only. Sequence numbers are renumbered by any expunge, including one
  *     that happens between two of our own commands.
+ *
+ * Section 6 is the fourth decision and the newest: some providers no longer
+ * accept a password at all, so the client speaks `AUTHENTICATE XOAUTH2` as well
+ * as LOGIN and PLAIN, and the bearer token it needs is minted here by an OAuth
+ * device authorization grant against a registration the USER owns. Nothing else
+ * about the client changes — the mechanism is chosen by config in one branch of
+ * `login()`, and every other byte of the session is the same session.
  */
 
 import net from 'node:net';
@@ -24,6 +31,7 @@ import tls from 'node:tls';
 
 import { imapDate, instant } from '../time.mjs';
 import { log as defaultLog } from '../log.mjs';
+import { getSecret, setSecret, deleteSecret } from '../secrets.mjs';
 import {
   decodeCharset,
   decodeTransfer,
@@ -558,6 +566,33 @@ export function tlsRequiredByDefault(host) {
   return !isLoopbackHost(host);
 }
 
+/**
+ * Which SASL mechanism a session will use — stated, never inferred from what
+ * happens to be lying around.
+ *
+ * The inferred version has one failure mode and it is expensive. An account
+ * configured for OAuth whose token could not be minted — the refresh token was
+ * revoked, the machine was offline, the user changed their password — arrives
+ * here with an EMPTY access token, and "no token, so fall back to a password"
+ * then sends Microsoft a LOGIN with a blank password. That is a real
+ * authentication attempt against an account with basic auth switched off, so
+ * what the user is told is `AUTHENTICATIONFAILED`, which reads as "your
+ * credentials are wrong" and sends them to re-type a password that has not been
+ * accepted since 16 September 2024. What they need to be told is "reconnect the
+ * account", and the only way to say that is to know the account meant OAuth.
+ *
+ * So `auth: 'xoauth2'` with no token is refused before a socket is opened, and
+ * `auth: null` — which is what every config written before this existed says —
+ * still means "password", exactly as it always did.
+ */
+export function resolveAuthMethod(auth, accessToken) {
+  const named = String(auth ?? '').trim().toLowerCase();
+  if (named === 'xoauth2') return 'xoauth2';
+  if (named === 'password' || named === 'login') return 'password';
+  if (named) throw new Error(`ImapClient: unknown auth method ${JSON.stringify(auth)}`);
+  return accessToken ? 'xoauth2' : 'password';
+}
+
 export class ImapClient {
   #socket = null;
   #assembler = new ResponseAssembler();
@@ -609,8 +644,17 @@ export class ImapClient {
    * cancellation: the user has already said stop. An abort fails the command in
    * flight and destroys the socket, which is what makes the stop visible in the
    * same second it was asked for.
+   *
+   * `accessToken` and `auth` are the OAuth seam, and they are the whole of it:
+   * an account that carries a bearer token authenticates with `AUTHENTICATE
+   * XOAUTH2` instead of a password and every other byte of the session is
+   * unchanged. See `resolveAuthMethod` for why the choice is named rather than
+   * guessed from whether a token happens to be present.
    */
-  constructor({ host, port, secure = true, user, pass, requireTls = null, timeoutMs = 30000, logger, signal } = {}) {
+  constructor({
+    host, port, secure = true, user, pass, accessToken = '', auth = null,
+    requireTls = null, timeoutMs = 30000, logger, signal,
+  } = {}) {
     if (!host || typeof host !== 'string') throw new Error('ImapClient: host is required');
     this.host = host;
     this.secure = secure !== false;
@@ -620,6 +664,8 @@ export class ImapClient {
       : requireTls !== false;
     this.user = user == null ? '' : String(user);
     this.pass = pass == null ? '' : String(pass);
+    this.accessToken = accessToken == null ? '' : String(accessToken);
+    this.auth = resolveAuthMethod(auth, this.accessToken);
     this.timeoutMs = Number(timeoutMs) > 0 ? Number(timeoutMs) : 30000;
     this.mailbox = null;
     const base = logger || defaultLog;
@@ -776,9 +822,20 @@ export class ImapClient {
 
   async login() {
     if (this.#authenticated) return;
-    // The real gate: every path to a password on the wire runs through here,
+    // The real gate: every path to a credential on the wire runs through here,
     // including one on a client somebody built by hand rather than via connect().
+    // A bearer token needs this exactly as much as a password does: it is a
+    // reusable credential with an hour of life on it, and base64 is not
+    // encryption.
     this.#assertEncrypted();
+
+    if (this.auth === 'xoauth2') {
+      await this.#authenticateXOAuth2();
+      this.#authenticated = true;
+      this.#caps = null;
+      return;
+    }
+
     const caps = await this.capabilities();
     const asciiCredentials = isAsciiSafe(this.user) && isAsciiSafe(this.pass);
 
@@ -813,6 +870,92 @@ export class ImapClient {
         return payload;
       },
     });
+  }
+
+  /**
+   * SASL XOAUTH2, and specifically its failure handshake, which is the part
+   * everybody gets wrong.
+   *
+   * The success path is unremarkable: the server prompts, we send
+   * `base64(user=…^Aauth=Bearer …^A^A)`, the server says OK. The failure path is
+   * not a tagged NO. The server answers the payload with ANOTHER continuation —
+   * `+ eyJzdGF0dXMiOiI0MDAi…`, a base64 JSON object carrying `status` and
+   * `scope` — and then says nothing. It is waiting for the client to
+   * acknowledge, and the acknowledgement is an EMPTY line. A client that treats
+   * a second prompt as "something went wrong, abort" and sends `*` is answering
+   * a question that was not asked; a client that sends nothing at all sits there
+   * until its own idle timer fires and reports a timeout, which names the wrong
+   * problem entirely. Either way the one thing the server was trying to hand
+   * over — WHY it refused — is thrown away, and that JSON is the difference
+   * between "your token expired, reconnect" and "your mail server is broken".
+   *
+   * So: first prompt, send the payload. Second prompt, keep the challenge and
+   * send an empty line. The tagged NO then arrives and the challenge is decoded
+   * into it.
+   */
+  async #authenticateXOAuth2() {
+    if (!this.accessToken) {
+      const err = this.#error(
+        'this account signs in with OAuth and there is no access token to sign in with — '
+        + 'reconnect the account in Settings',
+      );
+      err.reconnect = true;
+      throw err;
+    }
+    const caps = await this.capabilities();
+    if (!caps.has('AUTH=XOAUTH2')) {
+      throw this.#error(
+        'this account signs in with OAuth but the server does not offer AUTH=XOAUTH2, '
+        + 'so there is nothing a bearer token can be presented to',
+      );
+    }
+
+    const payload = xoauth2Payload(this.user, this.accessToken);
+    let challenge = null;
+    let sent = false;
+    let failure = null;
+    try {
+      await this.#exec('AUTHENTICATE XOAUTH2', {
+        onContinuation: (text) => {
+          if (!sent) {
+            sent = true;
+            return payload;
+          }
+          challenge = text;
+          return '';
+        },
+      });
+    } catch (err) {
+      failure = err;
+    }
+    if (!failure) return;
+
+    // A tagged NO on AUTHENTICATE is the server refusing the credential, and the
+    // credential is a bearer token: retrying with the same one cannot work, and
+    // neither can retrying with a password there is no longer any such thing as.
+    // Settings reads this to say "connect this account again" instead of "check
+    // your password", which is the only sentence that helps here.
+    if (failure.status === 'NO') failure.reconnect = true;
+
+    const note = describeXOAuth2Challenge(challenge);
+    // `failure.status` is only set when the server ACTUALLY answered NO or BAD.
+    // Without that check a socket that died mid-handshake — after the challenge
+    // arrived and before the tagged line did — would be reported as a rejected
+    // token, which is a diagnosis nobody can act on and the opposite of true.
+    if (!note || !failure.status) throw failure;
+    // Rebuilt rather than appended to, because `#error` is the only thing that
+    // strikes our own credentials out — and the challenge is bytes a hostile
+    // server chose, so it is exactly the place a reflected bearer token would
+    // arrive.
+    const err = this.#error(
+      `AUTHENTICATE XOAUTH2 failed — ${failure.status}`
+      + `${failure.detail ? ` ${failure.detail}` : ''} (${note})`,
+    );
+    err.status = failure.status;
+    err.code = failure.code;
+    err.reconnect = true;
+    err.cause = failure;
+    throw err;
   }
 
   async capabilities() {
@@ -1070,6 +1213,11 @@ export class ImapClient {
       const err = this.#error(`${verbOf(job.command)} failed — ${status}${detail ? ` ${detail}` : ''}`);
       err.status = status;
       err.code = code;
+      // The server's own words, already struck of our credentials, kept apart
+      // from the sentence they are wrapped in. `#authenticateXOAuth2` rebuilds
+      // its error rather than appending to one, and this is what lets it do that
+      // without either losing the diagnosis or printing the host twice.
+      err.detail = withoutCredentials(detail, this.user, this.pass, this.accessToken);
       job.reject(err);
     }
     this.#pump();
@@ -1132,7 +1280,7 @@ export class ImapClient {
    * /api/state. So the password is struck out of the message before it exists.
    */
   #error(message, cause) {
-    const err = new Error(`IMAP ${this.host}:${this.port}: ${withoutCredentials(message, this.user, this.pass)}`);
+    const err = new Error(`IMAP ${this.host}:${this.port}: ${withoutCredentials(message, this.user, this.pass, this.accessToken)}`);
     err.host = this.host;
     err.port = this.port;
     if (cause) err.cause = cause;
@@ -1255,21 +1403,37 @@ const MIN_BARE_REDACTION = 4;
  * A server that echoes any of these forms is handing the credential back, and
  * everything downstream — the Settings "Test connection" response body,
  * `runs.stats_json` on disk, /api/state, a log line — would keep it.
+ *
+ * `accessToken` joined the list when XOAUTH2 did, and it is not a nicety. A
+ * bearer token is a bigger credential than the password it replaces — it is
+ * mail access for the next hour with no second factor in front of it — and it
+ * travels in exactly two shapes: verbatim (the challenge a server writes back)
+ * and inside `base64(user=…^Aauth=Bearer <token>^A^A)` (the SASL blob a server
+ * quoting the line it rejected hands straight back). Both are listed, because
+ * an XOAUTH2 `NO` lands in `sources[].error` by the same route a LOGIN one does.
  */
-function withoutCredentials(message, user, pass) {
+function withoutCredentials(message, user, pass, accessToken = '') {
   const text = String(message);
-  if (!pass) return text;
-  const escaped = String(pass).replace(/([\\"])/g, '\\$1');
-  const sasl = Buffer.concat([
-    Buffer.from([0]), Buffer.from(String(user ?? ''), 'utf8'),
-    Buffer.from([0]), Buffer.from(pass, 'utf8'),
-  ]).toString('base64');
-  const forms = [...new Set([
+  const token = String(accessToken ?? '');
+  if (!pass && !token) return text;
+  const escaped = String(pass ?? '').replace(/([\\"])/g, '\\$1');
+  const passForms = pass ? [
     `"${escaped}"`,
     Buffer.from(pass, 'utf8').toString('base64'),
-    sasl,
+    Buffer.concat([
+      Buffer.from([0]), Buffer.from(String(user ?? ''), 'utf8'),
+      Buffer.from([0]), Buffer.from(pass, 'utf8'),
+    ]).toString('base64'),
     ...[pass, escaped].filter((form) => form.length >= MIN_BARE_REDACTION),
-  ])]
+  ] : [];
+  const tokenForms = token ? [
+    // Built by the same function that puts it on the wire. Two copies of this
+    // string is how the redaction comes to be searching for a payload the
+    // client no longer sends.
+    xoauth2Bytes(String(user ?? ''), token).toString('base64'),
+    ...[token].filter((form) => form.length >= MIN_BARE_REDACTION),
+  ] : [];
+  const forms = [...new Set([...passForms, ...tokenForms])]
     .filter(Boolean)
     // Longest first, so a tie at the same offset — the bare password sitting
     // one character inside its own quoted spelling — is resolved in favour of
@@ -1349,7 +1513,709 @@ function specialUseOf(name, flags) {
 }
 
 /* ================================================================== *
- * 6. The function the engine calls
+ * 6. XOAUTH2 credentials: the device authorization grant
+ * ================================================================== */
+
+/**
+ * Why this section exists, and why it is a device code and nothing else.
+ *
+ * Microsoft switched basic authentication off for personal Outlook, Hotmail,
+ * Live and MSN accounts on 16 September 2024, and app passwords went with it —
+ * there is no password of any kind that opens an IMAP session on those accounts
+ * any more. Zelos went on offering `outlook.office365.com` as a preset with no
+ * caveat next to it, so the shipped path for one of the two largest consumer
+ * mail providers was an authentication failure in the middle of onboarding,
+ * with nothing anywhere saying why. `AUTHENTICATE XOAUTH2` is the way back in
+ * and a bearer token is the only thing it accepts.
+ *
+ * Which OAuth flow is not a preference. Zelos ships NO client id of its own: one
+ * we published would need Microsoft publisher verification (a Partner One ID and
+ * a verified domain), and it would make every install's mail access contingent
+ * on an app registration this project holds and could lose. So the credential is
+ * a thing the USER mints in their own account and pastes in, like every other
+ * credential in this app — which rules out a client secret (there is nowhere to
+ * keep one) and rules out a redirect URI (a desktop app with no inbound port
+ * cannot receive a callback, and RFC 8252's loopback receiver needs the
+ * registration to name the port range). What is left is RFC 8628: the program
+ * shows a code, the user types it into a browser they already trust, and the
+ * program polls. It was designed for televisions and printers, and a mail
+ * client that refuses to run a web server is the same shape of problem.
+ *
+ * Everything here is inert without a registration: no client id, no request.
+ */
+
+/** The only origin outside loopback that a refresh token may be spent against. */
+export const MS_LOGIN_ORIGIN = 'https://login.microsoftonline.com';
+
+/**
+ * The delegated permission that buys IMAP, plus the one that makes the grant
+ * outlive the hour an access token lasts.
+ *
+ * `offline_access` is not optional on the v2 endpoint and its absence is silent:
+ * Microsoft answers with an access token, no refresh token, and no error, so the
+ * account works perfectly for an hour and then cannot be renewed without the
+ * user going through the whole dance again. Asking for it is the difference
+ * between connecting an account and borrowing one.
+ */
+export const MS_IMAP_SCOPES = Object.freeze([
+  'https://outlook.office.com/IMAP.AccessAsUser.All',
+  'offline_access',
+]);
+
+/**
+ * A failure in the token half of the mail path.
+ *
+ * `code` is the machine-readable reason — the OAuth error verbatim where the
+ * server named one (`authorization_pending`, `slow_down`, `invalid_grant`,
+ * `expired_token`), otherwise one of ours (`not_configured`, `not_connected`,
+ * `bad_endpoint`, `bad_tenant`, `network`, `timeout`, `bad_response`).
+ *
+ * `reconnect` is the flag every caller above this actually acts on, and the
+ * reason this class exists rather than a bare Error. There are two entirely
+ * different failures here that look alike from a distance: "the network was
+ * down, try the next sweep" and "this grant is dead and no amount of retrying
+ * will revive it". Only the second one is worth interrupting a person for, and
+ * only the second one has an answer they can act on — reconnect the account.
+ * Retrying an `invalid_grant` every fifteen minutes forever, which is what an
+ * undifferentiated error gets you, is how a mailbox goes quietly stale.
+ */
+export class ImapOAuthError extends Error {
+  constructor(message, { code = 'oauth_error', reconnect = false, status = 0, description = '' } = {}) {
+    super(message);
+    this.name = 'ImapOAuthError';
+    this.code = code;
+    this.reconnect = reconnect === true;
+    this.status = status;
+    this.description = description;
+  }
+}
+
+const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const DOMAIN_RE = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$/i;
+
+/**
+ * The three tenant aliases Microsoft defines, next to the two real spellings.
+ *
+ * `consumers` is the one a personal Outlook.com account needs, `organizations`
+ * the one a work account needs, and `common` accepts either — which is why it is
+ * the default and why the Settings copy tells people to leave it alone unless
+ * their sign-in fails.
+ */
+const TENANT_ALIASES = new Set(['common', 'organizations', 'consumers']);
+
+/**
+ * The tenant is the one piece of user input that becomes a URL PATH SEGMENT, so
+ * it is validated as a closed set rather than escaped.
+ *
+ * A tenant of `..` or `../..` is not hypothetical — it is what a mistyped or
+ * pasted value looks like, and `${origin}/${tenant}/oauth2/v2.0/token` with one
+ * in it resolves, silently and without error, to a completely different endpoint
+ * on the same host. What goes to that endpoint is the refresh token, which is
+ * the whole account. There is no legitimate tenant that is not a GUID, a domain
+ * name, or one of the three aliases, so anything else is refused before a socket
+ * exists rather than sanitised into something that might still be wrong.
+ */
+export function normalizeTenant(tenantId) {
+  const raw = String(tenantId ?? '').trim();
+  if (!raw) return 'common';
+  const lower = raw.toLowerCase();
+  if (TENANT_ALIASES.has(lower)) return lower;
+  if (GUID_RE.test(raw)) return raw.toLowerCase();
+  if (DOMAIN_RE.test(raw)) return lower;
+  throw new ImapOAuthError(
+    `oauth: ${JSON.stringify(raw)} is not a Microsoft tenant — use common, organizations, consumers, `
+    + 'the directory (tenant) ID from your app registration, or your organisation\'s domain',
+    { code: 'bad_tenant' },
+  );
+}
+
+/** Entra hands out GUIDs. Anything else is a paste that went wrong. */
+export function normalizeClientId(clientId) {
+  const raw = String(clientId ?? '').trim();
+  if (!raw) {
+    throw new ImapOAuthError(
+      'oauth: this account has no application (client) ID, so there is no registration to sign in against',
+      { code: 'not_configured' },
+    );
+  }
+  if (!GUID_RE.test(raw)) {
+    throw new ImapOAuthError(
+      `oauth: ${JSON.stringify(raw.slice(0, 60))} is not an application (client) ID — Entra shows it as a GUID `
+      + 'on the app registration\'s Overview page',
+      { code: 'not_configured' },
+    );
+  }
+  return raw.toLowerCase();
+}
+
+/**
+ * Where a refresh token is allowed to go.
+ *
+ * Only the origin survives this function — a path, a query string or a
+ * fragment someone put on the end is dropped rather than honoured — which is
+ * what makes the tenant check above sufficient: the host cannot be moved from
+ * the path, and the path cannot be moved from the tenant.
+ *
+ * Loopback is permitted for the same reason `isLoopbackHost` exists further up:
+ * it is where the test rig's mock authorization server lives, and it is traffic
+ * that never leaves the machine. Everything else must be the Microsoft origin,
+ * spelled exactly, over https. A config that could name its own token endpoint
+ * would be a one-field exfiltration route for the most valuable secret this app
+ * holds, so this is a check and not a default.
+ */
+export function assertTokenEndpoint(base) {
+  let url;
+  try {
+    url = new URL(String(base ?? ''));
+  } catch {
+    throw new ImapOAuthError(`oauth: ${JSON.stringify(String(base ?? '').slice(0, 80))} is not a URL`, {
+      code: 'bad_endpoint',
+    });
+  }
+  if (url.origin === MS_LOGIN_ORIGIN) return url.origin;
+  if (isLoopbackHost(url.hostname)) return url.origin;
+  throw new ImapOAuthError(
+    `oauth: refusing to send a refresh token to ${url.origin} — the only sign-in endpoint Zelos will use is ${MS_LOGIN_ORIGIN}`,
+    { code: 'bad_endpoint' },
+  );
+}
+
+function endpointFor(base, tenant, leaf) {
+  return `${assertTokenEndpoint(base)}/${tenant}/oauth2/v2.0/${leaf}`;
+}
+
+const TOKEN_TIMEOUT_MS = 30_000;
+
+/**
+ * A token endpoint answers in a few hundred bytes. This is three orders of
+ * magnitude past that, and it is read off the STREAM rather than off
+ * `content-length` for the same reason section 1 counts bytes as they arrive: a
+ * server that intends to hand Zelos a gigabyte does not announce it first.
+ */
+const MAX_TOKEN_RESPONSE_BYTES = 256 * 1024;
+
+async function readCapped(res) {
+  const reader = res.body?.getReader?.();
+  if (!reader) return '';
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.length;
+    if (total > MAX_TOKEN_RESPONSE_BYTES) {
+      await reader.cancel().catch(() => {});
+      throw new ImapOAuthError('oauth: the sign-in endpoint sent more than Zelos will read', {
+        code: 'bad_response',
+        status: res.status,
+      });
+    }
+    chunks.push(Buffer.from(value));
+  }
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+/**
+ * One POST to a Microsoft OAuth endpoint.
+ *
+ * `redirect: 'error'` rather than the default, and the reason is the same one
+ * core/connectors/http.mjs writes out at length: undici follows twenty hops, and
+ * a redirect chain is a way for the first host to hand the credential in the
+ * body to the twentieth. There is no legitimate redirect on a token endpoint.
+ *
+ * A public client sends no secret, so `client_secret` is deleted from the body
+ * on the way out — structurally, not by everyone remembering.
+ */
+async function postForm(url, form, { timeoutMs = TOKEN_TIMEOUT_MS, signal = null, fetchImpl = null } = {}) {
+  const doFetch = fetchImpl || globalThis.fetch;
+  const body = new URLSearchParams(form);
+  body.delete('client_secret');
+
+  const deadline = AbortSignal.timeout(Math.max(1, Number(timeoutMs) || TOKEN_TIMEOUT_MS));
+  let res;
+  try {
+    res = await doFetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Accept: 'application/json',
+      },
+      body: body.toString(),
+      signal: signal ? AbortSignal.any([signal, deadline]) : deadline,
+      redirect: 'error',
+    });
+  } catch (err) {
+    throw new ImapOAuthError(`oauth: could not reach the sign-in endpoint (${err.message})`, {
+      code: err?.name === 'TimeoutError' ? 'timeout' : 'network',
+    });
+  }
+
+  let text;
+  try {
+    text = await readCapped(res);
+  } catch (err) {
+    // A connection torn down between the headers and the body reads as a
+    // network failure, not as an unhandled undici error two frames up.
+    if (err instanceof ImapOAuthError) throw err;
+    throw new ImapOAuthError(`oauth: the sign-in endpoint hung up mid-answer (${err.message})`, { code: 'network' });
+  }
+  let payload = null;
+  try {
+    payload = text ? JSON.parse(text) : null;
+  } catch {
+    payload = null;
+  }
+
+  if (!res.ok) {
+    // The OAuth `error` verbatim, because the polling loop above branches on
+    // `authorization_pending` and `slow_down` by name and an invented code would
+    // turn "the user has not finished yet" into a hard failure.
+    const code = String(payload?.error || `http_${res.status}`).slice(0, 80);
+    const description = String(payload?.error_description || '').slice(0, 300);
+    throw new ImapOAuthError(
+      `oauth: the sign-in endpoint refused the request (${code}${description ? `: ${description}` : ''})`,
+      { code, status: res.status, description, reconnect: RECONNECT_CODES.has(code) },
+    );
+  }
+  if (!payload || typeof payload !== 'object') {
+    throw new ImapOAuthError('oauth: the sign-in endpoint answered with something that was not JSON', {
+      code: 'bad_response',
+      status: res.status,
+    });
+  }
+  return payload;
+}
+
+/**
+ * The errors that mean "this grant is over", as opposed to "try again".
+ *
+ * `invalid_grant` is the important one and the easy one to get wrong. It is what
+ * Microsoft returns when the refresh token has been revoked, when the user
+ * changed their password, when the tenant's conditional access policy changed,
+ * and when 90 days of inactivity expired it — every one of which is permanent
+ * until a human does something. Treating it as retryable turns a two-minute fix
+ * into a mailbox that silently stops updating and a sweep that dials Microsoft
+ * every fifteen minutes forever to be told the same thing.
+ */
+const RECONNECT_CODES = new Set([
+  'invalid_grant',
+  'invalid_client',
+  'unauthorized_client',
+  'expired_token',
+  'authorization_declined',
+  'bad_verification_code',
+  'consent_required',
+  'interaction_required',
+]);
+
+/* ---------------- the device code dance ---------------- */
+
+/** RFC 8628 §3.5: never poll faster than this, whatever the server said. */
+const POLL_FLOOR_MS = 5_000;
+
+/** RFC 8628 §3.5: `slow_down` means "add five seconds", not "back off a bit". */
+const SLOW_DOWN_STEP_MS = 5_000;
+
+const defaultSleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms).unref?.(); });
+
+/**
+ * Step one: ask for a device code. Returns what the user has to be shown and
+ * the handle `pollForDeviceToken` needs.
+ *
+ * `deviceCode` in the returned object is a credential — whoever holds it
+ * collects the tokens when the user finishes — so it is never logged and never
+ * displayed. `userCode` is the one meant for a human's eyes.
+ */
+export async function beginDeviceAuthorization({
+  clientId,
+  tenantId = 'common',
+  scopes = MS_IMAP_SCOPES,
+  endpoint = MS_LOGIN_ORIGIN,
+  timeoutMs = TOKEN_TIMEOUT_MS,
+  signal = null,
+  fetchImpl = null,
+  now = Date.now(),
+} = {}) {
+  const id = normalizeClientId(clientId);
+  const tenant = normalizeTenant(tenantId);
+  const scope = (Array.isArray(scopes) ? scopes : [scopes]).map((s) => String(s ?? '').trim()).filter(Boolean).join(' ');
+  if (!scope) throw new ImapOAuthError('oauth: at least one scope is required', { code: 'bad_scope' });
+
+  const payload = await postForm(
+    endpointFor(endpoint, tenant, 'devicecode'),
+    { client_id: id, scope },
+    { timeoutMs, signal, fetchImpl },
+  );
+
+  const deviceCode = String(payload.device_code ?? '');
+  const userCode = String(payload.user_code ?? '');
+  const verificationUri = String(payload.verification_uri || payload.verification_url || 'https://microsoft.com/devicelogin');
+  if (!deviceCode || !userCode) {
+    throw new ImapOAuthError('oauth: the sign-in endpoint answered without a device code', { code: 'bad_response' });
+  }
+
+  const expiresIn = Number(payload.expires_in);
+  const interval = Number(payload.interval);
+  defaultLog.info('imap: started a device sign-in', { tenant });
+  return {
+    clientId: id,
+    tenantId: tenant,
+    endpoint,
+    scope,
+    deviceCode,
+    userCode,
+    verificationUri,
+    // Microsoft's own sentence, which names the code and the URL together and is
+    // already localised. Shown verbatim where there is one, because a
+    // hand-written English paraphrase is worse for everyone who is not reading
+    // this app in English.
+    message: typeof payload.message === 'string' ? payload.message.slice(0, 500) : '',
+    expiresAt: new Date((Number.isFinite(expiresIn) ? now + expiresIn * 1000 : now + 900_000)).toISOString(),
+    intervalMs: Math.max(POLL_FLOOR_MS, Number.isFinite(interval) && interval > 0 ? interval * 1000 : POLL_FLOOR_MS),
+  };
+}
+
+/**
+ * Step two: poll until the user finishes in their browser, or until the code
+ * expires.
+ *
+ * `sleep` is a parameter because the interval is the behaviour under test.
+ * Microsoft's floor is five seconds and `slow_down` adds five more, so a test
+ * that proved the back-off with a real timer would take a minute to run and
+ * would therefore be written not to prove it at all. Recording the delays the
+ * loop ASKS for is both faster and stricter than watching a clock.
+ */
+export async function pollForDeviceToken(pending, {
+  signal = null,
+  fetchImpl = null,
+  timeoutMs = TOKEN_TIMEOUT_MS,
+  sleep = defaultSleep,
+  now = () => Date.now(),
+} = {}) {
+  if (!pending?.deviceCode) throw new TypeError('oauth: pollForDeviceToken needs the handle beginDeviceAuthorization returned');
+  const url = endpointFor(pending.endpoint ?? MS_LOGIN_ORIGIN, normalizeTenant(pending.tenantId), 'token');
+  const deadline = Date.parse(pending.expiresAt);
+  let interval = Math.max(POLL_FLOOR_MS, Number(pending.intervalMs) || POLL_FLOOR_MS);
+
+  for (;;) {
+    if (signal?.aborted) throw new ImapOAuthError('oauth: the sign-in was cancelled', { code: 'cancelled' });
+    if (Number.isFinite(deadline) && now() >= deadline) {
+      throw new ImapOAuthError(
+        'oauth: the sign-in code expired before it was entered — start again from Settings',
+        { code: 'expired_token', reconnect: true },
+      );
+    }
+    // Before the first request, not after it: the user has not had time to open
+    // a browser, and RFC 8628 §3.5 asks for the wait between polls in any case.
+    await sleep(interval);
+
+    let payload;
+    try {
+      payload = await postForm(url, {
+        grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+        client_id: pending.clientId,
+        device_code: pending.deviceCode,
+      }, { timeoutMs, signal, fetchImpl });
+    } catch (err) {
+      if (err?.code === 'authorization_pending') continue;
+      if (err?.code === 'slow_down') { interval += SLOW_DOWN_STEP_MS; continue; }
+      throw err;
+    }
+    defaultLog.info('imap: a device sign-in completed', { tenant: pending.tenantId });
+    return normalizeTokenSet(payload, { now: now() });
+  }
+}
+
+/**
+ * Begin, show the code, poll, store. The one call a Settings "Connect" button
+ * needs, and it hands back no tokens — only whether there is one and when it
+ * runs out — so a caller cannot casually log the thing it just stored.
+ */
+export async function connectDeviceCode({
+  clientId,
+  tenantId = 'common',
+  tokenRef,
+  scopes = MS_IMAP_SCOPES,
+  endpoint = MS_LOGIN_ORIGIN,
+  onCode,
+  signal = null,
+  fetchImpl = null,
+  timeoutMs = TOKEN_TIMEOUT_MS,
+  sleep = defaultSleep,
+  now = Date.now(),
+} = {}) {
+  if (!tokenRef) throw new TypeError('oauth: connectDeviceCode needs the ref to store the grant under');
+  const pending = await beginDeviceAuthorization({
+    clientId, tenantId, scopes, endpoint, timeoutMs, signal, fetchImpl, now,
+  });
+  if (typeof onCode === 'function') {
+    onCode({
+      userCode: pending.userCode,
+      verificationUri: pending.verificationUri,
+      message: pending.message,
+      expiresAt: pending.expiresAt,
+    });
+  }
+  const tokens = await pollForDeviceToken(pending, { signal, fetchImpl, timeoutMs, sleep });
+  if (!tokens.refreshToken) {
+    throw new ImapOAuthError(
+      'oauth: Microsoft returned no refresh token, so this connection would stop working within the hour — '
+      + 'the app registration has to request the offline_access scope',
+      { code: 'no_refresh_token', reconnect: true },
+    );
+  }
+  await saveOAuthTokens(tokenRef, tokens);
+  return {
+    ok: true,
+    ref: tokenRef,
+    scope: tokens.scope,
+    expiresAt: tokens.expiresAt,
+    hasRefreshToken: true,
+  };
+}
+
+/* ---------------- the stored grant ---------------- */
+
+/**
+ * A token set as this file keeps it. `expiresAt` is an instant, never a
+ * wall-clock reading: it is only ever compared.
+ *
+ * `previous` exists because a refresh that omits `refresh_token` means "keep the
+ * one you have" and not "you no longer have one". Microsoft usually rotates —
+ * see `accessTokenFor` — but the omitting case is legal and dropping the token
+ * on it would sign the user out on the first quiet refresh.
+ */
+function normalizeTokenSet(payload, { now = Date.now(), previous = null } = {}) {
+  const expiresIn = Number(payload.expires_in);
+  return {
+    accessToken: String(payload.access_token ?? ''),
+    refreshToken: payload.refresh_token ? String(payload.refresh_token) : (previous?.refreshToken ?? null),
+    tokenType: String(payload.token_type || 'Bearer'),
+    scope: typeof payload.scope === 'string' && payload.scope ? payload.scope : (previous?.scope ?? ''),
+    expiresAt: Number.isFinite(expiresIn) ? new Date(now + expiresIn * 1000).toISOString() : null,
+    obtainedAt: new Date(now).toISOString(),
+  };
+}
+
+/**
+ * The grant goes in the secret store, under the mail account's own `keyRef` —
+ * the same place the password used to live.
+ *
+ * Not a second ref beside it, deliberately. Removing an account deletes exactly
+ * one secret, `account.keyRef`, and a refresh token filed anywhere else would be
+ * left behind on the machine after the user believed they had disconnected the
+ * account — a live credential for a mailbox nothing is reading any more.
+ *
+ * `JSON.stringify` escapes any newline inside a value, so the stored string is
+ * always single-line, which the macOS keychain backend requires.
+ */
+export async function saveOAuthTokens(ref, tokens) {
+  if (!tokens || typeof tokens !== 'object') throw new TypeError('oauth: saveOAuthTokens needs a token set');
+  await setSecret(ref, JSON.stringify({
+    v: 1,
+    kind: 'xoauth2',
+    accessToken: tokens.accessToken ?? '',
+    refreshToken: tokens.refreshToken ?? null,
+    tokenType: tokens.tokenType ?? 'Bearer',
+    scope: tokens.scope ?? '',
+    expiresAt: tokens.expiresAt ?? null,
+    obtainedAt: tokens.obtainedAt ?? new Date().toISOString(),
+  }));
+  return { ok: true, ref };
+}
+
+export async function loadOAuthTokens(ref) {
+  const raw = await getSecret(ref);
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    // A password stored under this ref parses as nothing, and so does a
+    // password that happens to be valid JSON. `kind` is what tells the two
+    // apart, and a miss reads as "not connected" rather than as a broken grant.
+    if (!parsed || typeof parsed !== 'object' || parsed.kind !== 'xoauth2') return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+export async function forgetOAuthTokens(ref) {
+  return deleteSecret(ref);
+}
+
+/** Spent a minute early, so a fetch never races its own expiry across the wire. */
+export function oauthTokensExpired(tokens, { now = Date.now(), skewMs = 60_000 } = {}) {
+  if (!tokens?.accessToken) return true;
+  if (!tokens.expiresAt) return true;
+  const at = Date.parse(tokens.expiresAt);
+  if (Number.isNaN(at)) return true;
+  return at - skewMs <= now;
+}
+
+/** Spend the refresh token for a new access token. */
+export async function refreshAccessToken({
+  clientId,
+  tenantId = 'common',
+  refreshToken,
+  scopes = MS_IMAP_SCOPES,
+  endpoint = MS_LOGIN_ORIGIN,
+  timeoutMs = TOKEN_TIMEOUT_MS,
+  signal = null,
+  fetchImpl = null,
+  now = Date.now(),
+  previous = null,
+} = {}) {
+  const id = normalizeClientId(clientId);
+  const tenant = normalizeTenant(tenantId);
+  if (!refreshToken) {
+    throw new ImapOAuthError(
+      'oauth: there is no stored sign-in for this account, so it has to be connected again',
+      { code: 'no_refresh_token', reconnect: true },
+    );
+  }
+  const payload = await postForm(endpointFor(endpoint, tenant, 'token'), {
+    grant_type: 'refresh_token',
+    client_id: id,
+    refresh_token: String(refreshToken),
+    scope: (Array.isArray(scopes) ? scopes : [scopes]).map((s) => String(s ?? '').trim()).filter(Boolean).join(' '),
+  }, { timeoutMs, signal, fetchImpl });
+
+  const tokens = normalizeTokenSet(payload, { now, previous: previous || { refreshToken: String(refreshToken) } });
+  if (!tokens.accessToken) {
+    throw new ImapOAuthError('oauth: the sign-in endpoint answered without an access token', { code: 'bad_response' });
+  }
+  return tokens;
+}
+
+/**
+ * A usable access token for one mail account: load the grant, refresh it if the
+ * stored token is spent, write the result back.
+ *
+ * The write-back is not an optimisation. Microsoft ROTATES the refresh token on
+ * every redemption — each refresh response carries a new `refresh_token` and
+ * invalidates the one that was sent — so a version of this that returned the
+ * access token without storing the new refresh token would work exactly once and
+ * then hand the same dead token to Microsoft on every sweep after it, for an
+ * `invalid_grant` the user has no way to interpret.
+ */
+export async function accessTokenFor({
+  clientId,
+  tenantId = 'common',
+  tokenRef,
+  scopes = MS_IMAP_SCOPES,
+  endpoint = MS_LOGIN_ORIGIN,
+  timeoutMs = TOKEN_TIMEOUT_MS,
+  signal = null,
+  fetchImpl = null,
+  now = Date.now(),
+  skewMs = 60_000,
+} = {}) {
+  if (!tokenRef) throw new TypeError('oauth: accessTokenFor needs the ref the grant is stored under');
+  const id = normalizeClientId(clientId);
+  const tenant = normalizeTenant(tenantId);
+
+  const stored = await loadOAuthTokens(tokenRef);
+  if (!stored) {
+    throw new ImapOAuthError(
+      'oauth: this account has not been connected to Microsoft on this machine — connect it from Settings',
+      { code: 'not_connected', reconnect: true },
+    );
+  }
+  if (!oauthTokensExpired(stored, { now, skewMs })) {
+    return { accessToken: stored.accessToken, expiresAt: stored.expiresAt, refreshed: false, ref: tokenRef };
+  }
+
+  const next = await refreshAccessToken({
+    clientId: id,
+    tenantId: tenant,
+    refreshToken: stored.refreshToken,
+    scopes,
+    endpoint,
+    timeoutMs,
+    signal,
+    fetchImpl,
+    now,
+    previous: stored,
+  });
+  await saveOAuthTokens(tokenRef, next);
+  return { accessToken: next.accessToken, expiresAt: next.expiresAt, refreshed: true, ref: tokenRef };
+}
+
+/* ---------------- the SASL payload ---------------- */
+
+/**
+ * The bytes of a SASL XOAUTH2 initial client response, before base64.
+ *
+ * `^A` in every document that describes this is a literal 0x01 — SOH, not a
+ * caret followed by an A — and the payload ends with TWO of them: the first
+ * terminates `auth=…`, the second terminates the (empty) list of further
+ * key/value pairs. Exchange rejects a payload with one trailing SOH using the
+ * same opaque challenge it uses for an expired token, so getting this wrong
+ * costs an afternoon and looks like a credential problem the whole time.
+ *
+ * One function, called by the client and by the redaction, so the two can never
+ * disagree about what is on the wire.
+ */
+function xoauth2Bytes(user, accessToken) {
+  return Buffer.from(`user=${user}\x01auth=Bearer ${accessToken}\x01\x01`, 'utf8');
+}
+
+/**
+ * The base64 the client sends, with the one check that matters: neither field
+ * may contain a 0x01 of its own.
+ *
+ * SOH is the field separator, so a username or a token carrying one would append
+ * key/value pairs of somebody else's choosing to our authentication request.
+ * Nothing legitimate contains one — an access token is base64url and an address
+ * is an address — which is exactly why the check is cheap and worth having.
+ */
+export function xoauth2Payload(user, accessToken) {
+  const u = String(user ?? '');
+  const t = String(accessToken ?? '');
+  if (!t) throw new Error('xoauth2Payload: an access token is required');
+  if (/[\x00\x01\r\n]/.test(u) || /[\x00\x01\r\n]/.test(t)) {
+    throw new Error('xoauth2Payload: a SASL field contains a separator or a line break');
+  }
+  return xoauth2Bytes(u, t).toString('base64');
+}
+
+/**
+ * Turn the base64 JSON a server sends when it refuses an XOAUTH2 payload into
+ * one clause a person can act on, or null when there is nothing in it.
+ *
+ * Microsoft's is `{"status":"400","schemes":"Bearer","scope":"…"}`. `status` is
+ * the whole diagnosis: 400 is a malformed or expired token, 401 an invalid one,
+ * 403 a token whose scopes do not include IMAP — three different things to do,
+ * behind one identical `NO AUTHENTICATE failed` on the tagged line.
+ */
+export function describeXOAuth2Challenge(challenge) {
+  const raw = String(challenge ?? '').trim();
+  if (!raw) return null;
+  let text = '';
+  try {
+    text = Buffer.from(raw, 'base64').toString('utf8');
+  } catch {
+    return null;
+  }
+  let parsed = null;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    parsed = null;
+  }
+  if (!parsed || typeof parsed !== 'object') {
+    // Not JSON, but still the server's own words about why it said no.
+    return /^[\x20-\x7e]+$/.test(text) ? text.slice(0, 200) : null;
+  }
+  const bits = [];
+  if (parsed.status) bits.push(`status ${String(parsed.status).slice(0, 20)}`);
+  if (parsed.scope) bits.push(`scope ${String(parsed.scope).slice(0, 160)}`);
+  if (parsed.schemes) bits.push(`schemes ${String(parsed.schemes).slice(0, 60)}`);
+  return bits.length ? bits.join(', ') : null;
+}
+
+/* ================================================================== *
+ * 7. The function the engine calls
  * ================================================================== */
 
 /**
@@ -1365,6 +2231,12 @@ function specialUseOf(name, flags) {
  * function is a single `fetch()` of a hundred bodies, and that is exactly where
  * a Ctrl-C lands. The client fails the command in flight and destroys the
  * socket, so this function's rejection is what the caller waits for.
+ *
+ * `auth: 'xoauth2'` plus `oauth: {clientId, tenantId, tokenRef}` is the OAuth
+ * account. `pass` is not read on that path — there is no password to read — and
+ * `oauth.tokenRef` is the account's own `keyRef`, which is where section 6 files
+ * the grant so that removing the account removes it too. A caller that already
+ * holds a token can hand it over as `accessToken` and nothing is minted.
  */
 export async function fetchRecent({
   host,
@@ -1372,6 +2244,9 @@ export async function fetchRecent({
   secure,
   user,
   pass,
+  auth = null,
+  oauth = null,
+  accessToken = '',
   requireTls = null,
   mailbox = 'INBOX',
   sinceDays = 14,
@@ -1382,7 +2257,22 @@ export async function fetchRecent({
   signal,
 } = {}) {
   const progress = typeof onProgress === 'function' ? onProgress : () => {};
-  const client = new ImapClient({ host, port, secure, user, pass, requireTls, timeoutMs, logger, signal });
+  const method = resolveAuthMethod(auth, accessToken);
+
+  // Minted before the socket, not during the session: a refresh is an HTTPS
+  // round trip to Microsoft and an IMAP connection holding open across it buys
+  // nothing except a longer window for the server's idle timer to fire.
+  let bearer = accessToken;
+  if (method === 'xoauth2' && !bearer) {
+    progress({ phase: 'connect', message: 'Renewing the Microsoft sign-in', done: 0, total: 0 });
+    ({ accessToken: bearer } = await accessTokenFor({ ...(oauth || {}), signal }));
+  }
+
+  const client = new ImapClient({
+    host, port, secure, user, pass, requireTls, timeoutMs, logger, signal,
+    auth: method,
+    accessToken: bearer,
+  });
 
   try {
     progress({ phase: 'connect', message: `Connecting to ${host}`, done: 0, total: 0 });
@@ -1521,16 +2411,38 @@ function stripAngles(value) {
 }
 
 /* ================================================================== *
- * 7. Setup helpers
+ * 8. Setup helpers
  * ================================================================== */
 
-/** Connect, authenticate, list. Never throws — the UI wants the reason, not a stack. */
-export async function testConnection({ host, port, secure, user, pass, requireTls = null, timeoutMs, logger } = {}) {
+/**
+ * Connect, authenticate, list. Never throws — the UI wants the reason, not a stack.
+ *
+ * The OAuth account is tested the same way it is swept, which is the point:
+ * minting the token is where most of these accounts fail, so a "Test the
+ * connection" that skipped it would report success on an account the 07:00 sweep
+ * cannot open. `reconnect` comes back alongside `error` so the button can say
+ * "connect this account again" instead of "check your password".
+ */
+export async function testConnection({
+  host, port, secure, user, pass, auth = null, oauth = null, accessToken = '',
+  requireTls = null, timeoutMs, logger,
+} = {}) {
   let client;
   try {
-    client = new ImapClient({ host, port, secure, user, pass, requireTls, timeoutMs, logger });
+    const method = resolveAuthMethod(auth, accessToken);
+    let bearer = accessToken;
+    if (method === 'xoauth2' && !bearer) {
+      ({ accessToken: bearer } = await accessTokenFor({ ...(oauth || {}) }));
+    }
+    client = new ImapClient({
+      host, port, secure, user, pass, requireTls, timeoutMs, logger,
+      auth: method,
+      accessToken: bearer,
+    });
   } catch (err) {
-    return { ok: false, capabilities: [], mailboxes: [], error: err.message };
+    return {
+      ok: false, capabilities: [], mailboxes: [], error: err.message, reconnect: err.reconnect === true,
+    };
   }
   try {
     await client.connect();
@@ -1539,9 +2451,11 @@ export async function testConnection({ host, port, secure, user, pass, requireTl
     const mailboxes = await client.listMailboxes();
     // A logout that fails after everything else worked is not a failed test.
     await client.logout().catch(() => {});
-    return { ok: true, capabilities, mailboxes, error: null };
+    return { ok: true, capabilities, mailboxes, error: null, reconnect: false };
   } catch (err) {
-    return { ok: false, capabilities: [], mailboxes: [], error: err.message };
+    return {
+      ok: false, capabilities: [], mailboxes: [], error: err.message, reconnect: err.reconnect === true,
+    };
   } finally {
     await client.close();
   }
@@ -1577,7 +2491,15 @@ const PROVIDERS = [
     host: 'outlook.office365.com',
     port: 993,
     secure: true,
-    note: 'Microsoft is retiring password-based IMAP for personal accounts. If sign-in fails, check whether IMAP is still enabled for your account, and use an app password if you have two-step verification on.',
+    /* Written in the past tense on purpose. The previous version of this note
+       said Microsoft "is retiring" password IMAP and suggested an app password
+       if two-step verification was on — a sentence that had been false for
+       eleven months by the time anyone read it, and that sent every one of these
+       users to generate an app password Microsoft would refuse. Basic auth for
+       personal Outlook, Hotmail, Live and MSN ended on 16 September 2024 and
+       app passwords went with it: there is no password of any kind that opens
+       an IMAP session on these accounts now. */
+    note: 'Microsoft switched password sign-in off for personal Outlook, Hotmail, Live and MSN accounts on 16 September 2024, and app passwords no longer work either. Connect this account with "Sign in with Microsoft" instead — Zelos asks you to register a free app in your own Microsoft account and then hands you a code to type into microsoft.com/devicelogin. A work or school account may still allow a password if your administrator has left IMAP on.',
   },
   {
     domains: ['fastmail.com', 'fastmail.fm', 'messagingengine.com'],

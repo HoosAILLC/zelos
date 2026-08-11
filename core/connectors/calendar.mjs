@@ -71,7 +71,7 @@ export function eventsFrom(text, window) {
  * family-level. Keeping it family-level is what lets the `calendar.kind` branch
  * die inside `defaultFetchEvents` without any caller noticing.
  */
-export function calendarConnector({ type, label, option, credential = null, read }) {
+export function calendarConnector({ type, label, option, credential = null, read, check = undefined }) {
   return {
     type,
     family: 'calendar',
@@ -91,6 +91,17 @@ export function calendarConnector({ type, label, option, credential = null, read
      * seam from `ctx.http`. The migration cost is paid by the old four.
      */
     read,
+
+    /**
+     * `zelos doctor`'s probe for this kind, when the kind has one that is not
+     * the generic "fetch the .ics and parse it".
+     *
+     * It is optional, and `undefined` is a real answer rather than an omission:
+     * core/doctor.mjs falls back to reading the address as a subscribed .ics
+     * exactly as `enabledSources` falls back to the `ics` reader, so a calendar
+     * connector that adds nothing to that question declares nothing here.
+     */
+    check,
 
     async collect(ctx) {
       const { source: calendar, secret: pass, deps, window, timezone, identityEmail, signal, emit, label: at } = ctx;

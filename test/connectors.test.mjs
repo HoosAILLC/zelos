@@ -243,11 +243,17 @@ test('enabledSources reads all three places config keeps a source, and drops wha
 
      Dispatching strictly instead made the row VANISH: a calendar the user can
      see in Settings, contributing nothing, with nothing anywhere saying why.
-     The registry does have the right answer for that — `unknownSources()` — but
-     it has no production reader yet, so today the honest choice is the old
-     fallback. When doctor becomes connector-aware and reads `unknownSources()`,
-     this should become a drop plus a named doctor line, and this test should
-     change with it.
+     The registry does have the right answer for that — `unknownSources()` —
+     which had no production reader when this was written.
+
+     IT HAS ONE NOW: core/doctor.mjs reads it and names every entry no connector
+     claims, asserted in test/connector-seam.test.mjs. So the condition this
+     comment set has been met and the fallback below is the LAST thing standing
+     between here and a strict dispatch. It is still asserted as a fallback
+     because the change belongs in its own diff: the assertion, the comment
+     above it and core/connectors/index.mjs's own note all move together, and
+     folding that into the pass that built the reader would make both
+     unreviewable.
 
      A generic `sources[]` entry is different: there is no sensible default
      reader for a type nobody claims, so it is dropped and reported. */

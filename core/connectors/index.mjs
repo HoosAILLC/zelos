@@ -187,6 +187,37 @@ const BY_TYPE = new Map(LIST.map((c) => [c.type, c]));
 /** The connector for a `kind`/`type` string, or null. Never throws. */
 export const get = (type) => BY_TYPE.get(String(type ?? '')) ?? null;
 
+/**
+ * Add a connector after module load, and hand back the way to take it out again.
+ *
+ * NOTHING IN PRODUCTION CALLS THIS, and test/connectors.test.mjs asserts that no
+ * file outside this one does. The static import list above stays the only way a
+ * connector ships, for the reason at the top of this file.
+ *
+ * It exists because the alternative proof that the seam is real is a grep, and a
+ * grep cannot tell a registry from decoration — three surfaces (the Settings
+ * picker, config validation, `zelos doctor`) each read a list of source kinds,
+ * and the only way to show they read THIS list is to put something in it that no
+ * other file names and watch all three find it. That test is the reason the
+ * hardcoded lists cannot come back without somebody noticing.
+ *
+ * The type is released on removal rather than left in `seenTypes`, so the same
+ * throwaway can be registered by more than one test: keeping it would make the
+ * second `register` throw "is registered twice" about a connector that is not
+ * there any more.
+ */
+export function register(connector) {
+  const frozen = deepFreeze(assertShape(connector, seenTypes));
+  LIST.push(frozen);
+  BY_TYPE.set(frozen.type, frozen);
+  return function unregister() {
+    const at = LIST.indexOf(frozen);
+    if (at >= 0) LIST.splice(at, 1);
+    BY_TYPE.delete(frozen.type);
+    seenTypes.delete(frozen.type);
+  };
+}
+
 /** Every registered connector, in declaration order. */
 export const all = () => [...LIST];
 
@@ -295,9 +326,22 @@ export function enabledSources(config) {
      calendar, a named error in the Now banner if it did not. Dispatching
      strictly instead made the row vanish silently, which is the one outcome a
      user cannot debug: a calendar they can see in Settings, contributing
-     nothing, with nothing anywhere saying why. `unknownSources()` reports the
-     entries no connector claims; a calendar is not one of those, because
-     `ics` claims it. */
+     nothing, with nothing anywhere saying why.
+
+     THAT REASON HAS NOW EXPIRED, AND THIS LINE HAS NOT BEEN CHANGED WITH IT.
+     `unknownSources()` finally has a production reader: core/doctor.mjs runs it
+     on every `zelos doctor` and names each entry, its id and the kind nobody
+     claims. So "the row vanishes and nothing says why" is no longer what a
+     strict dispatch costs — the row would vanish and `zelos doctor` would say
+     exactly why — and this fallback can become a drop, which is what the
+     `sources[]` line below already does.
+
+     It is deliberately left alone in this pass. test/connectors.test.mjs pins
+     the fallback and explains the ordering in the same breath, so changing the
+     behaviour and the test that documents it in one diff is the change nobody
+     can review. The next pass is: drop here, update that test, and check
+     ui/views/now.js still has something to show for a calendar that has stopped
+     being read. */
   for (const c of arr(config?.calendars)) push(get(c?.kind) ? c?.kind : 'ics', c);
   for (const s of arr(config?.sources)) push(s?.type, s);
   return out;

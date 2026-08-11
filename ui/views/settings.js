@@ -13,7 +13,10 @@
  */
 
 import { el, button, meander, section, copyText } from '../lib/dom.js';
-import { api } from '../lib/api.js';
+/* `request` rather than a named method on `api`: this panel is the only reader
+   of /api/connectors, and a one-line wrapper in ui/lib/api.js would be a second
+   place to look for a call that has exactly one call site. */
+import { api, request } from '../lib/api.js';
 import { state, saveConfig, setAccent, applyAccent, currentAccent, DEFAULT_ACCENT, markOnboarded } from '../lib/store.js';
 import { plural } from '../lib/format.js';
 import { aiAccessPanel } from './ai-access.js';
@@ -23,6 +26,7 @@ const PANELS = [
   { id: 'model', label: 'Model' },
   { id: 'mail', label: 'Mail' },
   { id: 'calendars', label: 'Calendars' },
+  { id: 'sources', label: 'Sources' },
   { id: 'sweep', label: 'Sweeps' },
   { id: 'privacy', label: 'Privacy' },
   { id: 'ai', label: 'AI access' },
@@ -133,6 +137,194 @@ function randomId(prefix) {
   const bytes = new Uint8Array(3);
   crypto.getRandomValues(bytes);
   return `${prefix}_${[...bytes].map((b) => b.toString(16).padStart(2, '0')).join('')}`;
+}
+
+/* --------------------------------------------------- the connector registry */
+
+/**
+ * Every connector this build has, as core/connectors/index.mjs describes it.
+ *
+ * This panel used to hold its own list of source kinds — three `<option>`s
+ * spelled out in `calendarForm`, and nothing at all for `config.sources`. That
+ * is the same defect the sweep had before the registry: a second list, in a file
+ * that knows nothing about the sources it names, which nobody remembers to edit.
+ * Everything below is drawn from the manifest instead, so a connector added to
+ * core/connectors/ appears in the pickers, gets its own fields, and asks for its
+ * own credential by name, with no edit to this file at all.
+ *
+ * Fetched once per page load and cached, because the answer is a property of the
+ * build and cannot change while the tab is open. A failure clears the cache so
+ * the next attempt is a real one rather than the same rejection replayed — a
+ * server restarted while Settings was open would otherwise stay broken until the
+ * page was reloaded.
+ */
+let connectorsPromise = null;
+
+export function connectorManifests() {
+  if (!connectorsPromise) {
+    connectorsPromise = request('/api/connectors')
+      .then((payload) => (Array.isArray(payload?.connectors) ? payload.connectors : []))
+      .catch((err) => { connectorsPromise = null; throw err; });
+  }
+  return connectorsPromise;
+}
+
+/** The manifests stored under one config key, in the order the registry lists them. */
+export const manifestsFor = (manifests, configKey) =>
+  (Array.isArray(manifests) ? manifests : []).filter((m) => m && m.configKey === configKey);
+
+/** One manifest by type, or null. */
+export const manifestFor = (manifests, type) =>
+  (Array.isArray(manifests) ? manifests : []).find((m) => m && m.type === type) || null;
+
+/**
+ * The picker for one config key: the registry's types, labelled with the
+ * sentence each connector wrote for exactly this control.
+ */
+export const kindOptions = (manifests, configKey) =>
+  manifestsFor(manifests, configKey).map((m) => ({ value: m.type, label: m.option }));
+
+/**
+ * A link, but only to somewhere a link can go.
+ *
+ * `credential.url` is where a user mints the token this source needs, and it
+ * arrives as data over HTTP. It comes from a manifest in this build rather than
+ * from a mail message, so this is not the difference between safe and unsafe —
+ * but `javascript:` in an href is a script that runs on click, and a field this
+ * file assigns without looking is exactly the shape of the hole ui/lib/dom.js
+ * exists to close. http and https, or no link.
+ */
+function mintLink(href) {
+  const raw = String(href ?? '').trim();
+  if (!/^https?:[/][/]\S+$/i.test(raw)) return null;
+  return el('a', { class: 'link', href: raw, target: '_blank', rel: 'noreferrer noopener', text: raw });
+}
+
+/**
+ * The controls for one connector's `fields[]`, and the two questions a form asks
+ * of them: what did the user type, and what did they leave blank that they
+ * cannot.
+ *
+ * Six field types, because core/connectors/index.mjs's FIELD_TYPES is six and
+ * says why: each one already had a control here. `int` reads back as a number
+ * and everything else as a string, because that is what `settings` has to hold —
+ * a connector reading `Number(settings.maxItems)` off the string "50" works
+ * today and stops working the day somebody compares it to a number.
+ *
+ * A blank optional field is OMITTED rather than stored as '', so the connector's
+ * own default applies. Storing the empty string would be a user choosing
+ * "nothing" for a value they never touched.
+ */
+export function fieldControls(manifest, values = {}) {
+  const stored = values && typeof values === 'object' ? values : {};
+  const controls = [];
+
+  for (const f of manifest?.fields ?? []) {
+    const current = stored[f.name];
+    const initial = current === undefined || current === null ? f.default : current;
+
+    if (f.type === 'bool') {
+      let checked = initial === true;
+      controls.push({
+        field: f,
+        node: checkbox(f.label, { checked, onChange: (v) => { checked = v; }, hint: f.hint || null }),
+        read: () => checked,
+      });
+      continue;
+    }
+
+    if (f.type === 'choice') {
+      const options = (f.choices ?? []).map((c) => (c && typeof c === 'object'
+        ? { value: String(c.value), label: String(c.label ?? c.value) }
+        : { value: String(c), label: String(c) }));
+      const node = select(options, { value: initial === undefined ? '' : String(initial) });
+      controls.push({ field: f, node: field(f.label, node, { hint: f.hint || null }), read: () => node.value });
+      continue;
+    }
+
+    const node = f.type === 'int'
+      ? input({
+        type: 'number',
+        value: initial === undefined || initial === null ? '' : String(initial),
+        ...(Number.isFinite(f.min) ? { min: String(f.min) } : {}),
+        ...(Number.isFinite(f.max) ? { max: String(f.max) } : {}),
+      })
+      : input({
+        value: initial === undefined || initial === null ? '' : String(initial),
+        placeholder: f.placeholder || '',
+        autocomplete: 'off',
+        ...(f.type === 'url' ? { spellcheck: 'false' } : {}),
+      });
+
+    controls.push({
+      field: f,
+      node: field(f.label, node, { hint: f.hint || null }),
+      read: () => {
+        const raw = String(node.value ?? '').trim();
+        if (!raw) return undefined;
+        if (f.type !== 'int') return raw;
+        const n = Number(raw);
+        return Number.isFinite(n) ? n : undefined;
+      },
+    });
+  }
+
+  return {
+    nodes: controls.map((c) => c.node),
+    read() {
+      const out = {};
+      for (const c of controls) {
+        const v = c.read();
+        if (v !== undefined) out[c.field.name] = v;
+      }
+      return out;
+    },
+    missing() {
+      return controls
+        .filter((c) => c.field.required && String(c.read() ?? '').trim() === '')
+        .map((c) => c.field);
+    },
+  };
+}
+
+/**
+ * The one credential a source may have, asked for in the connector's own words.
+ *
+ * `credential: null` and `{required: false}` are different facts and the whole
+ * difference is visible here: a connector with nothing to paste gets no field at
+ * all, not a field marked optional. core/connectors/file.mjs is the case that
+ * makes it matter — a calendar file on this machine has no password to be
+ * missing, and offering a box for one is how a user comes to believe their .ics
+ * failed because they left it empty.
+ */
+export function credentialControl(manifest, { keyRef = '', stored = false } = {}) {
+  const credential = manifest?.credential;
+  if (!credential) return null;
+
+  const node = el('input', {
+    class: 'input',
+    type: 'password',
+    autocomplete: 'off',
+    spellcheck: 'false',
+    placeholder: stored
+      ? 'one is stored — type a new one to replace it'
+      : `paste your ${credential.label.toLowerCase()}`,
+  });
+  const link = mintLink(credential.url);
+  return {
+    input: node,
+    keyRef,
+    node: el('div', null, [
+      field(credential.label, node, {
+        hint: [
+          credential.help || '',
+          credential.required ? '' : 'Only if this source needs one.',
+          'It goes straight to your OS keychain: never into config.json, never into a log, and there is no route that reads it back.',
+        ].filter(Boolean).join(' '),
+      }),
+      link ? el('p', { class: 'field-hint' }, ['Mint one at ', link]) : null,
+    ]),
+  };
 }
 
 /* ------------------------------------------------------------------- you */
@@ -723,41 +915,79 @@ export function mailPanel({ compact = false, onDone = null, rerender } = {}) {
 
 /* ------------------------------------------------------------- calendars */
 
-function calendarForm(calendar, { onSaved, onCancel }) {
+/**
+ * The calendar editor.
+ *
+ * The kind picker is the registry's `calendars` connectors and their own
+ * `option` sentences — it used to be three `<option>` elements written out here,
+ * which is why a fourth calendar kind would have been invisible to the only
+ * screen that can create one.
+ *
+ * `fields[]` plays no part: a calendar's address, username and keyRef are the
+ * ENVELOPE core/config.mjs stores for every calendar, not per-connector
+ * settings, and all three calendar connectors declare `fields: []` for the same
+ * reason core/connectors/imap.mjs does. What the manifest does drive is the
+ * credential — whether there is one at all, what it is called, and what to say
+ * about it — and that is the part that was wrong before: `file` has
+ * `credential: null`, and this form asked for a username and password to read a
+ * path on the user's own disk.
+ */
+export function calendarForm(calendar, { manifests = [], onSaved, onCancel }) {
   const draft = { ...calendar };
   const status = statusLine();
+  const options = kindOptions(manifests, 'calendars');
 
   const labelInput = input({ value: draft.label, placeholder: 'Personal' });
   labelInput.addEventListener('input', () => { draft.label = labelInput.value; });
 
-  const kindSelect = select([
-    { value: 'ics', label: 'Subscription URL (.ics / webcal)' },
-    { value: 'caldav', label: 'CalDAV account' },
-    { value: 'file', label: 'A file on this machine' },
-  ], { value: draft.kind || 'ics' });
-  kindSelect.addEventListener('change', () => { draft.kind = kindSelect.value; });
+  const kindSelect = select(options, { value: draft.kind || options[0]?.value || '' });
 
   const urlInput = input({ value: draft.url, placeholder: 'https://…  or  /Users/you/calendar.ics' });
   urlInput.addEventListener('input', () => { draft.url = urlInput.value.trim(); });
 
-  const userInput = input({ value: draft.user || '', placeholder: 'only for CalDAV or a protected URL', autocomplete: 'off' });
+  const userInput = input({ value: draft.user || '', placeholder: 'only for a protected address', autocomplete: 'off' });
   userInput.addEventListener('input', () => { draft.user = userInput.value.trim(); });
 
-  const passInput = el('input', { class: 'input', type: 'password', autocomplete: 'off', placeholder: 'optional' });
+  /* The sign-in half of the form, redrawn whenever the kind changes. Both
+     controls live or die together: a username with no password to go with it
+     authenticates nothing, so a connector that declares no credential gets
+     neither, and says so instead. */
+  const signIn = el('div', null);
+  let credential = null;
+  function drawCredential() {
+    const manifest = manifestFor(manifests, kindSelect.value);
+    credential = credentialControl(manifest, {
+      keyRef: draft.keyRef || `calendar.${draft.id}`,
+      stored: state.secretRefs.includes(draft.keyRef),
+    });
+    signIn.replaceChildren(...(credential
+      ? [field('Username', userInput), credential.node]
+      : [el('p', { class: 'quiet-note', text: `${manifest?.option || 'This kind of calendar'} needs no username and no password.` })]));
+  }
+  kindSelect.addEventListener('change', drawCredential);
+  drawCredential();
+
+  /* The kind is read off the control where it is needed rather than mirrored
+     into `draft` on change — the same rule the TLS selector states above, and
+     for a version of the same reason. A mirror starts out of step: a calendar
+     saved with no kind at all shows the first option and would have been stored
+     as `kind: ''` unless the user happened to touch the picker, which
+     `validateConfig` then refuses with a message about a control they never
+     saw. */
+  const kindNow = () => kindSelect.value;
 
   async function persistPassword() {
-    if (!passInput.value) return;
+    if (!credential?.input.value) return;
     if (!draft.keyRef) draft.keyRef = `calendar.${draft.id}`;
-    await api.setSecret(draft.keyRef, passInput.value);
-    passInput.value = '';
+    await api.setSecret(draft.keyRef, credential.input.value);
+    credential.input.value = '';
   }
 
   return el('div', { class: 'account-form' }, [
     field('Name it', labelInput),
     field('Kind', kindSelect),
     field('Address', urlInput, { hint: 'webcal:// links work; Zelos rewrites them to https.' }),
-    field('Username', userInput),
-    field('Password', passInput),
+    signIn,
     el('div', { class: 'row-inline' }, [
       button('Save calendar', {
         class: 'btn solid',
@@ -770,7 +1000,7 @@ function calendarForm(calendar, { onSaved, onCancel }) {
           try {
             await persistPassword();
             const others = (state.config.calendars || []).filter((c) => c.id !== draft.id);
-            await saveConfig({ calendars: [...others, draft] });
+            await saveConfig({ calendars: [...others, { ...draft, kind: kindNow() }] });
             status.good('Saved.');
             onSaved();
           } catch (err) {
@@ -784,8 +1014,11 @@ function calendarForm(calendar, { onSaved, onCancel }) {
           status.working('Fetching…');
           try {
             await persistPassword();
+            // The kind goes with it, from the same control the save reads, or
+            // this is a test of a different calendar from the one about to be
+            // stored — the mail form makes the same point about requireTls.
             const result = await api.testCalendar({
-              kind: draft.kind,
+              kind: kindNow(),
               url: draft.url,
               user: draft.user,
               keyRef: draft.keyRef,
@@ -807,10 +1040,31 @@ function calendarForm(calendar, { onSaved, onCancel }) {
   ]);
 }
 
+/**
+ * Open an editor once the registry has answered.
+ *
+ * Every form below is a pure function of the manifests, which arrive over HTTP —
+ * so the fetch happens on the click that needs it rather than during a render.
+ * A render that awaited would either block the panel or paint a picker with
+ * nothing in it, and a picker with nothing in it is how a user concludes their
+ * build supports no calendars.
+ */
+async function openEditor(editor, status, build) {
+  status.working('Reading what this build can connect to…');
+  try {
+    const manifests = await connectorManifests();
+    status.clear();
+    editor.replaceChildren(build(manifests));
+  } catch (err) {
+    status.bad(`Zelos could not say what kinds of source it has: ${err.message}`);
+  }
+}
+
 export function calendarPanel({ compact = false, onDone = null, rerender } = {}) {
   const calendars = state.config?.calendars || [];
   const wrap = el('div', { class: 'panel panel-calendars' });
   const editor = el('div', { class: 'editor' });
+  const status = statusLine();
 
   if (!compact) {
     wrap.appendChild(el('p', { class: 'panel-lede', text: 'Times are kept exactly as your calendar publishes them — with their own UTC offset — so an event at 2pm in New York stays at 2pm whatever zone this machine thinks it is in.' }));
@@ -826,7 +1080,8 @@ export function calendarPanel({ compact = false, onDone = null, rerender } = {})
       el('div', { class: 'row-inline' }, [
         button('Edit', {
           class: 'btn quiet',
-          onClick: () => editor.replaceChildren(calendarForm(calendar, {
+          onClick: () => openEditor(editor, status, (manifests) => calendarForm(calendar, {
+            manifests,
             onSaved: () => rerender?.(),
             onCancel: () => editor.replaceChildren(),
           })),
@@ -846,15 +1101,195 @@ export function calendarPanel({ compact = false, onDone = null, rerender } = {})
     class: 'btn solid',
     onClick: () => {
       const id = randomId('c');
-      editor.replaceChildren(calendarForm({
-        id, enabled: true, label: '', kind: 'ics', url: '', user: '', keyRef: null,
+      /* The blank a new calendar opens on comes from the registry, not from the
+         string 'ics': the first `calendars` connector is what the picker will be
+         showing, and a literal here is a default that can disagree with the
+         control under it. */
+      openEditor(editor, status, (manifests) => calendarForm({
+        id,
+        enabled: true,
+        label: '',
+        kind: kindOptions(manifests, 'calendars')[0]?.value || '',
+        url: '',
+        user: '',
+        keyRef: null,
       }, {
+        manifests,
         onSaved: () => { onDone?.(); rerender?.(); },
         onCancel: () => editor.replaceChildren(),
       }));
     },
   })));
   wrap.appendChild(editor);
+  wrap.appendChild(status.node);
+  return wrap;
+}
+
+/* ------------------------------------------------------------------ sources */
+
+/**
+ * The editor for `config.sources` — the third place config keeps a source, and
+ * until now the one with no screen at all.
+ *
+ * There is nothing about any particular connector in this function, and that is
+ * the whole point of it: the picker is the registry's `sources` connectors, the
+ * body is whatever `fields[]` that connector declared, and the credential is the
+ * one it asked for in the words it asked for it. A feed, a ticket queue and a
+ * repository each get a form nobody wrote.
+ *
+ * Changing the kind rebuilds the body and DROPS the settings, which is right
+ * rather than merely easy: `settings` is keyed by field name, and two connectors
+ * that both happen to declare `url` mean entirely different addresses by it.
+ * Carrying values across would hand a new connector a URL for somebody else's
+ * service and call it configured.
+ */
+export function sourceForm(source, { manifests = [], onSaved, onCancel }) {
+  const draft = { ...source };
+  const status = statusLine();
+  const options = kindOptions(manifests, 'sources');
+
+  const typeSelect = select(options, { value: draft.type || options[0]?.value || '' });
+  const labelInput = input({ value: draft.label || '', placeholder: 'Alder notices' });
+  labelInput.addEventListener('input', () => { draft.label = labelInput.value; });
+
+  const body = el('div', { class: 'stack' });
+  let controls = fieldControls(null);
+  let credential = null;
+
+  function drawBody() {
+    const manifest = manifestFor(manifests, typeSelect.value);
+    // The stored settings belong to the stored type. See the docstring.
+    const values = manifest && manifest.type === source.type ? source.settings : {};
+    controls = fieldControls(manifest, values);
+    credential = credentialControl(manifest, {
+      keyRef: draft.keyRef || `${typeSelect.value}.${draft.id}`,
+      stored: state.secretRefs.includes(draft.keyRef),
+    });
+    body.replaceChildren(
+      ...controls.nodes,
+      credential ? credential.node : el('p', { class: 'quiet-note', text: 'This source needs no credential.' }),
+    );
+  }
+  typeSelect.addEventListener('change', drawBody);
+  drawBody();
+
+  return el('div', { class: 'account-form' }, [
+    field('What is it', typeSelect),
+    field('Name it', labelInput, { hint: 'What the board calls anything that arrives from here.' }),
+    body,
+    el('div', { class: 'row-inline' }, [
+      button('Save source', {
+        class: 'btn solid',
+        onClick: async () => {
+          const type = typeSelect.value;
+          if (!type) {
+            status.bad('Pick what kind of source this is.');
+            return;
+          }
+          const missing = controls.missing();
+          if (missing.length) {
+            const names = missing.map((f) => `“${f.label}”`).join(', ');
+            status.bad(`${names} ${missing.length === 1 ? 'is' : 'are'} required.`);
+            return;
+          }
+          status.working('Saving…');
+          try {
+            /* The keyRef is minted only when there is something to put behind
+               it. core/config.mjs mints `${type}.${id}` on load for a source
+               that has a type, and this is the same string — a keyRef written
+               under one name and read under another is a password that is
+               there and cannot be found. */
+            if (credential?.input.value) {
+              if (!draft.keyRef) draft.keyRef = `${type}.${draft.id}`;
+              await api.setSecret(draft.keyRef, credential.input.value);
+              credential.input.value = '';
+            }
+            const others = (state.config.sources || []).filter((s) => s.id !== draft.id);
+            await saveConfig({
+              sources: [...others, {
+                ...draft,
+                type,
+                label: labelInput.value.trim(),
+                settings: controls.read(),
+              }],
+            });
+            status.good('Saved. The next sweep reads it.');
+            onSaved();
+          } catch (err) {
+            status.bad(err.message);
+          }
+        },
+      }),
+      button('Cancel', { class: 'btn quiet', onClick: onCancel }),
+    ]),
+    status.node,
+  ]);
+}
+
+export function sourcesPanel({ rerender } = {}) {
+  const sources = state.config?.sources || [];
+  const wrap = el('div', { class: 'panel panel-sources' });
+  const editor = el('div', { class: 'editor' });
+  const status = statusLine();
+
+  wrap.appendChild(el('p', { class: 'panel-lede', text: 'Everything that is neither mail nor a calendar. Zelos only ever reads: a source here is fetched on the sweep, stored in your Zelos home, and nothing is ever written back to it.' }));
+
+  wrap.appendChild(el('div', { class: 'stack' }, sources.length
+    ? sources.map((src) => el('div', { class: 'account' }, [
+      el('div', { class: 'account-head' }, [
+        el('span', { class: 'account-label', text: src.label || src.id }),
+        el('span', { class: 'mono account-host', text: src.type }),
+        src.enabled === false ? el('span', { class: 'chip', text: 'off' }) : null,
+      ]),
+      el('div', { class: 'row-inline' }, [
+        button(src.enabled === false ? 'Enable' : 'Disable', {
+          class: 'btn quiet',
+          onClick: async () => {
+            const next = (state.config.sources || []).map((s) => (s.id === src.id ? { ...s, enabled: src.enabled === false } : s));
+            await saveConfig({ sources: next });
+            rerender?.();
+          },
+        }),
+        button('Edit', {
+          class: 'btn quiet',
+          onClick: () => openEditor(editor, status, (manifests) => sourceForm(src, {
+            manifests,
+            onSaved: () => rerender?.(),
+            onCancel: () => editor.replaceChildren(),
+          })),
+        }),
+        button('Remove', {
+          class: 'btn quiet',
+          onClick: async () => {
+            await saveConfig({ sources: (state.config.sources || []).filter((s) => s.id !== src.id) });
+            if (src.keyRef) await api.deleteSecret(src.keyRef).catch(() => {});
+            rerender?.();
+          },
+        }),
+      ]),
+    ]))
+    : el('p', { class: 'quiet-note', text: 'Nothing else connected yet.' })));
+
+  wrap.appendChild(el('div', { class: 'row-inline' }, button('Add a source', {
+    class: 'btn solid',
+    onClick: () => {
+      const id = randomId('s');
+      openEditor(editor, status, (manifests) => sourceForm({
+        id,
+        enabled: true,
+        label: '',
+        type: kindOptions(manifests, 'sources')[0]?.value || '',
+        keyRef: null,
+        settings: {},
+      }, {
+        manifests,
+        onSaved: () => rerender?.(),
+        onCancel: () => editor.replaceChildren(),
+      }));
+    },
+  })));
+  wrap.appendChild(editor);
+  wrap.appendChild(status.node);
   return wrap;
 }
 
@@ -1182,6 +1617,7 @@ export function renderSettings(ctx) {
   if (panel === 'you') body = youPanel();
   else if (panel === 'mail') body = mailPanel({ rerender });
   else if (panel === 'calendars') body = calendarPanel({ rerender });
+  else if (panel === 'sources') body = sourcesPanel({ rerender });
   else if (panel === 'sweep') body = sweepPanel();
   else if (panel === 'privacy') body = privacyPanel();
   else if (panel === 'ai') body = aiAccessPanel();
@@ -1191,8 +1627,8 @@ export function renderSettings(ctx) {
 
   // The other half of the relationship the tabs now name. `tabindex="-1"` is
   // not for keyboard order — every panel here has focusable content of its own —
-  // it is so the panel can be given focus programmatically without becoming a
-  // ninth tab stop.
+  // it is so the panel can be given focus programmatically without becoming one
+  // more tab stop after the strip.
   body.setAttribute('id', panelId(panel));
   body.setAttribute('role', 'tabpanel');
   body.setAttribute('aria-labelledby', tabId(panel));
