@@ -451,6 +451,15 @@ const apiGet = async (p) => {
   return { status: res.status, body: await res.json() };
 };
 
+const apiPut = async (p, payload) => {
+  const res = await fetch(base + p, {
+    method: 'PUT',
+    headers: { 'X-Zelos-Token': token, 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return { status: res.status, body: await res.json().catch(() => null) };
+};
+
 /* ================================================================== *
  * Enough browser to run a view
  *
@@ -983,6 +992,7 @@ describe('SSE: core/server.mjs writes frames ui/lib/api.js can read', () => {
     assert.match(line, /tokens in · .* out$/, `the rail should render the counter, got ${JSON.stringify(line)}`);
     assert.notEqual(line, '');
   });
+
 
   test('an unauthenticated stream is refused before any frame is written', async () => {
     const res = await fetch(`${base}/api/sweep/stream`, { headers: { Accept: 'text/event-stream' } });

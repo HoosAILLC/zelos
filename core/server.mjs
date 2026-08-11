@@ -1492,13 +1492,22 @@ async function tokenRecorder() {
  * been written by this point; a `kv` table that will not take a write is a
  * reason to lose a number and never a reason to fail a request that succeeded.
  */
-async function recordAskSpend(db, usage) {
+async function recordAskSpend(db, usage, tz) {
   const tokensIn = Number(usage?.input) || 0;
   const tokensOut = Number(usage?.output) || 0;
   if (!tokensIn && !tokensOut) return;
   try {
     const record = await tokenRecorder();
-    record(db, { tokensIn, tokensOut, thought: false, sweep: false });
+    /* The zone is not decoration. `recordTokens` carries the running day
+       forward only while `stored.day === dayKey(now)`, and the sweep stamps its
+       row with `nowISO(tz)` — the configured zone. Defaulting this writer to
+       `nowISO()` reads the MACHINE zone instead, so for the hours when the two
+       are on different dates the keys disagree, the day is treated as new, and
+       the first question typed into Ask resets the counter the rail shows to
+       zero. Caught by test/sweep.test.mjs's non-sweep-spender test, which only
+       fails during that window: on a machine in EDT with the app configured for
+       UTC it is green until 20:00 and red after it. */
+    record(db, { tokensIn, tokensOut, thought: false, sweep: false, now: nowISO(tz) });
   } catch (err) {
     log.warn('server: could not record what Ask spent', { error: err.message });
   }
@@ -1555,7 +1564,7 @@ async function handleAsk(ctx) {
         // client reads. Both, not either: the SSE frame is what the Ask panel
         // shows about this answer, and the counter is what the rail shows about
         // the day. Until this line existed the second one had no writer at all.
-        await recordAskSpend(ctx.db, event.usage);
+        await recordAskSpend(ctx.db, event.usage, cfg.identity.timezone || localTimezone());
       }
     }
   } catch (err) {

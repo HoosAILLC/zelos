@@ -18,6 +18,7 @@ const {
 } = await import('../core/db.mjs');
 const { SWEEP_KV } = await import('../core/triage.mjs');
 const { seedSampleData } = await import('../core/sample-data.mjs');
+const { nowISO, dayKey } = await import('../core/time.mjs');
 const {
   runSweep, shouldRunFull, nextRunAt, isActiveHour, Scheduler, FULL_RUN_MAX_AGE_MS,
   recordTokens,
@@ -1386,7 +1387,20 @@ test('a non-sweep spender moves the tokens and neither of the run counts', async
   assert.equal(afterSweep.runs, 1);
   assert.equal(afterSweep.modelRuns, 1);
 
-  const after = recordTokens(db, { tokensIn: 900, tokensOut: 100, thought: false, sweep: false });
+  /* The zone is passed, exactly as core/server.mjs's recordAskSpend passes it,
+     and leaving it off is the bug this argument exists to prevent rather than a
+     shorthand. `recordTokens` carries the running day forward only while
+     `stored.day === dayKey(now)`; the sweep stamped its row with `nowISO(tz)`
+     for the configured zone, so a second writer that defaults to `nowISO()` —
+     the machine zone — computes a different date for every hour the two zones
+     disagree, and the day is treated as new. In production that meant the first
+     question typed into Ask reset the token counter the rail shows to zero.
+     Left as a bare call this test was green until 20:00 EDT and red after it,
+     which is how the defect surfaced. */
+  const tz = baseConfig().identity.timezone;
+  const after = recordTokens(db, {
+    tokensIn: 900, tokensOut: 100, thought: false, sweep: false, now: nowISO(tz),
+  });
   assert.equal(after.tokensIn, afterSweep.tokensIn + 900, 'Ask is spend, and spend is counted');
   assert.equal(after.tokensOut, afterSweep.tokensOut + 100);
   assert.equal(after.runs, 1, 'a question typed into a panel is not a sweep that happened');
@@ -1398,6 +1412,25 @@ test('a non-sweep spender moves the tokens and neither of the run counts', async
   const stored = JSON.parse(getKV(db, SWEEP_KV.tokens));
   assert.equal(stored.tokensIn, after.tokensIn);
   assert.equal(stored.runs, 1);
+
+  /* And the other half of the same contract: a second writer that stamps the
+     row from a DIFFERENT zone does not add to the day, it starts a new one.
+     This is the mechanism behind a real defect — core/server.mjs's
+     recordAskSpend defaulted to `nowISO()`, the machine zone, while the sweep
+     stamps `nowISO(tz)` for the configured one, so for every hour the two were
+     on different dates the first question typed into Ask silently reset the
+     counter the rail shows. The zone is picked at run time because a fixed one
+     only diverges for part of the day; at any instant two calendar dates exist
+     on Earth, so one of these always disagrees with `tz`. */
+  const elsewhere = ['Pacific/Kiritimati', 'Pacific/Midway', 'Asia/Tokyo', 'UTC']
+    .find((z) => dayKey(nowISO(z)) !== dayKey(nowISO(tz)));
+  assert.ok(elsewhere, 'no zone disagrees with the configured one about the date, which cannot happen');
+  const crossZone = recordTokens(db, {
+    tokensIn: 5, tokensOut: 5, thought: false, sweep: false, now: nowISO(elsewhere),
+  });
+  assert.equal(crossZone.tokensIn, 5,
+    'a row stamped in another zone must read as a new day — if this ever adds, dayKey stopped '
+    + 'deciding the day and recordAskSpend no longer needs to be handed the configured zone');
 });
 
 /* ================================================================== *

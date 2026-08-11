@@ -118,7 +118,17 @@ export async function startCore({ root, home = null, port = null } = {}) {
     db = core.db.open(where.db);
     core.db.migrate(db);
 
-    server = core.server.createServer({ db, config, logger });
+    /* `logFile` is what a 500 tells the user to go and read. Without it the
+       handler falls back to "the reason was written to the terminal Zelos is
+       running in — Zelos keeps no log file of its own", which in a packaged app
+       names nobody: there is no terminal, and the log file it denies having is
+       the one this very function opened, three statements up. */
+    server = core.server.createServer({
+      db,
+      config,
+      logger,
+      logFile: path.join(where.logsDir, 'desktop.log'),
+    });
 
     // Same ordering as the CLI launcher: the server exists first so the
     // scheduler's progress has somewhere to be reported, then the scheduler is
