@@ -850,6 +850,51 @@ test('describe() survives JSON and carries no functions', () => {
     'a source with nothing to paste must not be described as needing something');
 });
 
+test('REGRESSION: a server that sends no rate-limit header has not reported zero remaining', async (t) => {
+  /* This one line stopped three connectors from working at all, and shipped.
+
+     `res.headers.get()` returns null for a header that is not there,
+     `Number(null)` is 0, and both `Number.isFinite(0)` and `0 >= 0` are true —
+     so `state.spent = budget.calls - 0` marked the WHOLE declared budget spent
+     on the first response from any server that does not send
+     `x-ratelimit-remaining`.
+
+     GitHub sends it, which is why GitHub worked and hid this. Slack, Linear and
+     Todoist do not. All three therefore made exactly one request per window and
+     then rested: Slack read no messages at all, and neither of the other two
+     could reach a second page. Measured before the fix — a declared budget of
+     100 calls, one success, and the second call refused with "this source's own
+     allowance of 100 requests is spent".
+
+     Both directions are asserted, because the naive fix (ignore the header) is
+     just as wrong: a server that really does say zero must still stop us. */
+  const silent = await feedServer(t, {
+    handler: (req, res) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end('{}'); },
+  });
+  const generous = createHttp({
+    origins: [silent.origin],
+    limits: { budget: { calls: 100, perMs: 3_600_000 }, minGapMs: 0 },
+  });
+  for (let i = 0; i < 5; i += 1) {
+    await generous.get(`${silent.origin}/x`);       // must not throw
+  }
+  assert.equal(silent.hits(), 5, 'a declared budget of 100 refused a call before the fifth');
+
+  const exhausted = await feedServer(t, {
+    handler: (req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json', 'x-ratelimit-remaining': '0' });
+      res.end('{}');
+    },
+  });
+  const client = createHttp({
+    origins: [exhausted.origin],
+    limits: { budget: { calls: 100, perMs: 3_600_000 }, minGapMs: 0 },
+  });
+  await client.get(`${exhausted.origin}/x`);
+  await assert.rejects(() => client.get(`${exhausted.origin}/x`), /allowance/,
+    'a server that really reported zero remaining was ignored');
+});
+
 test('originsFor is the user\'s addresses plus the connector\'s, and nothing a document said', () => {
   const rss = connectorFor('rss');
   assert.deepEqual(originsFor(rss, { settings: { url: 'https://alder.example/feed.xml' } }),

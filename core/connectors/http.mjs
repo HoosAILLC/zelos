@@ -333,8 +333,26 @@ export function createHttp({
       throw new Error(`${finalUrl.host} returned ${res.status}`);
     }
 
-    // The server's own remaining-call count beats ours whenever it offers one.
-    const remaining = Number(res.headers.get('x-ratelimit-remaining'));
+    /* The server's own remaining-call count beats ours WHENEVER IT OFFERS ONE,
+       and the absence of the header is not an offer of zero.
+
+       `res.headers.get()` returns null for a header that is not there;
+       `Number(null)` is 0; `Number.isFinite(0)` is true and `0 >= 0` is true.
+       So a server that simply does not send `x-ratelimit-remaining` drove
+       `state.spent` to the entire declared budget on its FIRST response, and
+       every later call in the window was refused with "this source's own
+       allowance is spent".
+
+       GitHub sends the header, which is why GitHub worked and hid this. Slack,
+       Linear and Todoist do not send it — so all three made exactly one request
+       per window and then rested: Slack read no messages at all, and Linear and
+       Todoist could never reach a second page. Measured against a loopback
+       server with a declared budget of 100: one call succeeded, the second was
+       refused.
+
+       Read the header first, and only believe a number that is really there. */
+    const rawRemaining = res.headers.get('x-ratelimit-remaining');
+    const remaining = rawRemaining === null ? NaN : Number(rawRemaining);
     if (budget && Number.isFinite(remaining) && remaining >= 0) {
       state.spent = Math.max(state.spent, budget.calls - remaining);
     }
