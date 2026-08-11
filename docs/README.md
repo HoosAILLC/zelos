@@ -324,6 +324,49 @@ it. Useful for exports and for calendars that only publish downloads.
 
 ---
 
+## Connecting everything else
+
+Mail and calendar are the two Zelos needs. Beyond them it can read eight more
+things, all of them from **Settings → Sources**:
+
+| | |
+| --- | --- |
+| **GitHub** | What needs you — assignments, review requests, mentions |
+| **Slack** | Your conversations, with a token you mint in your own workspace |
+| **Fireflies** | Meeting recaps, with the action items |
+| **Linear** | The issues assigned to you that are due |
+| **Todoist** | Tasks due today or overdue |
+| **A feed** | Any RSS or Atom address |
+| **A folder** | Anything a script drops into a directory on this machine |
+| **A WhatsApp export** | A chat you exported yourself |
+
+Every one of them is a credential **you** mint in your own account, or a file on
+your own disk. Zelos publishes no OAuth app anywhere — there is no client id, no
+consent screen and no "Connect with…" button, because there is no server for one
+to call back to. All of them are read-only, and that is enforced by the shape of
+the interface rather than by convention.
+
+**[SOURCES.md](SOURCES.md)** is the page for these: one section each, with where
+you mint the credential, what scopes it needs, what it costs, what it
+deliberately does not do, and where it stops. Two things worth knowing before
+you go looking for them:
+
+- **The watched folder is the answer to "webhook".** Zelos opens no inbound
+  port, so a webhook is impossible rather than missing — and a directory anything
+  can write into buys the same thing with no public URL and no token to leak.
+- **The WhatsApp source is an archive, not a connection.** It shows nothing new
+  until you export the chat again.
+
+And one whole category needs no source at all. **[NOTETAKERS.md](NOTETAKERS.md)**
+covers the AI notetakers — Fireflies, Otter, Grain, Fathom, tl;dv, Read.ai,
+Circleback and Granola. Seven of the eight email you a structured recap when a
+meeting ends, and Zelos already reads your mail: turn the setting on, scope it to
+yourself, and the action items you agreed to out loud arrive on the board with no
+key and no API. That page says, per vendor, which setting produces the mail and
+how to aim it at yourself only.
+
+---
+
 ## Where your data lives
 
 Everything is in one folder: **`~/.zelos`** — that's
@@ -633,10 +676,13 @@ core/
   home-lock.mjs      one Zelos per data folder, and a warning when there are two
   log.mjs, time.mjs  redacted logging; zone-aware clock arithmetic
   sources/           imap.mjs, mime.mjs, ics.mjs, caldav.mjs, oauth.mjs
+  connectors/        one file per source, plus the registry and the one way out
 ui/                  the page you look at — plain HTML, CSS and JavaScript
 desktop/             the Electron shell — a window and a tray, nothing more
 test/                the tests; run them with `node --test "test/*.test.mjs"`
-docs/                SPEC.md (what it must do), SECURITY.md (what it defends)
+docs/                SPEC.md (what it must do), SECURITY.md (what it defends),
+                     SOURCES.md (the eight sources), NOTETAKERS.md (the category
+                     that needs none)
 ```
 
 Two notes on that list. `core/sources/oauth.mjs` is **not wired to anything** —

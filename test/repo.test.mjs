@@ -1007,3 +1007,150 @@ test('no tracked source file carries a carriage return', () => {
     'these files have CRLF line endings, which silently breaks every guard in this suite that '
     + `matches a pattern against source text:\n  ${offenders.join('\n  ')}`);
 });
+
+/* ------------------------------------------------------------------ *
+ * Personal data in a public repository
+ * ------------------------------------------------------------------ */
+
+test('no tracked file carries the operator\'s real identity', () => {
+  /* REGRESSION, and it reached a release build before anything caught it.
+     `core/connectors/linear.mjs` and its test both used `nemo@` followed by the
+     operator's real company domain as a fixture address — the one this test
+     forbids, spelled out here only as a description because writing it would
+     make this file fail its own check. `nemo` is the house's fictional person
+     and is fine; the DOMAIN is a real business, in a public repository, in a
+     file that ships inside the source zip and inside every desktop bundle.
+
+     It survived being written, reviewed by a second agent, merged, and built —
+     because the only thing that had ever checked for this was a grep I ran by
+     hand at packaging time, and a check that depends on somebody remembering is
+     not a check. This is that grep, as a test.
+
+     Fixtures must use a RESERVED name: `.example`, `.test`, `.invalid`, or
+     `example.com` (RFC 2606 / 6761). Those can never resolve, so a fixture
+     address can never become mail to a real person. `github.com/HoosAILLC/zelos`
+     is the project's own public URL and is allowed by name — it is a fact about
+     where the code lives, not a personal detail.
+
+     Three things this deliberately does NOT flag, each of which it did on the
+     first run:
+
+     `nemo` is the house's fictional person and appears in scores of fixtures.
+     Only a REAL name is a leak.
+
+     `/users/nemo/` in a CalDAV path is a URL, not a home directory. The
+     home-path rule is case-SENSITIVE for exactly this reason: macOS writes
+     `/Users/`, while a server path is lowercase, and an `/i` here turned every
+     Nextcloud principal URL in test/caldav.test.mjs into a false positive.
+
+     And this comment cannot spell the domain it forbids, or the guard fails on
+     itself — which is why the rule below is assembled rather than written out. */
+  const realDomain = new RegExp(`\\bhoos${'ai'}\\.(biz|com|dev|ai)\\b`, 'i');
+  const forbidden = [
+    { what: 'the operator\'s name', re: /\bnehemiah\b/i },
+    { what: 'the operator\'s surname', re: /\bdrook\b/i },
+    { what: 'a real company domain used as a fixture', re: realDomain },
+    { what: 'an absolute path into somebody\'s home directory', re: /\/Users\/(?!you\b|nemo\b)[a-z][a-z0-9._-]*/ },
+    { what: 'something shaped like a live API key', re: /\b(sk-[a-zA-Z0-9]{20,}|ghp_[A-Za-z0-9]{20,}|xox[bp]-[A-Za-z0-9-]{20,})\b/ },
+  ];
+  const allowed = [/github\.com\/HoosAILLC\/zelos/i];
+
+  /* Walked rather than taken from `git ls-files`, so the check still runs from
+     an extracted tarball — which is the copy a stranger actually reads, and the
+     one where a leaked address would do its damage. */
+  const files = [];
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (entry.name === 'node_modules' || entry.name === 'dist' || entry.name === '.git') continue;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else files.push(path.relative(ROOT, full));
+    }
+  };
+  for (const root of ['core', 'ui', 'test', 'desktop', 'docs', '.github']) {
+    const dir = path.join(ROOT, root);
+    if (fs.existsSync(dir)) walk(dir);
+  }
+  for (const f of ['zelos.mjs', 'package.json', 'README.md', 'LICENSE']) {
+    if (fs.existsSync(path.join(ROOT, f))) files.push(f);
+  }
+
+  const offenders = [];
+  for (const rel of files) {
+    if (/\.(png|jpg|jpeg|webp|icns|ico|zip|dmg|exe|woff2?|mp4)$/i.test(rel)) continue;
+    let text;
+    try { text = fs.readFileSync(path.join(ROOT, rel), 'utf8'); } catch { continue; }
+    for (const line of text.split('\n')) {
+      if (allowed.some((ok) => ok.test(line))) continue;
+      for (const { what, re } of forbidden) {
+        if (re.test(line)) offenders.push(`${rel}: ${what} — ${line.trim().slice(0, 90)}`);
+      }
+    }
+  }
+
+  assert.deepEqual(offenders, [],
+    'this repository is public and these lines carry real personal data:\n  '
+    + `${offenders.join('\n  ')}\n\nUse a reserved name (.example, .test, .invalid, example.com) instead.`);
+});
+
+/* ------------------------------------------------------------------ *
+ * The transport is the only way out
+ * ------------------------------------------------------------------ */
+
+test('no connector reaches the network except through ctx.http', () => {
+  /* `core/connectors/http.mjs` says, in its header, that "a repo test greps
+     core/connectors/ for a bare `fetch(` and fails on a hit". Until this
+     existed, that test did not — a documented guard that was not there, which
+     is the same shape as a guard that only checks a file MENTIONS something.
+
+     It is worth having for its own sake, not just to make the sentence true.
+     The transport is where the origin allow-list, the one-hop redirect rule,
+     the byte cap, the timeout, the rate budget and the credential redaction all
+     live, and the reason they are written once is that writing them a sixth
+     time for the sixth connector is how docs/SECURITY.md's claim — that you can
+     watch Zelos with tcpdump and see only what you configured — stops being
+     true. A connector that calls global `fetch` silently opts out of all of it,
+     and nothing about the resulting code looks wrong.
+
+     `http.mjs` itself is exempt: it is the file that does the fetching.
+
+     `ics.mjs` is exempt BY NAME and on purpose, and the name is the point. Its
+     `fetchIcsText` predates the transport and hand-rolls the same protections —
+     `redirect: 'manual'` with a one-hop rule, credentials dropped when the hop
+     leaves the origin, `AbortSignal.timeout`, and a byte cap — so it is not a
+     hole; it is the DUPLICATION this transport exists to end, and the audit
+     already found real defects in one of the hand-rolled copies. Exempting it
+     by name rather than loosening the rule means a NEW bare fetch in any other
+     connector still fails here, and that migrating ics.mjs is a one-line
+     deletion from this list rather than a rediscovery. */
+  const dir = path.join(ROOT, 'core', 'connectors');
+  const EXEMPT = new Set([
+    'http.mjs',   // the transport itself
+    'ics.mjs',    // hand-rolls the same rules; see above. Migrating it removes this line.
+  ]);
+  const offenders = [];
+
+  for (const name of fs.readdirSync(dir).sort()) {
+    if (!name.endsWith('.mjs') || EXEMPT.has(name)) continue;
+    const text = fs.readFileSync(path.join(dir, name), 'utf8');
+    text.split('\n').forEach((line, i) => {
+      // Skip comment lines: these files discuss fetch at length, and a mention
+      // in prose is the opposite of a problem.
+      const code = line.replace(/\/\/.*$/, '').trim();
+      if (!code || code.startsWith('*') || code.startsWith('/*')) return;
+      // `ctx.http.get(...)`, `http.post(...)` and the like are the way out.
+      // A bare `fetch(`, `globalThis.fetch`, or a direct node: transport is not.
+      if (/(^|[^.\w])fetch\s*\(/.test(code)
+        || /globalThis\s*\.\s*fetch/.test(code)
+        || /require\(['"]node:(https?|net|tls)['"]\)/.test(code)
+        || /from\s+['"]node:(https?|net|tls)['"]/.test(code)) {
+        offenders.push(`core/connectors/${name}:${i + 1}: ${code.slice(0, 80)}`);
+      }
+    });
+  }
+
+  assert.deepEqual(offenders, [],
+    'these lines reach the network without the transport, so they skip the origin allow-list, the '
+    + 'one-hop redirect rule, the byte cap, the timeout, the rate budget and the credential '
+    + `redaction:\n  ${offenders.join('\n  ')}`);
+});

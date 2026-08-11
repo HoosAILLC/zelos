@@ -10,10 +10,20 @@
  * Slack is how the claim in docs/SECURITY.md — that you can watch Zelos with
  * tcpdump and see only what you configured — stops being true.
  *
- * So it is written once, here, and a connector cannot opt out: `ctx.http` is
- * the object it is handed, `fetch` is not in scope for it, and a repo test
- * greps core/connectors/ for a bare `fetch(` and fails on a hit. Everything
- * below is enforcement, not convenience:
+ * So it is written once, here, and a connector cannot opt out quietly:
+ * `ctx.http` is the object it is handed, and `test/repo.test.mjs`'s
+ * "no connector reaches the network except through ctx.http" greps this
+ * directory for a bare `fetch(` and fails on a hit.
+ *
+ * That test did not exist when this paragraph was first written, which is worth
+ * recording: for several days this file documented a guard that was not there,
+ * and the sentence read as enforcement while nothing enforced it. It exists
+ * now, with exactly two exemptions, both named in it — this file, and
+ * `ics.mjs`, whose `fetchIcsText` predates the transport and hand-rolls the
+ * same one-hop redirect rule, origin-scoped credentials, timeout and byte cap.
+ * That one is duplication rather than a hole, and it is on the list to migrate.
+ *
+ * Everything below is enforcement, not convenience:
  *
  *   1. ORIGIN ALLOW-LIST. A URL that is not on the connector's declared
  *      `origins`, or on the origin of a `type: 'url'` field the user filled in

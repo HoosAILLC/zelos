@@ -14,6 +14,7 @@ const secrets = await import('../core/secrets.mjs');
 const {
   backend, setSecret, getSecret, deleteSecret, listRefs,
   describeCommand, resetBackendCache, chooseBackend, SERVICE,
+  TIMEOUTS_MS, ATTEMPTS, setTimeoutsForTest,
 } = secrets;
 
 const mode = (p) => fs.statSync(p).mode & 0o777;
@@ -363,15 +364,26 @@ test('encrypted-file fallback: the store a home committed to is recorded, and a 
  */
 const SECRETS_URL = new URL('../core/secrets.mjs', import.meta.url).href;
 
-function detectInChild({ home, pathDir }) {
+/**
+ * Run `script` in a child that believes it is Linux, with `pathDir` as its
+ * whole PATH, and hand back whatever JSON it printed.
+ *
+ * Split out of `detectInChild` below rather than duplicated, because the
+ * timeout tests further down need the same three arrangements and a second
+ * copy of them is a second place for the ZELOS_SECRETS_BACKEND scrub to be
+ * forgotten. `detectInChild` keeps its exact signature and answer.
+ */
+function askTheChild({ home, pathDir, body, env: extra = {} }) {
   const script = [
     "Object.defineProperty(process, 'platform', { value: 'linux' });",
-    `const { backend } = await import(${JSON.stringify(SECRETS_URL)});`,
-    'process.stdout.write(JSON.stringify(await backend()));',
+    `const secrets = await import(${JSON.stringify(SECRETS_URL)});`,
+    body,
   ].join('\n');
 
   const { ZELOS_SECRETS_BACKEND: _, ...inherited } = process.env;
-  const env = { ...inherited, ZELOS_HOME: home, ZELOS_LOG_LEVEL: 'silent' };
+  const env = {
+    ...inherited, ZELOS_HOME: home, ZELOS_LOG_LEVEL: 'silent', ...extra,
+  };
   // Windows keeps this variable under the name `Path`, and writing a second
   // one called `PATH` into a child's block is asking for trouble. It does not
   // need scrubbing there anyway: `secret-tool` is a Linux binary and the child
@@ -380,7 +392,15 @@ function detectInChild({ home, pathDir }) {
 
   const child = spawnSync(process.execPath, ['--input-type=module', '-e', script], { env, encoding: 'utf8' });
   assert.equal(child.status, 0, `the probe child failed: ${child.stderr}`);
-  return JSON.parse(child.stdout).name;
+  return JSON.parse(child.stdout);
+}
+
+function detectInChild({ home, pathDir }) {
+  return askTheChild({
+    home,
+    pathDir,
+    body: 'process.stdout.write(JSON.stringify(await secrets.backend()));',
+  }).name;
 }
 
 test('detect() honours the store a home is committed to, even when the probe disagrees', async (t) => {
@@ -455,6 +475,24 @@ const NEEDS_A_SHELL_STUB = process.platform === 'win32'
   ? 'this test puts a #!/bin/sh stub for secret-tool on PATH, which Windows cannot execute'
   : false;
 
+/**
+ * Two modes and a log were added for the timeout tests below, and both are
+ * additive: with ZELOS_STUB_LOG and ZELOS_STUB_ONCE unset the script behaves
+ * exactly as it did, so the test above is unchanged.
+ *
+ *  - `hang` never answers, which is the only way to reach `run()`'s timer with
+ *    a real subprocess. `sleep 5` rather than something longer because a
+ *    SIGKILL to the shell leaves the sleep behind as an orphan, and a suite
+ *    should not litter a machine with half-minute processes.
+ *  - `hang-once` hangs the FIRST time and then behaves as ZELOS_STUB_AFTER,
+ *    which is what makes "the retry" something the stub can distinguish. The
+ *    marker file is the only state a `#!/bin/sh` stub can keep between spawns.
+ *  - ZELOS_STUB_LOG collects one line per invocation, so a test can count
+ *    attempts instead of trusting that a retry happened.
+ *
+ * The `--zelos-stub` self-identification stays ahead of the log, so the proof
+ * that the stub is what PATH resolves to does not appear in the count.
+ */
 function installSecretToolStub(dir) {
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, 'secret-tool');
@@ -462,14 +500,58 @@ function installSecretToolStub(dir) {
     '#!/bin/sh',
     '# Stands in for secret-tool. ZELOS_STUB_MODE picks what the keyring says.',
     'if [ "$1" = "--zelos-stub" ]; then echo zelos-stub; exit 0; fi',
-    'case "${ZELOS_STUB_MODE:-found}" in',
+    'if [ -n "$ZELOS_STUB_LOG" ]; then echo "$*" >> "$ZELOS_STUB_LOG"; fi',
+    'mode="${ZELOS_STUB_MODE:-found}"',
+    'if [ "$mode" = "hang-once" ]; then',
+    '  if [ -f "$ZELOS_STUB_ONCE" ]; then mode="${ZELOS_STUB_AFTER:-found}"; else : > "$ZELOS_STUB_ONCE"; mode=hang; fi',
+    'fi',
+    'case "$mode" in',
     '  found)   echo found-a-value; exit 0 ;;',
     '  missing) exit 1 ;;',
     '  dbus)    echo "Cannot autolaunch D-Bus without X11" >&2; exit 1 ;;',
     '  crash)   echo boom >&2; exit 3 ;;',
+    /* Two things this one line has to get right, both measured here.
+       `/bin/sleep` by absolute path, because the probe children below run with
+       a stripped PATH holding this stub and nothing else: a bare `sleep` is not
+       found, the case falls straight through, and the stub answers exit 0 —
+       a healthy keyring, reported by the stub written to be an unhealthy one.
+       And `exec`, so the shell BECOMES the sleep: without it, run()'s SIGKILL
+       kills the shell and leaves the sleep holding the stdio pipes it
+       inherited, which keeps the calling process alive until the sleep ends.
+       Measured: a 250 ms timeout took 5,832 ms to be observed. If exec fails
+       the shell exits 126/127, which no branch of core/secrets.mjs reads as
+       anything good. */
+    '  hang)    exec /bin/sleep 5 ;;',
     'esac',
   ].join('\n')}\n`, { mode: 0o755 });
   return file;
+}
+
+/** How many times the stub was actually spawned. */
+function stubCalls(logFile) {
+  if (!fs.existsSync(logFile)) return 0;
+  return fs.readFileSync(logFile, 'utf8').split('\n').filter((l) => l.trim()).length;
+}
+
+/**
+ * Prove the stub is what `secret-tool` resolves to, and warm it while we are
+ * here. Both halves matter and the second one is not a micro-optimisation.
+ *
+ * The stub writes its log line after the shell has started, and a `hang` spawn
+ * is racing a SIGKILL from the caller's timeout — so a shell that is slow to
+ * reach its first statement is a spawn that happened and was never counted.
+ * Measured on this machine: shell-start-to-first-write is 3–9 ms warm, even
+ * under six busy cores, but 277 ms cold. Four copies of this file running at
+ * once undercounted by exactly one spawn, four times out of four, against a
+ * 250 ms budget. Which is the same cold-start effect the module's retry exists
+ * for, arriving in the test that measures it.
+ */
+function proveAndWarmStub(file = 'secret-tool') {
+  const proof = spawnSync(file, ['--zelos-stub'], { encoding: 'utf8' });
+  assert.equal(proof.stdout?.trim(), 'zelos-stub',
+    `${file} did not identify itself as the stub. Called by name, that means "secret-tool" resolves to `
+    + 'something else and everything below would be talking to a real keyring; called by path, it means the '
+    + 'stub is not runnable at all.');
 }
 
 /**
@@ -528,6 +610,346 @@ test('a keyring that will not answer must not erase the index', { skip: NEEDS_A_
     assert.deepEqual(JSON.parse(fs.readFileSync(indexFile, 'utf8')), { refs: [] });
   } finally {
     delete process.env.ZELOS_STUB_MODE;
+    process.env.PATH = realPath;
+    process.env.ZELOS_SECRETS_BACKEND = 'encrypted-file';
+    resetBackendCache();
+  }
+});
+
+/* -------------------------------------------- a timeout that lost things
+ *
+ * The measurements these are all about, once, so the tests below can cite them
+ * instead of restating them:
+ *
+ *   (1) A GitHub Actions windows-latest runner — fast, idle — failed a release
+ *       build with `powershell.exe timed out after 15000ms`, on a test whose
+ *       wall clock was 18136ms. Re-running it passed.
+ *   (2) `listRefs()` returned `[]` after 15_020 ms: the probe's own 15_000 plus
+ *       change, a fallback to encrypted-file, and an empty store reporting that
+ *       this home has no credentials at all.
+ *
+ * The suite reaches a real `run()` timeout with the `hang` stub, but it does
+ * not sit through the product's 60-second budget to do it: `setTimeoutsForTest`
+ * shrinks the numbers, because what is under test is the retry and the
+ * classification, and neither depends on the size of the number. The numbers
+ * themselves are pinned separately, immediately below.
+ */
+
+test('the probe budget and the credential budget are different numbers, and both are derived', () => {
+  const { probe, access } = TIMEOUTS_MS;
+
+  // The defect in one line: one constant, 15_000, for a liveness check and for
+  // a password write. Neither may be that number again.
+  assert.notEqual(probe, 15_000);
+  assert.notEqual(access, 15_000);
+  assert.ok(probe < access,
+    `a liveness check must not be given the budget of a write that can lose a credential (${probe} vs ${access})`);
+
+  // Measurement (1) says everything up to and including a cold `powershell.exe`
+  // fitted inside 18_136 − 15_000 = 3_136 ms on the reference runner, and that
+  // figure contains the test's own setup, so it is an upper bound. The probe
+  // gets twice it: room for a machine twice as slow, on the cold attempt.
+  assert.equal(probe, (18_136 - 15_000) * 2);
+
+  // And the whole probe, retry included, is still less wall clock than the one
+  // 15_000 ms budget it replaces. This is the claim that makes "the probe can
+  // afford to be short" true rather than hopeful.
+  assert.ok(probe * ATTEMPTS <= 15_000,
+    `${ATTEMPTS} probe attempts at ${probe}ms is ${probe * ATTEMPTS}ms, which is more than the 15000ms it replaced`);
+
+  // 15_000 is not a measurement of what an access needs — it is what one was
+  // allowed before it was killed with work left, on the fastest machine in the
+  // fleet. So the access budget is a multiple of a known-too-small floor.
+  assert.equal(access, 15_000 * 4);
+  assert.ok(access > 15_000);
+});
+
+/**
+ * Measurement (2), reproduced end to end and then fixed.
+ *
+ * Every probe used to answer `false` for any failure whatsoever, and
+ * `probeBackend` reads `false` as "this store is not on this machine". So a
+ * PowerShell that was merely slow moved a Windows home to the encrypted file,
+ * and `listRefs()` answered `[]` — not "I could not ask", but "you have no
+ * credentials".
+ *
+ * The home here has refs in its index and no `secrets.backend.json`, and that
+ * combination is deliberate: it is the one state the backend record cannot
+ * protect, because there is nothing recorded for a bad probe to lose to.
+ * `recordBackend` treats a failed record write as a warning rather than a
+ * failed save — losing the record costs the protection, not the secret — so
+ * this is a state the module reaches on purpose, and it is also every home in
+ * the window between the first `rememberRef` and the first record.
+ *
+ * The child is the same arrangement `detect()`'s other test uses and for the
+ * same reason — pinned to Linux so the probe takes the secret-tool branch on
+ * every host, with a stub for its whole PATH — so no real credential store is
+ * anywhere near it.
+ */
+test('a probe that could not answer must not report the store as missing', { skip: NEEDS_A_SHELL_STUB }, () => {
+  const binDir = path.join(HOME_ROOT, 'hang-bin');
+  proveAndWarmStub(installSecretToolStub(binDir));
+  const home = path.join(HOME_ROOT, 'probe-timeout');
+  fs.mkdirSync(home, { recursive: true });
+  fs.writeFileSync(path.join(home, 'secrets.index.json'), JSON.stringify({ refs: ['mail.m_9f3a1c'] }));
+  const log = path.join(HOME_ROOT, 'hang-log.txt');
+
+  const answer = askTheChild({
+    home,
+    pathDir: binDir,
+    env: { ZELOS_STUB_MODE: 'hang', ZELOS_STUB_LOG: log },
+    body: [
+      'secrets.setTimeoutsForTest({ probe: 400, access: 400 });',
+      'const b = await secrets.backend();',
+      'process.stdout.write(JSON.stringify({ backend: b.name, refs: await secrets.listRefs() }));',
+    ].join('\n'),
+  });
+
+  assert.equal(answer.backend, 'libsecret',
+    'the spawn SUCCEEDED and the tool did not finish, which is the one thing that cannot mean the tool is '
+    + 'absent — falling back here puts the first credential this home ever stores into secrets.enc while '
+    + 'the UI note and docs/SECURITY.md both say the desktop keyring is holding it');
+  assert.deepEqual(answer.refs, ['mail.m_9f3a1c'],
+    'this is the measured defect verbatim: listRefs() answered [] after 15,020 ms, and an empty list is '
+    + 'what Settings and Ask read as "nothing was ever configured"');
+
+  // Nothing here ever answers, so every spawn burns its whole budget: the probe
+  // is tried ATTEMPTS times, and then listRefs asks about the one ref ATTEMPTS
+  // times. A probe that gives up after a single cold spawn is the failure this
+  // whole section is about, and it shows up here as half the count.
+  assert.equal(stubCalls(log), ATTEMPTS * 2,
+    `expected ${ATTEMPTS} probe attempts and ${ATTEMPTS} attempts at the one ref`);
+});
+
+/**
+ * The other side of the same rule, and without it the fix above is a new bug:
+ * "a timeout means the store is there" must not become "a timeout means the
+ * store is there and nothing may say otherwise". A machine with secret-tool
+ * installed and no keyring daemon has to keep falling back — that is what the
+ * D-Bus branch in `probeSecretTool` is for — and on a slow machine the first
+ * spawn is exactly the one that might not get far enough to say so.
+ *
+ * So the stub hangs once and then complains about D-Bus, which is a real
+ * answer. Honouring it is the difference between one re-entered password and a
+ * home pinned forever to a keyring that cannot hold anything.
+ */
+test('a probe that answers on the retry is believed, timeout or not', { skip: NEEDS_A_SHELL_STUB }, () => {
+  const binDir = path.join(HOME_ROOT, 'hang-once-bin');
+  proveAndWarmStub(installSecretToolStub(binDir));
+  const home = path.join(HOME_ROOT, 'probe-retry');
+  fs.mkdirSync(home, { recursive: true });
+  const log = path.join(HOME_ROOT, 'hang-once-log.txt');
+
+  const answer = askTheChild({
+    home,
+    pathDir: binDir,
+    env: {
+      ZELOS_STUB_MODE: 'hang-once',
+      ZELOS_STUB_AFTER: 'dbus',
+      ZELOS_STUB_ONCE: path.join(HOME_ROOT, 'hang-once-marker'),
+      ZELOS_STUB_LOG: log,
+    },
+    body: [
+      'secrets.setTimeoutsForTest({ probe: 400, access: 400 });',
+      'const b = await secrets.backend();',
+      'process.stdout.write(JSON.stringify({ backend: b.name }));',
+    ].join('\n'),
+  });
+
+  assert.equal(stubCalls(log), ATTEMPTS,
+    'a timed-out probe has to be retried; without the second attempt the D-Bus complaint below is never heard');
+  assert.equal(answer.backend, 'encrypted-file',
+    'the retry said the keyring daemon is not reachable, and that is an answer — treating every timeout as '
+    + '"the store is present" would pin this machine to a keyring that will refuse every write');
+});
+
+/**
+ * The headline consequence of measurement (1). The CI run that failed was a
+ * WRITE: it went through `setSecret`, PowerShell was slow once, and the release
+ * build went red. For a user the same spawn is the moment they press Save on a
+ * mail password, and the old code turned one slow subprocess into "Zelos could
+ * not store your password".
+ *
+ * The stub hangs once and then succeeds, which is what the CI runner did when
+ * the job was re-run — and what a cold PowerShell does on its second spawn,
+ * with the CLR and its assemblies now in the page cache.
+ */
+test('a credential write that times out once is not a lost credential', { skip: NEEDS_A_SHELL_STUB }, async () => {
+  useHome('write-retry');
+  const home = process.env.ZELOS_HOME;
+  const binDir = path.join(HOME_ROOT, 'write-retry-bin');
+  const log = path.join(HOME_ROOT, 'write-retry-log.txt');
+  const realPath = process.env.PATH;
+  installSecretToolStub(binDir);
+  process.env.PATH = `${binDir}${path.delimiter}${realPath}`;
+  // Forced, so detection never runs and nothing here can reach this machine's
+  // own store. Proved below before a single value is stored.
+  process.env.ZELOS_SECRETS_BACKEND = 'libsecret';
+  resetBackendCache();
+  const restore = setTimeoutsForTest({ access: 300 });
+
+  try {
+    proveAndWarmStub();
+
+    process.env.ZELOS_STUB_MODE = 'hang-once';
+    process.env.ZELOS_STUB_AFTER = 'found';
+    process.env.ZELOS_STUB_ONCE = path.join(HOME_ROOT, 'write-retry-marker');
+    process.env.ZELOS_STUB_LOG = log;
+
+    assert.deepEqual(await setSecret('model.default', 'a-password-worth-keeping'), { ok: true, backend: 'libsecret' });
+    assert.equal(stubCalls(log), ATTEMPTS, 'the write was retried exactly once after the timeout');
+
+    // The write really completed, rather than being reported as done: the ref
+    // is indexed and the home is committed to the store that took it.
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(home, 'secrets.index.json'), 'utf8')), { refs: ['model.default'] });
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(home, 'secrets.backend.json'), 'utf8')), { backend: 'libsecret' });
+  } finally {
+    restore();
+    for (const v of ['ZELOS_STUB_MODE', 'ZELOS_STUB_AFTER', 'ZELOS_STUB_ONCE', 'ZELOS_STUB_LOG']) delete process.env[v];
+    process.env.PATH = realPath;
+    process.env.ZELOS_SECRETS_BACKEND = 'encrypted-file';
+    resetBackendCache();
+  }
+});
+
+/**
+ * The dangerous half, stated as a rule: a read that could not be answered must
+ * never be handed to a caller as "there is no such secret". Two ways in, and
+ * the module used to take both.
+ *
+ *  - the tool never finished. That has always thrown, and now it is retried
+ *    first — the same cold-start argument as the write above, and the same
+ *    consequence if it is not: `core/sweep.mjs:636` turns a thrown getSecret
+ *    into a per-source error the user can see, which is right, but it turns a
+ *    NULL into "No password stored for <account>. Add it in Settings" — an
+ *    instruction to re-type a password that is sitting in the keyring.
+ *  - secret-tool exited 1 and complained. It spends exit 1 on both "no such
+ *    item" and "the keyring did not answer"; `hasSecret` has always read stderr
+ *    to tell them apart and this read did not, so a keyring that was down
+ *    answered "there is no password for this account" in as many words.
+ */
+test('a read that could not be answered is an error, never "no such secret"', { skip: NEEDS_A_SHELL_STUB }, async () => {
+  useHome('read-timeout');
+  const binDir = path.join(HOME_ROOT, 'read-timeout-bin');
+  const log = path.join(HOME_ROOT, 'read-timeout-log.txt');
+  const realPath = process.env.PATH;
+  installSecretToolStub(binDir);
+  process.env.PATH = `${binDir}${path.delimiter}${realPath}`;
+  // Forced, so detection never runs and nothing here can reach this machine's
+  // own store.
+  process.env.ZELOS_SECRETS_BACKEND = 'libsecret';
+  resetBackendCache();
+  const restore = setTimeoutsForTest({ access: 300 });
+
+  try {
+    proveAndWarmStub();
+
+    process.env.ZELOS_STUB_MODE = 'hang';
+    process.env.ZELOS_STUB_LOG = log;
+    // Taken as a value rather than through two `assert.rejects` calls, so the
+    // whole budget is spent once and so "it did not resolve" is stated outright
+    // — `assert.rejects` alone would also be satisfied by a different error.
+    const failed = await getSecret('model.default').then((v) => ({ resolved: v }), (err) => err);
+    assert.ok(failed instanceof Error,
+      `a read that never came back resolved to ${JSON.stringify(failed.resolved)}; null here is a password `
+      + 'sitting in the keyring that the user is told to type again');
+    assert.match(failed.message, /timed out after 300ms/);
+    // The message also has to say WHICH of the module's spawns died. The CI
+    // failure that started this said only `powershell.exe timed out after
+    // 15000ms`, and which of that test's PowerShell calls it was had to be
+    // reconstructed from a wall clock. A ref is an opaque id, so it leaks
+    // nothing to name one.
+    assert.match(failed.message, /libsecret get model\.default/);
+    assert.equal(stubCalls(log), ATTEMPTS, 'and it must be retried once before it becomes an error');
+
+    fs.rmSync(log, { force: true });
+    process.env.ZELOS_STUB_MODE = 'dbus';
+    await assert.rejects(() => getSecret('model.default'), /could not read model\.default from libsecret/,
+      'exit 1 with a D-Bus complaint on stderr is how secret-tool reports a keyring it cannot reach, and it '
+      + 'used to be read as an empty keyring');
+
+    // The other half of the same branch, which the tri-state has to keep: a
+    // straight not-found is exit 1 with NOTHING on stderr, and that really is
+    // "no such secret".
+    process.env.ZELOS_STUB_MODE = 'missing';
+    assert.equal(await getSecret('model.default'), null);
+  } finally {
+    restore();
+    for (const v of ['ZELOS_STUB_MODE', 'ZELOS_STUB_LOG']) delete process.env[v];
+    process.env.PATH = realPath;
+    process.env.ZELOS_SECRETS_BACKEND = 'encrypted-file';
+    resetBackendCache();
+  }
+});
+
+/**
+ * `listRefs` is the one caller that multiplies a timeout, and it is on a path a
+ * UI request waits on: `core/server.mjs:768` and `:1053`. Two things keep that
+ * bounded, and both are measured here rather than reasoned about.
+ *
+ *  - `hasSecret` draws on the SHORT budget, not the credential one. Its "I
+ *    could not tell" already keeps the ref, so a longer wait buys only the
+ *    chance to prune, and pruning is tidiness that self-corrects. The two
+ *    budgets are set far apart below and the clock says which one was used.
+ *  - once one ref has gone unanswered, the rest are not asked. The index is
+ *    already un-prunable for this pass and a ref nobody has said is gone stays
+ *    in the list either way, so every further spawn is time spent on an outcome
+ *    that is settled.
+ *
+ * The clock is asserted as well as the spawn count, because a count can be
+ * right while the work is not — and because the count is what a refactor would
+ * preserve while the wait is what a user would feel.
+ */
+test('a store that stops answering is asked once, on the short budget', { skip: NEEDS_A_SHELL_STUB }, async () => {
+  useHome('list-timeout');
+  const home = process.env.ZELOS_HOME;
+  const binDir = path.join(HOME_ROOT, 'list-timeout-bin');
+  const log = path.join(HOME_ROOT, 'list-timeout-log.txt');
+  const realPath = process.env.PATH;
+  installSecretToolStub(binDir);
+  process.env.PATH = `${binDir}${path.delimiter}${realPath}`;
+  // Forced, so detection never runs and nothing here can reach this machine's
+  // own store.
+  process.env.ZELOS_SECRETS_BACKEND = 'libsecret';
+  resetBackendCache();
+  // Far apart on purpose: `access` is what `hasSecret` must NOT be using, and
+  // it is kept small enough that a regression fails in about eight seconds
+  // instead of hanging the suite for the two minutes the real number would.
+  const budget = 400;
+  const restore = setTimeoutsForTest({ probe: budget, access: 4_000 });
+
+  try {
+    proveAndWarmStub();
+
+    const indexFile = path.join(home, 'secrets.index.json');
+    const refs = ['mail.m_a1', 'mail.m_b2', 'model.default'];
+    fs.mkdirSync(home, { recursive: true });
+    fs.writeFileSync(indexFile, JSON.stringify({ refs }));
+
+    process.env.ZELOS_STUB_MODE = 'hang';
+    process.env.ZELOS_STUB_LOG = log;
+    const started = Date.now();
+    assert.deepEqual(await listRefs(), refs, 'a ref nobody has said is gone is still ours');
+    const elapsed = Date.now() - started;
+
+    assert.deepEqual(JSON.parse(fs.readFileSync(indexFile, 'utf8')), { refs },
+      'the index is the only record that these keyring items are Zelos\'s, and nothing can rebuild it');
+    assert.equal(stubCalls(log), ATTEMPTS,
+      `one ref asked, retried once, and then it stops: ${refs.length} refs at ${ATTEMPTS} attempts each would be `
+      + `${refs.length * ATTEMPTS} spawns for an answer that was settled after the first`);
+    /* The passing case is two short budgets plus two shell spawns: about
+       800 ms. The two ways this can go wrong are 2,400 ms (asking every ref)
+       and 8,000 ms (asking on the credential budget). The bound is set at
+       double the expectation so a loaded runner has room, and it is still well
+       under either failure — a wall-clock assertion is only worth having if it
+       cannot fail for being on a busy machine or pass for the wrong reason. */
+    assert.ok(elapsed < budget * ATTEMPTS * 2,
+      `listRefs took ${elapsed}ms. It should be about ${budget * ATTEMPTS}ms: asking every ref would be about `
+      + `${budget * ATTEMPTS * refs.length}ms, and asking on the credential budget would be about 8000ms — a `
+      + 'health check must not sit on a stalled keyring for the time a password write is allowed');
+  } finally {
+    restore();
+    for (const v of ['ZELOS_STUB_MODE', 'ZELOS_STUB_LOG']) delete process.env[v];
     process.env.PATH = realPath;
     process.env.ZELOS_SECRETS_BACKEND = 'encrypted-file';
     resetBackendCache();

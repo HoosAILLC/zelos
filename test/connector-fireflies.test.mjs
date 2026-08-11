@@ -12,10 +12,23 @@
  *
  *  2. FAILURE ARRIVES AS 200. GraphQL states a bad key, a spent allowance and a
  *     mistyped field in the body, so the whole "is this a success" decision is
- *     the connector's rather than the transport's. Six tests below feed it a 200
- *     and demand a rejection; the one that matters most is the partial — `data`
- *     populated AND `errors` present — because that is the shape a `?? []`
- *     reader turns into "you had no meetings".
+ *     the connector's rather than the transport's. Several tests below feed it a
+ *     200 and demand a rejection; the one that matters most is the partial —
+ *     `data` populated AND `errors` present — because that is the shape a
+ *     `?? []` reader turns into "you had no meetings".
+ *
+ *  3. THE SERVER ANSWERS THE DOCUMENT, NOT THE TEST. This one was added after
+ *     the first two had been true for a while and were not enough. The original
+ *     mock returned a fixture whatever it was asked for, so MEETINGS_QUERY —
+ *     the entire design of this connector, per the head of the file it tests —
+ *     was unpinned: twelve separate edits to it left every test green, including
+ *     dropping `summary { … }` (a poll that reads every meeting and no action
+ *     item), removing the date arguments (a poll that ignores the window it
+ *     computed) and removing `limit`. `serve()` below parses the document,
+ *     refuses fields and arguments a written-out SCHEMA does not have, applies
+ *     the arguments, and projects each fixture through the selection set. All
+ *     twelve now fail. `ok()` is kept for the handful of cases that need a body
+ *     no well-behaved server would produce.
  *
  * EVERY SOCKET GOES TO 127.0.0.1. The connector posts to the real
  * https://api.fireflies.ai/graphql and the transport's origin allow-list is
@@ -65,7 +78,7 @@ const {
 const { AuthError, RateLimitError, createHttp } = await import('../core/connectors/http.mjs');
 const registry = await import('../core/connectors/index.mjs');
 const { assertShape } = registry;
-const { open, close, migrate, upsertMessages, listMessages } = await import('../core/db.mjs');
+const { open, close, migrate, upsertMessages, listMessages, messagesInThread } = await import('../core/db.mjs');
 const { diagnose } = await import('../core/doctor.mjs');
 
 let seq = 0;
@@ -142,7 +155,246 @@ const MEETING_LATER_BUT_LOWER = {
   summary: null,
 };
 
+/**
+ * A meeting three weeks before the sweep window opens.
+ *
+ * It exists so the date arguments in MEETINGS_QUERY have something to exclude.
+ * A mock that hands back its whole fixture list no matter what it was asked
+ * cannot tell a document that filters from one that does not — and "the
+ * endpoint ignores the question" is a defect that looks exactly like a healthy
+ * poll from inside the connector.
+ */
+const MEETING_OUT_OF_WINDOW = {
+  id: 'tr_old1',
+  title: 'Kickoff, three weeks ago',
+  dateString: '2026-07-21T15:00:00.000Z',
+  date: Date.parse('2026-07-21T15:00:00.000Z'),
+  duration: 60,
+  transcript_url: 'https://app.fireflies.ai/view/tr_old1',
+  host_email: 'dana@vance.example',
+  participants: ['dana@vance.example'],
+  meeting_attendees: [],
+  summary: { overview: 'Kickoff', short_summary: '', gist: '', action_items: '' },
+};
+
 const ok = (transcripts) => JSON.stringify({ data: { transcripts } });
+
+/* ================================================================== *
+ * A mock that answers the DOCUMENT rather than the test
+ * ================================================================== *
+ *
+ * `ok([MEETING_FULL])` hands back the same body whatever was asked for, and
+ * that is the difference between a test file and a test file that catches
+ * something. Measured by mutating the connector and re-running this suite as it
+ * stood: TWELVE separate edits to MEETINGS_QUERY left every test green —
+ * dropping `summary { … }` entirely, dropping `action_items` from it, renaming
+ * `transcripts` to `transcript`, renaming `fromDate`, removing the date
+ * arguments altogether, removing `limit`, dropping `title`, `transcript_url`,
+ * `dateString`, `duration`, `host_email` and `meeting_attendees`. Every one of
+ * those is a live connector that returns rows and reads nothing, and the stub
+ * agreed with all of them, because the fixture it returns was written by the
+ * test rather than derived from the request.
+ *
+ * So the mock below is a small GraphQL server instead: it parses the document,
+ * refuses fields and arguments that are not in SCHEMA the way a real endpoint
+ * does (200 with an `errors` array — the vendor's own failure shape), applies
+ * `fromDate`/`toDate`/`limit`/`skip`, and PROJECTS each fixture through the
+ * selection set so a field the document did not ask for is not in the answer.
+ *
+ * SCHEMA is written out rather than derived from MEETINGS_QUERY on purpose. A
+ * schema generated from the document would accept the document by construction,
+ * which is the circularity that let the twelve mutants through in the first
+ * place.
+ */
+
+/** Object types have subfields; anything else is a leaf. */
+const SCHEMA = {
+  Query: {
+    transcripts: { type: 'Transcript', list: true, args: ['fromDate', 'toDate', 'limit', 'skip', 'mine', 'host_email', 'participant_email', 'user_id'] },
+    transcript: { type: 'Transcript', list: false, args: ['id'] },
+    users: { type: 'User', list: true, args: [] },
+    user: { type: 'User', list: false, args: ['id'] },
+  },
+  Transcript: {
+    id: 'ID', title: 'String', date: 'Float', dateString: 'DateTime', duration: 'Float',
+    transcript_url: 'String', audio_url: 'String', video_url: 'String', meeting_link: 'String',
+    host_email: 'String', organizer_email: 'String', participants: 'String', calendar_id: 'String',
+    meeting_attendees: 'Attendee', summary: 'Summary', sentences: 'Sentence', speakers: 'Speaker',
+  },
+  Summary: {
+    overview: 'String', short_summary: 'String', gist: 'String', action_items: 'String',
+    keywords: 'String', bullet_gist: 'String', shorthand_bullet: 'String', outline: 'String',
+    meeting_type: 'String', topics_discussed: 'String',
+  },
+  Attendee: { displayName: 'String', name: 'String', email: 'String', phoneNumber: 'String', location: 'String' },
+  User: { user_id: 'ID', name: 'String', email: 'String', num_transcripts: 'Int', minutes_consumed: 'Float', is_admin: 'Boolean' },
+  Sentence: { index: 'Int', text: 'String', speaker_name: 'String', start_time: 'Float' },
+  Speaker: { id: 'Int', name: 'String' },
+};
+
+const TOKEN = /\$?[A-Za-z_][A-Za-z0-9_]*|"[^"]*"|-?\d+(?:\.\d+)?|[{}():,![\]=]/g;
+
+/**
+ * The selection set of a single-operation query document.
+ *
+ * Enough GraphQL for the two documents this connector sends and no more: an
+ * operation header, variable definitions (skipped as a paren block), fields,
+ * literal-or-variable arguments, and nesting. A document this cannot parse
+ * throws, which is a louder failure than quietly matching nothing.
+ */
+function parseDocument(text) {
+  const tokens = String(text ?? '').match(TOKEN) || [];
+  let i = 0;
+  const peek = () => tokens[i];
+  const take = () => tokens[i++];
+  const skipParens = () => {
+    let depth = 0;
+    do {
+      const t = take();
+      if (t === '(') depth += 1;
+      else if (t === ')') depth -= 1;
+      else if (t === undefined) throw new Error('unbalanced ( in the document');
+    } while (depth > 0);
+  };
+
+  if (peek() === 'query' || peek() === 'mutation') {
+    take();
+    if (peek() && peek() !== '{' && peek() !== '(') take();   // operation name
+    if (peek() === '(') skipParens();                          // variable definitions
+  }
+  const root = parseSelectionSet();
+  if (i < tokens.length) throw new Error(`trailing tokens in the document at ${tokens[i]}`);
+  return root;
+
+  function parseSelectionSet() {
+    if (take() !== '{') throw new Error('expected a selection set');
+    const out = [];
+    while (peek() && peek() !== '}') out.push(parseField());
+    if (take() !== '}') throw new Error('unclosed selection set');
+    return out;
+  }
+  function parseField() {
+    const name = take();
+    if (!/^[A-Za-z_]/.test(String(name))) throw new Error(`expected a field name, got ${name}`);
+    const args = {};
+    if (peek() === '(') {
+      take();
+      while (peek() && peek() !== ')') {
+        const key = take();
+        if (take() !== ':') throw new Error(`expected a value for argument ${key}`);
+        args[key] = take();
+        if (peek() === ',') take();
+      }
+      take();
+    }
+    const children = peek() === '{' ? parseSelectionSet() : null;
+    return { name, args, children };
+  }
+}
+
+/** What a GraphQL server says about a document its schema does not recognise. */
+function validateAgainstSchema(fields, typeName, errors) {
+  for (const f of fields) {
+    const def = SCHEMA[typeName]?.[f.name];
+    if (!def) {
+      errors.push({ message: `Cannot query field "${f.name}" on type "${typeName}".`, extensions: { code: 'GRAPHQL_VALIDATION_FAILED' } });
+      continue;
+    }
+    const type = typeof def === 'string' ? def : def.type;
+    const allowed = typeof def === 'string' ? [] : def.args;
+    for (const arg of Object.keys(f.args)) {
+      if (!allowed.includes(arg)) {
+        errors.push({ message: `Unknown argument "${arg}" on field "${typeName}.${f.name}".`, extensions: { code: 'GRAPHQL_VALIDATION_FAILED' } });
+      }
+    }
+    const isObject = !!SCHEMA[type];
+    if (isObject && !f.children) {
+      errors.push({ message: `Field "${f.name}" of type "${type}" must have a selection of subfields.`, extensions: { code: 'GRAPHQL_VALIDATION_FAILED' } });
+    } else if (!isObject && f.children) {
+      errors.push({ message: `Field "${f.name}" must not have a selection since type "${type}" has no subfields.`, extensions: { code: 'GRAPHQL_VALIDATION_FAILED' } });
+    } else if (isObject) {
+      validateAgainstSchema(f.children, type, errors);
+    }
+  }
+}
+
+/** A fixture, reduced to the fields the document actually selected. */
+function project(value, fields, typeName) {
+  if (value === null || value === undefined) return null;
+  if (Array.isArray(value)) return value.map((v) => project(v, fields, typeName));
+  const out = {};
+  for (const f of fields) {
+    const def = SCHEMA[typeName]?.[f.name];
+    const type = typeof def === 'string' ? def : def?.type;
+    const raw = value[f.name];
+    out[f.name] = f.children ? project(raw, f.children, type) : (raw === undefined ? null : raw);
+  }
+  return out;
+}
+
+const instantOf = (t) => Date.parse(String(t?.dateString ?? '')) || Number(t?.date) || 0;
+
+/**
+ * An answerer for `graphqlServer`: a real-enough Fireflies endpoint over the
+ * fixtures it is given.
+ *
+ * `transcripts` honours the arguments the DOCUMENT named — not the ones the
+ * connector meant to name — so a query that stopped filtering by date, or
+ * stopped capping with `limit`, hands back rows the assertions can see.
+ */
+function serve({ transcripts = [], users = [] } = {}) {
+  return (nth, body) => {
+    let doc;
+    try {
+      doc = parseDocument(body?.query);
+    } catch (err) {
+      return JSON.stringify({ errors: [{ message: `Syntax Error: ${err.message}` }] });
+    }
+    const errors = [];
+    validateAgainstSchema(doc, 'Query', errors);
+    if (errors.length) return JSON.stringify({ errors });
+
+    const vars = body?.variables ?? {};
+    const value = (raw) => {
+      if (raw === undefined) return undefined;
+      if (String(raw).startsWith('$')) return vars[String(raw).slice(1)];
+      return String(raw).replace(/^"|"$/g, '');
+    };
+
+    const data = {};
+    for (const f of doc) {
+      if (f.name === 'users') { data.users = project(users, f.children, 'User'); continue; }
+      if (f.name === 'user') {
+        const id = value(f.args.id);
+        data.user = project(users.find((u) => u.user_id === id) ?? users[0] ?? null, f.children, 'User');
+        continue;
+      }
+      if (f.name === 'transcript') {
+        const id = value(f.args.id);
+        data.transcript = project(transcripts.find((t) => t.id === id) ?? null, f.children, 'Transcript');
+        continue;
+      }
+      // transcripts
+      const fromMs = Date.parse(String(value(f.args.fromDate) ?? ''));
+      const toMs = Date.parse(String(value(f.args.toDate) ?? ''));
+      const limit = Number(value(f.args.limit));
+      const skip = Number(value(f.args.skip));
+      let rows = transcripts.filter((t) => {
+        const at = instantOf(t);
+        if (Number.isFinite(fromMs) && at < fromMs) return false;
+        if (Number.isFinite(toMs) && at > toMs) return false;
+        return true;
+      });
+      if (Number.isFinite(skip) && skip > 0) rows = rows.slice(skip);
+      if (Number.isFinite(limit) && limit >= 0) rows = rows.slice(0, limit);
+      data.transcripts = project(rows, f.children, 'Transcript');
+    }
+    return JSON.stringify({ data });
+  };
+}
+
+/** The meetings half, which is what almost every test wants. */
+const meetings = (...list) => serve({ transcripts: list });
 
 /* ------------------------------------------------------------------ *
  * The mock, the transport and the ctx
@@ -156,7 +408,7 @@ const ok = (transcripts) => JSON.stringify({ data: { transcripts } });
  * trip" assertion below has teeth: if the connector went back for summaries,
  * the mock would hand it something and the count would say so.
  */
-async function graphqlServer(t, answer, { status = 200 } = {}) {
+async function graphqlServer(t, answer, { status = 200, headers = {} } = {}) {
   const requests = [];
   const server = http.createServer((req, res) => {
     let raw = '';
@@ -167,7 +419,7 @@ async function graphqlServer(t, answer, { status = 200 } = {}) {
       try { body = JSON.parse(raw); } catch { /* recorded as null */ }
       requests.push({ method: req.method, url: req.url, headers: { ...req.headers }, body, raw });
       const text = typeof answer === 'function' ? answer(requests.length, body) : answer;
-      res.writeHead(status, { 'content-type': 'application/json' });
+      res.writeHead(status, { 'content-type': 'application/json', ...headers });
       res.end(text);
     });
   });
@@ -289,11 +541,12 @@ test('the declared budget is one an hourly poll actually fits inside the free ti
  * ================================================================== */
 
 test('collect asks for the meetings and their summaries in ONE request', async (t) => {
-  const mock = await graphqlServer(t, (nth) => {
+  const answer = meetings(MEETING_FULL);
+  const mock = await graphqlServer(t, (nth, body) => {
     // Anything after the first would be an N+1 fetch. It is answered rather
     // than refused so the failure is a count, not a crash.
     if (nth > 1) return ok([]);
-    return ok([MEETING_FULL]);
+    return answer(nth, body);
   });
   const { ctx } = ctxFor(transportFor(mock));
 
@@ -310,7 +563,7 @@ test('collect asks for the meetings and their summaries in ONE request', async (
 });
 
 test('the request carries the key as a Bearer header and a JSON GraphQL document', async (t) => {
-  const mock = await graphqlServer(t, ok([MEETING_FULL]));
+  const mock = await graphqlServer(t, meetings(MEETING_FULL));
   const { ctx } = ctxFor(transportFor(mock));
 
   await connector.collect(ctx);
@@ -334,6 +587,61 @@ test('`graphql: true` is what makes the POST legal at all', async (t) => {
 
   await assert.rejects(connector.collect(ctx), /did not declare `graphql: true`/);
   assert.equal(mock.requests.length, 0, 'a refused POST must not reach a socket');
+});
+
+test('the whole day\'s allowance is spendable through one transport, header or no header', async (t) => {
+  /* The regression test for `ffda7ee`, from the connector that pays for it.
+     `res.headers.get()` is null for a header that is not there, `Number(null)`
+     is 0, `Number.isFinite(0)` is true and `0 >= 0` is true — so the transport
+     used to read "zero calls remaining" out of a header the server never sent
+     and spend the entire declared budget on the FIRST response. Fireflies
+     sends no `x-ratelimit-remaining` (the mock above sends only a
+     content-type, which is the honest shape), so this connector is exactly the
+     one that would go back to reading one meeting a day if it returned.
+
+     Forty polls through ONE transport — the whole declared allowance, which is
+     more than the hourly interval can spend in a day — and then the refusal,
+     which is the budget doing its job rather than a header doing it wrongly. */
+  const mock = await graphqlServer(t, meetings(MEETING_FULL));
+  const client = transportFor(mock);
+  const { calls } = connector.limits.budget;
+
+  for (let i = 0; i < calls; i += 1) {
+    const result = await connector.collect(ctxFor(client).ctx);
+    assert.equal(result.parts[0].rows.length, 1, `poll ${i + 1} of ${calls} read nothing`);
+  }
+  assert.equal(mock.requests.length, calls, 'one request per poll, all the way to the end of the allowance');
+  assert.equal(client.meter.spent, calls);
+
+  await assert.rejects(connector.collect(ctxFor(client).ctx), RateLimitError,
+    'the allowance is spent and the next poll must be refused here rather than at the vendor');
+});
+
+test('the connector reaches the network only through `ctx.http`', async (t) => {
+  /* Two claims, and only the second one is a real guard.
+
+     The text scan is a lint: it says the module contains no call to `fetch`,
+     `http.request` or a socket, which is worth having and is not proof of
+     anything at run time. The behaviour is: `globalThis.fetch` is replaced
+     with a throw for the length of one poll, and the poll still succeeds —
+     which can only be true if every byte went through the transport `ctx.http`
+     was built from. That is what makes the origin allow-list, the redirect
+     rule, the byte cap and the budget unavoidable rather than merely offered. */
+  const source = fs.readFileSync(new URL('../core/connectors/fireflies.mjs', import.meta.url), 'utf8');
+  for (const forbidden of [/\bfetch\s*\(/, /\bhttps?\.request\s*\(/, /\bnet\.(connect|createConnection)\s*\(/, /child_process/]) {
+    assert.doesNotMatch(source, forbidden, `core/connectors/fireflies.mjs reaches past ctx.http with ${forbidden}`);
+  }
+
+  const mock = await graphqlServer(t, meetings(MEETING_FULL));
+  const { ctx } = ctxFor(transportFor(mock));
+  const guard = globalThis.fetch;
+  globalThis.fetch = () => { throw new Error('the connector called globalThis.fetch'); };
+  try {
+    const rows = (await connector.collect(ctx)).parts[0].rows;
+    assert.equal(rows.length, 1);
+  } finally {
+    globalThis.fetch = guard;
+  }
 });
 
 test('the transport built from this manifest refuses any other host', async (t) => {
@@ -445,6 +753,147 @@ test('graphqlError says nothing about a healthy body', () => {
   assert.equal(graphqlError({ data: { transcripts: [] }, errors: [] }), null);
 });
 
+/* ---------------------------------------------------------------- *
+ * The classifier, branch by branch.
+ *
+ * `graphqlError` decides between AuthError (core/sweep.mjs rests the
+ * credential for six hours), RateLimitError (it rests the clock) and a plain
+ * Error (it rests nothing and retries in an hour, forever). On a fifty-a-day
+ * allowance those are three completely different outcomes, and the function
+ * reaches each of them down TWO independent paths — the extension code and the
+ * prose — because, as the comment there says, the prose has been more stable
+ * than the codes.
+ *
+ * Until these tests landed, every 200-body case in this file carried BOTH a
+ * recognisable code and recognisable prose, so either path could be deleted
+ * whole and the suite stayed green. Measured: removing the code branch,
+ * removing the message branch, and reducing the code pattern to
+ * `/unauthenticated/` were all invisible. Each test below feeds exactly one
+ * path and blinds the other.
+ * ---------------------------------------------------------------- */
+
+test('an auth failure stated ONLY in the extension code is still an AuthError', () => {
+  for (const code of ['unauthenticated', 'unauthorized', 'forbidden', 'invalid_api_key']) {
+    const err = graphqlError({ errors: [{ message: 'Something went wrong', extensions: { code } }] });
+    assert.ok(err instanceof AuthError, `${code} came back as ${err?.constructor?.name} — the sweep would retry it every hour`);
+  }
+});
+
+test('`require_elevated_privilege` is an AuthError in either spelling', () => {
+  /* The pattern read `require_elevated_privileges` and a substring test for the
+     plural does not match the singular, so one of the two spellings a vendor
+     might ship was classified and the other was not. A missed auth failure is
+     not a worse message: core/sweep.mjs:745 answers a plain Error with
+     `record({})` — no rest at all — so the source spends 24 of its 50 daily
+     requests every day, forever, on a key that will never gain the privilege.
+     The stem matches both. */
+  for (const code of ['require_elevated_privilege', 'require_elevated_privileges']) {
+    const err = graphqlError({ errors: [{ message: 'You do not have access to this resource', extensions: { code } }] });
+    assert.ok(err instanceof AuthError,
+      `${code} came back as ${err?.constructor?.name}, so a key that is missing a privilege is retried hourly forever`);
+  }
+});
+
+test('an auth failure stated ONLY in the prose is still an AuthError', () => {
+  /* No `extensions` at all — the shape a vendor sends the day it renames its
+     codes, which is the case the message pattern exists for. */
+  for (const message of [
+    'Please provide a valid API key',
+    'You are not authenticated',
+    'Unauthorised',
+    'invalid token supplied',
+    'expired token',
+  ]) {
+    const err = graphqlError({ errors: [{ message }] });
+    assert.ok(err instanceof AuthError, `"${message}" came back as ${err?.constructor?.name}`);
+  }
+});
+
+test('a rate limit stated in EITHER the code or the prose rests the clock', () => {
+  const byCode = graphqlError({ errors: [{ message: 'oops', extensions: { code: 'too_many_requests' } }] });
+  assert.ok(byCode instanceof RateLimitError, `by code: ${byCode?.constructor?.name}`);
+
+  const byProse = graphqlError({ errors: [{ message: 'Rate limit exceeded for this workspace' }] });
+  assert.ok(byProse instanceof RateLimitError, `by prose: ${byProse?.constructor?.name}`);
+
+  // Three hours, not a day: core/sweep.mjs turns this into `notBefore`, and the
+  // free allowance rolls over at an hour nothing tells us.
+  assert.equal(byCode.retryAfterMs, 3 * 60 * 60 * 1000);
+});
+
+test('an error the vendor sent no message for still says something, and none of them are dropped', () => {
+  /* GraphQL permits an error with an `extensions.code` and no message, and
+     `.filter(Boolean)` over `e.message` alone would turn that into an Error
+     whose text is the empty string — a doctor row that says a source failed and
+     will not say how. */
+  const nameless = graphqlError({ errors: [{ extensions: { code: 'object_not_found' } }] });
+  assert.match(nameless.message, /object_not_found/, 'an error with only a code was reported as nothing at all');
+
+  const several = graphqlError({
+    errors: [{ message: 'first thing broke' }, { message: 'second thing broke' }, { message: 'third thing broke' }],
+  });
+  assert.match(several.message, /first thing broke/);
+  assert.match(several.message, /third thing broke/,
+    'only the first error survived; a document can fail in several places at once and the last one is as much the diagnosis as the first');
+});
+
+/* ---------------------------------------------------------------- *
+ * Failure on the STATUS LINE, which is the other half.
+ *
+ * Everything above is a 200 with a body, because that is the shape this vendor
+ * has bitten people with. But Fireflies is still HTTP, an intermediary is still
+ * an intermediary, and the manifest is what decides whether the transport can
+ * classify a 401 or read a `Retry-After` at all — `credential.send` has to be
+ * present for the header to be attached, and `limits.budget` has to be present
+ * for a 429 to close the window. None of that was exercised.
+ * ---------------------------------------------------------------- */
+
+test('a 401 on the status line is an AuthError, the same as a 200 that means one', async (t) => {
+  const mock = await graphqlServer(t, JSON.stringify({ errors: [{ message: 'nope' }] }), { status: 401 });
+  const { ctx } = ctxFor(transportFor(mock));
+
+  await assert.rejects(connector.collect(ctx), (err) => {
+    assert.ok(err instanceof AuthError,
+      `a 401 came back as ${err.constructor.name}; core/sweep.mjs only rests the credential for an AuthError`);
+    return true;
+  });
+});
+
+test('a 429 rests for the number the SERVER named, not the one this file guessed', async (t) => {
+  /* `Retry-After: 90` is a fact and RATE_LIMIT_REST_MS is a guess, and the
+     transport is written so the fact wins. Worth pinning here rather than only
+     in the transport's own tests, because it only works if this manifest
+     declares a budget: core/connectors/http.mjs:327 closes the window on a 429
+     so the rest of the process does not spend an allowance the server has
+     already refused, and that line is a no-op for a connector with no budget. */
+  const mock = await graphqlServer(t, '{}', { status: 429, headers: { 'retry-after': '90' } });
+  const client = transportFor(mock);
+  const { ctx } = ctxFor(client);
+
+  await assert.rejects(connector.collect(ctx), (err) => {
+    assert.ok(err instanceof RateLimitError, `came back as ${err.constructor.name}`);
+    assert.equal(err.retryAfterMs, 90_000, 'the server said 90 seconds and Zelos rested for something else');
+    return true;
+  });
+  assert.equal(client.meter.spent, connector.limits.budget.calls,
+    'a 429 must close this window: the allowance is fifty a day and the server has already said no');
+});
+
+test('a body that stops halfway is a failure, not an empty read', async (t) => {
+  /* A dropped connection mid-response is the commonest way a proxy answers 200
+     and hands over half a body. `JSON.parse` throws on it, and the whole point
+     of this file is that a throw is the correct outcome and `?? []` is not. */
+  const mock = await graphqlServer(t, `{"data":{"transcripts":[{"id":"tr_0f1e","title":"Alder & Va`);
+  const { ctx, emitted } = ctxFor(transportFor(mock));
+
+  await assert.rejects(connector.collect(ctx), (err) => {
+    assert.match(err.message, /not JSON/);
+    assert.match(err.message, /tr_0f1e/, 'the fragment that arrived is the only clue there is; quote it');
+    return true;
+  });
+  assert.deepEqual(emitted, [], 'a truncated response must not be reported as a count of zero meetings');
+});
+
 test('parseGraphql hands back the field it was asked for', () => {
   assert.deepEqual(parseGraphql(JSON.stringify({ data: { users: [{ name: 'Dana' }] } }), 'users'), [{ name: 'Dana' }]);
   // An account with no meetings is an empty ARRAY, and that is a real answer.
@@ -456,7 +905,7 @@ test('parseGraphql hands back the field it was asked for', () => {
  * ================================================================== */
 
 test('a recap becomes a message-shaped row: title, summary, attendees, meeting time', async (t) => {
-  const mock = await graphqlServer(t, ok([MEETING_FULL]));
+  const mock = await graphqlServer(t, meetings(MEETING_FULL));
   const { ctx, emitted } = ctxFor(transportFor(mock));
 
   const result = await connector.collect(ctx);
@@ -475,7 +924,7 @@ test('a recap becomes a message-shaped row: title, summary, attendees, meeting t
 });
 
 test('the action items lead the body and the snippet — they are what you owe', async (t) => {
-  const mock = await graphqlServer(t, ok([MEETING_FULL]));
+  const mock = await graphqlServer(t, meetings(MEETING_FULL));
   const { ctx } = ctxFor(transportFor(mock));
 
   const [row] = (await connector.collect(ctx)).parts[0].rows;
@@ -496,7 +945,7 @@ test('the action items lead the body and the snippet — they are what you owe',
 });
 
 test('a meeting whose summary has not been generated yet still produces a usable row', async (t) => {
-  const mock = await graphqlServer(t, ok([MEETING_LATER_BUT_LOWER]));
+  const mock = await graphqlServer(t, meetings(MEETING_LATER_BUT_LOWER));
   const { ctx } = ctxFor(transportFor(mock));
 
   const [row] = (await connector.collect(ctx)).parts[0].rows;
@@ -505,10 +954,65 @@ test('a meeting whose summary has not been generated yet still produces a usable
   assert.equal(row.snippet, '', 'there is nothing to summarise yet, and inventing something would be worse');
   assert.match(row.text, /app\.fireflies\.ai\/view\/tr_77aa/);
   assert.equal(Date.parse(row.date), Date.parse('2026-08-10T17:00:00.000Z'));
+
+  /* This fixture has `host_email` and no `organizer_email`, which is what makes
+     it the one that proves the document asks for `host_email` at all: every
+     other meeting here carries both, so dropping one selection from
+     MEETINGS_QUERY was invisible until this line. */
+  assert.deepEqual(row.from, { name: 'kit@alder.example', email: 'kit@alder.example' },
+    'with no display name anywhere, the address is the best name there is — and it has to have been asked for');
+});
+
+test('both spellings of the meeting instant are asked for, because only one of them arrives', async (t) => {
+  /* The document asks for `date` AND `dateString` and the file says why: they
+     are the same instant in two encodings and which one is populated has not
+     been stable across the vendor's own examples. Every other fixture in this
+     file carries both, so either selection could be dropped from
+     MEETINGS_QUERY and nothing noticed. These two carry one each. */
+  const isoOnly = { ...MEETING_FULL, id: 'tr_iso', date: null };
+  const epochOnly = { ...MEETING_FULL, id: 'tr_epoch', dateString: null };
+  const mock = await graphqlServer(t, meetings(isoOnly, epochOnly));
+  const { ctx } = ctxFor(transportFor(mock));
+
+  const rows = (await connector.collect(ctx)).parts[0].rows;
+  assert.equal(rows.length, 2);
+  for (const row of rows) {
+    assert.equal(Date.parse(row.date), Date.parse('2026-08-10T16:00:00.000Z'),
+      `${row.messageId} lost its meeting time — one of the two encodings is not in the document`);
+  }
+});
+
+test('a three-hour meeting cannot put an unbounded body or snippet in the database', async (t) => {
+  /* Both ceilings existed and neither was exercised: every fixture here is a
+     few hundred characters, so `.slice(0, BODY_CHARS)` and
+     `.slice(0, SNIPPET_CHARS)` could both be deleted and the suite stayed
+     green. They are not decoration. The snippet is what the board renders
+     directly (core/triage.mjs:544 puts it at every level but `bare`), and an
+     all-hands recap with forty action items is a real thing that would push a
+     wall of text through it. */
+  const huge = {
+    ...MEETING_FULL,
+    id: 'tr_long',
+    summary: {
+      overview: 'The team went through it. '.repeat(4000),
+      short_summary: '',
+      gist: '',
+      action_items: Array.from({ length: 60 }, (_, n) => `Chase deliverable number ${n} with the trade partner`).join('\n'),
+    },
+  };
+  const mock = await graphqlServer(t, meetings(huge));
+  const { ctx } = ctxFor(transportFor(mock));
+  const [row] = (await connector.collect(ctx)).parts[0].rows;
+
+  assert.ok(row.text.length <= 20_000, `a ${row.text.length}-character body reached the database`);
+  assert.ok(row.snippet.length <= 400, `a ${row.snippet.length}-character snippet reached the board`);
+  // And the cap keeps the useful end: the action items still lead both.
+  assert.match(row.text, /^Action items\n- Chase deliverable number 0/);
+  assert.match(row.snippet, /^Action items: Chase deliverable number 0/);
 });
 
 test('a transcript with no id is dropped rather than given a colliding row id', async (t) => {
-  const mock = await graphqlServer(t, ok([{ ...MEETING_FULL, id: '' }, MEETING_FULL]));
+  const mock = await graphqlServer(t, meetings({ ...MEETING_FULL, id: '' }, MEETING_FULL));
   const { ctx } = ctxFor(transportFor(mock));
 
   const rows = (await connector.collect(ctx)).parts[0].rows;
@@ -525,16 +1029,20 @@ test('a row never mentions `uid`, and two polls of the same meeting insert it on
 
      Asserting the key is absent is half of it; the other half is driving the
      real `upsertMessage` twice and watching the second poll insert nothing. */
-  const mock = await graphqlServer(t, ok([MEETING_FULL]));
+  const mock = await graphqlServer(t, meetings(MEETING_FULL));
   /* A transport per poll, because that is what the sweep does: `createHttp` is
-     built fresh inside the per-source task on every sweep. It matters here for
-     a second reason — core/connectors/http.mjs:337 reads
-     `Number(res.headers.get('x-ratelimit-remaining'))`, and `Number(null)` is
-     0, so a vendor that does not send that header (Fireflies does not) drives
-     `state.spent` to the whole budget on the first response. Two polls through
-     one transport hit it. See this task's handoff note: it is a defect in a
-     file this connector does not own, and it makes EVERY budgeted connector a
-     once-per-window connector until it is fixed. */
+     built fresh inside the per-source task on every sweep.
+
+     THE SECOND REASON THIS COMMENT USED TO GIVE HAS EXPIRED. It said two polls
+     through ONE transport could not be written, because
+     `Number(res.headers.get('x-ratelimit-remaining'))` is `Number(null)` is 0
+     for a vendor that does not send the header — Fireflies does not — and that
+     drove `state.spent` to the whole budget on the first response. That was
+     true and was fixed at `ffda7ee`, which reads the header first and believes
+     only a number that is really there (core/connectors/http.mjs:354-358). The
+     test below spends the whole allowance through a single transport, which is
+     the measurement that says so. A transport per poll is kept here because it
+     is what production does, not because the other shape is impossible. */
   const poll = async () => (await connector.collect(ctxFor(transportFor(mock)).ctx)).parts[0].rows;
 
   const first = await poll();
@@ -550,6 +1058,126 @@ test('a row never mentions `uid`, and two polls of the same meeting insert it on
   const two = upsertMessages(db, stamp(second));
   assert.equal(two.inserted, 0, 'the same meeting was inserted a second time — the row id is not stable');
   assert.equal(listMessages(db, { sourceId: 's_ff' }).length, 1);
+});
+
+test('the row carries exactly the keys the message contract has, and no others', async (t) => {
+  /* `hasOwnProperty('uid')` above catches the one key that has cost this
+     project three times. It does not catch the fourth. The contract at
+     core/db.mjs:12 is a closed shape and the failure mode is a key that is
+     added, not one that is removed — so the whole set is pinned, which makes
+     `uid` a special case of a rule instead of the only rule.
+     `hasAttachments`, `cc` and `flags` are here for the same reason: nothing
+     read them, so nothing would have noticed a recap that started claiming an
+     attachment it does not have. */
+  const mock = await graphqlServer(t, meetings(MEETING_FULL));
+  const { ctx } = ctxFor(transportFor(mock));
+  const [row] = (await connector.collect(ctx)).parts[0].rows;
+
+  assert.deepEqual(Object.keys(row).sort(), [
+    'cc', 'date', 'direction', 'flags', 'folder', 'from', 'hasAttachments',
+    'messageId', 'snippet', 'subject', 'text', 'threadKey', 'to',
+  ].sort());
+  assert.equal(row.hasAttachments, false, 'a recap is prose; a paperclip on the board would be a lie about it');
+  assert.deepEqual(row.cc, []);
+  assert.deepEqual(row.flags, []);
+});
+
+test('one meeting is one thread, and two meetings are two', async (t) => {
+  /* `threadKey` was the last field in this row that nothing read: setting it to
+     a constant left the whole suite green, and a constant is what a connector
+     that "groups by source" would produce. It is a real index —
+     core/db.mjs:145 — and core/triage.mjs:550 hands the model a thread at a
+     time, so collapsing every meeting into one would present six unrelated
+     recaps as one conversation. A transcript IS the meeting: there is nothing
+     coarser to group by and nothing finer to split on. */
+  const mock = await graphqlServer(t, meetings(MEETING_FULL, MEETING_LATER_BUT_LOWER));
+  const { ctx } = ctxFor(transportFor(mock));
+  const rows = (await connector.collect(ctx)).parts[0].rows;
+
+  for (const row of rows) {
+    assert.equal(row.threadKey, row.messageId, 'one transcript is one meeting is one thread');
+  }
+
+  const db = freshDb();
+  upsertMessages(db, rows.map((r) => ({ ...r, sourceId: 's_thread' })));
+  assert.equal(messagesInThread(db, 'fireflies:tr_0f1e').length, 1);
+  assert.equal(messagesInThread(db, 'fireflies:tr_77aa').length, 1,
+    'two separate meetings landed in one thread — the board would read them as one conversation');
+});
+
+test('a meeting Zelos cannot place in time still reaches the model', async (t) => {
+  /* THE DEFECT THIS TEST WAS WRITTEN FOR. `date` used to be `meetingDate()`
+     straight through, which is null when neither `dateString` nor `date` came
+     back in a parseable shape — a vendor release that populates only one of
+     them, an empty string, an epoch of 0. A null lands in `messages.sent_at` as
+     NULL, and core/db.mjs:441 filters the prompt with `sent_at >= ?`, which
+     SQLite evaluates to NULL for a NULL column: not true, so the row is not
+     returned. The poll still emits "2 meetings", `stats.newMessages` still
+     counts two, `zelos doctor` still passes, both rows are really in the
+     database — and the model is handed one.
+
+     This is asserted against the REAL `upsertMessages` and the REAL
+     `listMessages`, with the same arguments core/sweep.mjs:1115 uses, because
+     the whole defect lives in what SQLite does with a NULL and no mock of the
+     database would have reproduced it. */
+  const undated = { ...MEETING_FULL, id: 'tr_nodate', title: 'No readable instant', dateString: '', date: 0 };
+  /* The raw answerer, not the honouring one: `serve` has to place a fixture in
+     time to apply `fromDate`, so it is the one server that CANNOT hand over a
+     meeting with no time. That is the shape a real vendor sends when a field
+     stops populating, and it is the whole subject here. */
+  const mock = await graphqlServer(t, ok([MEETING_FULL, undated]));
+  const { ctx, emitted } = ctxFor(transportFor(mock));
+
+  const result = await connector.collect(ctx);
+  const rows = result.parts[0].rows;
+  assert.equal(rows.length, 2);
+  assert.deepEqual(emitted, [{ message: 'Team meetings: 2 meetings', done: 2, total: 2 }]);
+
+  const db = freshDb();
+  upsertMessages(db, rows.map((r) => ({ ...r, sourceId: 's_nodate' })));
+
+  const sinceISO = new Date(Date.parse(NOW) - 21 * 86_400_000).toISOString();
+  const seen = listMessages(db, { sinceISO, limit: 500 }).map((m) => m.subject).sort();
+  assert.deepEqual(seen, ['Alder & Vance pre-con', 'No readable instant'],
+    'the poll reported two meetings and the prompt was handed one — a null `sent_at` fails `sent_at >= ?` in SQLite, silently');
+
+  /* And the fallback is the read instant rather than an invention: `ctx.now`,
+     which is what the sweep is calling this poll. */
+  const undatedRow = rows.find((r) => r.messageId === 'fireflies:tr_nodate');
+  assert.equal(undatedRow.date, NOW);
+});
+
+test('a meeting with no readable time does not drag the cursor to now', async (t) => {
+  /* The other half of the fallback, and the reason it is applied in `rowFrom`
+     rather than in `meetingDate`. If the high-water mark were read off
+     `row.date`, one meeting with no readable instant would push the cursor to
+     NOW — and the next poll would ask from now − 6h, so every meeting older
+     than six hours that had not been read yet would be skipped for good. The
+     cursor moves on the vendor's instant, which for that meeting is nothing. */
+  const undated = { ...MEETING_FULL, id: 'tr_nodate', dateString: '', date: 0 };
+  // `ok()` for the same reason as the test above: `serve` cannot place an
+  // undated meeting in its window, so it is the one thing it will not return.
+  const mock = await graphqlServer(t, ok([MEETING_LATER_BUT_LOWER, undated]));
+  const { ctx } = ctxFor(transportFor(mock));
+
+  const result = await connector.collect(ctx);
+
+  assert.equal(result.parts[0].rows.length, 2, 'the undated meeting has to be IN the batch for this to prove anything');
+  assert.equal(result.cursor.newestAt, '2026-08-10T17:00:00.000Z',
+    'the cursor followed a row whose time was invented, and the next poll would skip everything older than six hours');
+});
+
+test('a null inside the transcripts list is skipped, not a crash', async (t) => {
+  /* GraphQL nulls a list entry whose non-nullable field failed to resolve, and
+     a whole poll — every other meeting in it — must not be lost to one of them.
+     The mock is bypassed here because a well-behaved server will not produce
+     this; the connector still has to survive one that does. */
+  const mock = await graphqlServer(t, ok([null, MEETING_FULL, 'not an object']));
+  const { ctx } = ctxFor(transportFor(mock));
+
+  const rows = (await connector.collect(ctx)).parts[0].rows;
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].messageId, 'fireflies:tr_0f1e');
 });
 
 test('action items survive whether the vendor sends a string or a list', () => {
@@ -590,7 +1218,7 @@ test('rowFrom leaves the folder to the caller and never invents a from address',
  * ================================================================== */
 
 test('the first poll asks from the sweep window and no later than now', async (t) => {
-  const mock = await graphqlServer(t, ok([]));
+  const mock = await graphqlServer(t, meetings(MEETING_OUT_OF_WINDOW));
   const { ctx } = ctxFor(transportFor(mock));
 
   const result = await connector.collect(ctx);
@@ -599,10 +1227,19 @@ test('the first poll asks from the sweep window and no later than now', async (t
   assert.equal(varsOf(mock).to, NOW,
     'the sweep window reaches 60 days into the future; a meeting that has not happened has no recap');
   assert.equal(result.cursor, null, 'nothing has ever been seen, so there is nothing to remember');
+
+  /* The variables are half the claim and the weaker half. `from` and `to` can
+     be perfect while the DOCUMENT spends them on nothing — an argument the
+     schema does not have, or no date arguments at all — and the poll then reads
+     the whole account every hour and calls it a week. The server above honours
+     what it was asked, so the only way this row stays out is if MEETINGS_QUERY
+     really did narrow the window. */
+  assert.deepEqual(result.parts[0].rows, [],
+    'a meeting from three weeks before the window came back, so `fromDate` is not reaching the endpoint');
 });
 
 test('a poll resumes from the cursor, minus the window a summary can arrive late in', async (t) => {
-  const mock = await graphqlServer(t, ok([]));
+  const mock = await graphqlServer(t, meetings());
   const { ctx } = ctxFor(transportFor(mock), { cursor: { newestAt: '2026-08-10T17:00:00.000Z' } });
 
   const result = await connector.collect(ctx);
@@ -614,12 +1251,43 @@ test('a poll resumes from the cursor, minus the window a summary can arrive late
 });
 
 test('a stale cursor cannot widen the ask beyond the sweep window', async (t) => {
-  const mock = await graphqlServer(t, ok([]));
+  const mock = await graphqlServer(t, meetings(MEETING_OUT_OF_WINDOW));
   const { ctx } = ctxFor(transportFor(mock), { cursor: { newestAt: '2019-03-01T00:00:00.000Z' } });
 
-  await connector.collect(ctx);
+  const result = await connector.collect(ctx);
   assert.equal(varsOf(mock).from, WINDOW_FROM,
     'a laptop shut for a year must not ask Fireflies for a year of meetings');
+  assert.deepEqual(result.parts[0].rows, [],
+    'the 2019 cursor was clamped to the window, and the window is what the endpoint was given');
+});
+
+test('a cursor from a previous version is ignored, never obeyed and never fatal', async (t) => {
+  /* `kv` outlives the code that wrote it. core/sweep.mjs stores whatever a
+     connector hands back and reads it into `ctx.cursor` on the next poll, so
+     the first run after an upgrade hands this function a shape from BEFORE the
+     upgrade — a bare ISO string, a differently-named key, epoch milliseconds
+     where an ISO string now goes. All three have to land on "I have never read
+     this source", which is the sweep window: the alternatives are a crash
+     inside `new Date(NaN).toISOString()` and, worse, a silent ask from 1970.
+     None of this was covered — the guard could be deleted whole and the suite
+     stayed green. */
+  const mock = await graphqlServer(t, meetings(MEETING_OUT_OF_WINDOW));
+  const stale = [
+    'v1:2026-08-10T17:00:00.000Z',            // an older release stored a string
+    { since: '2026-08-10T17:00:00.000Z' },    // and an older one still named it differently
+    { newestAt: 1_760_000_000_000 },          // epoch ms where an ISO string goes now
+    { newestAt: 'last tuesday' },             // and something nobody ever wrote on purpose
+    [],
+    42,
+  ];
+
+  for (const cursor of stale) {
+    const { ctx } = ctxFor(transportFor(mock), { cursor });
+    const result = await connector.collect(ctx);
+    assert.equal(varsOf(mock, mock.requests.length - 1).from, WINDOW_FROM,
+      `a cursor of ${JSON.stringify(cursor)} was allowed to decide the window`);
+    assert.deepEqual(result.parts[0].rows, []);
+  }
 });
 
 test('the cursor tracks the latest INSTANT, not the highest-sorting string', async (t) => {
@@ -628,7 +1296,7 @@ test('the cursor tracks the latest INSTANT, not the highest-sorting string', asy
      `meetingDate` deliberately preserves whatever offset the vendor sent. A
      lexical high-water mark would settle on 16:00Z and re-read the 17:00
      meeting on every poll for as long as it stayed in the window. */
-  const mock = await graphqlServer(t, ok([MEETING_FULL, MEETING_LATER_BUT_LOWER]));
+  const mock = await graphqlServer(t, meetings(MEETING_FULL, MEETING_LATER_BUT_LOWER));
   const { ctx } = ctxFor(transportFor(mock));
 
   const result = await connector.collect(ctx);
@@ -638,18 +1306,35 @@ test('the cursor tracks the latest INSTANT, not the highest-sorting string', asy
 });
 
 test('the meeting count the user configured is what is asked for, clamped to the vendor ceiling', async (t) => {
-  const mock = await graphqlServer(t, ok([]));
-  const build = (meetings) => ctxFor(transportFor(mock), {
-    source: { id: 's_ff', label: 'Team meetings', type: 'fireflies', settings: { meetings } },
+  /* Sixty meetings inside the window, so every clamp below has more to refuse
+     than it asks for. An empty fixture list would let a document that dropped
+     `limit` altogether pass all three assertions. */
+  const MANY = Array.from({ length: 60 }, (_, n) => ({
+    ...MEETING_FULL,
+    id: `tr_many_${n}`,
+    dateString: new Date(Date.parse('2026-08-05T00:00:00.000Z') + n * 60_000).toISOString(),
+    date: Date.parse('2026-08-05T00:00:00.000Z') + n * 60_000,
+  }));
+  const mock = await graphqlServer(t, serve({ transcripts: MANY }));
+  const build = (count) => ctxFor(transportFor(mock), {
+    source: { id: 's_ff', label: 'Team meetings', type: 'fireflies', settings: { meetings: count } },
   }).ctx;
 
-  await connector.collect(build(10));
-  await connector.collect(build(500));
-  await connector.collect(build(0));
+  const asked10 = await connector.collect(build(10));
+  const asked500 = await connector.collect(build(500));
+  const asked0 = await connector.collect(build(0));
 
   assert.equal(varsOf(mock, 0).limit, 10);
   assert.equal(varsOf(mock, 1).limit, 50, 'Fireflies caps `limit` at 50 and asking for more is a rejected document');
   assert.equal(varsOf(mock, 2).limit, 25, 'a blank or zero setting falls back to the field default');
+
+  /* And the variable is SPENT, not merely sent. A document that computes the
+     right `limit` and then never passes it to `transcripts` reads the whole
+     account on every poll: 60 rows against a `maxRows` of 100 is silent today
+     and a truncation notice the day somebody records their 101st meeting. */
+  assert.equal(asked10.parts[0].rows.length, 10, '`limit` is in the variables but not in the document');
+  assert.equal(asked500.parts[0].rows.length, 50);
+  assert.equal(asked0.parts[0].rows.length, 25);
 });
 
 /* ================================================================== *
@@ -726,9 +1411,7 @@ const lineFor = (report, id) => report.checks.find((c) => c.id === id);
 
 test('doctor runs the check and names the account the key belongs to', async (t) => {
   withRegistered(t);
-  const mock = await graphqlServer(t, JSON.stringify({
-    data: { users: [{ user_id: 'u_1', name: 'Nemo Hale', email: 'nemo@example.com' }] },
-  }));
+  const mock = await graphqlServer(t, serve({ users: [{ user_id: 'u_1', name: 'Nemo Hale', email: 'nemo@example.com' }] }));
 
   const report = await diagnoseAgainst(t, mock);
   const line = lineFor(report, 'source.s_ff');
@@ -761,7 +1444,7 @@ test("doctor reports the vendor's own words when the key is refused with a 200",
 
 test('doctor says so when the key is valid but names nobody', async (t) => {
   withRegistered(t);
-  const mock = await graphqlServer(t, JSON.stringify({ data: { users: [] } }));
+  const mock = await graphqlServer(t, serve({ users: [] }));
 
   const report = await diagnoseAgainst(t, mock);
   const line = lineFor(report, 'source.s_ff');

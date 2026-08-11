@@ -93,7 +93,7 @@ const KEY = 'lin_api_0e2a4c6b';
 const NOW = '2026-08-11T09:00:00-04:00';
 const TODAY = '2026-08-11';
 const TZ = 'America/New_York';
-const IDENTITY = 'nemo@hoosai.biz';
+const IDENTITY = 'nemo@northgate.example';
 
 /** The address Linear knows this account by, deliberately NOT the identity's. */
 const VIEWER = { name: 'Nemo Hale', email: 'nemo@work.example' };
@@ -482,7 +482,7 @@ test('a row is addressed to the IDENTITY, which is the address triage actually c
      where `ctx.userEmail` is `identity.email` and `sameEmail` is exact
      case-insensitive equality — no alias handling, no domain handling. With
      Linear's own account address here instead, a user whose work tool says
-     nemo@work.example and whose Settings identity says nemo@hoosai.biz scores 0
+     nemo@work.example and whose Settings identity says nemo@northgate.example scores 0
      instead of 6, so every Linear obligation ranks lower than the connector
      believes and is cut from the prompt earlier. */
   const mock = await linearServer(t, page([issue()]));

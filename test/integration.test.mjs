@@ -34,8 +34,9 @@ process.env.ZELOS_LOG_LEVEL = 'silent';
 // database inside it is closed, and node:test runs root `after` hooks in the
 // order they were registered.
 
-const { open: openDb, migrate, close: closeDb, listMessages, getItemByKey, itemRowId, getKV } =
+const { open: openDb, migrate, close: closeDb, listMessages, getItemByKey, itemRowId, getKV, insertCapture } =
   await import('../core/db.mjs');
+const { todayKey, localTimezone } = await import('../core/time.mjs');
 const { runSweep } = await import('../core/sweep.mjs');
 const { createServer, listen } = await import('../core/server.mjs');
 const { DEFAULTS } = await import('../core/config.mjs');
@@ -1352,5 +1353,138 @@ describe('the board over several runs: sweep.mjs -> db.mjs -> /api/state', () =>
     assert.equal(totals.modelRuns, 3);
     assert.equal(totals.lifetime.tokensIn, 3 * 1234);
     assert.ok(totals.at, 'and it says when it was last touched');
+  });
+});
+
+/* ================================================================== *
+ * The sweep and the Ask panel have to agree about which day it is.
+ *
+ * There is one `sweep.tokens` row and two writers: `runSweep`'s `finish` and
+ * core/server.mjs's `recordAskSpend`. `recordTokens` carries the running day
+ * forward only while `stored.day === dayKey(now)`, so the two writers have to
+ * compute the same day key or the second one does not add to the first — it
+ * starts a new day on top of it.
+ *
+ * `runSweep` stamps `nowISO(tz)` for the CONFIGURED zone (core/sweep.mjs,
+ * `endedAt`). While `recordAskSpend` defaulted to `nowISO()` — the MACHINE zone
+ * — every hour the two were on different dates ended the same way: the first
+ * question typed into Ask wiped the day's counter, including the count of
+ * sweeps that had already run. Silently, because a counter that goes backwards
+ * looks exactly like a fresh day.
+ *
+ * test/sweep.test.mjs pins the carry-forward rule inside `recordTokens` and
+ * test/server.test.mjs pins the zone the call site passes. This is the third
+ * thing, and the one a user would have reported: a real sweep over a real model
+ * socket opens the day, a real `POST /api/ask` through the real HTTP server
+ * spends against it, and the counter must be the SUM.
+ *
+ * Measured on this test with the zone argument dropped from the call site, one
+ * sweep and one question, machine in America/Indianapolis and the app in
+ * Pacific/Kiritimati:
+ *
+ *     before the question  {"day":"2026-08-12","tokensIn":1234,"runs":1, …}
+ *     after the question   {"day":"2026-08-11","tokensIn":20,"runs":0, …}
+ *
+ * Not merely wrong: smaller than it was before the question was asked, and the
+ * sweep that had already run stopped being counted. Only `lifetime` survived,
+ * because it is the one total `recordTokens` never carries by day.
+ * ================================================================== */
+
+describe('a sweep and the first Ask of the day book against the same day', () => {
+  let zoneDb;
+  let zoneModel;
+  let zoneServer;
+  let zoneBase;
+  let zone;
+  let afterSweep;
+
+  before(async () => {
+    /* Chosen at RUN TIME. A hardcoded zone only disagrees with the machine for
+       part of the day, which is how the original defect stayed hidden — on a
+       machine in EDT with the app configured for UTC it was invisible until
+       20:00. Kiritimati (UTC+14) and Midway (UTC-11) are 25 hours apart, so no
+       third zone can agree with both and this always finds one. */
+    zone = ['Pacific/Kiritimati', 'Pacific/Midway', 'Asia/Tokyo', 'UTC']
+      .find((z) => todayKey(z) !== todayKey());
+
+    zoneModel = await startMockModel(() => JSON.stringify({ first: null, items: [], notes: [] }));
+    zoneDb = openDb(path.join(home, 'ask-spend-zone.db'));
+    migrate(zoneDb);
+    // One indexed row, so the Ask has something to ground on. Without it
+    // `handleAsk` answers from a short-circuit with a hand-written
+    // `usage: {input: 0, output: 0}` and never reaches the model at all — a
+    // test that looks like it ran and measures nothing.
+    insertCapture(zoneDb, 'Riverstone invoice: wire $18,400 by Friday.');
+
+    // No mail and no calendars: the subject here is the counter, and a fetch
+    // that could fail is a second thing that can move it.
+    const zoneConfig = structuredClone(config);
+    zoneConfig.mail = [];
+    zoneConfig.calendars = [];
+    zoneConfig.identity = { ...config.identity, timezone: zone };
+    zoneConfig.model = { ...config.model, baseUrl: `${zoneModel.origin}/v1`, keyRef: null };
+
+    const swept = await runSweep({
+      db: zoneDb,
+      config: zoneConfig,
+      mode: 'full',
+      deps: { getSecret: async () => null },
+    });
+    assert.equal(swept.ok, true, swept.error);
+    afterSweep = JSON.parse(getKV(zoneDb, 'sweep.tokens'));
+
+    /* The config is handed to `createServer` rather than PUT through
+       `/api/config`, and that is not shorthand. `saveConfig` merges a patch over
+       what is ON DISK, and no test here has ever written a config file, so every
+       field a patch leaves out falls back to DEFAULTS: a patch carrying only the
+       timezone reverts `model` to the Anthropic preset and `/api/ask` answers
+       409 before it spends anything. `handleAsk` reads `ctx.config()`, so this
+       reaches the same line with nothing in the way. */
+    zoneServer = createServer({ db: zoneDb, config: zoneConfig, token: FIXED_TOKEN, heartbeatMs: 50 });
+    zoneBase = (await listen(zoneServer, { port: 0 })).url.replace(/\/$/, '');
+  });
+
+  after(async () => {
+    await new Promise((done) => zoneServer.close(done));
+    closeDb(zoneDb);
+    await zoneModel.close();
+  });
+
+  test('the Ask adds to the day the sweep opened instead of starting a new one', async () => {
+    assert.ok(zone, `no zone disagrees with ${localTimezone()} about today's date, which cannot happen`);
+    assert.notEqual(todayKey(zone), todayKey(),
+      'the configured and machine zones must still be on different dates, or this proves nothing');
+
+    assert.equal(afterSweep.day, todayKey(zone), 'the sweep stamps the configured zone');
+    assert.equal(afterSweep.runs, 1, 'and one sweep really ran');
+    assert.ok(afterSweep.tokensIn > 0, 'and it really spent something');
+
+    const events = [];
+    await openStream(`${zoneBase}/api/ask`, {
+      method: 'POST',
+      body: { question: 'What do I owe Riverstone?' },
+      onEvent: (name, data) => events.push([name, data]),
+    });
+    const done = events.find(([n]) => n === 'done')?.[1];
+    assert.ok(done, `the answer must terminate, got ${events.map(([n]) => n).join(',')}`);
+    assert.equal(done.grounded, true, 'the model was reached, so there is real spend to book');
+    assert.ok(Number(done.usage.input) > 0, 'the mock upstream reports usage, so the counter has something to take');
+
+    const after = JSON.parse(getKV(zoneDb, 'sweep.tokens'));
+    assert.equal(after.day, afterSweep.day,
+      `the Ask must land on the day the sweep opened (${afterSweep.day}); `
+      + `${after.day} is ${after.day === todayKey() ? `the machine's day in ${localTimezone()}` : 'some other day'}`);
+    assert.equal(after.tokensIn, afterSweep.tokensIn + Number(done.usage.input),
+      'the day\'s spend is the sweep plus the question, not the question alone');
+    assert.equal(after.tokensOut, afterSweep.tokensOut + Number(done.usage.output));
+
+    /* The reading a person would have made the bug report about. `runs` is what
+       "you swept twice today" is counted from, and asking a question is not a
+       reason for it to fall to zero — but a day key that reads as new drops the
+       carried counts along with the carried tokens. */
+    assert.equal(after.runs, 1, 'the sweep that already ran today is still counted after a question');
+    assert.equal(after.modelRuns, 1);
+    assert.equal(after.lifetime.tokensIn, afterSweep.lifetime.tokensIn + Number(done.usage.input),
+      'and the lifetime total never resets, whichever day it is');
   });
 });

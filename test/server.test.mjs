@@ -31,7 +31,8 @@ const { createServer, listen } = await import('../core/server.mjs');
 const db = await import('../core/db.mjs');
 const { loadConfig } = await import('../core/config.mjs');
 const { setSecret, deleteSecret } = await import('../core/secrets.mjs');
-const { todayKey, addDaysToKey, instant } = await import('../core/time.mjs');
+const { todayKey, addDaysToKey, instant, localTimezone, offsetFor, wallClock } =
+  await import('../core/time.mjs');
 
 const SECRET_VALUE = 'zelos-test-secret-4d1f9c7b2e6a';
 
@@ -858,16 +859,185 @@ test('/api/ask refuses before streaming when no model is configured', async (t) 
   assert.match(res.headers.get('content-type'), /application\/json/);
 });
 
+/**
+ * REGRESSION — the zone `recordAskSpend` books in.
+ *
+ * `recordTokens` carries the running day forward only while
+ * `stored.day === dayKey(now)`, and `runSweep` stamps its row with
+ * `nowISO(tz)` for the CONFIGURED zone (core/sweep.mjs `endedAt`). A second
+ * writer that defaults to `nowISO()` reads the MACHINE zone, so for every hour
+ * the two are on different dates the two keys disagree, the day reads as new,
+ * and the first question typed into Ask resets the day's token counter to
+ * zero. Silently, because a counter going backwards looks like a fresh day.
+ *
+ * test/sweep.test.mjs pins the mechanism inside `recordTokens`. This pins the
+ * CALL SITE, which is the half that can rot on its own: delete the argument
+ * from the one line in `handleAsk` that passes it and every assertion about
+ * `recordTokens` stays green.
+ *
+ * Two things about the shape of this test, both of them load-bearing.
+ *
+ * **The zone is picked at RUN TIME.** A hardcoded one only diverges from the
+ * machine for part of the day, which is exactly how the original defect hid:
+ * on a machine in EDT with the app configured for UTC it was invisible until
+ * 20:00 and present after it. At any instant two calendar dates exist on
+ * Earth, so at least one candidate below always disagrees with this machine —
+ * `Pacific/Kiritimati` (UTC+14) and `Pacific/Midway` (UTC-11) are 25 hours
+ * apart and can never both agree with a third zone.
+ *
+ * **The zone is handed to `createServer`, never PUT.** Two earlier attempts
+ * went through `PUT /api/config` and neither could measure anything, because
+ * `saveConfig` merges the patch over what is ON DISK and this harness has
+ * never written a config file — so every field a patch omits falls back to
+ * DEFAULTS. Measured, both stages: a patch carrying only `identity` came back
+ * with `model` reset to `{protocol: "anthropic", baseUrl:
+ * "https://api.anthropic.com", model: ""}`, `modelIsConfigured` went false and
+ * `/api/ask` answered 409 before it could spend anything. Putting back the
+ * three fields `modelIsConfigured` reads (`baseUrl`, `model`, `keyRef`)
+ * cleared the 409 and left `protocol` at the DEFAULTS' `anthropic`: the
+ * request went to `POST /v1/messages` in Anthropic wire format, the openai
+ * mock answered openai-shaped SSE, the Anthropic parser recognised none of it,
+ * and the done frame carried `usage: {input: 0, output: 0}` with zero deltas —
+ * whereupon `recordAskSpend` returns early on `if (!tokensIn && !tokensOut)`
+ * and there is nothing to assert. `handleAsk` reads `ctx.config()`, so handing
+ * the zone over at construction exercises the identical line with none of that
+ * in the way.
+ */
+test('an Ask books its spend on the CONFIGURED zone\'s day, not the machine\'s', async (t) => {
+  const machineDay = todayKey(); // i.e. `nowISO()` with no zone — the reverted behaviour
+  const configuredZone = ['Pacific/Kiritimati', 'Pacific/Midway', 'Asia/Tokyo', 'UTC']
+    .find((z) => todayKey(z) !== machineDay);
+  assert.ok(configuredZone,
+    `no zone disagrees with ${localTimezone()} about today's date, which cannot happen`);
+
+  const upstream = await startMockUpstream(t);
+  const ctx = await startServer(t, {
+    config: baseConfig({
+      identity: { name: 'Nemo Hale', email: 'nemo@example.com', timezone: configuredZone },
+      model: { protocol: 'openai', baseUrl: upstream.baseUrl, model: 'mock-model', keyRef: 'model.default' },
+    }),
+  });
+
+  // Something to ground on. Without it `handleAsk` short-circuits with a
+  // hand-written `usage: {input: 0, output: 0}` and never reaches the model —
+  // the other way this test can look like it ran and measure nothing.
+  db.upsertMessage(ctx.db, {
+    sourceId: 'm_1',
+    uid: 7,
+    messageId: '<budget@test>',
+    from: { name: 'Ada', email: 'ada@example.com' },
+    subject: 'Budget review on Tuesday',
+    date: '2026-08-10T09:00:00-04:00',
+    snippet: 'Can we do the budget review on Tuesday at 2?',
+    text: 'Can we do the budget review on Tuesday at 2? — Ada',
+    folder: 'INBOX',
+  });
+
+  const response = await fetch(`${ctx.base}/api/ask`, {
+    method: 'POST',
+    headers: { 'X-Zelos-Token': ctx.token, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ question: 'When is the budget review?' }),
+  });
+  assert.equal(response.status, 200);
+
+  /* Read to EOF rather than stopping at the `done` frame. `handleAsk` sends
+     `done` and only THEN awaits `recordAskSpend`; `sse.end()` runs in the
+     `finally` after it. A reader that returns on `done` is racing the write it
+     is about to assert on, and would fail intermittently on a loaded CI box. */
+  const frames = (await readStream(response)).map(parseFrame).filter((f) => f.event);
+  const done = frames.find((f) => f.event === 'done');
+  assert.ok(done, `the answer must terminate, got ${frames.map((f) => f.event).join(',')}`);
+  assert.equal(done.data.grounded, true, 'the model was reached, so there is real spend to book');
+  assert.ok(done.data.usage.input > 0, 'the mock reports usage, so the counter has something to take');
+
+  const stored = JSON.parse(db.getKV(ctx.db, 'sweep.tokens'));
+  assert.ok(stored, 'the Ask must write the counter at all — SWEEP_KV.tokens is where the rail reads it');
+  assert.equal(stored.tokensIn, done.data.usage.input, 'and it books what it reported over SSE');
+  assert.equal(stored.tokensOut, done.data.usage.output);
+
+  // The assertion the whole test exists for.
+  assert.equal(stored.day, todayKey(configuredZone),
+    `the row must be stamped in the configured zone ${configuredZone} (${todayKey(configuredZone)}); `
+    + `${stored.day} is ${stored.day === machineDay ? `the machine's day in ${localTimezone()}` : 'neither day'}, `
+    + 'so a sweep that stamped the configured zone would read as a different day and the counter would reset');
+  assert.notEqual(stored.day, machineDay,
+    'and the two zones must still disagree, or this test proved nothing');
+
+  /* Corroboration that cannot race a midnight rollover: `recordTokens` keeps
+     the ISO string it was handed in `at`, and that string carries the OFFSET of
+     whichever zone wrote it. The day above can only be read once; the offset is
+     the same fingerprint and is stable except across a DST transition. */
+  assert.equal(wallClock(stored.at).offset, offsetFor(configuredZone),
+    `the stamp should carry ${configuredZone}'s offset, not ${localTimezone()}'s (${offsetFor(localTimezone())})`);
+});
+
 /* ================================================================== *
  * Port selection
+ *
+ * The promise `listen` makes is "a busy port does not stop the launch: walk up
+ * from the port you were given until you find a free one, and give up after
+ * `attempts`". It does NOT promise a particular landing port, and it must not be
+ * tested as if it did — see holdRunOfPorts below for what asserting `busy + 1`
+ * cost this suite.
  * ================================================================== */
 
-test('a busy port makes the server take the next free one', async (t) => {
-  const squatter = net.createServer();
-  await new Promise((r) => squatter.listen(0, '127.0.0.1', r));
-  const busy = squatter.address().port;
-  t.after(() => new Promise((r) => squatter.close(r)));
+/**
+ * Hold `count` CONSECUTIVE ports on 127.0.0.1 for the length of the test, and
+ * return the first of them.
+ *
+ * These two tests need a window of ports whose state they control. `listen(0)`
+ * hands out one ephemeral port and promises nothing about the next, so: take an
+ * ephemeral port as the base, bind the rest of the run explicitly, and if any of
+ * them is already taken, drop the whole run and start again from a fresh base.
+ * That loop is acquiring a FIXTURE, not re-running an assertion — it either
+ * produces the window or throws, so a machine too busy to spare a run of ports
+ * says exactly that instead of failing an assertion about the server.
+ *
+ * Why the window has to be held rather than assumed free: node:test runs the
+ * suite's files in parallel and 17 of the 33 bind ephemeral ports
+ * (test/connectors.test.mjs carries the same note). The version of this test
+ * that asserted the server lands on exactly `busy + 1` was asserting that no
+ * neighbouring file bound anything in the gap between this test taking `busy`
+ * and the server trying `busy + 1`. That was false about one run in four — a
+ * red suite that said nothing about the product, and taught the reader to
+ * re-run instead of to read.
+ *
+ * The 24 ports of headroom above the run are for the walk itself: the server
+ * needs somewhere to land, and `candidate + 1` past 65535 is not a port.
+ */
+async function holdRunOfPorts(t, count) {
+  const held = [];
+  t.after(() => Promise.all(held.map((s) => new Promise((r) => s.close(r)))));
 
+  for (let tries = 0; tries < 40; tries += 1) {
+    const first = net.createServer();
+    await new Promise((r) => first.listen(0, '127.0.0.1', r));
+    const base = first.address().port;
+    const run = [first];
+
+    while (run.length < count && base + count + 24 <= 65_535) {
+      const next = net.createServer();
+      // listen() reports "taken" as an error event, not a rejection, and the
+      // port is only ours once the 'listening' side of that race wins.
+      const took = await new Promise((resolve) => {
+        next.once('error', () => resolve(false));
+        next.listen(base + run.length, '127.0.0.1', () => resolve(true));
+      });
+      if (!took) break;
+      run.push(next);
+    }
+
+    if (run.length === count && base + count + 24 <= 65_535) {
+      held.push(...run);
+      return base;
+    }
+    await Promise.all(run.map((s) => new Promise((r) => s.close(r))));
+  }
+  throw new Error(`could not reserve ${count} consecutive free ports on 127.0.0.1`);
+}
+
+/** A real server on a real database, closed by the test — but not yet bound. */
+function unboundServer(t) {
   const handle = db.open(':memory:');
   db.migrate(handle);
   const server = createServer({ db: handle, uiDir: UI_DIR, assetsDir: ASSETS_DIR });
@@ -876,12 +1046,69 @@ test('a busy port makes the server take the next free one', async (t) => {
     await new Promise((r) => server.close(r));
     db.close(handle);
   });
+  return server;
+}
 
-  const bound = await listen(server, { port: busy });
+test('a busy port makes the server take the next free one', async (t) => {
+  const ATTEMPTS = 20;
+  const RUN = 3;
+  // Three in a row, so the walk has to iterate rather than merely try twice.
+  const busy = await holdRunOfPorts(t, RUN);
+  const server = unboundServer(t);
+
+  const bound = await listen(server, { port: busy, attempts: ATTEMPTS });
+
   assert.notEqual(bound.port, busy);
-  assert.equal(bound.port, busy + 1);
+  // Past every port we are holding: it kept walking, it did not stop at the
+  // first failure.
+  assert.ok(
+    bound.port >= busy + RUN,
+    `expected a port at or above ${busy + RUN} (${RUN} held from ${busy}), got ${bound.port}`,
+  );
+  // ...and still inside the window the walk can reach, which is the difference
+  // between walking up from the port it was given and quietly asking the OS for
+  // any free port at all. WHICH port inside the window is deliberately not
+  // asserted: a neighbouring test file taking one of them in the gap is legal
+  // and says nothing about this server.
+  assert.ok(
+    bound.port <= busy + ATTEMPTS,
+    `expected a port within ${ATTEMPTS} of ${busy}, got ${bound.port}`,
+  );
+
+  assert.equal(server.address().port, bound.port);
   assert.equal(bound.url, `http://127.0.0.1:${bound.port}/`);
   assert.equal(bound.tokenUrl, `http://127.0.0.1:${bound.port}/?t=${server.sessionToken}`);
+
+  // The launch survived, and the reported port is where THIS server answers —
+  // a squatter would leave the socket hanging, and 401 is Zelos refusing an
+  // untokened /api call rather than some other process being polite.
+  assert.equal(statusOf(await rawRequest(bound.port, 'GET /api/health HTTP/1.1')), 401);
+});
+
+/**
+ * The guard that keeps the range check above honest. A `listen` that ignored the
+ * port it was handed and took any free one would satisfy "not busy", "still
+ * running" and "answers HTTP" — the only thing it could not do is fail here.
+ *
+ * Nothing in this test depends on a neighbour: `attempts: 2` lets the walk touch
+ * exactly `busy`, `busy + 1` and `busy + 2`, and all three are ports we hold.
+ */
+test('the walk up is bounded by `attempts`, and gives up rather than landing anywhere', async (t) => {
+  const busy = await holdRunOfPorts(t, 3);
+  const server = unboundServer(t);
+
+  await assert.rejects(
+    listen(server, { port: busy, attempts: 2 }),
+    (err) => {
+      // Whichever of the two the platform reports for "that port is taken" —
+      // core/server.mjs walks on both, so both are a legitimate way for the walk
+      // to end. The claim under test is that it ENDED, not which errno said so.
+      assert.ok(err instanceof Error, `expected an Error, got ${err}`);
+      assert.ok(['EADDRINUSE', 'EACCES'].includes(err.code), `unexpected code ${err.code}`);
+      return true;
+    },
+  );
+  assert.equal(server.address(), null, 'it bound something after reporting that it could not');
 });
 
 test('the server binds 127.0.0.1, not every interface', async (t) => {

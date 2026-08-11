@@ -205,7 +205,17 @@ export function graphqlError(json) {
   const detail = oneLine(messages.join('; ') || 'no message given');
   const codeText = codes.join(' ');
 
-  if (/unauthenticated|unauthorized|forbidden|invalid_api_key|require_elevated_privileges/.test(codeText)
+  /* `require_elevated_privilege` is the STEM, and the singular is not a typo
+     being carried forward — it is the only spelling that matches both. This
+     read `require_elevated_privileges` (plural), and a substring test for the
+     plural does not match the singular, so exactly one of the two spellings a
+     vendor might ship was classified. The cost of missing it is not "a worse
+     error message": an unclassified error is a plain Error, core/sweep.mjs:745
+     answers that with `record({})` — no rest — and the source retries every
+     hour forever, 24 requests a day out of fifty, for a key that will never
+     gain the privilege it is missing. Matching the stem matches both, and
+     nothing else in a code string contains it. */
+  if (/unauthenticated|unauthorized|forbidden|invalid_api_key|require_elevated_privilege/.test(codeText)
     || /api key|not authenticated|unauthori[sz]ed|invalid token|expired token/i.test(detail)) {
     return new AuthError(
       `Fireflies rejected the API key: ${detail} Check it in Settings — Zelos will not keep trying with the one it has.`,
@@ -248,7 +258,15 @@ export function parseGraphql(text, field) {
   return value;
 }
 
-/** ISO for a Fireflies instant, from whichever of the two encodings arrived. */
+/**
+ * ISO for a Fireflies instant, from whichever of the two encodings arrived —
+ * or null when NEITHER did.
+ *
+ * The null is the honest answer to "when was this meeting", and `rowFrom` must
+ * not put it in a row. See the paragraph on `date` there for what a null
+ * `sent_at` costs. The cursor, by contrast, wants exactly this null: a meeting
+ * with no readable instant must not move a high-water mark.
+ */
 export function meetingDate(transcript) {
   const iso = parseDate(str(transcript?.dateString));
   if (iso) return iso;
@@ -322,6 +340,29 @@ const overviewOf = (summary) => str(summary?.overview).trim()
  * snippet for the same reason: core/triage.mjs:544 renders the snippet at every
  * level except `bare`, and the board shows it directly.
  *
+ * `date` FALLS BACK TO THE READ INSTANT, AND OMITTING IT IS NOT AN OPTION.
+ * `meetingDate` returns null when neither `dateString` nor `date` came back in a
+ * shape that parses — a vendor release that populates only one of them, an empty
+ * string, an epoch of 0 — and a null lands in `messages.sent_at` as NULL.
+ * core/db.mjs:441 filters the prompt with `sent_at >= ?` and SQLite evaluates
+ * `NULL >= '2026-07-21…'` to NULL, which is not true, so the row is dropped from
+ * `gatherPromptInput` (core/sweep.mjs:1115) — the only read that reaches the
+ * model and the board. Measured against a real database: two rows upserted, two
+ * rows stored, ONE row returned to the prompt. The poll still says "1 meeting",
+ * `stats.newMessages` still counts it, `zelos doctor` still passes, and the
+ * meeting is invisible. That is the worst failure this connector has, because
+ * nothing anywhere says it happened.
+ *
+ * core/connectors/linear.mjs:55-57 already names the rule — "Omitting `date`
+ * entirely is not an option either — `sent_at` would be NULL and `NULL >= ?` is
+ * NULL, so the row is dropped from the prompt just as silently" — and
+ * core/connectors/folder.mjs:439-445 already implements the other half of it, by
+ * falling back to the file's mtime rather than to nothing. So the fallback here
+ * is the read instant: it buys INCLUSION in the window, which is the whole of
+ * what is at stake. It does not pretend to be the meeting time — the transcript
+ * link in the body is one click from the real one — and `collect` deliberately
+ * does NOT let it move the cursor.
+ *
  * THERE IS NO `uid` KEY HERE AND THERE MUST NEVER BE ONE. core/db.mjs:384 reads
  * `Number.isFinite(Number(uid)) ? Number(uid) : null`, so `uid: null` becomes 0
  * while an OMITTED uid stays null — two different `messageRowId`s for the same
@@ -332,7 +373,7 @@ const overviewOf = (summary) => str(summary?.overview).trim()
  * user would be billed for a model call every thirty minutes. A meeting has no
  * integer identity, so this connector never mentions the field.
  */
-export function rowFrom(transcript, { folder }) {
+export function rowFrom(transcript, { folder, now = new Date().toISOString() }) {
   const summary = transcript?.summary && typeof transcript.summary === 'object' ? transcript.summary : {};
   const attendees = attendeesOf(transcript);
   const hostEmail = collapse(transcript?.host_email) || collapse(transcript?.organizer_email);
@@ -375,7 +416,7 @@ export function rowFrom(transcript, { folder }) {
     to: hostKey ? attendees.filter((a) => a.email.toLowerCase() !== hostKey) : attendees,
     cc: [],
     subject: collapse(transcript?.title) || '(untitled meeting)',
-    date: meetingDate(transcript),
+    date: meetingDate(transcript) || str(now),
     snippet: collapse(snippet).slice(0, SNIPPET_CHARS),
     text: body,
     hasAttachments: false,
@@ -499,6 +540,7 @@ export default {
 
     const transcripts = parseGraphql(res.text, 'transcripts');
     const folder = ctx.label || 'Fireflies';
+    const readAt = new Date(nowMs).toISOString();
 
     const rows = [];
     /* The high-water mark is carried as a NUMBER and re-emitted in one
@@ -518,9 +560,16 @@ export default {
       // `messageId` is `fireflies:` would collide with the next one like it and
       // overwrite it. Dropping it is the only honest option.
       if (!collapse(transcript.id)) continue;
-      const row = rowFrom(transcript, { folder });
-      rows.push(row);
-      const at = Date.parse(str(row.date));
+      rows.push(rowFrom(transcript, { folder, now: readAt }));
+      /* THE CURSOR MOVES ON THE VENDOR'S INSTANT, NEVER ON THE ROW'S.
+         `row.date` falls back to `readAt` when the vendor sent no readable
+         time (see `rowFrom`), and reading the high-water mark off the row
+         would let one such meeting shove the cursor to NOW — after which the
+         next poll asks from now − 6h and every meeting older than that is
+         skipped for good. `meetingDate` returns null there instead, which is
+         the answer this loop wants: a meeting Zelos cannot place in time is
+         not evidence about how far it has read. */
+      const at = Date.parse(str(meetingDate(transcript)));
       if (Number.isFinite(at) && at > newestMs) newestMs = at;
     }
 

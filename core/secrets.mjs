@@ -51,13 +51,184 @@ const NOTES = {
     'No system keychain was available, so secrets are stored in an AES-256-GCM encrypted file in your Zelos home, mode 0600, keyed by a random machine seed in .seed. This protects the file at rest — a copied disk or a stray backup is unreadable. It does NOT protect against a process already running as this user: that process can read .seed and decrypt the file exactly as Zelos does. Install a system keychain for stronger protection.',
 };
 
+/* -------------------------------------------------------------- timeouts
+ * One number served every subprocess this module runs — a liveness check, a
+ * "does this ref still exist", and the write that carries a password — and it
+ * was too small for the ones that can lose something.
+ *
+ * `run()` defaulted to 15_000 ms and the PowerShell probe passed 15_000
+ * explicitly, so a liveness check and the write that carries a user's IMAP
+ * password were handed the same budget. Two measurements say that is wrong in
+ * both directions.
+ *
+ * (1) A GitHub Actions `windows-latest` runner — fast, idle, nothing else on
+ *     it — failed a release build:
+ *
+ *       ✖ Windows CI: DPAPI is the detected backend and really round-trips a
+ *         secret (18136ms)
+ *         Error: powershell.exe timed out after 15000ms
+ *
+ *     It passed on re-run, which is the point. That is not a broken machine;
+ *     it is a machine that was slower than a number somebody picked, once.
+ *
+ *     Which of that test's PowerShell spawns died is not in the output, but it
+ *     is derivable, and the derivation is the useful half. The probe SWALLOWS a
+ *     timeout and answers false, so a probe that blew the budget would have
+ *     failed the test on its `assert.equal(b.name, 'windows-dpapi')` line
+ *     rather than escaping as an Error; only setSecret/getSecret/deleteSecret
+ *     let one out. So on that machine, at that moment: everything up to and
+ *     including the cold probe fitted inside 18_136 − 15_000 = 3_136 ms, and
+ *     the very next spawn — the one that autoloads
+ *     Microsoft.PowerShell.Security for ConvertFrom-SecureString and writes a
+ *     new file through whatever filter drivers are installed — was SIGKILLed at
+ *     15_000 ms with work left to do.
+ *
+ *     A liveness probe and a credential access are not the same size. On one
+ *     machine at one moment they differed by a factor of at least 4.8, and one
+ *     constant was flattening that.
+ *
+ * (2) `listRefs()` returned `[]` after 15_020 ms. Those 20 ms of slack over the
+ *     probe's own 15_000 are the whole story: the probe timed out, reported "no
+ *     PowerShell on this machine", detection fell through to encrypted-file,
+ *     and an empty secrets.enc answered that this home has no credentials at
+ *     all. Nothing was lost, and nothing said anything — which is the exact
+ *     conflation the longest comment in this file warns about, arriving through
+ *     the one door that comment did not watch.
+ *
+ * Where the numbers come from, and why they are not round
+ * -------------------------------------------------------
+ * 3_136 ms is an UPPER bound on a cold `powershell.exe` on the reference
+ * runner: the probe is inside it, but so is the test's own setup. 15_000 ms is
+ * not a measurement of how long an access takes — it is how long one was
+ * allowed to run before it was killed. The real requirement is unknown, because
+ * the kill destroyed the evidence, so it can only be treated as a floor already
+ * proved too small on the FASTEST, least contended machine in the fleet. A
+ * user's laptop, cold, under load, with an antivirus scanning the spawn and
+ * every assembly it maps, is the machine these budgets are actually for.
+ *
+ * So each budget is derived from one of those two, and its factor says what it
+ * is buying:
+ *
+ *   probe  = 3_136 × 2  =  6_272 ms   headroom for a machine twice as slow as
+ *                                     the reference runner, on the cold attempt
+ *   access = 15_000 × 4 = 60_000 ms   four times a floor that was already too
+ *                                     small on an idle CI box
+ *
+ * The probe getting SHORTER is not a typo. Two attempts at 6_272 ms is 12_544
+ * ms of worst-case wall clock — less than the single 15_000 ms budget it
+ * replaces — and it now survives cases the old one failed, because of the two
+ * changes below: a timeout is retried, and a timeout no longer reads as "this
+ * store is not on this machine".
+ *
+ * Neither number is what is expected to save a slow machine. The retry is.
+ */
+
+/**
+ * GH Actions windows-latest, idle: 18_136 ms of test wall clock minus the
+ * 15_000 ms the credential access burned before it was killed. An upper bound
+ * on a cold probe rather than a measurement of one — the test's own setup is
+ * inside it, which is the direction that makes it safe to build on.
+ */
+const MEASURED_COLD_PROBE_MS = 18_136 - 15_000;
+
+/**
+ * Not how long a credential access needs — how long one was allowed to run
+ * before it was SIGKILLed with work left. A floor known to be too small on the
+ * fastest machine available, and nothing more than that.
+ */
+const MEASURED_TOO_SMALL_MS = 15_000;
+
+/**
+ * The two budgets, exported so a test can pin them and so the arithmetic above
+ * is checkable rather than just readable.
+ *
+ * What sorts a caller into one of them is not who it is but what its silence
+ * costs — which is why `hasSecret` is on the short budget alongside the three
+ * liveness probes rather than with the other two reads. An unanswered `has`
+ * keeps the ref (that is the whole of #24 below), so the only thing a longer
+ * budget buys it is the chance to PRUNE, and pruning is a tidiness that
+ * self-corrects on the next call. Meanwhile `listRefs` is what `GET
+ * /api/health` and `modelIsConfigured` sit on, once per ref: on the access
+ * budget a single stalled keyring would hold a UI request for two minutes to
+ * arrive at the list it started with. An unanswered `get`, `set` or `delete`
+ * costs a credential, and those get the long one.
+ */
+export const TIMEOUTS_MS = Object.freeze({
+  /** Questions whose "I could not tell" answer is already safe. */
+  probe: MEASURED_COLD_PROBE_MS * 2, //  6_272
+  /** Operations where not getting an answer costs a credential. */
+  access: MEASURED_TOO_SMALL_MS * 4, // 60_000
+});
+
+/**
+ * A timeout is retried once, and ONLY a timeout.
+ *
+ * The CI failure above passed on re-run, and that is the shape of the entire
+ * problem. The first `powershell.exe` on a machine pages in the CLR, the
+ * assemblies it needs, and — on Windows — hands every one of them to an
+ * antivirus on-access scanner. The next spawn finds all of that in the page
+ * cache. So the attempt immediately after a timeout is precisely the attempt
+ * most likely to succeed, and the killed first attempt was not wasted: it
+ * warmed what it touched.
+ *
+ * Only a timeout, because a refused spawn is instant and definitive. ENOENT
+ * means powershell.exe or secret-tool is not on this machine, and asking twice
+ * is a second helping of the same answer. That distinction is also what lets
+ * the probe budget be short: a missing tool is reported by the operating system
+ * in microseconds and never reaches the timer at all, so shortening the timer
+ * costs nothing in the case a long timer looked like it was protecting.
+ *
+ * Two, not more. A third attempt buys progressively less — the cache is warm
+ * after the second — and every attempt is wall clock a caller is sitting on.
+ * Exported so the arithmetic above ("two probe attempts still cost less than
+ * the one 15_000 ms budget they replace") is something a test can check rather
+ * than something this comment asserts.
+ */
+export const ATTEMPTS = 2;
+
+/**
+ * What the code reads. `TIMEOUTS_MS` is the product's answer; this is the
+ * binding a test may shrink.
+ */
+let budgets = TIMEOUTS_MS;
+
+/**
+ * Testing seam, of the same kind as `resetBackendCache` below, and it exists
+ * for a measured reason: the access budget is 60 s, and a test that had to sit
+ * through two of them to prove one branch would add two minutes to a suite that
+ * runs in nine seconds. So the budgets are read through a binding a test can
+ * shrink — the behaviour under test is the retry and the classification, and
+ * neither depends on the size of the number.
+ *
+ * It hands back a restore function instead of exposing a setter, so a test
+ * cannot leave the module holding a 250 ms budget for everything after it. And
+ * it is deliberately NOT an environment variable: a knob a user can turn is a
+ * knob that can be turned down, and the whole subject of this block is what a
+ * number picked in a hurry costs a credential.
+ */
+export function setTimeoutsForTest(overrides) {
+  const previous = budgets;
+  budgets = Object.freeze({ ...previous, ...overrides });
+  return () => { budgets = previous; };
+}
+
 /* ------------------------------------------------------------ subprocess */
 
 /**
  * Run a command, feed `input` to stdin, capture output. Never uses a shell, so
  * nothing here is interpretable by /bin/sh.
+ *
+ * `timeoutMs` has no default. A default is how one number came to serve a
+ * liveness probe and a password write at once; every call site now has to say
+ * which of the two it is. `label` names the operation in the timeout message,
+ * because `powershell.exe timed out after 15000ms` did not say which of four
+ * spawns died and the answer had to be reconstructed from a test's wall clock.
+ * A ref is safe to put there — it is an opaque id, never a value.
  */
-function run(file, args, { input = null, env = null, timeoutMs = 15_000 } = {}) {
+function run(file, args, { input = null, env = null, timeoutMs, label = file } = {}) {
+  if (!Number.isInteger(timeoutMs) || timeoutMs <= 0) {
+    throw new TypeError(`secrets: run(${file}) needs an explicit timeout, not ${timeoutMs}`);
+  }
   return new Promise((resolve, reject) => {
     let child;
     try {
@@ -77,7 +248,15 @@ function run(file, args, { input = null, env = null, timeoutMs = 15_000 } = {}) 
       if (settled) return;
       settled = true;
       try { child.kill('SIGKILL'); } catch { /* already gone */ }
-      reject(new Error(`${file} timed out after ${timeoutMs}ms`));
+      const err = new Error(`${file} timed out after ${timeoutMs}ms (${label})`);
+      /* The one flag everything below reads, and the distinction the whole
+         block above turns on. Reaching this timer means the spawn SUCCEEDED —
+         we have a child, it started, and it did not finish. So "the tool is not
+         on this machine" is the single thing a timeout cannot mean, and the
+         only errors that do mean it (ENOENT, EACCES) arrive through the 'error'
+         handler below without this flag. */
+      err.timedOut = true;
+      reject(err);
     }, timeoutMs);
     timer.unref?.();
 
@@ -105,6 +284,33 @@ function run(file, args, { input = null, env = null, timeoutMs = 15_000 } = {}) 
     if (input !== null) child.stdin.end(input);
     else child.stdin.end();
   });
+}
+
+/**
+ * `run`, and once more if — and only if — it timed out. See ATTEMPTS above for
+ * why the second attempt is the one likely to work.
+ *
+ * Every command this module runs is safe to repeat. `security
+ * add-generic-password -U` updates in place, `secret-tool store` replaces, and
+ * the DPAPI script writes one file whole; none of them append or accumulate. A
+ * SIGKILL part-way through the DPAPI write can leave a truncated blob, and the
+ * retry is what REPAIRS that rather than what risks it — while a truncated blob
+ * left by two failed attempts is read back by `ConvertTo-SecureString` as an
+ * error, not as a plausible wrong password.
+ *
+ * The warning names the label and the budget and nothing else. `opts` carries
+ * the value on `input`, and it must not appear in a log line.
+ */
+async function runWithRetry(file, args, opts) {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await run(file, args, opts);
+    } catch (err) {
+      if (err?.timedOut !== true || attempt >= ATTEMPTS) throw err;
+      log.warn(`secrets: ${file} did not answer within ${opts.timeoutMs}ms — trying once more, which is usually the attempt that works`,
+        { operation: opts.label, attempt, of: ATTEMPTS });
+    }
+  }
 }
 
 /* --------------------------------------------------------- command shapes */
@@ -253,6 +459,44 @@ function detectionKey() {
   return `${process.platform}|${process.env.ZELOS_SECRETS_BACKEND || ''}|${paths().home}`;
 }
 
+/* A probe that did not answer is not a probe that said "no".
+ *
+ * This is measurement (2) at the top of the file, and it is the dangerous half
+ * of the timeout. Every probe below used to answer `false` for any failure at
+ * all, `probeBackend` reads `false` as "this store is not on this machine", and
+ * the fallback is encrypted-file. So one slow `powershell.exe` and `listRefs()`
+ * reported an empty store after 15_020 ms — not "I could not ask", but "you
+ * have no credentials".
+ *
+ * So two outcomes that used to be one are now separated:
+ *
+ *  - the spawn was REFUSED. ENOENT or EACCES: the tool is not on this machine,
+ *    or cannot be executed. That is a real answer, it costs microseconds, and
+ *    it is the answer that should send a home to the encrypted file.
+ *  - the spawn SUCCEEDED and the tool did not finish, twice. By construction
+ *    the tool exists and started, so absence is the one thing this cannot mean.
+ *    It is read as "the store is there and this machine is busy".
+ *
+ * The record below already protects any home that has successfully stored
+ * something. The home this protects is the one that has not: on a fresh
+ * install, a probe timeout used to put the FIRST credential a Windows user ever
+ * typed into secrets.enc, `recordBackend` pinned the home there, and
+ * docs/SECURITY.md and the note in the UI went on saying their operating system
+ * was holding it.
+ *
+ * Being wrong in this direction is loud and recoverable: the next getSecret
+ * throws "could not read model.default from windows-dpapi", which is exactly
+ * the outcome the record's own comment asks for. Being wrong in the other
+ * direction is silent and permanent.
+ */
+function probeUnanswered(name, err) {
+  if (err?.timedOut !== true) return false;
+  log.warn(`secrets: ${name} did not answer a liveness probe within ${budgets.probe}ms, twice — treating the store as present, `
+    + 'because a spawn that started is not a store that is missing, and falling back would put this home\'s '
+    + 'credentials somewhere the documentation says they are not');
+  return true;
+}
+
 async function probeMacKeychain() {
   try {
     fs.accessSync('/usr/bin/security', fs.constants.X_OK);
@@ -260,7 +504,8 @@ async function probeMacKeychain() {
     return false;
   }
   try {
-    const { code } = await run('/usr/bin/security', ['find-generic-password', '-s', SERVICE, '-a', 'zelos.probe'], { timeoutMs: 8000 });
+    const { code } = await runWithRetry('/usr/bin/security', ['find-generic-password', '-s', SERVICE, '-a', 'zelos.probe'],
+      { timeoutMs: budgets.probe, label: 'macos-keychain probe' });
     // 0 = an item is there, 44 = reachable and empty. Anything else means we
     // should not rely on it.
     //
@@ -272,32 +517,40 @@ async function probeMacKeychain() {
     // measured, and settling it means running `security` against whatever login
     // keychain the machine has, which this module's tests are not allowed to
     // do. The honest half is narrow: a code other than 0 or 44 is an answer we
-    // do not understand. The ways we know of to get one are the 8s timeout, a
-    // refused spawn, and a sandbox denial.
+    // do not understand. The ways we know of to get one are a refused spawn and
+    // a sandbox denial. A timeout used to be on that list and no longer belongs
+    // there: it does not produce a code at all, and `probeUnanswered` reads it
+    // for what it is.
     return code === 0 || code === NOT_FOUND_EXIT;
-  } catch {
-    return false;
+  } catch (err) {
+    return probeUnanswered('macos-keychain', err);
   }
 }
 
 async function probePowershell() {
   try {
-    const { code } = await run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'exit 0'], { timeoutMs: 15_000 });
+    const { code } = await runWithRetry('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'exit 0'],
+      { timeoutMs: budgets.probe, label: 'windows-dpapi probe' });
     return code === 0;
-  } catch {
-    return false;
+  } catch (err) {
+    return probeUnanswered('windows-dpapi', err);
   }
 }
 
 async function probeSecretTool() {
   try {
-    const { code, stderr } = await run('secret-tool', ['lookup', 'service', SERVICE, 'account', 'zelos.probe'], { timeoutMs: 8000 });
+    const { code, stderr } = await runWithRetry('secret-tool', ['lookup', 'service', SERVICE, 'account', 'zelos.probe'],
+      { timeoutMs: budgets.probe, label: 'libsecret probe' });
     // Not-found is exit 1 with nothing on stderr. A missing keyring daemon
     // complains about D-Bus, and then storing would fail later instead of now.
+    // That is a real answer and it still falls back — which is also why the
+    // probe budget has to be long enough for secret-tool to GIVE it. A budget
+    // so short that this branch could never be reached would pin a machine with
+    // no keyring daemon to a keyring that cannot hold anything.
     if (/dbus|d-bus|cannot create|no such secret|failed/i.test(stderr)) return false;
     return code === 0 || code === 1;
-  } catch {
-    return false;
+  } catch (err) {
+    return probeUnanswered('libsecret', err);
   }
 }
 
@@ -702,7 +955,8 @@ export async function setSecret(ref, value) {
 
   if (name === 'windows-dpapi') {
     const desc = describeCommand({ name, action: 'set', ref });
-    const { code, stderr } = await run(desc.file, desc.args, { input: stdinFor(desc, value), env: desc.env });
+    const { code, stderr } = await runWithRetry(desc.file, desc.args,
+      { input: stdinFor(desc, value), env: desc.env, timeoutMs: budgets.access, label: `windows-dpapi set ${ref}` });
     if (code !== 0) throw new Error(`secrets: DPAPI write failed for ${ref} (exit ${code}) ${stderr.trim()}`);
     rememberRef(ref);
     recordBackend(name);
@@ -710,7 +964,8 @@ export async function setSecret(ref, value) {
   }
 
   const desc = describeCommand({ name, action: 'set', ref });
-  const { code, stderr } = await run(desc.file, desc.args, { input: stdinFor(desc, value) });
+  const { code, stderr } = await runWithRetry(desc.file, desc.args,
+    { input: stdinFor(desc, value), timeoutMs: budgets.access, label: `${name} set ${ref}` });
   if (code !== 0) throw new Error(`secrets: ${desc.file} failed for ${ref} (exit ${code}) ${stderr.trim()}`);
   if (/passwords don't match/i.test(stderr)) {
     // security "succeeds" with exit 0 here and stores an empty password.
@@ -746,8 +1001,26 @@ export async function getSecret(ref) {
   }
 
   const desc = describeCommand({ name, action: 'get', ref });
-  const { code, stdout, stderr } = await run(desc.file, desc.args, { env: desc.env });
-  if (code === NOT_FOUND_EXIT || (name === 'libsecret' && code === 1)) return null;
+  const { code, stdout, stderr } = await runWithRetry(desc.file, desc.args,
+    { env: desc.env, timeoutMs: budgets.access, label: `${name} get ${ref}` });
+  if (code === NOT_FOUND_EXIT) return null;
+  if (name === 'libsecret' && code === 1) {
+    /* secret-tool spends exit 1 on both "no such item" and "the keyring did not
+       answer", and this read used to take either as "there is no password for
+       this account". `hasSecret` below has always told them apart by reading
+       stderr — not-found is exit 1 with nothing printed — and the same test
+       belongs here, because this is the conflation with the worse consequence:
+       an unanswered `has` leaves a ref in the index, while an unanswered `get`
+       hands the caller a null it will act on. Every caller of getSecret already
+       handles a throw; none of them can tell a wrong null from a right one.
+
+       The complaint itself is not quoted. secret-tool puts the value on stdout,
+       so its stderr is not carrying one, but this module's rule for a `get` is
+       that its stderr never reaches a message — on macOS it IS the value. */
+    if (!stderr.trim()) return null;
+    throw new Error(`secrets: could not read ${ref} from libsecret — secret-tool exited 1 and complained on stderr, `
+      + 'which is how it reports a keyring it could not reach, not how it reports an item that is not there');
+  }
   if (code !== 0) {
     // stderr may carry the value itself on macOS — never include it.
     throw new Error(`secrets: could not read ${ref} from ${name} (exit ${code})`);
@@ -784,7 +1057,8 @@ export async function deleteSecret(ref) {
   }
 
   const desc = describeCommand({ name, action: 'delete', ref });
-  const { code, stderr } = await run(desc.file, desc.args);
+  const { code, stderr } = await runWithRetry(desc.file, desc.args,
+    { timeoutMs: budgets.access, label: `${name} delete ${ref}` });
   forgetRef(ref);
   if (code === NOT_FOUND_EXIT || (name === 'libsecret' && code === 1)) return { ok: true, deleted: false };
   if (code !== 0) throw new Error(`secrets: could not delete ${ref} from ${name} (exit ${code}) ${stderr.trim()}`);
@@ -817,7 +1091,11 @@ async function hasSecret(name, ref) {
 
   const desc = describeCommand({ name, action: 'has', ref });
   try {
-    const { code, stderr } = await run(desc.file, desc.args, { env: desc.env });
+    // The short budget, and see TIMEOUTS_MS for why: this question's "I could
+    // not tell" is safe, and it is asked once per credential on a path a UI
+    // request is waiting on.
+    const { code, stderr } = await runWithRetry(desc.file, desc.args,
+      { env: desc.env, timeoutMs: budgets.probe, label: `${name} has ${ref}` });
     if (code === 0) return 'yes';
     if (name === 'libsecret' && code === 1) {
       // secret-tool spends exit 1 on both "no such item" and "the keyring did
@@ -829,9 +1107,9 @@ async function hasSecret(name, ref) {
     if (code === NOT_FOUND_EXIT) return 'no';
     return 'unknown';
   } catch {
-    // Spawn refused, or run()'s timeout fired and SIGKILLed the tool. Both mean
-    // the question was never answered, which is the one thing this must not
-    // report as an answer.
+    // Spawn refused, or the tool was SIGKILLed at the access budget on both
+    // attempts. Both mean the question was never answered, which is the one
+    // thing this must not report as an answer.
     return 'unknown';
   }
 }
@@ -848,7 +1126,15 @@ export async function listRefs() {
   const alive = [];
   let answered = true;
   for (const ref of known) {
-    const state = await hasSecret(name, ref);
+    /* Once one ref has gone unanswered the store is not answering, and asking
+       about the rest cannot change what this function DOES: the index is
+       already un-prunable for this pass, and a ref nobody has said is gone
+       stays in the list either way. What it can change is how long the caller
+       waits, and with the budgets at the top of this file that is 12.5 s per
+       remaining ref. A home with five credentials on a keyring that has stopped
+       answering used to spend a minute here — every sweep cycle, and on every
+       `GET /api/health` — to arrive at the list it already had. */
+    const state = answered ? await hasSecret(name, ref) : 'unknown';
     // A ref we could not ask about stays in the list. Zelos wrote it, nothing
     // has said it is gone, and the caller's next getSecret() will find out for
     // real — whereas dropping it turns a five-second keyring stall into a UI

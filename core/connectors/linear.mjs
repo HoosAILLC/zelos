@@ -452,7 +452,7 @@ function rowFor(entry, viewer, now, identityEmail) {
        ctx.userEmail))`, where `ctx.userEmail` is `identity.email` and
        `sameEmail` is exact case-insensitive equality with no alias or domain
        handling. A user whose Linear account is nemo@work.com and whose Settings
-       identity is nemo@hoosai.biz — anyone with a work tool and a personal
+       identity is nemo@northgate.example — anyone with a work tool and a personal
        identity line — scored 0 instead of 6 with the viewer's address here, so
        every Linear obligation ranked lower than this file claimed and was cut
        from the prompt earlier. The viewer's own address is still worth having as
