@@ -1,24 +1,71 @@
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 
-import {
+/* The environment has to be set before the modules that read it are evaluated,
+   which is why the imports below are dynamic and these three lines are not.
+   `core/log.mjs` fixes its level at import time, and — since the XOAUTH2 work —
+   `core/sources/imap.mjs` reaches `core/secrets.mjs` to keep a refresh token, so
+   an unforced backend would detect and use the operator's own login keychain no
+   matter where ZELOS_HOME points. */
+const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zelos-imap-test-'));
+process.env.ZELOS_HOME = home;
+process.env.ZELOS_SECRETS_BACKEND = 'encrypted-file';
+process.env.ZELOS_LOG_LEVEL = 'silent';
+
+/* ------------------------------------------------------- outbound guard
+ *
+ * The token half of this file talks HTTP, and every endpoint it talks to has to
+ * be a mock on 127.0.0.1. Wrapping `fetch` for the whole run is what makes that
+ * a fact rather than an intention: if an edit forgets to pass an explicit
+ * endpoint and falls back to login.microsoftonline.com, this suite says so
+ * instead of dialling Microsoft from whatever machine is running it. */
+const realFetch = globalThis.fetch;
+const LOOPBACK = /^(127\.0\.0\.1|localhost|\[::1\]|::1)$/;
+globalThis.fetch = (input, init) => {
+  const raw = typeof input === 'string' ? input : (input?.url ?? String(input));
+  const url = new URL(raw);
+  if (!LOOPBACK.test(url.hostname)) {
+    throw new Error(`this suite must not contact ${url.host} — every endpoint has to be a local mock`);
+  }
+  return realFetch(input, init);
+};
+
+const {
   ImapClient,
+  ImapOAuthError,
+  MS_IMAP_SCOPES,
+  MS_LOGIN_ORIGIN,
+  accessTokenFor,
+  assertTokenEndpoint,
+  beginDeviceAuthorization,
+  connectDeviceCode,
+  describeXOAuth2Challenge,
   fetchRecent,
   guessImapHost,
   isLoopbackHost,
+  loadOAuthTokens,
+  normalizeClientId,
+  normalizeTenant,
+  pollForDeviceToken,
+  refreshAccessToken,
+  resolveAuthMethod,
+  saveOAuthTokens,
   testConnection,
   tlsRequiredByDefault,
-} from '../core/sources/imap.mjs';
+  xoauth2Payload,
+} = await import('../core/sources/imap.mjs');
 
-// Nothing here reads the Zelos home, but no test should ever be one refactor
-// away from writing into the user's real ~/.zelos.
-const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zelos-imap-test-'));
-process.env.ZELOS_HOME = home;
-after(() => fs.rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
+const { getSecret, setSecret } = await import('../core/secrets.mjs');
+
+after(() => {
+  globalThis.fetch = realFetch;
+  fs.rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+});
 
 /* ================================================================== *
  * A mock IMAP server.
@@ -1503,5 +1550,892 @@ test('guessImapHost covers the other common providers and degrades sensibly', ()
     assert.equal(result.host, '');
     assert.equal(result.port, 993);
     assert.ok(result.note.length > 0, 'the user is always told what to do next');
+  }
+});
+
+/* ================================================================== *
+ * XOAUTH2 and the device authorization grant
+ *
+ * Microsoft ended password IMAP for personal Outlook, Hotmail, Live and MSN
+ * accounts on 16 September 2024, and app passwords went with it, so the preset
+ * this app ships for those domains had no working credential behind it at all.
+ * Everything below is the replacement, tested the way the rest of this file is
+ * tested: a real socket for the protocol half and a real loopback HTTP server
+ * for the token half, with nothing about either client stubbed out.
+ * ================================================================== */
+
+/** The SASL field separator. `^A` in every document that describes XOAUTH2. */
+const SOH = '\x01';
+
+/** A GUID-shaped client id, because normalizeClientId insists on one. */
+const CLIENT_ID = '11111111-2222-3333-4444-555555555555';
+
+/**
+ * A mock that speaks AUTH=XOAUTH2 the way Exchange does, including the part
+ * that matters: a refused payload is answered with a SECOND continuation
+ * carrying base64 JSON, and the tagged completion arrives only after the client
+ * acknowledges it.
+ *
+ * `seen.payload` is the base64 the client sent and `seen.afterChallenge` is the
+ * literal line it sent next, so a test can assert on bytes rather than on
+ * intentions.
+ */
+function xoauth2Session({
+  user,
+  token,
+  capability = 'IMAP4rev1 AUTH=XOAUTH2',
+  challenge = { status: '400', schemes: 'Bearer', scope: 'https://outlook.office.com/IMAP.AccessAsUser.All' },
+  extra = null,
+} = {}) {
+  const seen = { payload: null, afterChallenge: null, decoded: null };
+  let stage = 'idle';
+  let authTag = null;
+
+  const handler = (ctx) => {
+    const { tag, verb, line, send } = ctx;
+
+    if (stage === 'prompted') {
+      seen.payload = line;
+      seen.decoded = Buffer.from(line, 'base64').toString('utf8');
+      if (seen.decoded === `user=${user}${SOH}auth=Bearer ${token}${SOH}${SOH}`) {
+        send(`${authTag} OK AUTHENTICATE completed\r\n`);
+        stage = 'done';
+        authTag = null;
+        return;
+      }
+      send(`+ ${Buffer.from(JSON.stringify(challenge), 'utf8').toString('base64')}\r\n`);
+      stage = 'challenged';
+      return;
+    }
+
+    if (stage === 'challenged') {
+      seen.afterChallenge = line;
+      /* RFC 3501 §6.2.2 makes `*` a client-side abort and a conformant server
+         answers it, so this mock answers both — the difference is only in what
+         it calls the failure. What Microsoft documents as the acknowledgement
+         for an XOAUTH2 challenge is an EMPTY line, and that is what the test
+         asserts on, because it is the byte that actually went out. */
+      send(line === ''
+        ? `${authTag} NO AUTHENTICATE failed.\r\n`
+        : `${authTag} BAD Authentication aborted.\r\n`);
+      stage = 'done';
+      authTag = null;
+      return;
+    }
+
+    switch (verb) {
+      case 'CAPABILITY':
+        send(`* CAPABILITY ${capability}\r\n${tag} OK CAPABILITY completed\r\n`);
+        return;
+      case 'AUTHENTICATE':
+        authTag = tag;
+        stage = 'prompted';
+        send('+ \r\n');
+        return;
+      case 'LOGIN':
+        send(`${tag} NO [AUTHENTICATIONFAILED] basic authentication is disabled for this mailbox\r\n`);
+        return;
+      case 'EXAMINE':
+      case 'SELECT':
+        send(
+          '* 1 EXISTS\r\n'
+          + '* OK [UIDVALIDITY 42] UIDs valid\r\n'
+          + `${tag} OK [READ-ONLY] EXAMINE completed\r\n`,
+        );
+        return;
+      case 'LIST':
+        send(`* LIST (\\HasNoChildren) "/" "INBOX"\r\n${tag} OK LIST completed\r\n`);
+        return;
+      case 'LOGOUT':
+        send(`* BYE Logging out\r\n${tag} OK LOGOUT completed\r\n`);
+        return;
+      default:
+        if (extra && extra(ctx)) return;
+        send(`${tag} BAD unexpected command in mock\r\n`);
+    }
+  };
+  handler.seen = seen;
+  return handler;
+}
+
+/**
+ * A mock Microsoft identity platform: the two endpoints the device grant uses,
+ * on 127.0.0.1, recording every form it was posted.
+ *
+ * `pending` is how many `authorization_pending` answers to give before the user
+ * "finishes" in their browser, `slowDown` how many `slow_down` answers to give
+ * first. `rotate` models the behaviour that makes the write-back mandatory:
+ * every redemption of a refresh token invalidates it and issues a new one, and
+ * the old one is refused from then on.
+ */
+async function startMockEntra({
+  tenant = 'common',
+  clientId = CLIENT_ID,
+  pending = 0,
+  slowDown = 0,
+  interval = 5,
+  expiresIn = 3600,
+  rotate = true,
+  refreshToken = 'refresh-0',
+  deviceFailure = null,
+  tokenFailure = null,
+} = {}) {
+  const seen = [];
+  let live = refreshToken;
+  let issued = 0;
+  let polls = 0;
+
+  const server = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (d) => { body += d; });
+    req.on('end', () => {
+      const url = new URL(req.url, 'http://127.0.0.1');
+      const form = Object.fromEntries(new URLSearchParams(body).entries());
+      seen.push({ path: url.pathname, form });
+
+      const send = (status, payload) => {
+        const text = JSON.stringify(payload);
+        res.writeHead(status, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(text) });
+        res.end(text);
+      };
+
+      if (url.pathname === `/${tenant}/oauth2/v2.0/devicecode`) {
+        if (deviceFailure) { send(deviceFailure.status, deviceFailure.body); return; }
+        send(200, {
+          device_code: 'device-code-secret',
+          user_code: 'HXQR-2K9T',
+          verification_uri: 'https://microsoft.com/devicelogin',
+          expires_in: 900,
+          interval,
+          message: 'To sign in, use a web browser to open the page https://microsoft.com/devicelogin and enter the code HXQR-2K9T to authenticate.',
+        });
+        return;
+      }
+
+      if (url.pathname !== `/${tenant}/oauth2/v2.0/token`) {
+        send(404, { error: 'not_found' });
+        return;
+      }
+      if (tokenFailure) { send(tokenFailure.status, tokenFailure.body); return; }
+      if (form.client_id !== clientId) { send(400, { error: 'unauthorized_client' }); return; }
+
+      if (form.grant_type === 'urn:ietf:params:oauth:grant-type:device_code') {
+        polls += 1;
+        if (polls <= slowDown) { send(400, { error: 'slow_down' }); return; }
+        if (polls <= slowDown + pending) { send(400, { error: 'authorization_pending' }); return; }
+      } else if (form.grant_type === 'refresh_token') {
+        if (form.refresh_token !== live) {
+          send(400, {
+            error: 'invalid_grant',
+            error_description: 'AADSTS70008: the refresh token has expired or been revoked',
+          });
+          return;
+        }
+      }
+
+      issued += 1;
+      if (rotate) live = `refresh-${issued}`;
+      send(200, {
+        token_type: 'Bearer',
+        scope: MS_IMAP_SCOPES.join(' '),
+        expires_in: expiresIn,
+        access_token: `access-token-${issued}`,
+        refresh_token: live,
+      });
+    });
+  });
+
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  return {
+    origin: `http://127.0.0.1:${server.address().port}`,
+    seen,
+    get liveRefreshToken() { return live; },
+    async close() { await new Promise((done) => server.close(done)); },
+  };
+}
+
+/** Records the delays the poll loop ASKS for, without spending them. */
+function recordingSleep() {
+  const waited = [];
+  const sleep = (ms) => { waited.push(ms); return Promise.resolve(); };
+  sleep.waited = waited;
+  return sleep;
+}
+
+let refSeq = 0;
+const freshRef = () => `mail.m_xo${(refSeq += 1)}`;
+
+/* ------------------------------------------------------------ the wire */
+
+test('AUTHENTICATE XOAUTH2 puts the documented SASL payload on the wire, and no password', async () => {
+  const token = 'EwBwA8l6BAAUs5-access-token-with-no-substring-in-common';
+  const handler = xoauth2Session({ user: 'nemo@outlook.com', token });
+
+  await withServer({ greeting: '* OK Zelos mock ready', onCommand: handler }, async ({ port, received }) => {
+    const client = new ImapClient({
+      host: '127.0.0.1', port, secure: false, user: 'nemo@outlook.com',
+      auth: 'xoauth2', accessToken: token, timeoutMs: 5000,
+    });
+    await client.connect();
+    await client.login();
+
+    // The payload, byte for byte. There are TWO trailing separators — the first
+    // closes `auth=`, the second closes the empty list of further pairs — and
+    // Exchange refuses a payload with one of them using the same opaque
+    // challenge it uses for an expired token.
+    assert.equal(handler.seen.decoded, `user=nemo@outlook.com${SOH}auth=Bearer ${token}${SOH}${SOH}`);
+    assert.equal(handler.seen.payload, xoauth2Payload('nemo@outlook.com', token));
+
+    const sent = commands(received);
+    assert.ok(sent.includes('AUTHENTICATE XOAUTH2'), `the mechanism was named on the command line: ${sent.join(' | ')}`);
+    assert.ok(!sent.some((c) => /^LOGIN\b/i.test(c)), 'no password path was tried');
+    assert.ok(!received.some((line) => line.includes(token)), 'the bearer token never appears outside base64');
+
+    await client.close();
+  });
+});
+
+test('REGRESSION: a refused XOAUTH2 payload is answered with an empty line, and the challenge is decoded', async () => {
+  /* This is the handshake everyone gets wrong. A server that refuses an XOAUTH2
+     payload does NOT answer with a tagged NO — it answers with a second
+     continuation carrying base64 JSON (`{"status":"400","scope":...}`) and then
+     waits. The acknowledgement Microsoft documents is an EMPTY line, and only
+     after it does the tagged NO arrive.
+
+     Two things go wrong without it. A client that copies the PLAIN path and
+     sends `*` is aborting a request nobody asked it to abort; a client that
+     sends nothing at all sits until its own idle timer fires and then reports a
+     timeout, which names the wrong problem entirely — the connection was fine
+     and the token was not. And in both cases the one thing the server was
+     trying to hand over, WHY it refused, is thrown away: `status 400` (expired
+     or malformed) and `status 403` (a token with no IMAP scope) are two
+     different afternoons behind one identical `NO AUTHENTICATE failed.`
+
+     The assertion is on the byte that went out rather than on the outcome,
+     because against a conformant server the outcome is a rejection either way. */
+  const handler = xoauth2Session({ user: 'nemo@outlook.com', token: 'the-right-token' });
+
+  await withServer({ greeting: '* OK Zelos mock ready', onCommand: handler }, async ({ port }) => {
+    const client = new ImapClient({
+      host: '127.0.0.1', port, secure: false, user: 'nemo@outlook.com',
+      auth: 'xoauth2', accessToken: 'a-stale-token', timeoutMs: 5000,
+    });
+    await client.connect();
+    await assert.rejects(
+      () => client.login(),
+      (err) => {
+        assert.match(err.message, /IMAP 127\.0\.0\.1:\d+/, 'the error names the host');
+        assert.match(err.message, /status 400/, 'the decoded challenge is what says why');
+        assert.match(err.message, /IMAP\.AccessAsUser\.All/, 'the scope the server wanted survives too');
+        assert.equal(err.reconnect, true, 'a refused token is something the user has to fix, not a retry');
+        return true;
+      },
+    );
+
+    assert.equal(
+      handler.seen.afterChallenge,
+      '',
+      `the client answered the challenge with ${JSON.stringify(handler.seen.afterChallenge)} instead of an empty line`,
+    );
+    await client.close();
+  });
+});
+
+test('REGRESSION: a server that echoes the SASL blob does not get to hand the bearer token back', async () => {
+  /* The same harm the LOGIN redaction tests above cover, one credential up. A
+     bearer token is mail access for the next hour with no second factor in
+     front of it, and a server is entitled to quote the line it rejected — real
+     ones do. That string is not a screen: it is the body of POST
+     /api/mail/test, and it is `sources[].error`, which the sweep writes into
+     `runs.stats_json` on disk and re-serves from /api/state forever.
+
+     The base64 blob is the shape the token travels in, so the blob is what has
+     to be struck; the raw token is listed alongside it because the failure
+     challenge is bytes the server chooses and is the obvious place to reflect
+     one back. */
+  const token = 'EwBwA8l6BAAU-bearer-9f3a1c-do-not-echo-me';
+  const payload = xoauth2Payload('nemo@outlook.com', token);
+  // The SASL response is a bare line with no tag of its own, so the mock has to
+  // remember the tag AUTHENTICATE arrived under to answer it at all.
+  let authTag = null;
+
+  await withServer(
+    {
+      greeting: '* OK Zelos mock ready',
+      onCommand: ({ tag, verb, line, send }) => {
+        if (verb === 'CAPABILITY') {
+          send(`* CAPABILITY IMAP4rev1 AUTH=XOAUTH2\r\n${tag} OK CAPABILITY completed\r\n`);
+          return;
+        }
+        if (verb === 'AUTHENTICATE') { authTag = tag; send('+ \r\n'); return; }
+        // The bare SASL line, quoted straight back in the rejection.
+        send(`${authTag ?? tag} NO [AUTHENTICATIONFAILED] rejected: ${line}\r\n`);
+      },
+    },
+    async ({ port, received }) => {
+      const result = await testConnection({
+        host: '127.0.0.1', port, secure: false, user: 'nemo@outlook.com',
+        auth: 'xoauth2', accessToken: token, timeoutMs: 5000,
+      });
+      assert.equal(result.ok, false);
+      assert.ok(received.some((l) => l === payload), 'the fixture must put the real SASL blob on the wire');
+      assert.ok(!result.error.includes(payload), `the SASL blob came back intact: ${result.error}`);
+      assert.ok(!result.error.includes(token), `the bearer token came back intact: ${result.error}`);
+      assert.match(result.error, /<password withheld>/);
+      assert.match(result.error, /AUTHENTICATIONFAILED/, 'the diagnosis survives the redaction');
+      assert.equal(result.reconnect, true,
+        'a refused bearer token is a reconnect — "check your password" is advice about a thing that no longer exists');
+    },
+  );
+});
+
+test('a server with no AUTH=XOAUTH2 is refused before the token is offered to it', async () => {
+  await withServer(
+    {
+      greeting: '* OK Zelos mock ready',
+      onCommand: ({ tag, verb, send }) => {
+        if (verb === 'CAPABILITY') {
+          send(`* CAPABILITY IMAP4rev1 AUTH=PLAIN\r\n${tag} OK CAPABILITY completed\r\n`);
+          return;
+        }
+        send(`${tag} OK fine\r\n`);
+      },
+    },
+    async ({ port, received }) => {
+      const client = new ImapClient({
+        host: '127.0.0.1', port, secure: false, user: 'nemo@outlook.com',
+        auth: 'xoauth2', accessToken: 'a-perfectly-good-token', timeoutMs: 5000,
+      });
+      await client.connect();
+      await assert.rejects(() => client.login(), /does not offer AUTH=XOAUTH2/);
+      assert.ok(!received.some((line) => /AUTHENTICATE/i.test(line)),
+        `a token was offered to a server that cannot take one: ${received.join(' | ')}`);
+      await client.close();
+    },
+  );
+});
+
+test('an OAuth account with no token says to reconnect instead of trying a blank password', async () => {
+  /* The failure this exists to prevent is a quiet one. An OAuth account whose
+     token could not be minted has an EMPTY access token, and a client that
+     falls back to "well, use the password then" sends Microsoft a LOGIN with a
+     blank one. That is a real authentication attempt against a mailbox with
+     basic auth switched off, so what comes back is AUTHENTICATIONFAILED — which
+     reads as "your credentials are wrong" and sends the user off to re-type a
+     password that has not been accepted since September 2024. */
+  await withServer(
+    { greeting: '* OK Zelos mock ready', onCommand: xoauth2Session({ user: 'u', token: 't' }) },
+    async ({ port, received }) => {
+      const client = new ImapClient({
+        host: '127.0.0.1', port, secure: false, user: 'nemo@outlook.com',
+        auth: 'xoauth2', accessToken: '', timeoutMs: 5000,
+      });
+      await client.connect();
+      await assert.rejects(() => client.login(), /reconnect the account/);
+      assert.ok(!received.some((line) => /LOGIN|AUTHENTICATE/i.test(line)),
+        `something was offered as a credential anyway: ${received.join(' | ')}`);
+      await client.close();
+    },
+  );
+});
+
+test('the auth method is named, not guessed, and an unknown one is refused', () => {
+  assert.equal(resolveAuthMethod(null, ''), 'password', 'every config written before this says nothing');
+  assert.equal(resolveAuthMethod(null, 'tok'), 'xoauth2');
+  assert.equal(resolveAuthMethod('xoauth2', ''), 'xoauth2', 'a stated method survives a missing token');
+  assert.equal(resolveAuthMethod('password', 'tok'), 'password');
+  assert.throws(() => resolveAuthMethod('ntlm', ''), /unknown auth method/);
+  assert.equal(new ImapClient({ host: 'imap.example.com' }).auth, 'password');
+  assert.equal(new ImapClient({ host: 'imap.example.com', accessToken: 'tok' }).auth, 'xoauth2');
+});
+
+test('xoauth2Payload refuses a field carrying the SASL separator', () => {
+  // The separator is what delimits the fields, so a username or token holding
+  // one would append key/value pairs of somebody else's choosing to our
+  // authentication request.
+  assert.equal(
+    Buffer.from(xoauth2Payload('a@b.example', 'tok'), 'base64').toString('utf8'),
+    `user=a@b.example${SOH}auth=Bearer tok${SOH}${SOH}`,
+  );
+  assert.throws(() => xoauth2Payload(`a@b.example${SOH}auth=Bearer stolen`, 'tok'), /separator or a line break/);
+  assert.throws(() => xoauth2Payload('a@b.example', `tok${SOH}x=y`), /separator or a line break/);
+  assert.throws(() => xoauth2Payload('a@b.example', 'tok\r\nA1 LOGOUT'), /separator or a line break/);
+  assert.throws(() => xoauth2Payload('a@b.example', ''), /access token is required/);
+});
+
+test('a challenge that is not JSON, or not anything, degrades without throwing', () => {
+  assert.equal(describeXOAuth2Challenge(Buffer.from('{"status":"401"}').toString('base64')), 'status 401');
+  assert.equal(describeXOAuth2Challenge(Buffer.from('service unavailable').toString('base64')), 'service unavailable');
+  assert.equal(describeXOAuth2Challenge(''), null);
+  assert.equal(describeXOAuth2Challenge(null), null);
+  assert.equal(describeXOAuth2Challenge(Buffer.from('{}').toString('base64')), null);
+});
+
+/* ------------------------------------------------------- the device grant */
+
+test('the device grant hands back a code to type, then stores the refresh token and nothing else', async () => {
+  const entra = await startMockEntra({ pending: 2 });
+  const ref = freshRef();
+  const shown = [];
+  const sleep = recordingSleep();
+  try {
+    const result = await connectDeviceCode({
+      clientId: CLIENT_ID,
+      tenantId: 'common',
+      tokenRef: ref,
+      endpoint: entra.origin,
+      onCode: (code) => shown.push(code),
+      sleep,
+    });
+
+    assert.equal(shown.length, 1);
+    assert.equal(shown[0].userCode, 'HXQR-2K9T');
+    assert.equal(shown[0].verificationUri, 'https://microsoft.com/devicelogin');
+    assert.match(shown[0].message, /devicelogin/, "Microsoft's own localised sentence is passed through");
+    assert.ok(!JSON.stringify(shown[0]).includes('device-code-secret'),
+      'the device code is a credential and is not for showing');
+
+    assert.equal(result.ok, true);
+    assert.equal(result.hasRefreshToken, true);
+    assert.ok(!Object.values(result).some((v) => typeof v === 'string' && v.startsWith('access-token-')),
+      'the caller is told there is a token, never handed one');
+
+    // The scope has to be asked for, or there is no refresh token to store.
+    const devicecode = entra.seen.find((r) => r.path.endsWith('/devicecode'));
+    assert.match(devicecode.form.scope, /IMAP\.AccessAsUser\.All/);
+    assert.match(devicecode.form.scope, /\boffline_access\b/,
+      'without offline_access Microsoft returns no refresh token and the account dies in an hour');
+    assert.ok(!('client_secret' in devicecode.form), 'a public client sends no secret');
+
+    // Where it lives: the secret store, under the account's own keyRef.
+    const stored = JSON.parse(await getSecret(ref));
+    assert.equal(stored.kind, 'xoauth2');
+    assert.equal(stored.refreshToken, entra.liveRefreshToken);
+    assert.equal(stored.accessToken, 'access-token-1');
+    assert.ok(!(await getSecret(ref)).includes('\n'), 'the blob has to be one line for the macOS keychain');
+
+    // Two pending answers, three polls, and the interval the server asked for.
+    assert.deepEqual(sleep.waited, [5000, 5000, 5000]);
+  } finally {
+    await entra.close();
+  }
+});
+
+test('REGRESSION: slow_down adds five seconds to the interval instead of being ignored', async () => {
+  /* RFC 8628 §3.5 is explicit: `slow_down` means the client must increase its
+     polling interval by five seconds, not merely keep polling. A loop that
+     treats it as a synonym for `authorization_pending` keeps hammering at the
+     rate the server has just said is too fast, and the identity platform
+     answers that by refusing the device code outright — so the user, who is
+     doing everything right in their browser, watches the sign-in fail for
+     reasons that are entirely ours.
+
+     Asserted on the delays the loop ASKS for rather than on a clock: the floor
+     is five seconds and each slow_down adds five more, so proving this with a
+     real timer would cost most of a minute and would therefore have been
+     written not to prove it. */
+  const entra = await startMockEntra({ slowDown: 2, pending: 1 });
+  const sleep = recordingSleep();
+  try {
+    const pending = await beginDeviceAuthorization({
+      clientId: CLIENT_ID, tenantId: 'common', endpoint: entra.origin,
+    });
+    const tokens = await pollForDeviceToken(pending, { sleep });
+    assert.equal(tokens.accessToken, 'access-token-1');
+    assert.deepEqual(sleep.waited, [5000, 10000, 15000, 15000],
+      'each slow_down adds five seconds; authorization_pending changes nothing');
+  } finally {
+    await entra.close();
+  }
+});
+
+test('a declined sign-in stops polling and says the user has to start again', async () => {
+  const entra = await startMockEntra({
+    tokenFailure: { status: 400, body: { error: 'authorization_declined', error_description: 'the user declined' } },
+  });
+  const sleep = recordingSleep();
+  try {
+    await assert.rejects(
+      () => connectDeviceCode({
+        clientId: CLIENT_ID, tenantId: 'common', tokenRef: freshRef(), endpoint: entra.origin, sleep,
+      }),
+      (err) => {
+        assert.ok(err instanceof ImapOAuthError);
+        assert.equal(err.code, 'authorization_declined');
+        assert.equal(err.reconnect, true);
+        return true;
+      },
+    );
+    const polls = entra.seen.filter((r) => r.path.endsWith('/token'));
+    assert.equal(polls.length, 1, 'a declined grant is not polled again');
+  } finally {
+    await entra.close();
+  }
+});
+
+test('a device code that expires before it is typed is not polled forever', async () => {
+  const entra = await startMockEntra({ pending: 10_000 });
+  const sleep = recordingSleep();
+  try {
+    let clock = Date.parse('2026-08-11T09:00:00Z');
+    const pending = await beginDeviceAuthorization({
+      clientId: CLIENT_ID, tenantId: 'common', endpoint: entra.origin, now: clock,
+    });
+    await assert.rejects(
+      () => pollForDeviceToken(pending, {
+        sleep: (ms) => { clock += ms; return sleep(ms); },
+        now: () => clock,
+      }),
+      (err) => {
+        assert.equal(err.code, 'expired_token');
+        assert.equal(err.reconnect, true);
+        return true;
+      },
+    );
+    // 900 seconds of life at five seconds a poll: bounded, and the bound is the
+    // server's own expiry rather than a number this file invented.
+    assert.equal(sleep.waited.length, 180);
+  } finally {
+    await entra.close();
+  }
+});
+
+/* ------------------------------------------------------------- refreshing */
+
+test('REGRESSION: a refresh stores the rotated refresh token, or the account works exactly once', async () => {
+  /* Microsoft rotates: every redemption of a refresh token invalidates it and
+     the response carries a replacement. A version of this that returned the new
+     access token without writing the new refresh token back works perfectly the
+     first time and then hands Microsoft a dead token on every sweep after it,
+     for an `invalid_grant` the user has no way to interpret — an account that
+     appears to connect and then quietly goes stale.
+
+     The mock refuses anything but the current token, so the second refresh below
+     is the assertion: it can only succeed if the first one was stored. */
+  const entra = await startMockEntra({ refreshToken: 'refresh-0' });
+  const ref = freshRef();
+  try {
+    await saveOAuthTokens(ref, {
+      accessToken: 'expired-access-token',
+      refreshToken: 'refresh-0',
+      tokenType: 'Bearer',
+      scope: MS_IMAP_SCOPES.join(' '),
+      expiresAt: new Date(Date.now() - 60_000).toISOString(),
+      obtainedAt: new Date(Date.now() - 3_660_000).toISOString(),
+    });
+
+    const first = await accessTokenFor({
+      clientId: CLIENT_ID, tenantId: 'common', tokenRef: ref, endpoint: entra.origin,
+    });
+    assert.equal(first.refreshed, true);
+    assert.equal(first.accessToken, 'access-token-1');
+    assert.equal((await loadOAuthTokens(ref)).refreshToken, 'refresh-1', 'the rotated token was written back');
+
+    // A second sweep, an hour later. This is the call that used to fail.
+    const second = await accessTokenFor({
+      clientId: CLIENT_ID, tenantId: 'common', tokenRef: ref, endpoint: entra.origin,
+      now: Date.now() + 3_600_000,
+    });
+    assert.equal(second.refreshed, true);
+    assert.equal(second.accessToken, 'access-token-2');
+    assert.equal((await loadOAuthTokens(ref)).refreshToken, 'refresh-2');
+  } finally {
+    await entra.close();
+  }
+});
+
+test('a token that is still good is not refreshed, and one a minute from death is', async () => {
+  const entra = await startMockEntra();
+  const ref = freshRef();
+  try {
+    const now = Date.parse('2026-08-11T09:00:00Z');
+    await saveOAuthTokens(ref, {
+      accessToken: 'still-good',
+      refreshToken: 'refresh-0',
+      expiresAt: new Date(now + 600_000).toISOString(),
+    });
+    const fresh = await accessTokenFor({
+      clientId: CLIENT_ID, tenantId: 'common', tokenRef: ref, endpoint: entra.origin, now,
+    });
+    assert.equal(fresh.refreshed, false);
+    assert.equal(fresh.accessToken, 'still-good');
+    assert.deepEqual(entra.seen, [], 'a live token costs no round trip');
+
+    // Inside the skew: treated as spent, so a fetch never races its own expiry
+    // across the wire.
+    const soon = await accessTokenFor({
+      clientId: CLIENT_ID, tenantId: 'common', tokenRef: ref, endpoint: entra.origin,
+      now: now + 600_000 - 30_000,
+    });
+    assert.equal(soon.refreshed, true);
+  } finally {
+    await entra.close();
+  }
+});
+
+test('REGRESSION: invalid_grant is a reconnect, and a 503 is not', async () => {
+  /* The two failures that look alike from a distance and are nothing alike.
+     `invalid_grant` is what Microsoft returns when the refresh token was
+     revoked, the password changed, a conditional-access policy changed, or 90
+     days of inactivity expired it — permanent, every one, until a human does
+     something. A server error is the next sweep's problem and nobody else's.
+     Undifferentiated, the first becomes a mailbox that silently stops updating
+     while the sweep dials Microsoft every fifteen minutes forever to be told
+     the same thing. */
+  const dead = await startMockEntra({
+    tokenFailure: {
+      status: 400,
+      body: { error: 'invalid_grant', error_description: 'AADSTS50173: the token was revoked' },
+    },
+  });
+  try {
+    await assert.rejects(
+      () => refreshAccessToken({
+        clientId: CLIENT_ID, tenantId: 'common', refreshToken: 'refresh-0', endpoint: dead.origin,
+      }),
+      (err) => {
+        assert.equal(err.code, 'invalid_grant');
+        assert.equal(err.reconnect, true, 'the user has to reconnect; retrying can never work');
+        assert.match(err.message, /AADSTS50173/, "Microsoft's own diagnosis survives");
+        return true;
+      },
+    );
+  } finally {
+    await dead.close();
+  }
+
+  const flaky = await startMockEntra({ tokenFailure: { status: 503, body: { error: 'temporarily_unavailable' } } });
+  try {
+    await assert.rejects(
+      () => refreshAccessToken({
+        clientId: CLIENT_ID, tenantId: 'common', refreshToken: 'refresh-0', endpoint: flaky.origin,
+      }),
+      (err) => {
+        assert.equal(err.reconnect, false, 'a bad afternoon at Microsoft is not a broken account');
+        return true;
+      },
+    );
+  } finally {
+    await flaky.close();
+  }
+});
+
+test('an account that was never connected reads as not connected, not as a broken grant', async () => {
+  /* The grant is filed under the account's own `keyRef` — the same ref the
+     password used to live at, so that removing the account removes the refresh
+     token with it rather than leaving a live credential behind. That sharing is
+     the reason `kind` is checked and not merely `typeof`: an account carried
+     over from the password era has a PASSWORD sitting at that ref, and a
+     password is whatever the user's password manager generated. Most of them
+     fail to parse, but `{"note":"exported"}` is a legal password and parses into
+     a perfectly good object with no tokens in it — which would then be treated
+     as a connected account whose refresh token is `undefined`, and the user
+     would be told their grant was rejected rather than that they never made
+     one. */
+  const plain = freshRef();
+  await setSecret(plain, 'hunter2');
+  assert.equal(await loadOAuthTokens(plain), null);
+
+  const ref = freshRef();
+  await setSecret(ref, '{"note":"exported from my password manager"}');
+  assert.equal(await loadOAuthTokens(ref), null, 'a password that happens to be JSON is still a password');
+
+  await assert.rejects(
+    () => accessTokenFor({ clientId: CLIENT_ID, tenantId: 'common', tokenRef: ref, endpoint: MS_LOGIN_ORIGIN }),
+    (err) => {
+      assert.equal(err.code, 'not_connected');
+      assert.equal(err.reconnect, true);
+      return true;
+    },
+  );
+});
+
+/* ------------------------------------------------- where the token may go */
+
+test('REGRESSION: a tenant that is not a tenant never reaches the network', async () => {
+  /* The tenant is the one piece of user input that becomes a URL PATH SEGMENT.
+     `${origin}/${tenant}/oauth2/v2.0/token` with `..` in it resolves — silently,
+     with no error anywhere — to a different endpoint on the same host, and what
+     goes to that endpoint is the refresh token, which is the whole account. So
+     the tenant is a closed set: three aliases, a GUID, or a domain. */
+  for (const bad of ['..', '../..', 'common/../../evil', 'a b', 'tenant?x=1', 'tenant#f', '%2e%2e', 'tenant/']) {
+    assert.throws(() => normalizeTenant(bad), (err) => {
+      assert.equal(err.code, 'bad_tenant');
+      return true;
+    }, `${JSON.stringify(bad)} was accepted as a tenant`);
+  }
+  for (const good of ['common', 'CONSUMERS', 'organizations',
+    '72f988bf-86f1-41af-91ab-2d7cd011db47', 'contoso.onmicrosoft.com']) {
+    assert.equal(typeof normalizeTenant(good), 'string');
+  }
+  assert.equal(normalizeTenant(''), 'common', 'nothing said means the alias that accepts either kind of account');
+
+  const entra = await startMockEntra();
+  try {
+    await assert.rejects(
+      () => beginDeviceAuthorization({ clientId: CLIENT_ID, tenantId: '../../evil', endpoint: entra.origin }),
+      /is not a Microsoft tenant/,
+    );
+    assert.deepEqual(entra.seen, [], 'a request went out on a tenant that was refused');
+  } finally {
+    await entra.close();
+  }
+});
+
+test('REGRESSION: a refresh token is only ever spent against Microsoft or loopback', async () => {
+  /* A configurable token endpoint is a one-field exfiltration route for the most
+     valuable secret this app holds, so it is a check rather than a default.
+     Only the ORIGIN survives — a path, query or fragment on the end is dropped
+     rather than honoured, which is what makes the tenant check above sufficient:
+     the host cannot be moved from the path. */
+  assert.equal(assertTokenEndpoint(MS_LOGIN_ORIGIN), MS_LOGIN_ORIGIN);
+  assert.equal(assertTokenEndpoint('https://login.microsoftonline.com/anything?x=1#f'), MS_LOGIN_ORIGIN);
+  assert.equal(assertTokenEndpoint('http://127.0.0.1:9/x'), 'http://127.0.0.1:9');
+
+  for (const bad of [
+    'https://login.microsoftonline.com.evil.example',
+    'https://evil.example',
+    'https://login.microsoftonline.com@evil.example',
+    'not-a-url',
+    '',
+  ]) {
+    assert.throws(() => assertTokenEndpoint(bad), (err) => {
+      assert.equal(err.code, 'bad_endpoint');
+      return true;
+    }, `${JSON.stringify(bad)} was accepted as a sign-in endpoint`);
+  }
+
+  // And the check stands in front of the network rather than beside it.
+  let dialled = 0;
+  await assert.rejects(
+    () => refreshAccessToken({
+      clientId: CLIENT_ID,
+      tenantId: 'common',
+      refreshToken: 'refresh-0',
+      endpoint: 'https://evil.example',
+      fetchImpl: () => { dialled += 1; throw new Error('unreachable'); },
+    }),
+    /refusing to send a refresh token/,
+  );
+  assert.equal(dialled, 0);
+});
+
+test('a client id that is not a GUID is refused before anything is sent', () => {
+  assert.equal(normalizeClientId(' 11111111-2222-3333-4444-555555555555 '), CLIENT_ID);
+  for (const bad of ['', 'my-app', 'https://evil.example/app', '1111-2222']) {
+    assert.throws(() => normalizeClientId(bad), (err) => {
+      assert.ok(err instanceof ImapOAuthError);
+      assert.equal(err.code, 'not_configured');
+      return true;
+    }, `${JSON.stringify(bad)} was accepted as a client id`);
+  }
+});
+
+/* ------------------------------------------------------------- end to end */
+
+test('fetchRecent signs in with the stored Microsoft grant and reads the mailbox over XOAUTH2', async () => {
+  /* The whole path in one test: an expired grant in the secret store, a refresh
+     against the identity platform, and the minted token presented to the mail
+     server as XOAUTH2 — with no password anywhere in it, and every other byte
+     of the session exactly what it was before. */
+  const entra = await startMockEntra();
+  const ref = freshRef();
+  const headers = [
+    'From: Marcus Reyes <marcus@riverstone.example>',
+    'Subject: Change order',
+    'Date: Tue, 11 Aug 2026 09:15:00 -0400',
+    'Message-ID: <ms1@riverstone.example>',
+    '',
+    '',
+  ].join('\r\n');
+
+  const box = mailbox([{
+    uid: 501,
+    internalDate: '11-Aug-2026 09:15:00 -0400',
+    structure: PLAIN_TEXT_STRUCTURE,
+    headers,
+    parts: { 1: 'Numbers are firm.\r\n' },
+  }]);
+  const handler = xoauth2Session({ user: 'nemo@outlook.com', token: 'access-token-1', extra: box });
+
+  try {
+    await saveOAuthTokens(ref, {
+      accessToken: 'long-expired',
+      refreshToken: 'refresh-0',
+      expiresAt: new Date(Date.now() - 3_600_000).toISOString(),
+    });
+
+    await withServer(
+      { greeting: '* OK Zelos mock ready', onCommand: handler },
+      async ({ port, received }) => {
+        const messages = await fetchRecent({
+          host: '127.0.0.1',
+          port,
+          secure: false,
+          user: 'nemo@outlook.com',
+          auth: 'xoauth2',
+          oauth: { clientId: CLIENT_ID, tenantId: 'common', tokenRef: ref, endpoint: entra.origin },
+          timeoutMs: 5000,
+        });
+
+        assert.equal(messages.length, 1);
+        assert.equal(messages[0].subject, 'Change order');
+        assert.equal(messages[0].text, 'Numbers are firm.');
+
+        // The token on the wire is the one that was just minted, not the stale
+        // one that was in the store.
+        assert.equal(handler.seen.decoded, `user=nemo@outlook.com${SOH}auth=Bearer access-token-1${SOH}${SOH}`);
+        const sent = commands(received);
+        assert.ok(sent.includes('AUTHENTICATE XOAUTH2'));
+        assert.ok(!sent.some((c) => /^LOGIN\b/i.test(c)), 'an OAuth account never tries a password');
+        assert.ok(sent.some((c) => c === 'EXAMINE "INBOX"'), 'and the rest of the session is unchanged');
+        assert.ok(sent.some((c) => c.includes('BODY.PEEK[')), 'still read-only');
+      },
+    );
+
+    assert.equal((await loadOAuthTokens(ref)).refreshToken, 'refresh-1', 'the rotation survived the sweep');
+  } finally {
+    await entra.close();
+  }
+});
+
+test('an OAuth account that was never connected fails before a socket is opened', async () => {
+  await withServer(
+    { greeting: '* OK Zelos mock ready', onCommand: xoauth2Session({ user: 'u', token: 't' }) },
+    async ({ port, connections }) => {
+      await assert.rejects(
+        () => fetchRecent({
+          host: '127.0.0.1', port, secure: false, user: 'nemo@outlook.com',
+          auth: 'xoauth2',
+          oauth: { clientId: CLIENT_ID, tenantId: 'common', tokenRef: freshRef(), endpoint: MS_LOGIN_ORIGIN },
+          timeoutMs: 5000,
+        }),
+        (err) => {
+          assert.equal(err.code, 'not_connected');
+          assert.equal(err.reconnect, true);
+          return true;
+        },
+      );
+      assert.deepEqual(connections, [], 'the mail server was never dialled for an account with no grant');
+    },
+  );
+});
+
+test('the Outlook preset stops recommending a password that has not worked since 2024', () => {
+  /* The note is the whole user-facing half of this defect. What shipped said
+     Microsoft "is retiring" password IMAP and to try an app password if
+     two-step verification was on — a sentence that had been false for eleven
+     months by the time anyone read it, and that sent every one of these users
+     off to mint a credential Microsoft would refuse. */
+  const appPassword = /app[- ]?(specific[- ])?password/i;
+  for (const domain of ['outlook.com', 'hotmail.com', 'live.com', 'msn.com']) {
+    const guess = guessImapHost(`nemo@${domain}`);
+    assert.equal(guess.host, 'outlook.office365.com');
+    assert.match(guess.note, /16 September 2024/, `${domain}: the note has to name the date`);
+    assert.match(guess.note, /devicelogin/, `${domain}: and the way in that still works`);
+    assert.ok(
+      !appPassword.test(guess.note.replace(/app passwords no longer work[^.]*\./i, '')),
+      `${domain}: the note still recommends an app password: ${guess.note}`,
+    );
   }
 });

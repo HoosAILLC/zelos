@@ -143,6 +143,27 @@ export const api = {
   probeLocal: () => request('/api/local/probe'),
   testMail: (account) => request('/api/mail/test', { method: 'POST', body: account }),
   testCalendar: (calendar) => request('/api/calendar/test', { method: 'POST', body: calendar }),
+
+  /* "Sign in with Microsoft" — a device authorization grant, and three calls
+     from this page's point of view: start one, ask whether the person has
+     finished in their browser, give up.
+
+     There is deliberately no timing here. RFC 8628 §3.5 pins the poll interval
+     and the `slow_down` back-off, core/sources/imap.mjs implements both under
+     test, and the server runs that loop; a second implementation in the browser
+     would be a second thing to get wrong about the one operation a vendor rate
+     limit punishes. The page asks a question with no timing content and reads
+     an answer.
+
+     The device code never comes back here. Whoever holds it collects the tokens,
+     so it stays in the server process — what this gets is the USER code, which
+     is meant for a human to read aloud off a screen, and the address to type it
+     at. */
+  beginMailOAuth: ({ keyRef, clientId, tenantId }) =>
+    request('/api/mail/oauth', { method: 'POST', body: { keyRef, clientId, tenantId } }),
+  mailOAuthStatus: (id) => request(`/api/mail/oauth/${encodeURIComponent(id)}`),
+  cancelMailOAuth: (id) =>
+    request(`/api/mail/oauth/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   updateDraft: (id, patch) =>
     request(`/api/drafts/${encodeURIComponent(id)}`, { method: 'PUT', body: patch }),
   /**
