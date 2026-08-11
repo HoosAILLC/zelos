@@ -599,6 +599,43 @@ test('parseFeed reads what a feed means, not what its markup says', () => {
   }
 });
 
+test('REGRESSION: an escaped ampersand in a link is decoded, because it is a row identity', () => {
+  /* Found by pointing this connector at NASA's real feed instead of a fixture.
+     Two of ten entries came back as
+     `https://www.nasa.gov/?post_type=image-article&#038;p=1036264` — the raw
+     `&#038;` stored verbatim — because `&` is not legal raw in XML character
+     data, so every feed MUST escape it, and a person writing a test fixture
+     types a clean URL and never sees this.
+
+     It is not cosmetic. The link is the `<guid>` fallback, so it becomes
+     `messageId`, and `messageRowId` hashes it — if the publisher's escaping
+     ever changes (`&#038;` to `&amp;`, or a CDN normalising on the way out) the
+     same article hashes to a different row and arrives again as new. It is also
+     `threadKey`, so one article can become two threads.
+
+     All three spellings a feed may use, and a clean URL that must not be
+     touched. */
+  const xml = '<?xml version="1.0"?><rss version="2.0"><channel><title>T</title>'
+    + '<item><title>numeric</title><link>https://x.example/?a=1&#038;b=2</link>'
+    + '<guid>https://x.example/?a=1&#038;b=2</guid></item>'
+    + '<item><title>named</title><link>https://x.example/?c=3&amp;d=4</link><guid>g-amp</guid></item>'
+    + '<item><title>hex</title><link>https://x.example/?e=5&#x26;f=6</link><guid>g-hex</guid></item>'
+    + '<item><title>clean</title><link>https://x.example/plain</link><guid>g-clean</guid></item>'
+    + '</channel></rss>';
+
+  const [numeric, named, hex, clean] = parseFeed(xml).entries;
+  assert.equal(numeric.link, 'https://x.example/?a=1&b=2', 'a numeric reference survived into the link');
+  assert.equal(numeric.id, 'https://x.example/?a=1&b=2', 'the guid is the row identity and it kept an entity');
+  assert.equal(named.link, 'https://x.example/?c=3&d=4');
+  assert.equal(hex.link, 'https://x.example/?e=5&f=6');
+  assert.equal(clean.link, 'https://x.example/plain', 'a URL with nothing to decode was altered');
+
+  // A reference that is not a character stays as written rather than becoming
+  // a replacement character — better a visibly odd URL than a silently wrong one.
+  const weird = parseFeed('<rss><channel><item><link>https://x.example/?z=&#xD800;</link></item></channel></rss>');
+  assert.match(weird.entries[0].link, /&#xD800;/, 'a lone surrogate was decoded into something it is not');
+});
+
 test('a feed longer than the number the user chose is capped at it', async (t) => {
   const db = fresh();
   const items = Array.from({ length: 12 }, (_, i) =>

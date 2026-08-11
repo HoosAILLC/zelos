@@ -86,15 +86,51 @@ function attr(attrs, name) {
  * `rel` at all) is the one a human would click. `rel="enclosure"` is a media
  * file and `rel="self"` is the feed itself, and neither is the article.
  */
+/**
+ * XML entities, decoded — in a URL, where leaving them is not cosmetic.
+ *
+ * `&` is not legal raw in XML character data, so a feed that publishes
+ * `?a=1&b=2` MUST escape it, and publishers vary in how: `&amp;` from most,
+ * `&#038;` from WordPress. Found by pointing this connector at NASA's real feed
+ * rather than at a fixture — 2 of 10 entries came back with
+ * `?post_type=image-article&#038;p=1036264`, because a person writing a test
+ * fixture types a clean URL and never sees this.
+ *
+ * It matters beyond the href being slightly wrong. That string is the `<guid>`
+ * fallback, so it becomes `messageId`, and `messageRowId` hashes it: if the
+ * publisher ever changes escaping — `&#038;` to `&amp;`, or a CDN normalising
+ * on the way out — the same article hashes to a different row and arrives
+ * again as new. It is also `threadKey`, so one article can become two threads.
+ *
+ * Only the five predefined XML entities plus numeric references are decoded.
+ * The HTML named set (`&nbsp;`, `&copy;`, …) is deliberately not: those are not
+ * XML entities, a conforming feed cannot use them bare, and decoding them here
+ * would mean guessing at bytes the publisher never wrote.
+ */
+function decodeXmlEntities(s) {
+  return String(s ?? '').replace(/&(#\d+|#[xX][0-9a-fA-F]+|amp|lt|gt|quot|apos);/g, (whole, body) => {
+    if (body[0] === '#') {
+      const code = body[1] === 'x' || body[1] === 'X'
+        ? Number.parseInt(body.slice(2), 16)
+        : Number.parseInt(body.slice(1), 10);
+      // A reference outside Unicode, or to a surrogate half, is left as written
+      // rather than turned into a replacement character.
+      if (!Number.isFinite(code) || code < 1 || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) return whole;
+      return String.fromCodePoint(code);
+    }
+    return { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" }[body] ?? whole;
+  });
+}
+
 function linkOf(xml) {
   const body = first(xml, 'link');
   const inline = collapse(unwrapCdata(body));
-  if (inline) return inline;
+  if (inline) return decodeXmlEntities(inline);
   for (const m of xml.matchAll(/<(?:[A-Za-z0-9_.-]+:)?link(\s[^>]*)\/?>/g)) {
     const rel = attr(m[1], 'rel').toLowerCase();
     if (rel && rel !== 'alternate') continue;
     const href = attr(m[1], 'href');
-    if (href) return href.trim();
+    if (href) return decodeXmlEntities(href.trim());
   }
   return '';
 }
@@ -122,7 +158,11 @@ export function parseFeed(input) {
   const entries = blocks.slice(0, MAX_ENTRIES).map((block) => ({
     title: collapse(textOf(first(block, 'title'))),
     link: linkOf(block),
-    id: collapse(unwrapCdata(first(block, 'guid') || first(block, 'id'))),
+    // The guid gets the same treatment as the link, and for the same reason:
+    // it is usually a URL, it is the FIRST choice for messageId, and an escaped
+    // ampersand in it is a row identity that moves when the publisher's
+    // escaping does.
+    id: decodeXmlEntities(collapse(unwrapCdata(first(block, 'guid') || first(block, 'id')))),
     author: collapse(textOf(first(block, 'creator') || first(block, 'author') || first(block, 'name'))),
     date: collapse(unwrapCdata(
       first(block, 'pubDate') || first(block, 'published') || first(block, 'updated') || first(block, 'date'),
