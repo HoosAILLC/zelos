@@ -462,7 +462,12 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
   const presetWrap = el('div', { class: 'preset-grid' });
   const formWrap = el('div', { class: 'chosen' });
 
-  const keyStored = () => state.secretRefs.includes(draft.keyRef);
+  // Refs this panel has stored itself since it was drawn. `state.secretRefs`
+  // is refreshed by a config save, not by POST /api/secrets, so a key stored
+  // on the way into "Test the connection" would otherwise still read as
+  // missing when Save is pressed a moment later — and be refused.
+  const storedHere = new Set();
+  const keyStored = () => state.secretRefs.includes(draft.keyRef) || storedHere.has(draft.keyRef);
   const isLocal = () => /^https?:\/\/(127\.0\.0\.1|localhost|\[?::1\]?)(:|\/|$)/i.test(draft.baseUrl || '');
 
   function drawForm() {
@@ -483,7 +488,38 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
     const datalist = el('datalist', { id: 'zelos-models' });
     const suggestions = el('div', { class: 'suggestions' });
 
+    /**
+     * Put whatever is in the key field into the secret store, and empty the
+     * field. There is no route that carries a key alongside a test or a list
+     * call — secrets travel only through POST /api/secrets, by design — so
+     * the field is stored first and the call then names the ref. Before this
+     * was shared, only Save did it: paste a key, press Test, and the test went
+     * out with the ref of a key that was not stored yet, and came back
+     * "No API key configured" about the key sitting in the field.
+     */
+    async function storeTypedKey() {
+      const key = keyInput.value.trim();
+      if (!key) return;
+      await api.setSecret(draft.keyRef, key);
+      storedHere.add(draft.keyRef);
+      keyInput.value = '';
+    }
+
+    // A hosted endpoint will not answer without a key, and the server says so
+    // only after the call; said here, before it, about the field it is about.
+    const NEEDS_KEY = 'Paste an API key first — a hosted endpoint will not answer without one.';
+
     async function loadModels() {
+      try {
+        await storeTypedKey();
+      } catch (err) {
+        suggestions.replaceChildren(el('span', { class: 'quiet-note', text: `Could not store the key: ${err.message}` }));
+        return;
+      }
+      if (!isLocal() && !keyStored()) {
+        suggestions.replaceChildren(el('span', { class: 'quiet-note', text: NEEDS_KEY }));
+        return;
+      }
       suggestions.replaceChildren(el('span', { class: 'quiet-note', text: 'Asking the endpoint what it has…' }));
       try {
         const models = await api.listModels({
@@ -509,12 +545,16 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
         status.bad('A base URL and a model id are both required.');
         return false;
       }
+      // Refused rather than saved: a hosted model with no key is a model every
+      // sweep fails on, and this save used to go through silently — and, in
+      // onboarding, advance to the next step on the strength of it.
+      if (!isLocal() && !keyStored() && !keyInput.value.trim()) {
+        status.bad('A hosted endpoint needs an API key. Paste one above, or pick a runtime on this machine.');
+        return false;
+      }
       status.working('Saving…');
       try {
-        if (keyInput.value.trim()) {
-          await api.setSecret(draft.keyRef, keyInput.value.trim());
-          keyInput.value = '';
-        }
+        await storeTypedKey();
         await saveConfig({
           model: {
             protocol: draft.protocol,
@@ -533,6 +573,16 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
     }
 
     async function test() {
+      try {
+        await storeTypedKey();
+      } catch (err) {
+        status.bad(`Could not store the key: ${err.message}`);
+        return false;
+      }
+      if (!isLocal() && !keyStored()) {
+        status.bad(NEEDS_KEY);
+        return false;
+      }
       status.working(`Calling ${draft.baseUrl}…`);
       try {
         const result = await api.testModel({
@@ -587,6 +637,7 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
             onClick: async () => {
               try {
                 await api.deleteSecret(draft.keyRef);
+                storedHere.delete(draft.keyRef);
                 await saveConfig({});
                 status.good('Key deleted.');
                 drawForm();

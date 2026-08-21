@@ -541,11 +541,17 @@ function buildChatRequest(opts, { stream }) {
       address: null,
     });
   }
-  const apiKey = requireKey(opts.apiKey, address);
+  // The model before the key. DEFAULTS pre-select a hosted provider with an
+  // empty model id, so on a home nobody has set up the first thing missing is
+  // the choice, not the credential — and the key check ran first, so every run
+  // row, the SSE relay and the board banner named a missing API key on an
+  // install where the real next step was picking a model. Same sentence the
+  // doctor uses, so the CLI, the doctor and the board agree.
   const model = typeof opts.model === 'string' ? opts.model.trim() : '';
   if (!model) {
-    throw new LLMError(`No model selected for ${address}`, { address });
+    throw new LLMError(`No model selected for ${address} — open Settings → Model and pick one`, { address });
   }
+  const apiKey = requireKey(opts.apiKey, address);
 
   const local = isLocalAddress(address);
   // Local runtimes commonly reject response_format outright, so json:true
