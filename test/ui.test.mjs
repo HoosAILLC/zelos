@@ -872,7 +872,7 @@ test('a sweep that lost one source says so, and does not call the run failed', (
   assert.match(trouble[0], /sourcesFailed/, 'the count every sweep writes must have a reader');
   assert.match(trouble[0], /'partial'/);
 
-  const banner = /function failureBanner\(trouble\)[\s\S]*?\n\}/m.exec(src);
+  const banner = /function failureBanner\(trouble, navigate\)[\s\S]*?\n\}/m.exec(src);
   assert.ok(banner, 'failureBanner is missing');
   // Its own tone and its own sentence. "The last sweep failed" over a run that
   // read four sources out of five is a lie in the alarming direction, and it
@@ -1970,4 +1970,143 @@ test('a now-line that leaves takes the today marker with it', async (t) => {
   cal.tickNowLine();
   assert.equal(orphan.line.parentNode, null);
   assert.ok(!orphan.cols.some((c) => c.classes.has('is-today')), 'a today marker outlived its clock');
+});
+
+/* ------------------------------------------------------------ 10. first run */
+
+/**
+ * The operator's own install never worked: 38 runs, every one "No API key
+ * configured", no config.json, no sources. Three of the reasons were this
+ * screen and this store — a model save nothing downstream could see, a Test
+ * button that ignored the key sitting in the field, and a board whose only
+ * action after the first scheduled failure was to fail again. Each is pinned
+ * below at the line that stranded him.
+ */
+
+test('REGRESSION: a config save refetches health, so a model just saved is a model the screens can see', async (t) => {
+  stubBrowserGlobals();
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+
+  // `model.configured` lives in /api/health and nowhere else, and the
+  // onboarding's "Sweep now", its "Missing: a model" note, the rail foot and
+  // the Now view's empty state all read it from state.health. saveConfig
+  // updated config and secretRefs and never health, so pasting a working
+  // hosted key ended on a disabled button naming the thing just done as
+  // missing, until a page reload.
+  const model = { protocol: 'anthropic', baseUrl: 'https://api.example.invalid', model: 'm', keyRef: 'model.default' };
+  const calls = [];
+  globalThis.fetch = async (reqPath, opts = {}) => {
+    calls.push(`${opts.method || 'GET'} ${reqPath}`);
+    if (reqPath === '/api/config') {
+      return { ok: true, status: 200, text: async () => JSON.stringify({ config: { model }, errors: [], secretRefs: ['model.default'] }) };
+    }
+    if (reqPath === '/api/health') {
+      return { ok: true, status: 200, text: async () => JSON.stringify({ model: { configured: true } }) };
+    }
+    throw new Error(`unexpected ${reqPath}`);
+  };
+  t.after(() => { delete globalThis.fetch; });
+
+  store.state.health = { model: { configured: false } };
+  await store.saveConfig({ model });
+  assert.equal(store.state.config.model.model, 'm', 'the premise of this test has moved');
+  assert.ok(calls.includes('GET /api/health'), `the save never asked the server whether the model is usable now (${calls.join(', ')})`);
+  assert.equal(store.state.health?.model?.configured, true, 'the screens that gate on a model are still reading the answer from before the save');
+
+  // A health fetch that fails must not turn a save that succeeded into an error.
+  globalThis.fetch = async (reqPath) => {
+    if (reqPath === '/api/config') {
+      return { ok: true, status: 200, text: async () => JSON.stringify({ config: { model }, errors: [], secretRefs: ['model.default'] }) };
+    }
+    return { ok: false, status: 503, text: async () => '{"error":"not now"}' };
+  };
+  await assert.doesNotReject(() => store.saveConfig({ model }));
+
+  // The other moment a stale answer is noticed: the banner a failed sweep
+  // raises sits beside the same gated screens, and `done` already refetched.
+  const src = fs.readFileSync(path.join(UI, 'lib/store.js'), 'utf8');
+  const failed = /\} else if \(event === 'failed'\) \{[\s\S]*?\n {12}\}/m.exec(src);
+  assert.ok(failed, 'the failed branch of watchSweeps is missing');
+  assert.match(failed[0], /loadHealth\(\)/, 'a failed sweep leaves the health document where it was');
+});
+
+test('REGRESSION: Test and List store the key in the field first, and Save refuses a hosted endpoint with no key', () => {
+  const src = fs.readFileSync(path.join(UI, 'views/settings.js'), 'utf8');
+  const panel = /export function modelPanel\([\s\S]*?\n\}/m.exec(src);
+  assert.ok(panel, 'modelPanel is missing');
+
+  // "Test the connection" and "List available models" sent only the stored
+  // keyRef. Paste a key, press Test, and the call went out naming a ref that
+  // held nothing yet, and came back "No API key configured" about the key in
+  // the field — the message contradicting the screen. There is no route that
+  // carries a key alongside a test (secrets travel only through POST
+  // /api/secrets, by design), so the fix is the one Save already had: store
+  // the field, clear it, then call.
+  const helper = /async function storeTypedKey\(\)[\s\S]*?\n {4}\}/m.exec(panel[0]);
+  assert.ok(helper, 'storeTypedKey is missing');
+  assert.match(helper[0], /api\.setSecret\(draft\.keyRef, key\)/);
+  assert.match(helper[0], /keyInput\.value = ''/, 'a stored key must leave the field, as it does on Save');
+
+  const testFn = /async function test\(\)[\s\S]*?\n {4}\}/m.exec(panel[0]);
+  assert.ok(testFn, 'test() is missing');
+  const listFn = /async function loadModels\(\)[\s\S]*?\n {4}\}/m.exec(panel[0]);
+  assert.ok(listFn, 'loadModels() is missing');
+  for (const [name, fn, call] of [['test', testFn[0], 'api.testModel('], ['loadModels', listFn[0], 'api.listModels(']]) {
+    const stored = fn.indexOf('await storeTypedKey()');
+    assert.ok(stored >= 0, `${name} ignores the key typed in the form`);
+    assert.ok(stored < fn.indexOf(call), `${name} stores the key only after the call that needed it`);
+    // With nothing typed and nothing stored, a hosted endpoint is refused
+    // here, about the field, instead of by the server after the call.
+    const guard = fn.indexOf('!isLocal() && !keyStored()');
+    assert.ok(guard >= 0, `${name} lets a keyless call to a hosted endpoint go out`);
+    assert.ok(guard < fn.indexOf(call), `${name} checks for a key after the call`);
+  }
+
+  // Save accepted a remote endpoint with no key, said nothing, and in
+  // onboarding advanced on the strength of it — a model every sweep fails on.
+  const saveFn = /async function save\(\)[\s\S]*?\n {4}\}/m.exec(panel[0]);
+  assert.ok(saveFn, 'save() is missing');
+  const refuse = /if \(!isLocal\(\) && !keyStored\(\) && !keyInput\.value\.trim\(\)\) \{[\s\S]*?status\.bad\([\s\S]*?return false;/m.exec(saveFn[0]);
+  assert.ok(refuse, 'save() still writes a hosted model with no key');
+  assert.ok(saveFn[0].indexOf(refuse[0]) < saveFn[0].indexOf('saveConfig('), 'the refusal comes after the save');
+
+  // The trap in the fix: `state.secretRefs` is refreshed by a config save,
+  // not by POST /api/secrets, so a key stored on the way into Test would
+  // still read as missing when Save is pressed a moment later — and be
+  // refused by the guard above, for a key the server already holds.
+  assert.match(panel[0], /const keyStored = \(\) => state\.secretRefs\.includes\(draft\.keyRef\) \|\| storedHere\.has\(draft\.keyRef\)/,
+    'keyStored() does not know about a key this panel stored itself');
+  assert.match(helper[0], /storedHere\.add\(draft\.keyRef\)/);
+});
+
+test('REGRESSION: a failed sweep on an unconfigured home still offers "Choose a model", and the banner agrees', () => {
+  const src = fs.readFileSync(path.join(UI, 'views/now.js'), 'utf8');
+
+  // sweepTrouble() says 'whole' for any failed last run, and under a whole
+  // failure renderNow drew the plain "Nothing on the board yet" shell instead
+  // of emptyForContext — the only place "Choose a model" lives. On a home
+  // with no model the first scheduled run fails thirty minutes in, so the
+  // call to action the first screen exists for vanished at the first tick,
+  // and the banner's one action, "Sweep again", ran the same failure.
+  const missing = /function missingSetup\(\)[\s\S]*?\n\}/m.exec(src);
+  assert.ok(missing, 'missingSetup is missing');
+  assert.match(missing[0], /state\.health\?\.model\?\.configured/);
+  assert.match(missing[0], /'sources'/);
+
+  const render = /export function renderNow\(ctx\)[\s\S]*?\n\}/m.exec(src);
+  assert.ok(render, 'renderNow is missing');
+  assert.match(render[0], /if \(trouble === 'whole' && missingSetup\(\)\) \{\n\s*body\.appendChild\(emptyForContext\(navigate\)\);/,
+    'under a whole failure on an unconfigured home the context empty state is still skipped');
+  assert.match(render[0], /failureBanner\(trouble, navigate\)/, 'the banner cannot route anywhere without navigate');
+
+  const banner = /function failureBanner\(trouble, navigate\)[\s\S]*?\n\}/m.exec(src);
+  assert.ok(banner, 'failureBanner is missing');
+  assert.match(banner[0], /button\('Choose a model', \{[^}]*navigate\('#\/settings\/model'\)/,
+    'the banner on a modelless home does not open the model settings');
+  assert.match(banner[0], /button\('Connect a source', \{[^}]*navigate\('#\/settings\/mail'\)/,
+    'the banner on a sourceless home does not open the mail settings');
+  assert.match(banner[0], /button\('Sweep again'/, 'a configured home still gets the retry');
+  // The swap is on the whole-failure kind only: a partial failure read
+  // something, and "Sweep again" there is real advice.
+  assert.match(banner[0], /trouble === 'whole' \? missingSetup\(\) : null/);
 });

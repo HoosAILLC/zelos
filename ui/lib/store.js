@@ -227,6 +227,16 @@ export async function saveConfig(patch) {
   state.config = res.config;
   state.configErrors = res.errors || [];
   state.secretRefs = res.secretRefs || [];
+  // The health document is where `model.configured` lives, and every screen
+  // that gates on a model — the onboarding's "Sweep now", its "Missing: a
+  // model" note, the rail foot, the Now view's empty state — reads it from
+  // here and nowhere else. A config save is exactly the moment that answer
+  // changes, and until this line it was refetched only at boot and when a
+  // sweep finished, so pasting a working hosted key ended on a disabled
+  // button naming the thing just done as missing, until a page reload. Its
+  // failure is swallowed: the save itself succeeded, and the heartbeat and
+  // the next sweep both retry.
+  await loadHealth().catch(() => {});
   state.rev += 1;
   emit();
   return res;
@@ -336,6 +346,11 @@ export function watchSweeps() {
                 lastResult: data || null,
               };
               refreshBoard();
+              // A failed sweep is the usual way a stale health document gets
+              // noticed — the banner it raises sits beside screens that gate
+              // on `model.configured`, so both should be answers to the same
+              // question at the same moment, as they are after `done`.
+              loadHealth().catch(() => {});
             }
             emit();
           },

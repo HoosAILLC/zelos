@@ -1437,6 +1437,27 @@ test('bad options fail with an LLMError that names the address', async () => {
   assert.equal(mock.requests.length, 0);
 });
 
+test('REGRESSION: a blank install is told to pick a model, not that a key is missing', async () => {
+  // core/config.mjs DEFAULTS pre-select a hosted provider with `model: ''`,
+  // and requireKey ran before the empty-model check — so on a home nobody has
+  // set up, every run row, the SSE relay and the board banner said "No API
+  // key configured for https://api.anthropic.com" when the real next step was
+  // choosing a model. The existing assertion above uses a loopback base, where
+  // requireKey is a no-op and the order never showed.
+  await assert.rejects(
+    () => complete({ protocol: 'anthropic', baseUrl: FAKE_ORIGIN, model: '', messages: [{ role: 'user', content: 'hi' }] }),
+    (err) => {
+      assert.ok(err instanceof LLMError);
+      assert.match(err.message, /No model selected for https:\/\/api\.example\.invalid/);
+      assert.doesNotMatch(err.message, /API key/, 'a missing key is named before the missing choice that comes first');
+      // The doctor's sentence, so the CLI, the doctor and the board agree.
+      assert.match(err.message, /Settings → Model/);
+      return true;
+    },
+  );
+  assert.equal(mock.requests.length, 0);
+});
+
 test('LLMError is a real Error carrying status, address and retriable', () => {
   const err = new LLMError('nope', { status: 503, address: 'http://x', retriable: true });
   assert.ok(err instanceof Error);
