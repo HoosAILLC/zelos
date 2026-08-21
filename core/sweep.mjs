@@ -21,7 +21,7 @@
  */
 
 import { loadConfig } from './config.mjs';
-import { complete as llmComplete, extractJSON, LLMError } from './llm.mjs';
+import { complete as llmComplete, extractJSON, LLMError, isLocalAddress } from './llm.mjs';
 import { getSecret as realGetSecret } from './secrets.mjs';
 import {
   enabledSources,
@@ -1211,6 +1211,37 @@ function recomputeDerived(db, { now = nowISO() } = {}) {
  * ------------------------------------------------------------------ */
 
 /**
+ * Why a *scheduled* sweep should stand down, or null when it may run.
+ *
+ * The rule is the one core/server.mjs `modelIsConfigured` applies before it
+ * lets /api/ask through: an address and a model name, and either a local
+ * runtime (keyless is normal there) or a stored key. It is asked here, on the
+ * timer's path only, because `shouldRunFull` says "think" whenever no full run
+ * has ever succeeded — which on a home with no model is forever — so a default
+ * install that skipped setup otherwise ran a full sweep every interval, reached
+ * `requireKey`, and wrote a failed run row each time with nothing to sweep and
+ * nothing to ask. A hand-started sweep is deliberately not gated: a person who
+ * asked gets the real error.
+ *
+ * The key is read through the `getSecret` seam rather than the secret store's
+ * ref list so the check is injectable — the Scheduler tests never open a
+ * keychain — and so a key pasted after launch is seen on the very next tick.
+ */
+async function modelNotReadyReason(config, getSecret) {
+  const model = config?.model;
+  if (!model?.baseUrl || !model?.model) return 'No model is configured — open Settings → Model';
+  if (isLocalAddress(model.baseUrl)) return null;
+  let key = null;
+  try {
+    key = model.keyRef ? await getSecret(model.keyRef) : null;
+  } catch (err) {
+    slog.debug('no API key available', { error: errorText(err) });
+  }
+  if (typeof key === 'string' && key.trim()) return null;
+  return `No API key is stored for ${model.baseUrl} — open Settings → Model`;
+}
+
+/**
  * In-process sweep timer.
  *
  * Drift-free by construction: the next run time is an absolute instant computed
@@ -1228,6 +1259,7 @@ export class Scheduler {
   #runs = 0;
   #lastRunAt = null;
   #lastResult = null;
+  #skipLogged = null;
 
   constructor({
     db,
@@ -1332,6 +1364,26 @@ export class Scheduler {
       this.#arm();
       return;
     }
+
+    // No run row, no onRun relay, no source fetch: nothing happened, and the
+    // board must not paint "the last sweep failed" over a home that is merely
+    // not set up. status() — and so /api/health — carries the reason instead.
+    // Logged once per distinct reason, not every tick: the operator's own home
+    // had a line like this every half hour for as long as the app lived.
+    const { getSecret } = { ...DEFAULT_DEPS, ...this.deps };
+    const reason = await modelNotReadyReason(this.config, getSecret);
+    if (reason) {
+      this.#lastResult = { ok: false, skipped: true, reason };
+      if (this.#skipLogged !== reason) {
+        this.#skipLogged = reason;
+        slog.info('scheduled sweep skipped', { reason });
+      }
+      this.#advance();
+      this.#arm();
+      return;
+    }
+    this.#skipLogged = null;
+
     await this.#execute('auto');
     this.#advance();
     this.#arm();
