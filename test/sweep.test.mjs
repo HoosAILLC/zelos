@@ -266,7 +266,10 @@ function fetched(over = {}) {
     to: [{ name: 'Nemo', email: 'nemo@example.com' }],
     cc: [],
     subject: 'Dates for the walkthrough',
-    date: '2026-08-06T11:04:00+00:00',
+    /* An hour ago, off the real clock. The prompt window is 21 days back from
+       now and `runSweep` takes no clock, so a fixed date here fell out of
+       every prompt assertion three weeks after it was written. */
+    date: new Date(Date.now() - 3_600_000).toISOString(),
     snippet: 'Either the 28th or the 30th works',
     text: 'Either the 28th or the 30th works on our end.',
     hasAttachments: false,

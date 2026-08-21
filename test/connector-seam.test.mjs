@@ -52,6 +52,7 @@ const registry = await import('../core/connectors/index.mjs');
 const { register, describe: describeAll, enabledSources, unknownSources } = registry;
 const { validateConfig } = await import('../core/config.mjs');
 const { diagnose } = await import('../core/doctor.mjs');
+const { todayKey } = await import('../core/time.mjs');
 
 test.after(() => {
   try {
@@ -435,6 +436,37 @@ test('doctor counts a runtime-registered source, runs the check it declared, and
      deliberately never connected. */
   assert.equal(report.ok, true, JSON.stringify(report.checks.filter((c) => c.status === 'fail'), null, 2));
   assert.equal(report.ready, true, 'a model and one source are configured, and the source answered');
+});
+
+test('doctor hands a check the user\'s zone, and a now read in it', async (t) => {
+  /* `checkContext` handed over neither, so the two checks that count "overdue"
+     (Linear, Todoist) fell back to the machine's clock in the machine's zone —
+     the one-day error their sweep paths exist to prevent, printed in the one
+     command a stuck person runs. The sweep builds `ctx.now` with `nowISO(tz)`
+     from `identity.timezone`; this pins doctor to the same pair. Niue has no
+     DST, so its offset is −11:00 on every day this can run. */
+  const NIUE = 'Pacific/Niue';
+  const seen = [];
+  const off = register(throwaway({
+    async check(source, ctx) {
+      seen.push({ now: ctx.now, timezone: ctx.timezone });
+      return { status: 'pass', detail: 'recorded' };
+    },
+  }));
+  t.after(off);
+
+  await diagnose({
+    config: baseConfig({
+      identity: { name: 'Nemo Hale', email: 'nemo@example.com', timezone: NIUE },
+      sources: [quarrySource()],
+    }),
+    deps: { ...SILENT_DEPS, getSecret: async () => 'a-quarry-token' },
+  });
+
+  assert.equal(seen.length, 1, 'doctor did not run the check');
+  assert.equal(seen[0].timezone, NIUE, 'identity.timezone never reached the check');
+  assert.match(String(seen[0].now), /-11:00$/, `\`now\` is not read in ${NIUE}: ${seen[0].now}`);
+  assert.equal(String(seen[0].now).slice(0, 10), todayKey(NIUE), 'the day `now` names is not the day in that zone');
 });
 
 test("doctor's check runs on the transport, so it cannot contact an address the user never configured", async (t) => {

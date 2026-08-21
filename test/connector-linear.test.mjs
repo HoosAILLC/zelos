@@ -63,6 +63,7 @@ const { ISSUES_QUERY, graphqlError, dueness, duePhrase } = await import('../core
 const { AuthError, RateLimitError, createHttp } = await import('../core/connectors/http.mjs');
 const { assertShape } = await import('../core/connectors/index.mjs');
 const { open, close, migrate, upsertMessages, listMessages } = await import('../core/db.mjs');
+const { addDaysToKey, todayKey } = await import('../core/time.mjs');
 
 let seq = 0;
 const openDbs = [];
@@ -754,13 +755,65 @@ test('doctor runs the sweep\'s own query and names the account the key belongs t
   /* A `viewer { name }` probe proves the key works and proves nothing about the
      query, so a filter Linear has stopped accepting would pass doctor and fail at
      07:00 — and this is the command a stuck user runs. */
-  const mock = await linearServer(t, page([issue(), issue({ id: 'b', dueDate: '2026-08-18' })]));
-  const verdict = await connector.check({ id: 's_ln', settings: {} }, { http: transportFor(mock) });
+  /* Both due dates are derived from the clock the check is handed, so the
+     fixture cannot age: written as a bare `'2026-08-18'` against a check that
+     read the machine's clock, the in-horizon issue became overdue on the 19th
+     and this test went red eight days after it was written. */
+  const mock = await linearServer(t, page([
+    issue({ dueDate: addDaysToKey(TODAY, -9) }),
+    issue({ id: 'b', dueDate: addDaysToKey(TODAY, 7) }),
+  ]));
+  const verdict = await connector.check({ id: 's_ln', settings: {} }, { http: transportFor(mock), now: NOW, timezone: TZ });
 
   assert.equal(verdict.status, 'pass', verdict.detail);
   assert.equal(mock.requests[0].body.query, ISSUES_QUERY, 'doctor asked a cheaper question than the sweep asks');
   assert.match(verdict.detail, /Signed in as Nemo Hale/);
   assert.match(verdict.detail, /1 of them overdue/);
+});
+
+test('doctor measures overdue from the clock it is handed, not from the machine\'s', async (t) => {
+  /* `check` computed `today` with a bare `todayKey()` while `collect` read
+     `ctx.now`, so the same two issues were "1 overdue" on the board and
+     "2 overdue" in `zelos doctor` — and no test could hold the clock still.
+     Thirty days either side of TODAY puts both issues on one side of the line,
+     so a check that ignores the clock it was handed answers both probes the
+     same, whatever day the machine thinks it is. */
+  const mock = await linearServer(t, page([
+    issue({ dueDate: addDaysToKey(TODAY, -9) }),
+    issue({ id: 'b', dueDate: addDaysToKey(TODAY, 7) }),
+  ]));
+  const probe = (day) => connector.check(
+    { id: 's_ln', settings: {} },
+    { http: transportFor(mock), now: `${day}T09:00:00-04:00`, timezone: TZ },
+  );
+
+  const early = await probe(addDaysToKey(TODAY, -30));
+  const late = await probe(addDaysToKey(TODAY, 30));
+
+  assert.equal(early.status, 'pass', early.detail);
+  assert.doesNotMatch(early.detail, /of them overdue/, `nothing is overdue a month before TODAY: ${early.detail}`);
+  assert.match(late.detail, /2 of them overdue/, `everything is overdue a month after TODAY: ${late.detail}`);
+  assert.notEqual(early.detail, late.detail,
+    'a check that ignores the clock it was handed answers both probes identically');
+});
+
+test('doctor measures overdue in the zone it is given when no clock comes with it', async (t) => {
+  /* The fallback half of the same line. Niue is UTC−11 and Kiritimati is
+     UTC+14: 25 hours apart, so their local dates are never the same one, and
+     an issue due on today's date in Niue is not late there and already late
+     in Kiritimati — deterministic on any day, on any machine. */
+  const NIUE = 'Pacific/Niue';
+  const KIRITIMATI = 'Pacific/Kiritimati';
+  const dueToday = todayKey(NIUE);
+  const mock = await linearServer(t, page([issue({ dueDate: dueToday })]));
+  const probe = (timezone) => connector.check({ id: 's_ln', settings: {} }, { http: transportFor(mock), timezone });
+
+  const here = await probe(NIUE);
+  const ahead = await probe(KIRITIMATI);
+
+  assert.equal(here.status, 'pass', here.detail);
+  assert.doesNotMatch(here.detail, /of them overdue/, `an issue due ${dueToday} is not late in ${NIUE}: ${here.detail}`);
+  assert.match(ahead.detail, /1 of them overdue/, `${KIRITIMATI} is a day ahead of ${NIUE}, so the same issue is already late there`);
 });
 
 test('doctor returns a refusal rather than throwing one', async (t) => {

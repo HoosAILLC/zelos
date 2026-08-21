@@ -36,6 +36,7 @@ import { guessImapHost, testConnection as testImapConnection } from './sources/i
 import { testConnection as testCalDavConnection } from './sources/caldav.mjs';
 import { parseICS } from './sources/ics.mjs';
 import { safeUrl } from './safety.mjs';
+import { localTimezone, nowISO } from './time.mjs';
 /* The registry, for the same reason core/sweep.mjs reads it: a diagnostic that
    keeps its own list of source kinds is a second list, and the one that goes
    stale is always the one nobody is looking at. It costs no new weight here —
@@ -842,12 +843,21 @@ async function readCapped(response, maxBytes) {
  * built rather than lazily created because a connector reading `ctx.http` and
  * finding `undefined` is a crash in a diagnostic, which is the one place a crash
  * is least affordable.
+ *
+ * `now` and `timezone` are the user's, exactly as core/sweep.mjs hands them to
+ * `collect`. They were missing, so the two checks that count "overdue" (Linear,
+ * Todoist) fell back to the machine's clock in the machine's zone — the one-day
+ * error their sweep paths exist to prevent, printed in the one command a stuck
+ * person runs — and a test pinned to a fixed day had no way to hold the clock
+ * still.
  */
-function checkContext(connector, source, deps, { timeoutMs, signal, secret = null }) {
+function checkContext(connector, source, deps, { timeoutMs, signal, secret = null, timezone }) {
   return {
     secret,
     timeoutMs,
     signal,
+    now: nowISO(timezone),
+    timezone,
     maxBytes: MAX_ICS_BYTES,
     getSecret: deps.getSecret,
     testCalDav: deps.testCalDav,
@@ -865,7 +875,7 @@ function checkContext(connector, source, deps, { timeoutMs, signal, secret = nul
   };
 }
 
-async function checkCalendar(calendar, deps, { timeoutMs, signal }) {
+async function checkCalendar(calendar, deps, { timeoutMs, signal, timezone }) {
   const name = calendar.label || calendar.url || calendar.id;
   const id = `calendar.${calendar.id}`;
   const label = `Calendar · ${name}`;
@@ -884,7 +894,7 @@ async function checkCalendar(calendar, deps, { timeoutMs, signal }) {
   const connector = connectorFor(calendar.kind);
   if (connector?.check) {
     try {
-      const verdict = await connector.check(calendar, checkContext(connector, calendar, deps, { timeoutMs, signal }));
+      const verdict = await connector.check(calendar, checkContext(connector, calendar, deps, { timeoutMs, signal, timezone }));
       return check(id, label, verdict?.status ?? 'fail', verdict?.detail ?? '', verdict?.action ?? null);
     } catch (err) {
       /* A check that throws is a bug in a connector, and a bug in a connector
@@ -997,7 +1007,7 @@ async function checkCalendar(calendar, deps, { timeoutMs, signal }) {
  * look" would be the exact failure the database check at the top of this file
  * exists because of.
  */
-async function checkSource(source, deps, { timeoutMs, signal }) {
+async function checkSource(source, deps, { timeoutMs, signal, timezone }) {
   const connector = connectorFor(source.type);
   const name = source.label || source.id;
   const id = `source.${source.id}`;
@@ -1047,7 +1057,7 @@ async function checkSource(source, deps, { timeoutMs, signal }) {
   }
 
   try {
-    const verdict = await connector.check(source, checkContext(connector, source, deps, { timeoutMs, signal, secret }));
+    const verdict = await connector.check(source, checkContext(connector, source, deps, { timeoutMs, signal, secret, timezone }));
     return check(id, label, verdict?.status ?? 'fail', verdict?.detail ?? '', verdict?.action ?? null);
   } catch (err) {
     return check(id, label, 'fail', `${name}: ${errorText(err)}`,
@@ -1154,6 +1164,14 @@ export async function diagnose({ config = null, timeoutMs = 10_000, signal, deps
       }
     }
 
+    /* The user's zone, resolved the way core/sweep.mjs `timezoneOf` resolves
+       it, so a connector's check counts "overdue" on the same day the sweep
+       will. `config` may have arrived here unnormalised (DEFAULTS carries an
+       empty string, and `nowISO('')` quietly reads as UTC), hence the fallback
+       rather than the raw field. */
+    const rawTz = cfg.identity?.timezone;
+    const timezone = typeof rawTz === 'string' && rawTz.trim() ? rawTz : localTimezone();
+
     const calendars = (Array.isArray(cfg.calendars) ? cfg.calendars : []).filter((c) => c && c.enabled);
     if (!calendars.length) {
       checks.push(check(
@@ -1163,7 +1181,7 @@ export async function diagnose({ config = null, timeoutMs = 10_000, signal, deps
       ));
     } else {
       for (const calendar of calendars) {
-        checks.push(await checkCalendar(calendar, d, { timeoutMs, signal }));
+        checks.push(await checkCalendar(calendar, d, { timeoutMs, signal, timezone }));
       }
     }
 
@@ -1175,7 +1193,7 @@ export async function diagnose({ config = null, timeoutMs = 10_000, signal, deps
        connector are checked; the ones that do not are the report below. */
     for (const source of (Array.isArray(cfg.sources) ? cfg.sources : [])) {
       if (!source?.enabled || !connectorFor(source.type)) continue;
-      checks.push(await checkSource(source, d, { timeoutMs, signal }));
+      checks.push(await checkSource(source, d, { timeoutMs, signal, timezone }));
     }
 
     const unknown = checkUnknownSources(cfg);
