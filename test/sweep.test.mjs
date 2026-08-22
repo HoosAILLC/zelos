@@ -24,6 +24,8 @@ const {
   runSweep, shouldRunFull, nextRunAt, isActiveHour, Scheduler, FULL_RUN_MAX_AGE_MS,
   recordTokens,
 } = await import('../core/sweep.mjs');
+const { sourceStateKey } = await import('../core/connectors/index.mjs');
+const { AUTH_BLOCK_MS, secretHash } = await import('../core/connectors/http.mjs');
 
 let seq = 0;
 const openDbs = [];
@@ -777,6 +779,44 @@ test('an account with no stored password is reported, not crashed on', async () 
   assert.equal(source.ok, false);
   assert.match(source.error, /No password stored for Work/);
   assert.equal(result.stats.messages, 0);
+});
+
+test('REGRESSION: a source resting on a refused credential stays on the run record, and one resting on a rate limit stays off it', async () => {
+  /* Both rests are the same mechanism — a state row the sweep wrote after a
+     failure — and until this test they were reported the same way: not at
+     all. The Now banner, /api/state and the run record read only
+     `stats.sources`, and nothing reads `source.<id>.state`, so a token
+     revoked at 09:00 was red on the 09:00 sweep and a quiet day at 09:30, for
+     the rest of the six-hour block. The state rows are seeded here exactly as
+     core/sweep.mjs writes them after a 401 and a 429 (test/connectors.test.mjs
+     covers the writing), because the mail reader catches its own failures
+     into parts and so never rests on its own. */
+  const reads = [];
+  const deps = { getSecret: SECRETS, fetchMail: async (o) => { reads.push(o.mailbox); return [fetched()]; } };
+
+  const refused = fresh();
+  setKV(refused, sourceStateKey('m_work'), JSON.stringify({
+    lastAt: Date.now() - 1_800_000,
+    authBlockedUntil: Date.now() + AUTH_BLOCK_MS,
+    secretHash: secretHash('a-password'),
+  }));
+  const second = await runSweep({ db: refused, config: baseConfig({ mail: [mailAccount()] }), mode: 'light', deps });
+  assert.equal(reads.length, 0, 'the sweep asked again with the credential the host just refused');
+  assert.equal(second.stats.sources.length, 1, 'the resting source vanished from the run record');
+  assert.equal(second.stats.sources[0].id, 'm_work');
+  assert.equal(second.stats.sources[0].ok, false);
+  assert.equal(second.stats.sources[0].count, 0);
+  assert.match(second.stats.sources[0].error, /credential was refused; not retrying until .* or until it changes/,
+    'the row has to say when it retries and that a new credential lifts it');
+  assert.equal(second.stats.sourcesFailed, 1);
+  assert.equal(second.stats.sourcesOk, 0);
+
+  const limited = fresh();
+  setKV(limited, sourceStateKey('m_work'), JSON.stringify({ lastAt: Date.now() - 1_800_000, notBefore: Date.now() + 3_600_000 }));
+  const rested = await runSweep({ db: limited, config: baseConfig({ mail: [mailAccount()] }), mode: 'light', deps });
+  assert.equal(reads.length, 0, 'the sweep read a source that asked not to be read yet');
+  assert.deepEqual(rested.stats.sources, [],
+    'a rate-limit rest is minutes and routine; a red row for it is the noise the rest exists to stop');
 });
 
 /* ================================================================== *

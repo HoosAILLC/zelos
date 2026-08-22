@@ -1061,6 +1061,72 @@ test('maxPerChannel stops the paging as well as the rows', async (t) => {
   assert.equal(rowsOf(result).length, 7);
 });
 
+test('a channel with more messages than the cap says what it skipped, on the part that carries the rows', async (t) => {
+  /* `conversations.history` is newest-first, the cap keeps the newest, and the
+     high-water mark is the newest ts SEEN — so what the cap drops is the
+     oldest tail of the window, and the next sweep asks from above it.
+     Measured: three messages, `maxPerChannel: 2`, sweep one kept the two
+     newest and said nothing; sweep two asked with `oldest` = the newest ts
+     and got `[]`. The oldest was never read, under `ok: true`. The cut is the
+     right cut for a triage board and backfilling it would spend the budget on
+     old traffic; what was wrong was the silence. */
+  const three = [
+    { user: 'U_DANA', ts: ts('2026-08-11T09:00:02Z'), text: 'third (newest)' },
+    { user: 'U_DANA', ts: ts('2026-08-11T09:00:01Z'), text: 'second' },
+    { user: 'U_DANA', ts: ts('2026-08-11T09:00:00Z'), text: 'first (oldest)' },
+  ];
+  const mock = await slackServer(t, {
+    'auth.test': AUTH_OK,
+    'users.info': NAMES,
+    'conversations.list': listOf(CH_OPS),
+    // Honours `oldest` the way Slack does, so the second sweep sees the skip.
+    'conversations.history': (params) => historyOf(...three.filter((m) => Number(m.ts) > Number(params.oldest))),
+  });
+
+  const first = await slack.collect(ctxFor(mock, { settings: { maxPerChannel: 2 } }));
+  const part = first.parts.find((p) => p.rows.length);
+  assert.deepEqual(part.rows.map((r) => r.text), ['third (newest)', 'second']);
+  assert.match(part.note ?? '', /#site-ops had more than 2 messages since the last read/,
+    'the cut was silent, so "why is Monday missing from #site-ops" had no answer');
+  assert.match(part.note, /kept the newest 2 and skipped the rest/);
+  assert.match(part.note, /Messages per conversation/, 'the note has to name the setting that moves the line');
+  assert.equal(first.parts.filter((p) => p.note && !p.rows.length).length, 0,
+    'a note on a rows-less part reads as a failed source with a count of zero');
+
+  const second = await slack.collect(ctxFor(mock, { cursor: first.cursor, settings: { maxPerChannel: 2 } }));
+  assert.equal(rowsOf(second).length, 0, 'the skipped tail is not re-read — which is why the first sweep had to say so');
+  assert.ok(second.parts.every((p) => !p.note), 'nothing was cut this time, so nothing is said');
+});
+
+test('exactly the cap with a page still on offer is a cut too; a channel under the cap is not', async (t) => {
+  /* The paging stops at the cap BEFORE it reads the next cursor, so a channel
+     holding exactly `maxPerChannel` plus another page used to look complete:
+     the only evidence of more was the cursor nobody looked at. #zoning, with
+     the same two messages and no further page, is the control — a note there
+     would be a false alarm on every ordinary channel. */
+  const two = [
+    { user: 'U_DANA', ts: ts('2026-08-11T09:00:01Z'), text: 'second' },
+    { user: 'U_DANA', ts: ts('2026-08-11T09:00:00Z'), text: 'first' },
+  ];
+  const mock = await slackServer(t, {
+    'auth.test': AUTH_OK,
+    'users.info': NAMES,
+    'conversations.list': listOf(CH_OPS, CH_ZONING),
+    'conversations.history': (params) => (params.channel === 'C_OPS'
+      ? { ok: true, messages: two, response_metadata: { next_cursor: 'one-more-page' } }
+      : historyOf(...two)),
+  });
+
+  const result = await slack.collect(ctxFor(mock, { settings: { maxPerChannel: 2 } }));
+  const ops = result.parts.find((p) => p.label === '#site-ops');
+  const zoning = result.parts.find((p) => p.label === '#zoning');
+  assert.equal(ops.rows.length, 2);
+  assert.match(ops.note ?? '', /#site-ops had more than 2 messages/, 'a cursor still on offer is a cut, and was not read');
+  assert.equal(countOf(mock, 'conversations.history'), 2, 'saying so must not cost a page the cap was there to save');
+  assert.equal(zoning.rows.length, 2);
+  assert.equal(zoning.note, null, 'exactly the cap, with nothing behind it, is a complete read');
+});
+
 /* ================================================================== *
  * 9. What the request carries
  * ================================================================== */
