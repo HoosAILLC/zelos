@@ -533,7 +533,7 @@ export function aboutText({ version, commit = '', url = null, home = '' }) {
       `Data    ${home}`,
       '',
       'Listening on 127.0.0.1 only. Nothing leaves this machine except the',
-      'calls to the model you chose.',
+      'calls to the model you chose and to the sources you added.',
     ].join('\n'),
     buttons: ['OK'],
   };
@@ -746,7 +746,7 @@ async function bootstrap() {
     app.setAboutPanelOptions({
       applicationName: APP_NAME,
       applicationVersion: versionLabel(app.getVersion(), BUILD_COMMIT),
-      copyright: 'MIT licensed. Local-first: nothing leaves this machine except the model calls you configure.',
+      copyright: 'MIT licensed. Local-first: nothing leaves this machine except the model calls you configure and the sources you add.',
     });
   }
   if (process.platform === 'darwin' && app.dock) {
