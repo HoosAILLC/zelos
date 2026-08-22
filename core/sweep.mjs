@@ -382,8 +382,10 @@ function keepsState(connector) {
  * with a count of zero would inflate `stats.sourcesOk`, a number three files
  * consume, with sources that were never read; reporting it as a failure would
  * put a red banner on the screen forty-seven times a day for a source that is
- * deliberately resting. Settings can read `source.<id>.state` when it wants to
- * show "next attempt at 14:20".
+ * deliberately resting. Nothing outside this file reads `source.<id>.state`,
+ * so a rest is invisible by design — which is also why the refused-credential
+ * rest (`authResting`, and the `stillRefused` branch in runSweep) is the one
+ * rest that IS pushed: that source is waiting on the user, not pacing itself.
  */
 function restingFor(connector, state, nowMs) {
   const minInterval = Number(connector?.limits?.minIntervalMs) || 0;
@@ -652,7 +654,18 @@ export async function runSweep({
 
     const stillRefused = authResting(state, secret, startedMs);
     if (stillRefused) {
+      /* Reported, unlike the rests above. A rate-limit rest is minutes and
+         fixes itself; a refused credential rests for six hours and fixes
+         nothing — it is waiting on the user. Silence here meant the sweep that
+         hit the 401 pushed `ok: false` and the next eleven pushed nothing, and
+         since the Now banner, /api/state and the run record read only
+         `stats.sources` (no reader of `source.<id>.state` exists), a revoked
+         token was red for one sweep and then a quiet day for the remaining
+         five and a half hours of every block. The sentence is the one
+         `authResting` already writes to the debug log, so the user reads what
+         the log reads: not until when, and that a new credential lifts it. */
       slog.debug(`source resting: ${label}`, { id: source.id, why: stillRefused });
+      sources.push({ kind: connector.family, id: source.id, label, ok: false, count: 0, error: storedError(stillRefused) });
       return nothing;
     }
 

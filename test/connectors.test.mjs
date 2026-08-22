@@ -441,7 +441,7 @@ test('a cursor larger than the ceiling is refused rather than stored', async (t)
  * A refused credential, and a source that is deliberately resting
  * ================================================================== */
 
-test('a refused credential rests the source, and resting pushes nothing into sources[]', async (t) => {
+test('a refused credential rests the source, and the rest is on every run record until it lifts', async (t) => {
   const db = fresh();
   const feed = await feedServer(t, {
     handler: (req, res) => { res.writeHead(401, { 'content-type': 'text/plain' }); res.end('nope'); },
@@ -457,13 +457,21 @@ test('a refused credential rests the source, and resting pushes nothing into sou
 
   const second = await runSweep({ db, config, mode: 'light', deps: sweepDeps });
   assert.equal(feed.hits(), 1, 'the sweep asked again with the credential the host just refused');
-  /* Silence, not a green row. `{ok: true, count: 0}` would inflate
-     stats.sourcesOk — a number three files consume — with a source that was
-     never read; `{ok: false}` would put a red banner on the screen forty-seven
-     times a day for a source that is deliberately resting. */
-  assert.deepEqual(second.stats.sources, []);
+  /* A red row — not silence, and not a green one. `{ok: true, count: 0}` would
+     inflate stats.sourcesOk — a number three files consume — with a source that
+     was never read. Silence was the first design, on the argument that a red
+     banner forty-seven times a day is noise for a source deliberately resting;
+     but nothing outside core/sweep.mjs reads `source.<id>.state`, so silence
+     meant a revoked token was red for one sweep and then a quiet day for the
+     remaining five and a half hours of every block. A refused credential is
+     the user's to fix and the row stays until they do. The rate-limit rest
+     below stays silent, because that one fixes itself. */
+  assert.equal(second.stats.sources.length, 1, 'the resting source vanished from the run record');
+  assert.equal(second.stats.sources[0].ok, false);
+  assert.equal(second.stats.sources[0].count, 0);
+  assert.match(second.stats.sources[0].error, /not retrying until .* or until it changes/);
   assert.equal(second.stats.sourcesOk, 0);
-  assert.equal(second.stats.sourcesFailed, 0);
+  assert.equal(second.stats.sourcesFailed, 1);
 });
 
 test('changing the stored credential releases the block immediately', async (t) => {
