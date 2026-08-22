@@ -698,6 +698,50 @@ test('setItemState carries the snooze deadline, and only when one was chosen', a
   assert.deepEqual(captured.body, { state: 'snoozed', until: null });
 });
 
+/**
+ * REGRESSION. core/server.mjs answers an unexpected error with
+ * `{error: 'internal error', detail: 'the reason was written to …'}` — the
+ * error's own text is deliberately kept out of the response, and `detail` is
+ * the one thing the server does say: where to look. api.js stored it on the
+ * ApiError and built the message from `error` alone, and every view renders
+ * `err.message`, so what reached the screen was the two words "internal
+ * error" with no pointer to the terminal or to desktop.log.
+ */
+test('a 500\'s detail reaches the message a view renders, and a 4xx\'s is left alone', async (t) => {
+  stubBrowserGlobals();
+  const { api, ApiError } = await import(fileUrl(UI, 'lib/api.js'));
+  let answer = null;
+  globalThis.fetch = async () => ({ ok: false, status: answer.status, text: async () => JSON.stringify(answer.body) });
+  t.after(() => { delete globalThis.fetch; });
+
+  const pointer = 'the reason was written to /tmp/zelos-home/logs/desktop.log';
+  answer = { status: 500, body: { error: 'internal error', detail: pointer } };
+  await assert.rejects(api.health(), (err) => {
+    assert.ok(err instanceof ApiError);
+    assert.equal(err.status, 500);
+    assert.equal(err.message, `internal error — ${pointer}`);
+    assert.equal(err.detail, pointer, 'and still there on its own for a reader that wants it apart');
+    return true;
+  });
+
+  // A 4xx's `error` already names the caller's mistake, and its `detail` is
+  // structured — the 409's running-sweep status — not prose to append.
+  answer = { status: 409, body: { error: 'a sweep is already running', detail: { running: true, mode: 'full' } } };
+  await assert.rejects(api.sweep('full'), (err) => {
+    assert.equal(err.message, 'a sweep is already running');
+    assert.deepEqual(err.detail, { running: true, mode: 'full' });
+    return true;
+  });
+  // ...and a 4xx whose detail IS prose is not joined either: that text is the
+  // route's, to render where it chooses.
+  answer = { status: 400, body: { error: 'mode must be auto, light or full', detail: 'got "everything"' } };
+  await assert.rejects(api.sweep('everything'), (err) => err.message === 'mode must be auto, light or full');
+
+  // A 5xx with no detail — a proxy's, say — is still just its error.
+  answer = { status: 502, body: { error: 'bad gateway' } };
+  await assert.rejects(api.health(), (err) => err.message === 'bad gateway' && err.detail === null);
+});
+
 test('the snooze chooser offers three future deadlines in the configured zone', async () => {
   stubBrowserGlobals();
   const items = await import(fileUrl(UI, 'lib/items.js'));

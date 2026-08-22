@@ -314,6 +314,47 @@ test('a save that could not be loaded back is refused before it touches the disk
   assert.equal(saveConfig({ identity: { name: 'Still works' } }).identity.name, 'Still works');
 });
 
+/**
+ * REGRESSION. `normalizeAccounts` turns a non-array `mail`, `calendars` or
+ * `sources` into an empty one, and SECTIONS left those three out of the
+ * refuse-on-save rule because of it. So `saveConfig({ mail: 'nope' })` — or
+ * null, or `{}`, or a list with a string in it — merged, normalised to `[]`
+ * and was written: every configured account gone, with a return value that
+ * read as success. The repair is right for the FILE (the end of this test)
+ * and wrong for the PATCH, exactly as it is for the object sections above.
+ */
+test('a patch whose accounts are not a list of objects is refused, and the accounts it would have wiped survive', () => {
+  const home = freshHome('account-lists');
+  const file = path.join(home, 'config.json');
+  saveConfig({
+    mail: [{ id: 'm_keep', host: 'imap.example', user: 'keep@example.com' }],
+    calendars: [{ id: 'c_keep', kind: 'ics', url: 'https://cal.example/x.ics' }],
+    sources: [{ id: 's_keep', type: 'rss', settings: { url: 'https://feed.example/' } }],
+  });
+  const before = fs.readFileSync(file, 'utf8');
+
+  for (const key of ['mail', 'calendars', 'sources']) {
+    for (const junk of ['nope', null, {}, 5, true, [{ id: 'x_ok' }, 'garbage'], [null], [[]]]) {
+      const where = `${key} = ${JSON.stringify(junk)}`;
+      assert.throws(() => saveConfig({ [key]: junk }), new RegExp(`${key} must be an array of objects`), where);
+      assert.equal(fs.readFileSync(file, 'utf8'), before, `${where}: config.json must be untouched`);
+    }
+  }
+  const still = loadConfig();
+  assert.equal(still.mail[0].id, 'm_keep');
+  assert.equal(still.calendars[0].id, 'c_keep');
+  assert.equal(still.sources[0].id, 's_keep');
+
+  // An empty list is still how an account is removed — that has not changed.
+  assert.deepEqual(saveConfig({ mail: [] }).mail, []);
+
+  // ...and a FILE carrying the same nonsense still loads, as empty lists:
+  // doctor tells people to edit it by hand, and a typo must not brick the app.
+  fs.writeFileSync(file, '{\n  "version": 1,\n  "mail": "nope",\n  "calendars": null,\n  "sources": {}\n}\n');
+  const repaired = loadConfig();
+  assert.deepEqual([repaired.mail, repaired.calendars, repaired.sources], [[], [], []]);
+});
+
 test('a config hand-edited into nonsense loads with defaults instead of killing the launch', () => {
   const home = freshHome('unloadable-file');
   const file = path.join(home, 'config.json');
@@ -403,6 +444,48 @@ test('validateConfig() rejects non-objects and duplicate ids', () => {
   const cfg = saveConfig({ mail: [{ id: 'm_dup', host: 'a', user: 'a' }] });
   cfg.mail.push({ ...cfg.mail[0] });
   assert.ok(validateConfig(cfg).errors.some((e) => /duplicate account id/.test(e.message)));
+});
+
+/**
+ * REGRESSION. `validateConfig` checked the sections it knew and nothing else,
+ * so a top-level key it had never heard of — `sweeps` beside `sweep`, or
+ * `privacy ` with a trailing space — was merged, written, echoed back by
+ * GET /api/config and called valid by doctor. The setting the user thought
+ * they had changed did nothing, and nothing said so. It is named now, and
+ * nothing more: the file still loads and still saves, because refusing it
+ * would block the very save that removes it.
+ */
+test('validateConfig() names a top-level key Zelos does not know, and the file still loads and saves', () => {
+  const home = freshHome('unknown-keys');
+  const file = path.join(home, 'config.json');
+  paths(); // the directory, which nothing has had reason to create yet
+  fs.writeFileSync(file, `${JSON.stringify({
+    version: 1,
+    identity: { name: 'Nemo' },
+    sweeps: { auto: false },
+    'privacy ': { sendBodies: false },
+  }, null, 2)}\n`);
+
+  const cfg = loadConfig();
+  assert.equal(cfg.identity.name, 'Nemo', 'the file loads');
+  assert.equal(cfg.sweep.auto, true, 'the typo never reached the real setting — which is the whole complaint');
+  assert.deepEqual(cfg.sweeps, { auto: false }, 'and it is not dropped on the way in');
+
+  const { ok, errors } = validateConfig(cfg);
+  assert.equal(ok, false);
+  const unknown = errors.filter((e) => /not a setting Zelos knows/.test(e.message));
+  assert.deepEqual(unknown.map((e) => e.path).sort(), ['privacy ', 'sweeps']);
+
+  // Still saves, and the key survives the save: reported, never dropped.
+  const saved = saveConfig({ identity: { name: 'Still Nemo' } });
+  assert.equal(saved.identity.name, 'Still Nemo');
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')).sweeps, { auto: false });
+
+  // The keys other modules own are not unknown: `ai` (core/ai-access.mjs) and
+  // `oauth` (core/sources/oauth.mjs) have no block in validateConfig and must
+  // not trip this either.
+  const theirs = validateConfig({ ...loadConfig(), ai: { enabled: false }, oauth: { google: { clientId: '' } } });
+  assert.ok(!theirs.errors.some((e) => e.path === 'ai' || e.path === 'oauth'), JSON.stringify(theirs.errors));
 });
 
 test('newId() and isValidRef()', () => {
