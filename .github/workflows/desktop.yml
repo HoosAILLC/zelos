@@ -56,6 +56,11 @@ jobs:
       # parser as a number; main.js shows the first seven.
       - name: Build
         working-directory: desktop
+        # bash on both runners: PowerShell reads `-c.extraMetadata.commit=…` as the
+        # parameter `-c` followed by a bare word, and electron-builder then went
+        # looking for a config FILE named `.extraMetadata.commit=<sha>`. The suite
+        # step above already runs under bash for the same family of reason.
+        shell: bash
         run: npm run ${{ matrix.script }} -- -c.extraMetadata.commit=${{ github.sha }}
         env:
           # Unsigned on purpose. macOS builds are ad-hoc signed by the config
