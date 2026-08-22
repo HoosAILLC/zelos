@@ -40,14 +40,82 @@ import { htmlToText, parseDate } from '../sources/mime.mjs';
 /** How much of a feed is worth reading. Beyond this it is an archive, not news. */
 const MAX_ENTRIES = 200;
 
+/**
+ * How many dateless entries a cursor remembers a first-seen instant for. See
+ * `collect`: at ~43 characters each, 64 of them is under 3 KB of the 4 KB
+ * ceiling core/sweep.mjs puts on a cursor, with room left for the validators
+ * and the address beside them.
+ */
+const SEEN_MAX = 64;
+
 /** The snippet the board shows; the body it can open. */
 const SNIPPET_CHARS = 400;
 const BODY_CHARS = 20_000;
 
 const sha256 = (s) => crypto.createHash('sha256').update(String(s)).digest('hex').slice(0, 32);
 
-/** `<![CDATA[…]]>` is a quoting device, not content. */
-const unwrapCdata = (s) => String(s ?? '').replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1');
+/* ------------------------------------------------------------------ *
+ * The scan
+ *
+ * Every question asked of the XML below is answered by `indexOf` and a
+ * character test, never by a regex with `[\s\S]*?` in it. The first version
+ * used `<item(\s[^>]*)?>([\s\S]*?)</item\s*>` with matchAll, and a lazy
+ * quantifier with nothing to stop it scans to the end of the input for EVERY
+ * `<item>` that has no `</item>` after it. Measured: 1 MiB of `<item>` took
+ * 12.7 s, 1 MiB of `<!--` 23.8 s, four times longer per doubling, and the
+ * transport's 8 MiB cap extrapolated to a quarter of an hour with the event
+ * loop pinned — core/server.mjs runs the sweep in-process, so the board and
+ * /api/state stopped answering for the duration, and `ctx.signal` cannot
+ * pre-empt a synchronous regex. `<title>` repeated inside one item, `<link `
+ * repeated inside one item and `<![CDATA[` repeated inside one description
+ * had the same shape for the same reason. Same class as core/sources/mime.mjs
+ * `stripTags`, same cure: a search that fails from here fails from everywhere
+ * later, so one failed search ends the walk instead of starting it again one
+ * tag along.
+ * ------------------------------------------------------------------ */
+
+/**
+ * `<![CDATA[…]]>` is a quoting device, not content.
+ *
+ * An unterminated section is left as written, which is what the regex this
+ * replaces did by not matching it — except that the regex took 22 ms to decide
+ * so for 64 KB of openers and four times that per doubling.
+ */
+function unwrapCdata(input) {
+  const s = String(input ?? '');
+  let start = s.indexOf('<![CDATA[');
+  if (start < 0) return s;
+  let out = '';
+  let plain = 0;
+  while (start >= 0) {
+    const end = s.indexOf(']]>', start + 9);
+    if (end < 0) break;
+    out += s.slice(plain, start) + s.slice(start + 9, end);
+    plain = end + 3;
+    start = s.indexOf('<![CDATA[', plain);
+  }
+  return out + s.slice(plain);
+}
+
+/**
+ * Comments removed. An unterminated `<!--` takes the rest of the document, as
+ * a browser's tokenizer has it and as core/sources/mime.mjs `stripTags` has
+ * it; a comment that never closes has nothing after it to keep.
+ */
+function stripComments(xml) {
+  let start = xml.indexOf('<!--');
+  if (start < 0) return xml;
+  let out = '';
+  let plain = 0;
+  while (start >= 0) {
+    out += xml.slice(plain, start);
+    const end = xml.indexOf('-->', start + 4);
+    if (end < 0) return out;
+    plain = end + 3;
+    start = xml.indexOf('<!--', plain);
+  }
+  return out + xml.slice(plain);
+}
 
 /**
  * The text of one element, markup removed and entities decoded.
@@ -61,15 +129,94 @@ const textOf = (raw) => htmlToText(unwrapCdata(raw ?? ''));
 
 const collapse = (s) => String(s ?? '').replace(/\s+/g, ' ').trim();
 
-/** A tag, namespace prefix optional: `<title>`, `<dc:creator>`, `<atom:link>`. */
-function tagRe(name, flags = '') {
-  return new RegExp(`<(?:[A-Za-z0-9_.-]+:)?${name}(\\s[^>]*)?>([\\s\\S]*?)</(?:[A-Za-z0-9_.-]+:)?${name}\\s*>`, flags);
+const isNameChar = (code) => (code >= 0x30 && code <= 0x39) || (code >= 0x41 && code <= 0x5a)
+  || (code >= 0x61 && code <= 0x7a) || code === 0x5f || code === 0x2e || code === 0x2d;
+const isSpace = (code) => code === 0x20 || code === 0x09 || code === 0x0a || code === 0x0d;
+
+/**
+ * Does the qualified name starting at `i` have `name` as its local part?
+ * -> the index just past the name, or -1.
+ *
+ * Namespace prefix optional: `<title>`, `<dc:creator>`, `<atom:link>`. The
+ * whole token is read, so `<items>` is not `item` and `<content:encoded>` is
+ * not `content`.
+ */
+function localNameEnd(xml, i, name) {
+  let j = i;
+  while (isNameChar(xml.charCodeAt(j))) j += 1;
+  let local = i;
+  if (xml.charCodeAt(j) === 0x3a /* : */) {
+    local = j + 1;
+    j = local;
+    while (isNameChar(xml.charCodeAt(j))) j += 1;
+  }
+  return j - local === name.length && xml.startsWith(name, local) ? j : -1;
+}
+
+/**
+ * The next `<name …>` open tag at or after `from` -> {start, attrsAt, open,
+ * selfClosing}, or null when no complete tag of that name follows.
+ *
+ * The name must be followed by whitespace, `/` or `>`, and the tag by a `>`:
+ * a tag with no `>` after it is not a tag, and nothing after it is either.
+ */
+function nextTag(xml, name, from) {
+  let pos = from;
+  for (;;) {
+    const lt = xml.indexOf('<', pos);
+    if (lt < 0) return null;
+    const nameEnd = localNameEnd(xml, lt + 1, name);
+    const after = nameEnd < 0 ? -1 : xml.charCodeAt(nameEnd);
+    if (nameEnd < 0 || !(isSpace(after) || after === 0x3e /* > */ || after === 0x2f /* / */)) {
+      pos = lt + 1;
+      continue;
+    }
+    const gt = xml.indexOf('>', nameEnd);
+    if (gt < 0) return null;
+    return { start: lt, attrsAt: nameEnd, open: gt + 1, selfClosing: xml.charCodeAt(gt - 1) === 0x2f };
+  }
+}
+
+/** The next `</name>` at or after `from` -> {at, end}, or null. */
+function nextCloser(xml, name, from) {
+  let pos = from;
+  for (;;) {
+    const lt = xml.indexOf('</', pos);
+    if (lt < 0) return null;
+    const nameEnd = localNameEnd(xml, lt + 2, name);
+    if (nameEnd >= 0) {
+      let j = nameEnd;
+      while (isSpace(xml.charCodeAt(j))) j += 1;
+      if (xml.charCodeAt(j) === 0x3e) return { at: lt, end: j + 1 };
+    }
+    pos = lt + 2;
+  }
+}
+
+/**
+ * The next complete `<name …>…</name>` at or after `from` -> {start, open,
+ * close, end}, or null.
+ *
+ * A self-closing tag has no body and is stepped over. A tag with no closer
+ * ends the search outright: nothing later could be closed either, and looking
+ * again from each later tag is exactly the quadratic this replaces.
+ */
+function nextElement(xml, name, from) {
+  let pos = from;
+  for (;;) {
+    const tag = nextTag(xml, name, pos);
+    if (!tag) return null;
+    if (tag.selfClosing) { pos = tag.open; continue; }
+    const closer = nextCloser(xml, name, tag.open);
+    if (!closer) return null;
+    return { start: tag.start, open: tag.open, close: closer.at, end: closer.end };
+  }
 }
 
 /** The body of the first matching element, or ''. */
 function first(xml, name) {
-  const m = tagRe(name).exec(xml);
-  return m ? m[2] : '';
+  const el = nextElement(xml, name, 0);
+  return el ? xml.slice(el.open, el.close) : '';
 }
 
 /** One attribute off a tag's attribute string. */
@@ -126,36 +273,50 @@ function linkOf(xml) {
   const body = first(xml, 'link');
   const inline = collapse(unwrapCdata(body));
   if (inline) return decodeXmlEntities(inline);
-  for (const m of xml.matchAll(/<(?:[A-Za-z0-9_.-]+:)?link(\s[^>]*)\/?>/g)) {
-    const rel = attr(m[1], 'rel').toLowerCase();
+  for (let tag = nextTag(xml, 'link', 0); tag; tag = nextTag(xml, 'link', tag.open)) {
+    const attrs = xml.slice(tag.attrsAt, tag.open - 1);
+    const rel = attr(attrs, 'rel').toLowerCase();
     if (rel && rel !== 'alternate') continue;
-    const href = attr(m[1], 'href');
+    const href = attr(attrs, 'href');
     if (href) return decodeXmlEntities(href.trim());
   }
   return '';
 }
 
 /**
- * -> {title, entries: [{title, link, id, author, date, body}]}
+ * -> {title, date, entries: [{title, link, id, author, date, body}]}
  *
  * Comments are removed first, because a commented-out `<item>` is a real thing
- * in hand-edited feeds and it is not an entry.
+ * in hand-edited feeds and it is not an entry. `date` is the channel's own —
+ * `<lastBuildDate>`, Atom's feed-level `<updated>`, `<pubDate>`, `<dc:date>` —
+ * and is what `collect` dates an entry by when the entry has none.
  */
 export function parseFeed(input) {
-  const xml = String(input ?? '').replace(/<!--[\s\S]*?-->/g, '');
+  const xml = stripComments(String(input ?? ''));
 
+  // Collected up to MAX_ENTRIES and no further: what lies past the two
+  // hundredth entry is an archive, and scanning it would only cost time.
   const blocks = [];
-  for (const m of xml.matchAll(tagRe('item', 'g'))) blocks.push(m[2]);
-  if (!blocks.length) for (const m of xml.matchAll(tagRe('entry', 'g'))) blocks.push(m[2]);
+  let firstEntryAt = xml.length;
+  const blocksOf = (name) => {
+    for (let el = nextElement(xml, name, 0); el && blocks.length < MAX_ENTRIES; el = nextElement(xml, name, el.end)) {
+      if (!blocks.length) firstEntryAt = el.start;
+      blocks.push(xml.slice(el.open, el.close));
+    }
+  };
+  blocksOf('item');
+  if (!blocks.length) blocksOf('entry');
 
   // The feed's own title is whatever `<title>` comes before the first entry;
   // taking the first `<title>` in the document without that check picks up the
   // first article's title on a feed whose channel has none.
-  const firstEntryAt = blocks.length ? xml.indexOf(blocks[0]) : xml.length;
-  const head = xml.slice(0, Math.max(0, firstEntryAt));
+  const head = xml.slice(0, firstEntryAt);
   const title = collapse(textOf(first(head, 'title')));
+  const date = collapse(unwrapCdata(
+    first(head, 'lastBuildDate') || first(head, 'updated') || first(head, 'pubDate') || first(head, 'date'),
+  ));
 
-  const entries = blocks.slice(0, MAX_ENTRIES).map((block) => ({
+  const entries = blocks.map((block) => ({
     title: collapse(textOf(first(block, 'title'))),
     link: linkOf(block),
     // The guid gets the same treatment as the link, and for the same reason:
@@ -172,7 +333,7 @@ export function parseFeed(input) {
     ),
   }));
 
-  return { title, entries };
+  return { title, date, entries };
 }
 
 export default {
@@ -209,9 +370,23 @@ export default {
     if (!url) throw new Error('this feed has no address yet — add one in Settings');
 
     const cursor = ctx.cursor && typeof ctx.cursor === 'object' ? ctx.cursor : {};
+    /* A VALIDATOR DESCRIBES ONE ADDRESS. The cursor records the URL it was
+       minted at, and when the feed address has been edited in Settings the
+       validators are dropped rather than sent: nothing clears
+       `source.<id>.cursor` on a settings save, so without this the new address
+       was asked with the old address's `If-Modified-Since`. A server ignores
+       that header when an `If-None-Match` is beside it (RFC 9110 §13.1.3), but
+       the old feed need not have sent an ETag — and then a new feed whose own
+       Last-Modified is the older of the two answers 304, forever, about
+       entries it has never once sent, and the source reads "unchanged, 0
+       entries, ok". One full read per address change is what a change is
+       worth. github.mjs hashes the shape of its question into the cursor for
+       the same reason; a cursor written before `url` was recorded costs the
+       same single read, once. */
+    const sameAddress = cursor.url === url;
     const headers = {};
-    if (cursor.etag) headers['if-none-match'] = cursor.etag;
-    if (cursor.lastModified) headers['if-modified-since'] = cursor.lastModified;
+    if (sameAddress && cursor.etag) headers['if-none-match'] = cursor.etag;
+    if (sameAddress && cursor.lastModified) headers['if-modified-since'] = cursor.lastModified;
 
     const res = await ctx.http.get(url, {
       headers,
@@ -230,8 +405,45 @@ export default {
     const folder = feed.title || new URL(url).host;
     const keep = Math.max(1, Math.min(Number(ctx.source?.settings?.maxItems) || 50, MAX_ENTRIES));
 
+    /* AN ENTRY WITH NO DATE IS STILL DATED, AND THE DATE MUST NOT MOVE.
+       `pubDate` is optional in RSS 2.0 and hand-rolled feeds leave it out; a
+       `date: null` lands in `messages.sent_at` as NULL, and core/db.mjs:441
+       filters the prompt with `sent_at >= ?`, which SQLite evaluates to NULL
+       for a NULL row. So the entry was stored, counted as new, reported ok with
+       a count — and never once reached the model or the board. The same
+       failure fireflies.mjs had (fab9f6f), with the same half of the cure: fall
+       back to an instant that buys inclusion in the window.
+
+       WHICH instant is where this differs from Fireflies. core/db.mjs's upsert
+       sets `sent_at = excluded.sent_at` unconditionally, and a feed is
+       re-parsed whole on every 200 — so `|| readAt` alone would re-date every
+       dateless entry to "now" each time anything in the feed changed, and a
+       month-old post would walk back into the seven-day prompt window as
+       today's, every time its neighbours moved. The instant is therefore chosen
+       ONCE, the first time the entry is seen, and the cursor remembers it under
+       a hash of the entry's identity: the channel's own date first
+       (`<lastBuildDate>`, Atom's feed-level `<updated>` — the publisher's own
+       claim about when this feed was built, and the entry was in it), then the
+       instant of this read. Both go through `parseDate` so the stored form is
+       the one a parsed `<pubDate>` has; core/db.mjs orders `sent_at` as text,
+       and folder.mjs:424 already paid for learning that `+00:00` and `Z` sort
+       apart.
+
+       The memory is bounded at SEEN_MAX because core/sweep.mjs refuses a
+       cursor over 4 KB OUTRIGHT — validators and all — and it is keyed by
+       identity rather than position so an entry keeps its instant as the feed
+       reorders. Dateless entries past the bound are dated afresh on each
+       parse, which is the old behaviour minus the NULL; entries that leave the
+       feed leave the memory with them. The cursor is not moved by any of this
+       — there is no high-water mark here to move — so the Fireflies hazard of
+       an invented instant dragging the window forward does not arise. */
+    const seenBefore = cursor.seen && typeof cursor.seen === 'object' ? cursor.seen : {};
+    const seen = {};
+    let remembered = 0;
+    const feedDate = parseDate(feed.date);
+    const readAt = parseDate(new Date(Date.parse(String(ctx.now ?? '')) || Date.now()).toISOString());
+
     const rows = feed.entries.slice(0, keep).map((entry) => {
-      const date = parseDate(entry.date) || null;
       /* The row identity, and the one thing in this file that must be right
          forever: `messageRowId(sourceId, uid, messageId)` is the primary key, so
          a messageId that changes between releases re-inserts every entry and a
@@ -241,6 +453,13 @@ export default {
          it can never be mistaken for a real guid. */
       const messageId = entry.id
         || (entry.link ? `rss:sha256:${sha256(entry.link)}` : `rss:sha256:${sha256(`${entry.title}\n${entry.date}`)}`);
+      let date = parseDate(entry.date);
+      if (!date) {
+        const key = sha256(messageId).slice(0, 12);
+        const pinned = typeof seenBefore[key] === 'string' && seenBefore[key] ? seenBefore[key] : null;
+        date = pinned || feedDate || readAt;
+        if (remembered < SEEN_MAX) { seen[key] = date; remembered += 1; }
+      }
       const body = entry.body.slice(0, BODY_CHARS);
       return {
         messageId,
@@ -265,8 +484,12 @@ export default {
     const lastModified = res.headers.get('last-modified');
     // `null` clears a cursor the feed no longer supports; `undefined` would mean
     // "leave whatever was there", which would keep sending a validator this
-    // server has stopped honouring.
-    const next = etag || lastModified ? { etag: etag || null, lastModified: lastModified || null } : null;
+    // server has stopped honouring. The remembered instants ride along only
+    // when there are any, so a feed that dates its entries keeps the cursor it
+    // always had.
+    const next = etag || lastModified || remembered
+      ? { etag: etag || null, lastModified: lastModified || null, url, ...(remembered ? { seen } : {}) }
+      : null;
 
     return { parts: [{ label: '', rows, error: null, note: null }], cursor: next };
   },

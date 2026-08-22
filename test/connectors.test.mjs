@@ -37,7 +37,7 @@ process.env.ZELOS_HOME = path.join(HOME_ROOT, 'home');
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-const { open, close, migrate, listMessages, getKV, setKV } = await import('../core/db.mjs');
+const { open, close, migrate, listMessages, upsertMessages, getKV, setKV } = await import('../core/db.mjs');
 const { runSweep } = await import('../core/sweep.mjs');
 const registry = await import('../core/connectors/index.mjs');
 const {
@@ -390,7 +390,7 @@ test("a connector's cursor survives a run and is handed back to it", async (t) =
 
   const first = await runSweep({ db, config, mode: 'light', deps: sweepDeps });
   assert.equal(first.stats.sources[0].count, 2);
-  assert.deepEqual(JSON.parse(getKV(db, sourceCursorKey('s_feed'))), { etag: '"v1"', lastModified: null });
+  assert.deepEqual(JSON.parse(getKV(db, sourceCursorKey('s_feed'))), { etag: '"v1"', lastModified: null, url: feed.url });
 
   const second = await runSweep({ db, config, mode: 'light', deps: sweepDeps });
   assert.equal(feed.headers()[1]['if-none-match'], '"v1"',
@@ -398,7 +398,7 @@ test("a connector's cursor survives a run and is handed back to it", async (t) =
   assert.equal(second.stats.sources[0].ok, true, 'a 304 is a successful read of nothing, not a failure');
   assert.equal(second.stats.sources[0].count, 0);
   assert.equal(listMessages(db).length, 2, 'and nothing was duplicated');
-  assert.deepEqual(JSON.parse(getKV(db, sourceCursorKey('s_feed'))), { etag: '"v1"', lastModified: null },
+  assert.deepEqual(JSON.parse(getKV(db, sourceCursorKey('s_feed'))), { etag: '"v1"', lastModified: null, url: feed.url },
     'a 304 must keep the cursor, or the next sweep re-reads everything');
 });
 
@@ -650,6 +650,241 @@ test('a feed longer than the number the user chose is capped at it', async (t) =
   });
   assert.equal(result.stats.sources[0].count, 5, 'the connector honours the number the user chose');
   assert.equal(listMessages(db).length, 5);
+});
+
+test('REGRESSION: parseFeed is linear in the length of hostile input', () => {
+  /* The first parser answered "which elements are items" with
+     `<item(\s[^>]*)?>([\s\S]*?)</item\s*>` and matchAll, and a lazy quantifier
+     with no closer to stop it scans to the end of the input for EVERY opener:
+     measured on Node 26.3.0 before the rewrite, 1 MiB of `<item>` took 12.7 s
+     and 1 MiB of `<!--` 23.8 s, four times longer per doubling, so the
+     transport's 8 MiB cap was a quarter of an hour with the event loop pinned
+     — the board, /api/state and Settings all stop in the same process, and
+     the sweep's abort signal cannot interrupt a synchronous regex. `first()`,
+     `unwrapCdata` and the Atom `<link …/>` scan had the same shape: 64 KB of
+     `<title>` inside one item 55 ms, of `<link ` 512 ms, of `<![CDATA[` 22 ms,
+     each quadrupling per doubling. A feed of twenty thousand well-formed items
+     parsed in 5 ms throughout, so the answers were never wrong; the clock was.
+     A budget is the only assertion that catches it coming back. Every shape
+     below is a megabyte and none takes more than 45 ms now. */
+  const mib = 1024 * 1024;
+  const rep = (s) => s.repeat(Math.ceil(mib / s.length));
+  const shapes = [
+    ['unclosed items', rep('<item>')],
+    ['unclosed entries', rep('<entry>')],
+    ['unclosed comments', rep('<!--')],
+    ['unclosed titles inside one item', `<item>${rep('<title>')}</item>`],
+    ['unclosed link tags inside one item', `<item>${rep('<link ')}</item>`],
+    ['unclosed CDATA inside one description', `<item><description>${rep('<![CDATA[')}</description></item>`],
+    ['closers that never opened', rep('</item>')],
+    ['benign items', rep('<item><title>Notice</title><guid>g</guid><pubDate>Mon, 10 Aug 2026 08:00:00 +0000</pubDate><description>Bring the schedule.</description></item>')],
+  ];
+  for (const [name, xml] of shapes) {
+    assert.ok(xml.length >= mib, `${name}: the input must be a megabyte to be worth timing`);
+    const started = Date.now();
+    const feed = parseFeed(xml);
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed < 1000, `${name}: took ${elapsed}ms for ${xml.length} characters`);
+    assert.ok(Array.isArray(feed.entries), `${name}: the parser stopped answering`);
+  }
+  assert.equal(parseFeed(shapes.at(-1)[1]).entries.length, 200, 'the benign feed is capped at MAX_ENTRIES, not dropped');
+});
+
+test('REGRESSION: an entry with no date of its own still reaches the prompt window', async (t) => {
+  /* `pubDate` is optional in RSS 2.0 and hand-rolled feeds leave it out. The
+     connector emitted `date: null` for such an entry, which lands in
+     `messages.sent_at` as NULL; core/db.mjs:441 filters the prompt with
+     `sent_at >= ?`, which SQLite evaluates to NULL for a NULL row — so the
+     entry was stored, counted as new, reported ok with a count of one, and
+     never once reached the model or the board. The same defect fireflies.mjs
+     had (fab9f6f). Asserted against the real `upsertMessages` and the real
+     `listMessages` with the arguments core/sweep.mjs's gatherPromptInput uses,
+     because the whole defect lives in what SQLite does with a NULL.
+
+     The fallback is the channel's own date first — `<lastBuildDate>` is the
+     publisher's claim about when this feed was built, and the entry was in it
+     — and only then the instant of the read. */
+  const rss = connectorFor('rss');
+  const NOW = '2026-08-21T09:00:00Z';
+  const built = '<rss version="2.0"><channel><title>Built</title>'
+    + '<lastBuildDate>Thu, 20 Aug 2026 10:00:00 GMT</lastBuildDate>'
+    + '<item><title>Dated</title><guid>g-dated</guid><pubDate>Wed, 19 Aug 2026 08:00:00 GMT</pubDate></item>'
+    + '<item><title>Undated</title><guid>g-undated</guid><description>No pubDate anywhere.</description></item>'
+    + '</channel></rss>';
+  const bare = '<rss version="2.0"><channel><title>Bare</title>'
+    + '<item><title>Undated</title><guid>g-undated</guid></item></channel></rss>';
+  const feed = await feedServer(t, {
+    handler: (req, res) => {
+      res.writeHead(200, { 'content-type': 'application/rss+xml' });
+      res.end(req.url === '/bare.xml' ? bare : built);
+    },
+  });
+  const ctxFor = (url) => ({
+    source: { id: 's_nodate', settings: { url } },
+    label: 'Feed',
+    secret: null,
+    cursor: null,
+    window: { from: '2026-08-01T00:00:00Z', to: '2026-09-01T00:00:00Z' },
+    timezone: 'UTC',
+    identityEmail: 'nemo@example.com',
+    now: NOW,
+    emit() {},
+    signal: null,
+    log: { debug() {}, info() {}, warn() {}, error() {} },
+    http: createHttp({ origins: [feed.origin], limits: rss.limits }),
+    deps: {},
+  });
+
+  const r = await rss.collect(ctxFor(feed.url));
+  const rows = r.parts[0].rows;
+  assert.equal(rows.length, 2);
+  assert.equal(rows.find((x) => x.subject === 'Dated').date, '2026-08-19T08:00:00+00:00', 'an entry with a date keeps it');
+  assert.equal(rows.find((x) => x.subject === 'Undated').date, '2026-08-20T10:00:00+00:00',
+    'the channel said when it was built, and that beats the read instant');
+
+  const db = fresh();
+  upsertMessages(db, rows.map((row) => ({ ...row, sourceId: 's_nodate' })));
+  const sinceISO = new Date(Date.parse(NOW) - 21 * 86_400_000).toISOString();
+  assert.deepEqual(listMessages(db, { sinceISO, limit: 500 }).map((m) => m.subject).sort(), ['Dated', 'Undated'],
+    'the poll reported two entries and the prompt was handed one — a null `sent_at` fails `sent_at >= ?` in SQLite, silently');
+
+  // No channel date either: the read instant, in the same form a parsed date has.
+  const bareRow = (await rss.collect(ctxFor(`${feed.origin}/bare.xml`))).parts[0].rows[0];
+  assert.equal(bareRow.date, '2026-08-21T09:00:00+00:00', 'with nothing to go on, the read instant is the honest date');
+});
+
+test('REGRESSION: a dateless feed arrives on the board through the sweep, not only through collect', async (t) => {
+  /* The end-to-end half: a real sweep, a real database, and the read the
+     prompt makes. No fixture date anywhere, so this cannot age into a failure
+     the way test/connector-linear.test.mjs:763 did — the fallback instant is
+     the sweep's own clock and the window is measured from it. */
+  const db = fresh();
+  const feed = await feedServer(t, {
+    body: '<rss version="2.0"><channel><title>Undated notices</title>'
+      + '<item><title>First</title><guid>u-1</guid></item><item><title>Second</title><guid>u-2</guid></item>'
+      + '</channel></rss>',
+  });
+  const result = await runSweep({
+    db,
+    config: baseConfig({ sources: [feedSource({ settings: { url: feed.url } })] }),
+    mode: 'light',
+    deps: sweepDeps,
+  });
+  assert.equal(result.stats.sources[0].count, 2);
+  const sinceISO = new Date(Date.now() - 21 * 86_400_000).toISOString();
+  assert.deepEqual(listMessages(db, { sinceISO, limit: 500 }).map((m) => m.subject).sort(), ['First', 'Second'],
+    'two rows stored, none visible to the prompt');
+});
+
+test('REGRESSION: a dateless entry keeps the instant it was first seen across re-reads', async (t) => {
+  /* The half that makes the fallback safe. core/db.mjs's upsert sets
+     `sent_at = excluded.sent_at` unconditionally and a feed is re-parsed whole
+     on every 200, so `|| readAt` alone would re-date every dateless entry to
+     "now" each time anything in the feed changed — a month-old post walking
+     back into the prompt window as today's, every time its neighbours moved.
+     The instant is chosen once and the cursor remembers it per entry; a new
+     entry gets its own first-seen instant, and an entry that leaves the feed
+     leaves the memory. */
+  const rss = connectorFor('rss');
+  let body = '<rss version="2.0"><channel><title>Undated</title>'
+    + '<item><title>Old</title><guid>u-old</guid></item></channel></rss>';
+  const feed = await feedServer(t, {
+    handler: (req, res) => { res.writeHead(200, { 'content-type': 'application/rss+xml' }); res.end(body); },
+  });
+  const read = (now, cursor) => rss.collect({
+    source: { id: 's_pin', settings: { url: feed.url } },
+    label: 'Feed',
+    secret: null,
+    cursor,
+    window: { from: '2026-08-01T00:00:00Z', to: '2026-09-01T00:00:00Z' },
+    timezone: 'UTC',
+    identityEmail: 'nemo@example.com',
+    now,
+    emit() {},
+    signal: null,
+    log: { debug() {}, info() {}, warn() {}, error() {} },
+    http: createHttp({ origins: [feed.origin], limits: rss.limits }),
+    deps: {},
+  });
+
+  const first = await read('2026-08-11T09:00:00Z', null);
+  assert.equal(first.parts[0].rows[0].date, '2026-08-11T09:00:00+00:00');
+  assert.ok(first.cursor && first.cursor.seen, 'the cursor does not remember when the entry was first seen');
+  assert.ok(JSON.stringify(first.cursor).length < 4096, 'a cursor the sweep would refuse');
+
+  // The feed changes a day later: a new dateless entry appears above the old one.
+  body = '<rss version="2.0"><channel><title>Undated</title>'
+    + '<item><title>New</title><guid>u-new</guid></item><item><title>Old</title><guid>u-old</guid></item></channel></rss>';
+  const second = await read('2026-08-12T09:00:00Z', first.cursor);
+  const by = Object.fromEntries(second.parts[0].rows.map((r) => [r.subject, r.date]));
+  assert.equal(by.Old, '2026-08-11T09:00:00+00:00', 'the entry was re-dated to the second read, and the upsert would overwrite sent_at with it');
+  assert.equal(by.New, '2026-08-12T09:00:00+00:00', 'a new entry is dated when it was first seen');
+  assert.equal(Object.keys(second.cursor.seen).length, 2);
+
+  // The old entry drops off the feed, and the memory of it goes too.
+  body = '<rss version="2.0"><channel><title>Undated</title>'
+    + '<item><title>New</title><guid>u-new</guid></item></channel></rss>';
+  const third = await read('2026-08-13T09:00:00Z', second.cursor);
+  assert.equal(third.parts[0].rows[0].date, '2026-08-12T09:00:00+00:00');
+  assert.equal(Object.keys(third.cursor.seen).length, 1, 'an entry no longer in the feed is still in the cursor');
+});
+
+test('REGRESSION: a feed address edited in Settings does not inherit the old address\'s validators', async (t) => {
+  /* Nothing clears `source.<id>.cursor` on a settings save, so the cursor
+     minted at the old address was replayed against the new one. A server
+     ignores `If-Modified-Since` beside an `If-None-Match` (RFC 9110 §13.1.3),
+     but the old feed need not have sent an ETag — and then a new feed whose
+     own Last-Modified is the older of the two answers 304, forever, about
+     entries it has never sent: "unchanged", 0 entries, ok, until the new feed
+     happens to publish something newer than the old feed's last change. */
+  const rss = connectorFor('rss');
+  const feeds = {
+    '/a.xml': { modified: 'Thu, 20 Aug 2026 10:00:00 GMT', body: '<rss><channel><title>A</title><item><title>A post</title><guid>a-1</guid></item></channel></rss>' },
+    '/b.xml': { modified: 'Mon, 10 Aug 2026 10:00:00 GMT', body: '<rss><channel><title>B</title><item><title>B post</title><guid>b-1</guid></item></channel></rss>' },
+  };
+  const feed = await feedServer(t, {
+    handler: (req, res) => {
+      const served = feeds[req.url];
+      // Ordinary validator semantics: not modified since the date you name.
+      const since = Date.parse(req.headers['if-modified-since'] || '');
+      if (Number.isFinite(since) && since >= Date.parse(served.modified)) { res.writeHead(304); res.end(); return; }
+      res.writeHead(200, { 'content-type': 'application/rss+xml', 'last-modified': served.modified });
+      res.end(served.body);
+    },
+  });
+  const read = (path, cursor) => rss.collect({
+    source: { id: 's_moved', settings: { url: `${feed.origin}${path}` } },
+    label: 'Feed',
+    secret: null,
+    cursor,
+    window: { from: '2026-08-01T00:00:00Z', to: '2026-09-01T00:00:00Z' },
+    timezone: 'UTC',
+    identityEmail: 'nemo@example.com',
+    now: '2026-08-21T09:00:00Z',
+    emit() {},
+    signal: null,
+    log: { debug() {}, info() {}, warn() {}, error() {} },
+    http: createHttp({ origins: [feed.origin], limits: rss.limits }),
+    deps: {},
+  });
+
+  const first = await read('/a.xml', null);
+  assert.deepEqual(first.parts[0].rows.map((r) => r.subject), ['A post']);
+  assert.equal(first.cursor.lastModified, feeds['/a.xml'].modified);
+
+  // The user edits the address in Settings; the cursor is the one from before.
+  const moved = await read('/b.xml', first.cursor);
+  assert.equal(feed.headers()[1]['if-modified-since'], undefined,
+    'the old address\'s validator was sent to the new one, and a standard server answers 304 to it forever');
+  assert.equal(feed.headers()[1]['if-none-match'], undefined);
+  assert.deepEqual(moved.parts[0].rows.map((r) => r.subject), ['B post'], 'the new feed\'s entries never arrived');
+  assert.equal(moved.cursor.lastModified, feeds['/b.xml'].modified, 'and the cursor now describes the new address');
+
+  // The same address again is still a cheap read: the validator is honoured
+  // where it was minted.
+  const again = await read('/b.xml', moved.cursor);
+  assert.equal(feed.headers()[2]['if-modified-since'], feeds['/b.xml'].modified);
+  assert.equal(again.parts[0].rows.length, 0);
 });
 
 /* ================================================================== *
