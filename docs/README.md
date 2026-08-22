@@ -23,7 +23,8 @@ and asking you to trust them. Zelos is built the other way round:
 - **You choose the model, and you can choose one that runs on your laptop.**
   Ollama, LM Studio, llama.cpp — Zelos treats them exactly like a paid API.
   With one of those selected, Zelos makes no outbound connection except to
-  your own mail and calendar servers.
+  your own mail and calendar servers, and to the host of any source you add
+  in Settings → Sources.
 - **Nothing else phones home.** No analytics, no telemetry, no crash reports, no
   update checks, no web fonts, no tracking pixels. There is no code in Zelos
   that talks to us, because there is no "us" to talk to.
@@ -495,39 +496,57 @@ this one uses three primitives to do it: `fetch()`, `tls.connect` and
 `zelos` folder:
 
 ```
-grep -rn "fetch(\|tls.connect\|net.connect" core/ zelos.mjs
+grep -rn "fetch\s*(\|globalThis\.fetch\|tls\.connect\|net\.connect" core/ zelos.mjs
 ```
 
-That returns **19 lines** today. Ten of them are not network calls, and you can
-throw them out by two rules:
+Two things about that pattern are deliberate, because an earlier version of
+this page got both wrong. The dots are escaped: `net.connect` with a bare dot
+also matched the word *internet connection* in an error message, and a recipe
+that turns up prose as a false positive is tolerable, but it was a sign the
+pattern had not been thought about. And `globalThis\.fetch` is in it because
+Zelos's connectors never write `fetch(` at all — the transport they all share
+does `const doFetch = fetchImpl || globalThis.fetch;` once, and a grep for
+`fetch(` walked straight past every one of them. That is the shape this
+pattern can still miss — a bare alias like `const go = fetch` — and
+`grep -rnw fetch core/ zelos.mjs` is the noisier superset that cannot. Run
+it after this one if you want to be sure.
 
-- **Comments.** Seven of the nineteen are prose inside `/* */` or `//` blocks
-  that happen to mention `fetch(`.
+The command above returns **22 lines** today. Eleven of them are not network
+calls, and you can throw them out by two rules:
+
+- **Comments.** Eight of the twenty-two are prose inside `/* */` or `//`
+  blocks that happen to mention `fetch(`.
 - **Zelos's own IMAP object.** Three lines in `core/sources/imap.mjs` say
   `async fetch(` or `client.fetch(`. That is Zelos's IMAP client having a
   method named after the IMAP `FETCH` command. It talks on a socket that is
   already open; it does not open one.
 
-**Nine lines survive that, and one of them is an English sentence.**
-`core/doctor.mjs:567` is an error message ending "check this machine's internet
-connection" — it matches because `.` is a wildcard in `grep`'s pattern
-language, so `net.connect` finds "**net**␣**connect**ion" inside the word
-*internet*. Worth knowing as a rule: **this grep over-matches prose, and never
-under-matches code.** A false positive you can read is the right way round.
+So: **eleven real outbound calls**, and this is all of them. They are named by
+function rather than by line, because the line numbers in the last version of
+this table went stale within a week and nobody noticed; a function name is
+something you can `grep` for, and the test named below checks that each of
+these still exists in the file this table says it is in.
 
-So: **eight real outbound calls**, and this is all of them.
-
-| Where | Lines | What it connects to |
+| Where | Function | What it connects to |
 | --- | --- | --- |
-| `core/sources/imap.mjs` | 719, 720, 770 | your mail server — the address you typed in Settings |
-| `core/sources/caldav.mjs` | 322 | your CalDAV calendar — the address you typed |
-| `core/sweep.mjs` | 237 | your `.ics` calendar link — the address you typed |
-| `core/llm.mjs` | 801 | the model — the address you chose |
-| `core/server.mjs` | 1277 | the calendar address you typed, when you press **Test** |
-| `core/doctor.mjs` | 62 | the one `fetch` `zelos doctor` uses, to try your model endpoint and your calendar address — both from your settings |
+| `core/sources/imap.mjs` | `#openSocket` | your mail server — the address you typed in Settings. Two lines: one opens with TLS, the other in the clear for a server that upgrades with `STARTTLS` |
+| `core/sources/imap.mjs` | `#startTls` | the same server, upgrading that plain socket to TLS before a password is sent |
+| `core/sources/imap.mjs` | `postForm` | `login.microsoftonline.com`, and only for a mailbox you set to **Sign in with Microsoft** |
+| `core/sources/caldav.mjs` | `request` | your CalDAV calendar — the address you typed |
+| `core/connectors/ics.mjs` | `fetchIcsText` | your `.ics` calendar link — the address you typed |
+| `core/server.mjs` | `fetchIcsOnce` | the calendar address you typed, when you press **Test** |
+| `core/llm.mjs` | `requestWithRetry` | the model — the address you chose |
+| `core/doctor.mjs` | `DEFAULT_DEPS.fetchImpl` | the one `fetch` `zelos doctor` uses, to try your model endpoint and your calendar address — both from your settings |
+| `core/connectors/http.mjs` | `createHttp` | **every source in Settings → Sources**, through one transport: GitHub, Slack, Linear, Todoist, Fireflies and a feed each reach the host their connector declares in `origins` (`core/connectors/*.mjs`), plus any address you typed into that source's own fields. Anything else is refused before a socket exists |
+| `core/sources/oauth.mjs` | `postForm` | nothing — the file is not imported by anything in the program, and `"!core/sources/oauth.mjs"` in `package.json` keeps it out of the package; see [OAUTH.md](OAUTH.md) |
 
 Every one of them goes to an address that came from your own settings. There is
-no ninth.
+no twelfth. The one directory in that table that grows is `core/connectors/`,
+and the test *no connector reaches the network except through ctx.http* in
+`test/repo.test.mjs` fails the build on a connector that calls `fetch` itself
+instead of going through `createHttp`; the test beside it runs the command
+above and fails when the count, the files or the function names on this page
+stop matching the tree.
 
 **And "three primitives" is itself a claim you should check**, since a grep for
 three names proves nothing if a fourth is in use. The other ways Node can reach
@@ -577,10 +596,14 @@ With Zelos running, in another terminal:
   Get-NetTCPConnection -State Established | Where-Object OwningProcess -in (Get-Process node).Id
   ```
 
-Press **Sweep now** in Zelos and run it again. You should see exactly three
-kinds of connection and no others: **your mail server**, **your calendar host**,
-and **the model address you chose**. If you picked a local model, that third one
-is `127.0.0.1` — your own machine.
+Press **Sweep now** in Zelos and run it again. You should see three kinds of
+connection by default and no others: **your mail server**, **your calendar
+host**, and **the model address you chose** — plus one host for each source you
+have added in Settings → Sources, which is also an address you chose:
+`api.github.com` if you added GitHub, the feed's own host if you added a feed.
+Each connector names its host (`origins` in `core/connectors/*.mjs`) and the
+transport they share refuses any other. If you picked a local model, the model
+one is `127.0.0.1` — your own machine.
 
 For a continuous view, macOS users can use [Little Snitch](https://obdev.at) or
 LuLu, which will show you every connection attempt as it happens and let you
@@ -685,9 +708,13 @@ docs/                SPEC.md (what it must do), SECURITY.md (what it defends),
                      that needs none)
 ```
 
-Two notes on that list. `core/sources/oauth.mjs` is **not wired to anything** —
-989 lines with no importer outside its own test, excluded from the published
-package; [OAUTH.md](OAUTH.md) says exactly what is missing. And `desktop/` is
+Two notes on that list. `core/sources/oauth.mjs` — the Google half, and the
+Microsoft *calendar* half — is **not wired to anything**: 989 lines with no
+importer outside its own test, excluded from the published package;
+[OAUTH.md](OAUTH.md) says exactly what is missing. The Microsoft *mail*
+sign-in is a different thing and does ship: a device-code flow in
+`core/sources/imap.mjs` § 6, reached from **Settings → Mail → Sign in with
+Microsoft**, against an app you register in your own Entra tenant. And `desktop/` is
 the only directory with a `node_modules`: Electron and electron-builder, both
 `devDependencies` of the shell, neither reaching the core.
 
