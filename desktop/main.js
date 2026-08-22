@@ -33,6 +33,7 @@
  * on start would leave the user with no window and no message.
  */
 
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -56,6 +57,39 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = app.isPackaged ? process.resourcesPath : path.resolve(HERE, '..');
 
 const APP_NAME = 'Zelos';
+
+/**
+ * The commit this build was cut from, read off the package.json beside this
+ * file. CI writes it there at packaging time (`-c.extraMetadata.commit=` in
+ * .github/workflows/desktop.yml), because three builds that all said
+ * "Zelos 1.0.0" in About and shared a filename were three builds nobody could
+ * tell apart — and the one the operator ran for a day predated every fix.
+ * A source checkout carries no stamp and a build made by hand may not either;
+ * that reads as the plain version, never as an error, so the shell starts the
+ * same way with or without it. Anything that is not a sha is treated as no
+ * stamp rather than shown.
+ */
+export function readBuildCommit(dir) {
+  try {
+    const { commit } = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'));
+    return typeof commit === 'string' && /^[0-9a-f]{7,40}$/i.test(commit.trim()) ? commit.trim() : '';
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * "1.1.0 (a1b2c3d)" when stamped, "1.1.0" when not. CI stamps the whole sha —
+ * a short one that happens to be all digits is a number by the time
+ * electron-builder's argument parser has seen it — and seven characters is
+ * what a person holds up against `git log`.
+ */
+export function versionLabel(version, commit = '') {
+  return commit ? `${version} (${commit.slice(0, 7)})` : String(version);
+}
+
+const BUILD_COMMIT = readBuildCommit(HERE);
+
 /** ui/app.css: marble ground and black-figure ground. Kills the white flash. */
 const GROUND = { light: '#F4EFE6', dark: '#12100E' };
 /** The one permission the board needs: the Owed view copies drafts. */
@@ -482,6 +516,29 @@ function installAppMenu() {
   Menu.setApplicationMenu(Menu.buildFromTemplate(buildAppMenuTemplate({ appName: APP_NAME, actions })));
 }
 
+/**
+ * The About dialog, as data. Pure so a test can hold what the dialog says up
+ * against the build stamp without Electron; `commit` may be empty, see
+ * readBuildCommit.
+ */
+export function aboutText({ version, commit = '', url = null, home = '' }) {
+  return {
+    type: 'info',
+    title: `About ${APP_NAME}`,
+    message: `${APP_NAME} ${versionLabel(version, commit)}`,
+    detail: [
+      'A local-first second brain.',
+      '',
+      `Board   ${url ?? 'not running'}`,
+      `Data    ${home}`,
+      '',
+      'Listening on 127.0.0.1 only. Nothing leaves this machine except the',
+      'calls to the model you chose and to the sources you added.',
+    ].join('\n'),
+    buttons: ['OK'],
+  };
+}
+
 function buildActions() {
   return {
     sweepNow: () => {
@@ -537,21 +594,12 @@ function buildActions() {
     openInstallNotes: () => openLocalPath(path.join(ROOT, 'docs', 'INSTALL.md')),
     openSecurityNotes: () => openLocalPath(path.join(ROOT, 'docs', 'SECURITY.md')),
     about: () => {
-      dialog.showMessageBox({
-        type: 'info',
-        title: `About ${APP_NAME}`,
-        message: `${APP_NAME} ${app.getVersion()}`,
-        detail: [
-          'A local-first second brain.',
-          '',
-          `Board   ${zelos?.url ?? 'not running'}`,
-          `Data    ${zelos?.paths.home ?? ''}`,
-          '',
-          'Listening on 127.0.0.1 only. Nothing leaves this machine except the',
-          'calls to the model you chose.',
-        ].join('\n'),
-        buttons: ['OK'],
-      });
+      dialog.showMessageBox(aboutText({
+        version: app.getVersion(),
+        commit: BUILD_COMMIT,
+        url: zelos?.url,
+        home: zelos?.paths.home ?? '',
+      }));
     },
     quit: () => {
       quitting = true;
@@ -691,15 +739,14 @@ async function bootstrap() {
       getPort: () => zelos?.port ?? 0,
       openExternal: (url) => shell.openExternal(url),
       logger,
-      onInternalPopup: (url) => mainWindow?.loadURL(url),
     });
   });
 
   if (typeof app.setAboutPanelOptions === 'function') {
     app.setAboutPanelOptions({
       applicationName: APP_NAME,
-      applicationVersion: app.getVersion(),
-      copyright: 'MIT licensed. Local-first: nothing leaves this machine except the model calls you configure.',
+      applicationVersion: versionLabel(app.getVersion(), BUILD_COMMIT),
+      copyright: 'MIT licensed. Local-first: nothing leaves this machine except the model calls you configure and the sources you add.',
     });
   }
   if (process.platform === 'darwin' && app.dock) {
@@ -727,7 +774,11 @@ async function bootstrap() {
 
   if (flags.sweepNow) zelos.sweepNow('full');
 
-  zelos.logger.info('desktop: shell ready', { url: zelos.url, root: ROOT });
+  zelos.logger.info('desktop: shell ready', {
+    url: zelos.url,
+    root: ROOT,
+    version: versionLabel(app.getVersion(), BUILD_COMMIT),
+  });
   return { ok: true, zelos, window: mainWindow, tray, actions, flags };
 }
 

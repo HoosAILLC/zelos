@@ -299,8 +299,15 @@ async function paginate(ctx, method, params, pick, { maxPages, stop = () => fals
     const body = await slackGet(ctx, method, cursor ? { ...params, cursor } : params);
     const chunk = pick(body);
     if (Array.isArray(chunk)) out.push(...chunk);
-    if (stop(out)) break;
     const next = String(body?.response_metadata?.next_cursor ?? '');
+    if (stop(out)) {
+      // Stopped by the caller's cap with a page still on offer: the same fact
+      // as the ceiling below, and the caller reads it the same way. Without
+      // this a channel holding exactly the cap plus one more page looks
+      // complete, because the cursor that says otherwise was never read.
+      if (next && next !== cursor) out.truncated = true;
+      break;
+    }
     if (!next || next === cursor) break;
     cursor = next;
     // Slack still had more to give and this was the last page allowed.
@@ -983,10 +990,29 @@ export default {
           { maxPages: MAX_HISTORY_PAGES, stop: (all) => all.length >= maxPerChannel },
         );
 
-        const kept = items
+        const usable = items
           .filter((msg) => isObj(msg) && collapse(msg.ts))
-          .filter((msg) => !NOISE_SUBTYPES.has(String(msg.subtype ?? '')))
-          .slice(0, maxPerChannel);
+          .filter((msg) => !NOISE_SUBTYPES.has(String(msg.subtype ?? '')));
+        const kept = usable.slice(0, maxPerChannel);
+
+        /* THE CUT IS SAID, NOT REPAIRED. `conversations.history` is newest-first
+           and the mark below is the newest ts seen, so whatever the cap drops
+           here is the oldest tail of the window and is never asked for again.
+           Measured: three messages, `maxPerChannel: 2`, the first sweep kept
+           the two newest and reported a clean read; the second asked with
+           `oldest` = the newest ts and got nothing. The first sweep of a busy
+           channel with a seven-day lookback is the ordinary case. The tail is
+           the least relevant slice for a board that triages what is current,
+           and backfilling it would spend the 120-calls-per-half-hour budget
+           re-reading old traffic — so the only change is that the part says
+           so, and names the setting that moves the line. It rides on this part
+           because this part has rows; on a rows-less one it would read as a
+           failed source (see the cap note below), so a cut that kept nothing
+           stays unsaid rather than red. */
+        const capped = kept.length > 0 && (usable.length > maxPerChannel || items.truncated === true);
+        const capNote = capped
+          ? `${folder} had more than ${maxPerChannel.toLocaleString('en-US')} messages since the last read; Zelos kept the newest ${kept.length.toLocaleString('en-US')} and skipped the rest — raise “Messages per conversation” if that matters.`
+          : null;
 
         // Every author and every mention, resolved once, before anything is
         // rendered — see `renderSlackText` on why the renderer cannot await.
@@ -1009,7 +1035,7 @@ export default {
         }, mark || '');
         if (newest) seen[channelId] = newest;
 
-        parts.push({ label: folder, rows, error: null, note: null });
+        parts.push({ label: folder, rows, error: null, note: capNote });
       } catch (err) {
         if (err instanceof AuthError) throw err;
         if (err instanceof RateLimitError) {

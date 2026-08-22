@@ -61,8 +61,12 @@ npm pack --dry-run
 **49 files, about 430 kB packed, 1.3 MB unpacked** at the time of writing — run
 the command rather than trusting the number, since editing these very documents
 moves it. Two things are deliberately *excluded*. `core/sources/oauth.mjs`, 989
-lines of OAuth that nothing in the app imports — see [OAUTH.md](OAUTH.md); the
-published tarball carries no OAuth code at all. And `assets/icon.png`, the
+lines of Google and Microsoft *calendar* OAuth that nothing in the app imports —
+see [OAUTH.md](OAUTH.md); no Google sign-in code ships. (The Microsoft *mail*
+sign-in is not in that file and does ship: a device-code flow in
+`core/sources/imap.mjs` § 6, reached from **Settings → Mail → Sign in with
+Microsoft**, which needs an app you register in your own Entra tenant with
+"Allow public client flows" switched on.) And `assets/icon.png`, the
 1024px app icon, which is 290 kB and was briefly 40% of this download: it is
 read only by the desktop shell (`desktop/main.js`, and electron-builder), and
 `desktop/` is not in the package, so it was shipping to nobody. The web UI's
@@ -547,8 +551,10 @@ this machine.
 
 **Where did the app go when I closed the window?**
 It is in the tray (macOS: the menu bar, top right). That is where **Sweep now**,
-**Open Zelos** and **Quit** live. On Windows and Linux this only happens when
-automatic sweeps are switched on; with them off, closing the window quits.
+**Open Zelos** and **Quit** live. On Windows this only happens when automatic
+sweeps are switched on; with them off, closing the window quits. On Linux,
+closing the window quits even with sweeps on, unless you have set
+`ZELOS_TRAY_RESIDENT=1` — see "What the shell adds" above for why.
 
 **Something is wrong and I want to see why.**
 Run `zelos doctor` first. If you want the raw record after that:

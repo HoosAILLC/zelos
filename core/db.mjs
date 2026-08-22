@@ -438,15 +438,29 @@ export function getMessage(db, id) {
 export function listMessages(db, { sinceISO = null, sourceId = null, direction = null, limit = 500 } = {}) {
   const where = [];
   const args = [];
-  if (sinceISO) { where.push('sent_at >= ?'); args.push(sinceISO); }
+  /* Both sides through datetime(), for the reason core/sweep.mjs gives at
+     RECENTLY_RESOLVED_SQL. `sent_at` keeps each sender's offset verbatim —
+     core/sources/mime.mjs does that on purpose — while the cutoff the sweep
+     passes is UTC, and as TEXT '2026-08-07T09:15:00-04:00' sorts BELOW
+     '2026-08-07T12:00:00.000Z' although it is the later instant by 75 minutes.
+     So the 21-day prompt window was wrong by every sender's offset. The ORDER
+     BY goes through datetime() too, or the LIMIT keeps whichever rows sort
+     well as characters rather than the ones the filter chose. This forgoes
+     the messages_sent_at index for a scan: measured at 50,000 rows it is
+     6.7 ms against 0.2 ms, which at one person's mailbox is nothing and not
+     worth a third schema version for an expression index. */
+  if (sinceISO) { where.push('datetime(sent_at) >= datetime(?)'); args.push(sinceISO); }
   if (sourceId) { where.push('source_id = ?'); args.push(sourceId); }
   if (direction) { where.push('direction = ?'); args.push(direction); }
-  const sql = `SELECT * FROM messages ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY sent_at DESC LIMIT ?`;
+  const sql = `SELECT * FROM messages ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY datetime(sent_at) DESC LIMIT ?`;
   return prep(db, sql).all(...args, Math.max(1, Number(limit) || 500)).map(hydrateMessage);
 }
 
 export function messagesInThread(db, threadKey, { limit = 50 } = {}) {
-  return prep(db, 'SELECT * FROM messages WHERE thread_key = ? ORDER BY sent_at ASC LIMIT ?')
+  // Instants, not characters, for the same reason as listMessages: a reply
+  // from a -04:00 sender and one from a Z sender would otherwise interleave
+  // by their digits, and a thread is read in the order it happened.
+  return prep(db, 'SELECT * FROM messages WHERE thread_key = ? ORDER BY datetime(sent_at) ASC LIMIT ?')
     .all(str(threadKey), Math.max(1, Number(limit) || 50)).map(hydrateMessage);
 }
 

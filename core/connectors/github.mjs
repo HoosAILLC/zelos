@@ -437,7 +437,7 @@ export function inScope(list, fullName) {
  * counter that has already passed 2^53 for some accounts, and `Number()` on it
  * would silently round. It goes in `messageId`, as text, where it is exact.
  */
-export function notificationRow(notification, { identityEmail = '' } = {}) {
+export function notificationRow(notification, { identityEmail = '', now = new Date().toISOString() } = {}) {
   const id = String(notification?.id ?? '').trim();
   if (!id) return null;
 
@@ -494,7 +494,14 @@ export function notificationRow(notification, { identityEmail = '' } = {}) {
     to: ADDRESSED_TO_YOU.has(reason) ? me : [],
     cc: COPIED_IN.has(reason) ? me : [],
     subject: `${label} · ${title}`,
-    date: parseDate(notification?.updated_at) || null,
+    /* The read instant, never null. A null lands in `messages.sent_at` as
+       NULL, core/db.mjs:441 filters the prompt with `sent_at >= ?`, and SQLite
+       makes that NULL for a NULL row — the row is stored and counted and never
+       reaches the model or the board. GitHub always sends `updated_at`, so
+       this is the guard fireflies.mjs (fab9f6f) and rss.mjs needed and this
+       file happened not to; it is here so a payload change cannot turn a
+       notification invisible rather than visibly mis-dated. */
+    date: parseDate(notification?.updated_at) || now,
     snippet: collapse(body).slice(0, SNIPPET_CHARS),
     text: body,
     hasAttachments: false,
@@ -895,8 +902,11 @@ export default {
     }
 
     const rows = [];
+    // Through `parseDate` so a fallback date has the form a parsed one has;
+    // core/db.mjs orders `sent_at` as text and `+00:00` and `Z` sort apart.
+    const readAt = parseDate(new Date(nowMs).toISOString());
     for (const n of matched.slice(0, keep)) {
-      const row = notificationRow(n, { identityEmail: ctx.identityEmail });
+      const row = notificationRow(n, { identityEmail: ctx.identityEmail, now: readAt });
       if (row) rows.push(row);
       else dropped += 1;
     }

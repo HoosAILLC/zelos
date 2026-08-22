@@ -648,10 +648,25 @@ class SweepSupervisor {
    * Put an event that came from outside — the Scheduler's own loop — on the
    * stream. `runId` is picked up here as well as from a sweep we started, since
    * on the Scheduler path that is the only place it appears.
+   *
+   * A `done`/`failed` for a sweep WE started is held rather than emitted. The
+   * Scheduler's `onRun` fires for every run it completes, including one that
+   * `start()` asked it for — and `start()` emits its own completion when the
+   * run resolves. Both went out: every sweep put two `done` (or two `failed`)
+   * frames on /api/sweep/stream, in two shapes — the relayed one with the
+   * engine's counts, notes and repairs and no `mode`; ours with `mode` and
+   * none of those — so the board refreshed twice and `lastResult` ended up as
+   * the poorer frame. The payload is parked on the in-flight state for
+   * `start()` to merge into the one frame it sends. With nothing of ours in
+   * flight the completion is the Scheduler's own tick and goes straight out.
    */
   relay(event, data) {
     const payload = data ?? {};
     if (this.#current && typeof payload.runId === 'string') this.#current.runId = payload.runId;
+    if (this.#current && (event === 'done' || event === 'failed')) {
+      this.#current.relayed = payload;
+      return;
+    }
     this.#emit(event, payload);
   }
 
@@ -699,7 +714,10 @@ class SweepSupervisor {
         const result = await run();
         if (result && typeof result.runId === 'string') state.runId = result.runId;
         const ok = !result || result.ok !== false;
+        // The relayed payload first, so the engine's richer fields survive;
+        // ours after, so `mode` and the settled `ok` are what the frame says.
         this.#emit(ok ? 'done' : 'failed', {
+          ...(state.relayed ?? {}),
           runId: state.runId,
           mode,
           ok,

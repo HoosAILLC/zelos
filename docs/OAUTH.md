@@ -107,14 +107,26 @@ things are missing, and none of them is a registration:
    only importer in the repo is its own test.
 2. **No config.** `DEFAULTS` in `core/config.mjs` has no `oauth` key. `OAUTH_DEFAULTS` is exported
    from `oauth.mjs` and merged by nobody.
-3. **No Settings surface.** `grep -rin oauth ui/` returns nothing. There is no button to press.
+3. **No Settings surface for it.** There is no Google button to press, and no Microsoft
+   *calendar* one. (`grep -rin oauth ui/` does return lines now — they belong to the Microsoft
+   *mail* sign-in described below, which is a different module.)
 4. **No reader.** `CALENDAR_KINDS` in `core/config.mjs` is `['ics', 'caldav', 'file']`. There is no
    `google` or `microsoft` branch, so even a valid access token sitting in your keychain would have
    nothing to read a calendar with.
 
 Since it ships in no release, the module is excluded from the published package:
-`"!core/sources/oauth.mjs"` in `package.json`'s `files`. `npm pack --dry-run` lists 50 files and
-that is not one of them. What a user installs contains this document and no OAuth code at all.
+`"!core/sources/oauth.mjs"` in `package.json`'s `files`. `npm pack --dry-run` lists it nowhere.
+What a user installs contains this document and none of *this* file's code.
+
+**One OAuth flow does ship, and it is not in this file.** "Sign in with Microsoft" for a
+*mailbox* — IMAP with `XOAUTH2` — is an RFC 8628 device-code grant in `core/sources/imap.mjs`
+§ 6, served by `POST /api/mail/oauth` in `core/server.mjs` and reached from **Settings → Mail →
+How Zelos signs in**. It needs no publisher verification because the app registration is the
+user's own: they register an app in their Entra tenant, switch on **Allow public client flows**,
+and paste its Application (client) ID and, for a work or school account, the tenant ID. Zelos
+ships no client ID, for the reason this whole page gives. Some tenants reserve app registration
+for administrators, which is why Microsoft 365 is still the least dependable mail provider to
+connect.
 
 So the order of work below is right, but step 1 is not the first thing to buy. Wiring the four
 points above is a real change to `core/config.mjs`, `core/sweep.mjs`, `ui/views/settings.js` and

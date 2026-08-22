@@ -231,6 +231,31 @@ test('message listing, threading and fetched-since counting', () => {
   assert.equal(countMessagesFetchedSince(db, '2026-08-03T00:00:00-04:00'), 2);
 });
 
+test('the prompt window compares instants, not strings — a -04:00 row after a Z cutoff is inside it', () => {
+  /* core/sweep.mjs hands listMessages a UTC cutoff (`toISOString()`) while
+     `sent_at` keeps each sender's offset verbatim, which core/sources/mime.mjs
+     does on purpose. As TEXT, '2026-08-07T09:15:00-04:00' is below
+     '2026-08-07T12:00:00.000Z' — '0' sorts before '1' — though it is the later
+     instant by 75 minutes, so the 21-day window was wrong by every sender's
+     offset. The ORDER BY has the same trap: the LIMIT kept whichever rows
+     sort well as characters rather than the ones the filter chose, and a
+     thread read its replies in digit order rather than the order they
+     happened. */
+  const db = fresh();
+  upsertMessages(db, [
+    { ...MSG, uid: 1, messageId: '<ny@example.com>', subject: 'New York, 13:15Z', date: '2026-08-07T09:15:00-04:00' },
+    { ...MSG, uid: 2, messageId: '<ldn@example.com>', subject: 'London, 10:00Z', date: '2026-08-07T10:00:00Z' },
+  ], { now: '2026-08-07T14:00:00Z' });
+
+  const since = (sinceISO) => listMessages(db, { sinceISO }).map((m) => m.subject);
+  assert.deepEqual(since('2026-08-07T12:00:00.000Z'), ['New York, 13:15Z'], 'a cutoff 75 minutes before the message excluded it');
+  assert.deepEqual(since('2026-08-07T14:00:00.000Z'), []);
+  assert.deepEqual(since('2026-08-07T09:30:00.000Z'), ['New York, 13:15Z', 'London, 10:00Z'], 'newest instant first, whatever its offset');
+  assert.deepEqual(listMessages(db, { limit: 1 }).map((m) => m.subject), ['New York, 13:15Z'], 'the LIMIT kept the row that sorts well as text');
+  assert.deepEqual(messagesInThread(db, 'thread-1').map((m) => m.subject), ['London, 10:00Z', 'New York, 13:15Z'],
+    'a thread reads in the order it happened');
+});
+
 test('upsertMessage defends its inputs', () => {
   const db = fresh();
   assert.throws(() => upsertMessage(db, null), TypeError);

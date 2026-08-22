@@ -760,6 +760,87 @@ test('a sweep is run through the scheduler when there is one', async (t) => {
   assert.deepEqual(asked, ['full']);
 });
 
+/**
+ * REGRESSION. The Scheduler calls `onRun` for every run it finishes, and both
+ * launchers (zelos.mjs, desktop/runtime.js) relay that onto the stream as a
+ * `done`/`failed`. SweepSupervisor.start() ALSO emitted one when the run it had
+ * asked the Scheduler for resolved. So every sweep put two completion frames on
+ * /api/sweep/stream, in two shapes: the relayed one carrying the engine's
+ * counts, notes and repairs and no `mode`; the supervisor's carrying `mode` and
+ * none of those. The board refreshed twice per sweep and kept the poorer frame
+ * as lastResult. Nothing here saw it, because nothing here wired the relay.
+ */
+test('a sweep through the scheduler finishes with exactly one frame, carrying both halves', async (t) => {
+  const { Scheduler } = await import('../core/sweep.mjs');
+  const ctx = await startServer(t);
+  const results = [
+    { runId: 'run_one', ok: true, stats: { items: 2 }, counts: { now: 1 }, repairs: [] },
+    { runId: 'run_two', ok: false, stats: null, error: 'No API key configured' },
+  ];
+  const scheduler = new Scheduler({
+    db: ctx.db,
+    config: baseConfig(),
+    run: async () => results.shift(),
+    // Exactly what zelos.mjs and desktop/runtime.js wire.
+    onRun: (result) => ctx.server.zelos.sweeps.relay(result?.ok === false ? 'failed' : 'done', result),
+  });
+  ctx.server.zelos.useScheduler(scheduler);
+
+  const controller = new AbortController();
+  const response = await fetch(`${ctx.base}/api/sweep/stream`, {
+    headers: { 'X-Zelos-Token': ctx.token },
+    signal: controller.signal,
+  });
+  const frames = [];
+  const reading = readStream(response, (frame) => frames.push(frame)).catch(() => frames);
+  await delay(30);
+
+  const isCompletion = (f) => f.startsWith('event: done') || f.startsWith('event: failed');
+  const completions = () => frames.filter(isCompletion).length;
+  const untilAnother = async (seen) => {
+    for (let i = 0; i < 400 && completions() === seen; i++) await delay(5);
+    // A second frame, had one been coming, was emitted in the same tick as the
+    // first — this is generous.
+    await delay(60);
+  };
+
+  for (const mode of ['full', 'light']) {
+    const seen = completions();
+    assert.equal((await call(ctx, 'POST', '/api/sweep', { body: { mode } })).status, 202);
+    await untilAnother(seen);
+  }
+
+  // The Scheduler's own tick has no sweep of ours in flight, and its
+  // completion must still reach the stream — it is the only one it gets.
+  const seen = completions();
+  ctx.server.zelos.sweeps.relay('done', { runId: 'run_tick', ok: true, stats: {} });
+  await untilAnother(seen);
+
+  controller.abort();
+  await reading;
+
+  const parsed = frames.filter(isCompletion).map(parseFrame);
+  assert.equal(parsed.length, 3, `one frame per sweep, got: ${parsed.map((c) => `${c.event}/${c.data?.runId}`).join(', ')}`);
+
+  const [done, failed, tick] = parsed;
+  assert.equal(done.event, 'done');
+  assert.equal(done.data.runId, 'run_one');
+  assert.equal(done.data.mode, 'full', 'the supervisor knows the mode; the scheduler result does not');
+  assert.equal(done.data.ok, true);
+  assert.equal(done.data.stats.items, 2);
+  assert.deepEqual(done.data.counts, { now: 1 }, 'the engine\'s richer fields survive the merge');
+  assert.deepEqual(done.data.repairs, []);
+
+  assert.equal(failed.event, 'failed');
+  assert.equal(failed.data.runId, 'run_two');
+  assert.equal(failed.data.mode, 'light');
+  assert.equal(failed.data.ok, false);
+  assert.equal(failed.data.error, 'No API key configured');
+
+  assert.equal(tick.event, 'done');
+  assert.equal(tick.data.runId, 'run_tick');
+});
+
 test('an unknown sweep mode is refused', async (t) => {
   const ctx = await startServer(t, { runSweep: async () => ({ runId: 'x', ok: true, stats: {} }) });
   const res = await call(ctx, 'POST', '/api/sweep', { body: { mode: 'everything' } });
@@ -1500,6 +1581,41 @@ test('a config patch with a malformed section is a 400 that says which', async (
   assert.equal(res.json.detail, undefined);
   // Nothing was written, and the server is still serving the config it had.
   assert.equal((await call(ctx, 'GET', '/api/config')).status, 200);
+});
+
+/**
+ * REGRESSION. A patch whose `mail`, `calendars` or `sources` was not a list —
+ * a string, null, an object — came back 200 with `errors: []` and `mail: []`,
+ * and config.json on disk had been rewritten to match: every account deleted
+ * by a request that was told it succeeded. core/config.mjs refuses those with
+ * the same TypeError it uses for `{"identity": 5}`, and this route already
+ * turns that into a 400 that names the section.
+ */
+test('a config patch whose accounts are not a list is a 400, and the accounts on disk survive', async (t) => {
+  const ctx = await startServer(t);
+  const file = path.join(HOME, 'config.json');
+  // Disabled, so no later test that sweeps against this home reaches for it.
+  const seeded = await call(ctx, 'PUT', '/api/config', {
+    body: {
+      mail: [{ id: 'm_keep', enabled: false, host: 'imap.example', user: 'keep@example.com' }],
+      calendars: [{ id: 'c_keep', enabled: false, kind: 'ics', url: 'https://cal.example/x.ics' }],
+    },
+  });
+  assert.equal(seeded.status, 200);
+  const before = fs.readFileSync(file, 'utf8');
+
+  for (const body of [{ mail: 'nope' }, { mail: null }, { calendars: {} }, { sources: 5 }, { mail: [{ id: 'm_ok' }, 'garbage'] }]) {
+    const res = await call(ctx, 'PUT', '/api/config', { body });
+    assert.equal(res.status, 400, `${JSON.stringify(body)}: the caller sent nonsense, and must be told`);
+    assert.match(res.json.error, new RegExp(`${Object.keys(body)[0]} must be an array of objects`));
+    assert.equal(fs.readFileSync(file, 'utf8'), before, `${JSON.stringify(body)}: config.json must be untouched`);
+  }
+  const after = await call(ctx, 'GET', '/api/config');
+  assert.equal(after.json.config.mail[0].id, 'm_keep');
+  assert.equal(after.json.config.calendars[0].id, 'c_keep');
+
+  // This home is shared with the rest of the file: leave it as it was found.
+  assert.equal((await call(ctx, 'PUT', '/api/config', { body: { mail: [], calendars: [] } })).status, 200);
 });
 
 test('saving calendars forgets what CalDAV remembered about them', async (t) => {

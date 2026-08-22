@@ -62,7 +62,7 @@ function emptyForContext(navigate) {
   if (last.ok === false) {
     return emptyState({
       title: 'The last sweep did not finish',
-      detail: last.error || 'It failed without saying why. The log in your Zelos home has the detail.',
+      detail: last.error || 'It failed without saying why. Run from a terminal, the reason is in that terminal — Zelos keeps no log file of its own. In the desktop app it is in desktop.log, under Board → Show logs.',
       action: button('Try again', { class: 'btn solid', onClick: () => startSweep('full') }),
     });
   }

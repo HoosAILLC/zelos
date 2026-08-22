@@ -269,7 +269,8 @@ entire reason this file is allowed to be a blocklist.
 
 ## 5. What leaves your machine
 
-Three outbound destinations exist. All three are ones you typed in yourself.
+Three outbound destinations exist by default, plus one for each source you add
+in **Settings → Sources**. All of them are ones you typed in yourself.
 
 1. **Your IMAP host**, on the port you configured, over TLS.
 
@@ -287,27 +288,37 @@ Three outbound destinations exist. All three are ones you typed in yourself.
 2. **Your calendar URL** — an `.ics` feed or a CalDAV server.
 3. **Your model endpoint** — the `model.baseUrl` you chose. If you point that
    at Ollama, LM Studio, llama.cpp, vLLM or LocalAI on `127.0.0.1`, then
-   **nothing leaves the machine at all**, and Zelos still works with no API
-   key.
+   **nothing Zelos read leaves the machine at all**, and Zelos still works
+   with no API key.
+4. **One host per source you add** — `api.github.com` for GitHub, the feed's
+   own host for a feed, and so on. Each connector names the host it may reach
+   in its manifest (`origins` in `core/connectors/*.mjs`), and the only thing
+   that widens that list is an address *you* typed into one of that source's
+   fields. All of them go through one transport, `createHttp` in
+   `core/connectors/http.mjs`, which refuses any other origin before a socket
+   exists. Footnote 4 below has the list.
 
-That is the complete list. There is no telemetry, no analytics, no crash
-reporting, no update check, no CDN, no remote font, no remote image, no
-"anonymous usage statistics". The package has zero third-party runtime
-dependencies, which is what makes that claim checkable rather than merely
-stated: there is no transitive package that could phone home behind Zelos's
-back. You can verify it with `lsof -i` or Little Snitch or `tcpdump` and see
-exactly three conversations.
+That is the complete list: three by default, and nothing you did not type.
+There is no telemetry, no analytics, no crash reporting, no update check, no
+CDN, no remote font, no remote image, no "anonymous usage statistics". The
+package has zero third-party runtime dependencies, which is what makes that
+claim checkable rather than merely stated: there is no transitive package that
+could phone home behind Zelos's back. You can verify it with `lsof -i` or
+Little Snitch or `tcpdump` and count the conversations against your own
+settings.
 
-Three footnotes, because "three destinations" is nearly true rather than exactly
+Four footnotes, because "three destinations" is nearly true rather than exactly
 true.
 
 1. **A server you configured can redirect, and Zelos follows one hop** — so a
    fourth host can appear in `tcpdump`. One hop is the rule everywhere it can
    happen and it is hand-rolled in each place, because `redirect: 'follow'` is
-   not a policy, it is undici's, and undici's is twenty: the sweep's `.ics`
-   reader (`core/sweep.mjs`), the Settings **Test** button
-   (`fetchIcsOnce` in `core/server.mjs`), `zelos doctor` (`core/doctor.mjs`)
-   and the CalDAV client (`core/sources/caldav.mjs`) all cap at one and all
+   not a policy, it is undici's, and undici's is twenty: the `.ics` reader
+   (`fetchIcsText` in `core/connectors/ics.mjs`), the Settings **Test** button
+   (`fetchIcsOnce` in `core/server.mjs`), `zelos doctor` (`core/doctor.mjs`),
+   the CalDAV client (`core/sources/caldav.mjs`) and the transport every
+   source in Settings → Sources shares (`createHttp` in
+   `core/connectors/http.mjs`) all cap at one and all
    re-send a credential only when the hop stayed on the same origin. A second
    3xx is an error naming the intermediate host, not a third connection.
    `core/llm.mjs` refuses redirects outright. That hop will not be carrying a
@@ -319,6 +330,23 @@ true.
    running before Settings offers you a paid provider. It sends no credential
    and nothing but `127.0.0.1` is contacted, but it is traffic, and `lsof` will
    show it.
+4. **The sources you add each declare their host, and the declaration is the
+   allow-list.** What each connector names in `origins` today: GitHub
+   `https://api.github.com` (`core/connectors/github.mjs`, widened only by a
+   GitHub Enterprise address you type), Slack `https://slack.com`
+   (`slack.mjs`), Linear `https://api.linear.app` (`linear.mjs`), Todoist
+   `https://api.todoist.com` (`todoist.mjs`), Fireflies
+   `https://api.fireflies.ai` (`fireflies.mjs`); a feed declares nothing and
+   may reach only the feed address you typed (`rss.mjs`); a folder and a
+   WhatsApp export declare nothing and contact nothing (`folder.mjs`,
+   `whatsapp.mjs`). One more that is not a source: a mailbox set to **Sign in
+   with Microsoft** talks to `https://login.microsoftonline.com`
+   (`MS_LOGIN_ORIGIN` in `core/sources/imap.mjs`) to get and refresh its
+   token. A URL that arrived inside a payload — a feed's `<link>`, a
+   redirect target — is stored as text and never fetched. The guard is the
+   test *no connector reaches the network except through ctx.http* in
+   `test/repo.test.mjs`, which fails the build on a connector that calls
+   `fetch` itself rather than through the transport that enforces the list.
 
 ### `privacy.sendBodies`
 

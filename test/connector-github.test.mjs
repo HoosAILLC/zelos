@@ -24,7 +24,7 @@ import http from 'node:http';
 
 const github = (await import('../core/connectors/github.mjs')).default;
 const { createHttp } = await import('../core/connectors/http.mjs');
-const { upsertMessages, open, close, migrate } = await import('../core/db.mjs');
+const { upsertMessages, listMessages, open, close, migrate } = await import('../core/db.mjs');
 
 /* ------------------------------------------------------------------ *
  * A GitHub that does what each test says
@@ -187,6 +187,33 @@ test('a row carries no uid, so a second sweep of the same notification inserts n
   assert.equal(first.inserted, 1, 'the first sweep stored nothing');
   assert.equal(second.inserted, 0,
     'the same notification inserted twice — the row id is not stable, so the board duplicates every sweep');
+});
+
+test('REGRESSION: a notification with no readable updated_at still reaches the prompt window', async (t) => {
+  /* Latent rather than live — GitHub always sends `updated_at` — but it was
+     the exact shape fireflies.mjs (fab9f6f) and rss.mjs failed on: `date:
+     null` lands in `messages.sent_at` as NULL, core/db.mjs:441 filters the
+     prompt with `sent_at >= ?`, and SQLite makes that NULL for a NULL row, so
+     the notification is stored, counted, and never shown. Asserted against
+     the real database, because the defect lives in what SQLite does with a
+     NULL. The fallback is the sweep's own clock, `ctx.now`, in the form a
+     parsed date has. */
+  const { origin } = await githubServer(t, (req, res) => okJson(res, [
+    notification(),
+    notification({ id: '2', updated_at: '', subject: { title: 'No instant', type: 'Issue', url: 'https://api.github.com/repos/octocat/Hello-World/issues/7' } }),
+  ]));
+  const rows = (await github.collect(ctxFor(origin))).parts.flatMap((p) => p.rows);
+  assert.equal(rows.length, 2);
+  assert.equal(rows.find((r) => r.messageId === 'github:thread:2').date, '2026-08-11T13:00:00+00:00',
+    'a notification with no readable time was dated with nothing at all');
+
+  const db = open(':memory:');
+  t.after(() => close(db));
+  migrate(db);
+  upsertMessages(db, rows.map((r) => ({ ...r, sourceId: 's_gh' })));
+  const sinceISO = new Date(NOW_MS - 21 * 86_400_000).toISOString();
+  assert.equal(listMessages(db, { sinceISO, limit: 500 }).length, 2,
+    'the poll reported two notifications and the prompt was handed one — a null `sent_at` fails `sent_at >= ?` in SQLite, silently');
 });
 
 test('a review request puts the user on the To line, which is how triage sees it at all', async (t) => {
