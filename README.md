@@ -62,9 +62,12 @@ has the exact extent of it.
 
 ## What leaves your machine
 
-Exactly three things, and you chose all three: your mail provider, your calendar address, and your
-model endpoint. Point it at a local model and that becomes none. No telemetry, no analytics, no
-update pings, no crash reports.
+Three things by default, and you chose all three: your mail provider, your calendar address, and
+your model endpoint — plus one host for each source you add in Settings → Sources, which is also
+an address you chose. Each connector names its host (`origins` in `core/connectors/*.mjs`) and the
+one transport they all share (`core/connectors/http.mjs`) refuses any other. Of all of those, only
+the model request carries what Zelos read; point it at a local model and nothing it read leaves at
+all. No telemetry, no analytics, no update pings, no crash reports.
 
 Your keys live in your operating system's keychain — **when there is one**. With no keychain
 available (a headless Linux box, or a desktop without `secret-tool`), they go to `secrets.enc` in

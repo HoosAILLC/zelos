@@ -1154,3 +1154,94 @@ test('no connector reaches the network except through ctx.http', () => {
     + 'one-hop redirect rule, the byte cap, the timeout, the rate budget and the credential '
     + `redaction:\n  ${offenders.join('\n  ')}`);
 });
+
+test('docs/README.md counts the outbound calls with a recipe that still matches the tree', () => {
+  /* REGRESSION. docs/README.md § "Count the places it could phone home" hands
+     the reader a grep and a table and says there is no further call. Within a
+     week of being written the grep returned 20 lines where the page said 19,
+     every line number in the table had moved, one row (core/sweep.mjs) matched
+     nothing — and, the part that mattered, the transport every connector goes
+     through does `const doFetch = fetchImpl || globalThis.fetch` and never
+     writes `fetch(`, so the recipe could not see GitHub, Slack, Linear,
+     Todoist, Fireflies or a feed at all. The page promised the grep "never
+     under-matches code", and that was the one sentence that was false.
+
+     So the page is pinned to the tree. This runs the exact command the page
+     prints, applies the two discard rules the page states, and checks every
+     number it states, and the files and function names in its table, against
+     what the tree contains. Names rather than line numbers, because a name is
+     something the next edit has to keep or rename, and either way this
+     notices; a new bare `fetch(` in a file the table does not list fails here
+     too. Walked in Node rather than shelled out, because CI runs this on
+     Windows, where there is no grep. */
+  const doc = fs.readFileSync(path.join(ROOT, 'docs', 'README.md'), 'utf8');
+  const start = doc.indexOf('### 2. Count the places');
+  const end = doc.indexOf('### 3.', start);
+  assert.ok(start !== -1 && end !== -1,
+    'docs/README.md no longer has the "Count the places it could phone home" section this test pins');
+  const section = doc.slice(start, end);
+
+  const cmd = /```\ngrep -rn "([^"\n]+)" core\/ zelos\.mjs\n```/.exec(section);
+  assert.ok(cmd, 'the section should print one `grep -rn "…" core/ zelos.mjs` command in a fenced block');
+  // grep's basic syntax to JavaScript's: `\|` is alternation and a bare `(` is
+  // literal. `\s` and `\.` mean the same thing in both.
+  const pattern = new RegExp(cmd[1].split('\\|').map((alt) => alt.replace(/\(/g, '\\(')).join('|'));
+
+  const files = [];
+  const walk = (dir) => {
+    const entries = fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else files.push(full);
+    }
+  };
+  walk(path.join(ROOT, 'core'));
+  files.push(path.join(ROOT, 'zelos.mjs'));
+
+  const hits = [];
+  for (const full of files) {
+    const rel = path.relative(ROOT, full).split(path.sep).join('/');
+    fs.readFileSync(full, 'utf8').split('\n').forEach((text, i) => {
+      if (pattern.test(text)) hits.push({ file: rel, line: i + 1, text });
+    });
+  }
+  const show = (list) => list.map((h) => `${h.file}:${h.line}: ${h.text.trim().slice(0, 80)}`).join('\n  ');
+
+  // The two discard rules, encoded the way the page states them.
+  const isComment = (h) => /^\s*(\*|\/\*|\/\/)/.test(h.text);
+  const isImapObject = (h) => /\basync fetch\(|client\.fetch\(/.test(h.text);
+  const comments = hits.filter(isComment);
+  const imap = hits.filter((h) => !isComment(h) && isImapObject(h));
+  const real = hits.filter((h) => !isComment(h) && !isImapObject(h));
+
+  // The page writes small counts as words, the way prose does.
+  const WORDS = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten',
+    'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen', 'eighteen', 'nineteen', 'twenty'];
+  const stated = (re, what) => {
+    const m = re.exec(section);
+    assert.ok(m, `the section no longer states ${what} where this test looks for it`);
+    const word = WORDS.indexOf(m[1].toLowerCase());
+    return word === -1 ? Number(m[1]) : word;
+  };
+
+  assert.equal(hits.length, stated(/returns \*\*(\d+) lines\*\* today/, 'how many lines the grep returns'),
+    `the documented grep returns ${hits.length} lines today, and the page says otherwise:\n  ${show(hits)}`);
+  assert.equal(comments.length, stated(/\*\*Comments\.\*\* (\w+) of the/, 'how many of those lines are comments'),
+    `${comments.length} of the matched lines are comments:\n  ${show(comments)}`);
+  assert.equal(imap.length, stated(/\*\*Zelos's own IMAP object\.\*\* (\w+) lines/, 'how many lines are the IMAP object'),
+    `${imap.length} of the matched lines are the IMAP client's own fetch:\n  ${show(imap)}`);
+  assert.equal(real.length, stated(/\*\*(\w+) real outbound calls\*\*/, 'how many real outbound calls survive'),
+    `${real.length} real outbound calls survive the two rules:\n  ${show(real)}`);
+
+  const rows = [...section.matchAll(/^\| `([^`]+)` \| `([^`]+)` \|/gm)].map((m) => ({ file: m[1], fn: m[2] }));
+  assert.ok(rows.length > 0, 'the table of outbound calls has no `file` | `function` rows this test can read');
+  assert.deepEqual([...new Set(real.map((h) => h.file))].sort(), [...new Set(rows.map((r) => r.file))].sort(),
+    'the files with a real outbound call and the files the table names must be the same set — a new '
+    + `bare fetch needs a row, and a row whose file no longer connects needs deleting:\n  ${show(real)}`);
+  for (const { file, fn } of rows) {
+    const name = fn.split('.').pop();
+    assert.ok(fs.readFileSync(path.join(ROOT, file), 'utf8').includes(name),
+      `docs/README.md says ${fn} in ${file} opens a connection, and no such name appears in that file`);
+  }
+});
