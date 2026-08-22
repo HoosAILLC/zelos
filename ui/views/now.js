@@ -21,7 +21,11 @@ const MAX_NOW_ROWS = 4;
  */
 function missingSetup() {
   if (!state.health?.model?.configured) return 'model';
-  const hasSources = (state.config?.mail?.length || 0) + (state.config?.calendars?.length || 0) > 0;
+  // Mail, calendars, and the connector sources in Settings → Sources: a home
+  // reading only GitHub is a home with something to read, and under a whole
+  // failure the banner must offer "Sweep again", not "Connect a source".
+  const hasSources = (state.config?.mail?.length || 0) + (state.config?.calendars?.length || 0)
+    + (state.config?.sources?.length || 0) > 0;
   return hasSources ? null : 'sources';
 }
 
