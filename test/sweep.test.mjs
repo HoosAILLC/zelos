@@ -17,6 +17,7 @@ const {
   getRun, getKV, setKV, startRun, finishRun,
 } = await import('../core/db.mjs');
 const { SWEEP_KV } = await import('../core/triage.mjs');
+const { DEFAULTS } = await import('../core/config.mjs');
 const { seedSampleData } = await import('../core/sample-data.mjs');
 const { nowISO, dayKey } = await import('../core/time.mjs');
 const {
@@ -266,7 +267,10 @@ function fetched(over = {}) {
     to: [{ name: 'Nemo', email: 'nemo@example.com' }],
     cc: [],
     subject: 'Dates for the walkthrough',
-    date: '2026-08-06T11:04:00+00:00',
+    /* An hour ago, off the real clock. The prompt window is 21 days back from
+       now and `runSweep` takes no clock, so a fixed date here fell out of
+       every prompt assertion three weeks after it was written. */
+    date: new Date(Date.now() - 3_600_000).toISOString(),
     snippet: 'Either the 28th or the 30th works',
     text: 'Either the 28th or the 30th works on our end.',
     hasAttachments: false,
@@ -1554,6 +1558,147 @@ test('the scheduler honours sweep.auto and active hours without stopping the loo
   assert.equal(scheduler.status().auto, true);
   assert.equal(scheduler.status().nextRunAt, '2026-08-08T11:01:00+00:00');
   scheduler.stop();
+});
+
+/** The config a fresh install loads: the Anthropic preset, no model chosen, no key. */
+function blankModelConfig(over = {}) {
+  return baseConfig({ model: { ...DEFAULTS.model }, ...over });
+}
+
+function countRuns(db) {
+  return db.prepare('SELECT count(*) AS n FROM runs').get().n;
+}
+
+/**
+ * REGRESSION. `#tick` gated on `sweep.auto` alone, and `shouldRunFull` says
+ * "think" whenever no full run has ever succeeded — which on a home with no
+ * model is forever. A default install that skipped setup therefore ran a full
+ * sweep every interval, reached `requireKey`, and wrote a failed run row: the
+ * operator's own ~/.zelos held 38 of them, one every half hour, with nothing to
+ * sweep and nothing to ask, under a red "The last sweep failed" banner whose
+ * only offer was to fail again. The scheduled path now asks the question
+ * /api/health's `model.configured` asks and stands down — keeping time, and
+ * saying why.
+ *
+ * The real run loop is used on purpose: a fake `run` would pass on the unfixed
+ * code too. The key is read through the `getSecret` seam so no keychain is
+ * opened, and the missing key is found before any request is built, so no
+ * socket is opened either.
+ */
+test('REGRESSION: a scheduler on a home with no model runs nothing, writes no run row, keeps ticking and says why', async (t) => {
+  const db = fresh();
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.UTC(2026, 7, 8, 10, 0, 0) });
+
+  const relayed = [];
+  const scheduler = new Scheduler({
+    db,
+    config: blankModelConfig(),
+    deps: { getSecret: async () => null },
+    onRun: (r) => relayed.push(r),
+  });
+  scheduler.start();
+
+  t.mock.timers.tick(31 * 60_000);
+  await flush();
+
+  assert.equal(countRuns(db), 0, 'a scheduled sweep with no model must not write a run row');
+  assert.equal(relayed.length, 0, 'and must not relay a result the board would paint as a failed sweep');
+  const after = scheduler.status();
+  assert.equal(after.runs, 0);
+  assert.equal(after.busy, false);
+  assert.equal(after.nextRunAt, '2026-08-08T11:00:00+00:00', 'the timer keeps its grid');
+  assert.equal(after.lastResult?.skipped, true, 'status() must say the slot was skipped, not failed');
+  assert.match(after.lastResult?.reason ?? '', /Settings → Model/, 'and say where to go');
+
+  // The next slot is the same story: still no row, still on the grid.
+  t.mock.timers.tick(30 * 60_000);
+  await flush();
+  assert.equal(countRuns(db), 0);
+  assert.equal(scheduler.status().nextRunAt, '2026-08-08T11:30:00+00:00');
+
+  scheduler.stop();
+});
+
+test('the same scheduler starts sweeping once reconfigure() hands it a ready model, without a restart', async (t) => {
+  const db = fresh();
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.UTC(2026, 7, 8, 10, 0, 0) });
+
+  let runs = 0;
+  const scheduler = new Scheduler({
+    db,
+    config: blankModelConfig(),
+    deps: { getSecret: async () => null },
+    run: async () => { runs += 1; return { ok: true }; },
+  });
+  scheduler.start();
+
+  t.mock.timers.tick(31 * 60_000);
+  await flush();
+  assert.equal(runs, 0);
+  assert.equal(scheduler.status().lastResult?.skipped, true);
+
+  // Settings → Model saved a local runtime; the server hands the new config
+  // to the running scheduler exactly as it does for sweep.auto.
+  scheduler.reconfigure(baseConfig());
+  assert.equal(scheduler.status().nextRunAt, '2026-08-08T11:01:00+00:00');
+  t.mock.timers.tick(31 * 60_000);
+  await flush();
+  assert.equal(runs, 1, 'a keyless local model is ready, so the next slot sweeps');
+  assert.deepEqual(scheduler.status().lastResult, { ok: true }, 'and the skip is no longer the last word');
+
+  scheduler.stop();
+});
+
+test('a remote model with no stored key is skipped until the key is pasted, then sweeps', async (t) => {
+  const db = fresh();
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.UTC(2026, 7, 8, 10, 0, 0) });
+
+  let stored = null;
+  let runs = 0;
+  const scheduler = new Scheduler({
+    db,
+    config: blankModelConfig({ model: { ...DEFAULTS.model, model: 'claude-sonnet-4-5' } }),
+    deps: { getSecret: async () => stored },
+    run: async () => { runs += 1; return { ok: true }; },
+  });
+  scheduler.start();
+
+  t.mock.timers.tick(31 * 60_000);
+  await flush();
+  assert.equal(runs, 0, 'a model name alone is not enough for a remote endpoint');
+  assert.match(scheduler.status().lastResult?.reason ?? '', /No API key is stored for https:\/\/api\.anthropic\.com/);
+
+  // The key is pasted under Settings → Model. No reconfigure is needed: the
+  // config did not change, the secret store did.
+  stored = 'sk-ant-test';
+  t.mock.timers.tick(30 * 60_000);
+  await flush();
+  assert.equal(runs, 1, 'the next slot reads the key and sweeps');
+
+  scheduler.stop();
+});
+
+test('a hand-started sweep on the same home still fails loudly, with the real error and its run row', async () => {
+  const db = fresh();
+  const relayed = [];
+  const scheduler = new Scheduler({
+    db,
+    config: blankModelConfig(),
+    deps: { getSecret: async () => null },
+    onRun: (r) => relayed.push(r),
+  });
+
+  const result = await scheduler.runNow('auto');
+  assert.equal(result.ok, false);
+  assert.equal(result.skipped, undefined, 'a person who asked is told what went wrong, not that nothing happened');
+  assert.match(result.error, /API key|model/i);
+  assert.equal(relayed.length, 1, 'the board hears about a sweep the user started');
+
+  assert.equal(countRuns(db), 1);
+  const row = db.prepare('SELECT ok, error FROM runs').get();
+  assert.equal(row.ok, 0);
+  assert.equal(row.error, result.error);
+  assert.equal(scheduler.status().runs, 1);
 });
 
 test('the scheduler runs on demand and records the result', async (t) => {

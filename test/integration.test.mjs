@@ -248,28 +248,57 @@ function soonISO(dayOffset, hour) {
   return `${d.getUTCFullYear()}${p(d.getUTCMonth() + 1)}${p(d.getUTCDate())}T${p(hour)}0000`;
 }
 
+/**
+ * `n` days back at `hour`:00 on a fixed −04:00 wall clock, in the three shapes
+ * one message wears on the way in: the IMAP INTERNALDATE, the RFC 5322 `Date:`
+ * header, and the ISO string imap.mjs stores for it. Off the real clock for the
+ * same reason `soonISO` is: the sweep's prompt window is 21 days back from now,
+ * and a fixture dated the day this file was written fell out of it three weeks
+ * later and took the "mail reaches the model" proof with it. The `Date:` line
+ * carries no weekday — core/sources/mime.mjs `parseDate` makes it optional — so
+ * none has to be computed to match.
+ */
+function daysAgo(n, hour) {
+  // The wall-clock fields at −04:00 are the UTC fields of the instant four hours earlier.
+  const d = new Date(Date.now() - n * 86_400_000 - 4 * 3_600_000);
+  const p = (k) => String(k).padStart(2, '0');
+  const mon = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][d.getUTCMonth()];
+  const day = p(d.getUTCDate());
+  const year = d.getUTCFullYear();
+  const time = `${p(hour)}:00:00`;
+  return {
+    internalDate: `${day}-${mon}-${year} ${time} -0400`,
+    header: `Date: ${day} ${mon} ${year} ${time} -0400`,
+    iso: `${year}-${p(d.getUTCMonth() + 1)}-${day}T${time}-04:00`,
+  };
+}
+
+const INVOICE_SENT = daysAgo(1, 9);
+const WALK_ASKED = daysAgo(1, 11);
+const WALK_ANSWERED = daysAgo(1, 12);
+
 const INBOX = [
   {
     uid: 101,
-    internalDate: '07-Aug-2026 09:15:00 -0400',
+    internalDate: INVOICE_SENT.internalDate,
     // RFC 2047 base64: "Café invoice — final numbers"
     headers: headerBlock([
       'From: "Reyes, Marcus" <marcus@riverstone.example>',
       'To: Nemo Hale <nemo@northgate.example>',
       'Subject: =?utf-8?B?Q2Fmw6kgaW52b2ljZSDigJQgZmluYWwgbnVtYmVycw==?=',
-      'Date: Fri, 07 Aug 2026 09:15:00 -0400',
+      INVOICE_SENT.header,
       'Message-ID: <inv-1@riverstone.example>',
     ]),
     body: 'The final number is $18,400. Wire by Friday.\r\n',
   },
   {
     uid: 102,
-    internalDate: '07-Aug-2026 11:00:00 -0400',
+    internalDate: WALK_ASKED.internalDate,
     headers: headerBlock([
       'From: Jane Roe <jane@aldervance.example>',
       'To: Nemo Hale <nemo@northgate.example>',
       'Subject: Re: site walk (rescheduled) ) stray paren',
-      'Date: Fri, 07 Aug 2026 11:00:00 -0400',
+      WALK_ASKED.header,
       'Message-ID: <walk-2@aldervance.example>',
     ]),
     body: 'Can we move the site walk to Thursday?\r\n',
@@ -279,12 +308,12 @@ const INBOX = [
 const SENT = [
   {
     uid: 201,
-    internalDate: '07-Aug-2026 12:00:00 -0400',
+    internalDate: WALK_ANSWERED.internalDate,
     headers: headerBlock([
       'From: Nemo Hale <nemo@northgate.example>',
       'To: Jane Roe <jane@aldervance.example>',
       'Subject: Re: site walk (rescheduled) ) stray paren',
-      'Date: Fri, 07 Aug 2026 12:00:00 -0400',
+      WALK_ANSWERED.header,
       'Message-ID: <walk-3@northgate.example>',
       'In-Reply-To: <walk-2@aldervance.example>',
     ]),
@@ -385,8 +414,10 @@ before(async () => {
   }];
   config.sweep.auto = false;
 
-  // The mail fixture is dated Aug 2026; a short lookback would search it away on
-  // a machine whose clock is far from that. 400 days keeps the fixture in range.
+  // A short lookback would SEARCH the fixture away on a machine whose clock is
+  // far from it; 400 days keeps IMAP finding it. It does nothing for the sweep's
+  // 21-day prompt window, which is why the fixtures above are dated off the real
+  // clock rather than the day this file was written.
   model = await startMockModel(() => boardReply(`msg:${inboxMessageId}`));
   config.model = {
     ...config.model,
@@ -560,7 +591,8 @@ describe('mail: imap.mjs -> sweep.mjs -> db.mjs', () => {
     const row = listMessages(db, { limit: 50 }).find((m) => m.uid === 101);
     assert.equal(row.subject, 'Café invoice — final numbers');
     assert.equal(row.from_email, 'marcus@riverstone.example');
-    assert.equal(row.sent_at, '2026-08-07T09:15:00-04:00');
+    // The −04:00 is the point: the stated offset is stored verbatim, not converted.
+    assert.equal(row.sent_at, INVOICE_SENT.iso);
   });
 
   test('the sent mailbox is stored as outbound and the inbox as inbound', () => {

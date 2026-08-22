@@ -716,7 +716,15 @@ export default {
   async check(source, ctx) {
     const settings = source?.settings && typeof source.settings === 'object' ? source.settings : {};
     const horizon = clampInt(settings.horizonDays, DEFAULT_HORIZON_DAYS, 0, 365);
-    const today = todayKey();
+    /* The user's day, from the clock doctor hands over — the same rule
+       `collect` reads above. This was a bare `todayKey()`: the machine's clock
+       in the machine's zone, so the overdue count in the one line a stuck
+       person reads was measured wherever the laptop happens to be, and the
+       test that pinned it aged into a failure eight days after it was
+       written. `ctx.now` is already zoned (core/doctor.mjs builds it with
+       `nowISO(tz)`), so its own day key is the right one; the zone alone is
+       the fallback for a caller that hands over nothing else. */
+    const today = dayKey(str(ctx?.now)) || todayKey(str(ctx?.timezone) || undefined);
     try {
       const data = await query(ctx.http, { after: null, dueBy: addDaysToKey(today, horizon) });
       const me = data?.viewer;

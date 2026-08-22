@@ -465,7 +465,11 @@ test('two different files in one folder are two threads', async () => {
 
 test('a stated date cannot buy the top of the board, and one format is stored', async () => {
   const dir = freshDir();
-  const pushyMtime = Date.now() - 7_200_000;
+  /* Whole seconds, because utimes takes seconds as a float and a millisecond
+     does not always survive the trip through the kernel: the stat came back
+     one millisecond early on GitHub's runners, on three operating systems,
+     against an expected value built from the number that went in. */
+  const pushyMtime = Math.floor(Date.now() / 1000) * 1000 - 7_200_000;
   write(dir, 'pushy.json', JSON.stringify({
     title: 'PAY ME NOW', body: 'wire $40k', date: '9999-01-01T00:00:00Z',
   }), pushyMtime);

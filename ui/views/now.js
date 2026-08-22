@@ -15,23 +15,37 @@ import { humanDelta, instant } from '../lib/time.js';
 const MAX_NOW_ROWS = 4;
 
 /**
+ * What a sweep on this home is missing before it can succeed at all — 'model',
+ * 'sources' — or null. One rule, read by the empty state and by the failure
+ * banner, so the two cannot disagree about whether "Sweep again" is advice.
+ */
+function missingSetup() {
+  if (!state.health?.model?.configured) return 'model';
+  // Mail, calendars, and the connector sources in Settings → Sources: a home
+  // reading only GitHub is a home with something to read, and under a whole
+  // failure the banner must offer "Sweep again", not "Connect a source".
+  const hasSources = (state.config?.mail?.length || 0) + (state.config?.calendars?.length || 0)
+    + (state.config?.sources?.length || 0) > 0;
+  return hasSources ? null : 'sources';
+}
+
+/**
  * Why the board is empty is a different screen every time, and each one has to
  * say what to do next. "Nothing here" with no explanation is the failure mode
  * this function exists to avoid.
  */
 function emptyForContext(navigate) {
-  const configured = Boolean(state.health?.model?.configured);
+  const missing = missingSetup();
   const last = state.board.runs?.last;
-  const hasSources = (state.config?.mail?.length || 0) + (state.config?.calendars?.length || 0) > 0;
 
-  if (!configured) {
+  if (missing === 'model') {
     return emptyState({
       title: 'No model yet',
       detail: 'Zelos reads your mail and calendar and thinks about them with a model you choose — including one running on this machine. Nothing happens until you pick one.',
       action: button('Choose a model', { class: 'btn solid', onClick: () => navigate('#/settings/model') }),
     });
   }
-  if (!hasSources) {
+  if (missing === 'sources') {
     return emptyState({
       title: 'Nothing to read yet',
       detail: 'Connect a mailbox or a calendar and Zelos will have something to think about. Both stay on this machine.',
@@ -89,9 +103,14 @@ function sweepTrouble() {
  * that read four sources out of five is a lie in the alarming direction, and it
  * would send the reader looking for a broken app instead of a dead password.
  */
-function failureBanner(trouble) {
+function failureBanner(trouble, navigate) {
   const last = state.board.runs?.last;
   const live = state.sweep.error;
+  // Under a whole failure on a home with no model or nothing to read,
+  // "Sweep again" is the failure again: the one action on the screen ran the
+  // same run that wrote the banner. What is missing is a setting, so the
+  // action opens it.
+  const missing = trouble === 'whole' ? missingSetup() : null;
   const failedSources = (last?.stats?.sources || []).filter((s) => s && s.ok === false);
   const counted = Math.max(failedSources.length, Number(last?.stats?.sourcesFailed) || 0);
   const whole = trouble === 'whole';
@@ -110,7 +129,11 @@ function failureBanner(trouble) {
         el('li', { text: `${s.label}: ${s.error}` })))
       : null,
     el('div', { class: 'banner-actions' }, [
-      button('Sweep again', { class: 'btn solid', onClick: () => startSweep('full') }),
+      missing === 'model'
+        ? button('Choose a model', { class: 'btn solid', onClick: () => navigate('#/settings/model') })
+        : missing === 'sources'
+          ? button('Connect a source', { class: 'btn solid', onClick: () => navigate('#/settings/mail') })
+          : button('Sweep again', { class: 'btn solid', onClick: () => startSweep('full') }),
     ]),
   ]);
 }
@@ -132,7 +155,7 @@ export function renderNow(ctx) {
 
   const body = el('div', { class: 'view view-now' });
   const trouble = sweepTrouble();
-  const banner = trouble ? failureBanner(trouble) : null;
+  const banner = trouble ? failureBanner(trouble, navigate) : null;
   if (banner) body.appendChild(banner);
 
   if (!hero) {
@@ -150,18 +173,30 @@ export function renderNow(ctx) {
     // as full as it is ever going to get from this run, and the part nobody has
     // seen is the part that could not be read. Two titles, because they are two
     // different states of the world.
-    body.appendChild(banner
-      ? emptyState(trouble === 'partial'
-        ? {
-          title: 'Nothing on the board — and not everything was read',
-          detail: 'Nothing Zelos could read needs you. The sources named above went unread, '
-            + 'and whatever they hold is not on this board.',
-        }
-        : {
-          title: 'Nothing on the board yet.',
-          detail: 'The board fills in when a sweep finishes.',
-        })
-      : emptyForContext(navigate));
+    //
+    // The one case the plain shell gets wrong: a WHOLE failure on a home with
+    // no model, or nothing to read. "The board fills in when a sweep finishes"
+    // is a promise about a sweep that cannot, and the context-aware empty
+    // state — the only place "Choose a model" lives — went missing the moment
+    // the first scheduled run failed, which on such a home is thirty minutes
+    // in. So there it comes back under the banner, which has already swapped
+    // its own action to match.
+    if (trouble === 'whole' && missingSetup()) {
+      body.appendChild(emptyForContext(navigate));
+    } else {
+      body.appendChild(banner
+        ? emptyState(trouble === 'partial'
+          ? {
+            title: 'Nothing on the board — and not everything was read',
+            detail: 'Nothing Zelos could read needs you. The sources named above went unread, '
+              + 'and whatever they hold is not on this board.',
+          }
+          : {
+            title: 'Nothing on the board yet.',
+            detail: 'The board fills in when a sweep finishes.',
+          })
+        : emptyForContext(navigate));
+    }
   } else {
     body.appendChild(itemHero(hero, { tz }));
     if (rest.length) {
