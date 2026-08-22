@@ -314,6 +314,35 @@ export function fieldControls(manifest, values = {}) {
 }
 
 /**
+ * Where a secret goes, in the words of the store actually in use.
+ *
+ * Three hints said "your OS keychain" unconditionally — one of them under the
+ * `rm -rf` block, right after "back it up by copying it" — and on the
+ * encrypted-file store (any machine without a working keychain: the documented
+ * headless-Linux case) that was false in the one direction that matters.
+ * There, secrets.enc and .seed both sit inside the home, so a copy of the
+ * folder is a copy of every credential plus the key that opens them, and a
+ * user who took the panel at its word could hand that folder over as a
+ * password-free snapshot. `state.health.backend.name` is the store in use and
+ * aboutPanel already reads it; before health has loaded it is unknown, and
+ * the keychain wording stands until it says otherwise.
+ */
+export function secretStoreNotes(backendName) {
+  if (backendName === 'encrypted-file') {
+    return {
+      field: 'It goes into secrets.enc in your Zelos home, encrypted with the key in .seed beside it: never into config.json, never into a log, and there is no route that reads it back.',
+      password: 'Goes into secrets.enc in your Zelos home, encrypted with the key in .seed beside it. It is never written to config.json, never passed on a command line, and never logged.',
+      data: 'On this machine the stored passwords and API keys ARE in that directory: secrets.enc holds them and .seed holds the key that opens them, so a copy of the folder is a copy of the credentials plus their key. Deleting the folder deletes them too.',
+    };
+  }
+  return {
+    field: 'It goes straight to your OS keychain: never into config.json, never into a log, and there is no route that reads it back.',
+    password: 'Goes straight to your OS keychain. It is never written to config.json, never passed on a command line, and never logged.',
+    data: 'Stored passwords and API keys live in your OS keychain under the service com.zelos.app and are not in that directory. Remove them with your keychain tool.',
+  };
+}
+
+/**
  * The one credential a source may have, asked for in the connector's own words.
  *
  * `credential: null` and `{required: false}` are different facts and the whole
@@ -345,7 +374,7 @@ export function credentialControl(manifest, { keyRef = '', stored = false } = {}
         hint: [
           credential.help || '',
           credential.required ? '' : 'Only if this source needs one.',
-          'It goes straight to your OS keychain: never into config.json, never into a log, and there is no route that reads it back.',
+          secretStoreNotes(state.health?.backend?.name).field,
         ].filter(Boolean).join(' '),
       }),
       link ? el('p', { class: 'field-hint' }, ['Mint one at ', link]) : null,
@@ -931,7 +960,7 @@ function mailForm(account, { onSaved, onCancel }) {
 
   const passwordBlock = el('div', { class: 'stack' }, [
     field('Password', passInput, {
-      hint: 'Goes straight to your OS keychain. It is never written to config.json, never passed on a command line, and never logged.',
+      hint: secretStoreNotes(state.health?.backend?.name).password,
     }),
   ]);
 
@@ -1645,7 +1674,7 @@ function dataPanel() {
       note: 'Zelos deliberately has no route that wipes your data — a local server that can destroy the database on request is a local server a stray web page can point at. Do it yourself, with the app closed:',
     }, [
       el('pre', { class: 'code' }, el('code', { text: `rm -rf "${home}"` })),
-      el('p', { class: 'quiet-note', text: 'Stored passwords and API keys live in your OS keychain under the service com.zelos.app and are not in that directory. Remove them with your keychain tool.' }),
+      el('p', { class: 'quiet-note', text: secretStoreNotes(state.health?.backend?.name).data }),
     ]),
     status.node,
   ]);
@@ -1672,7 +1701,7 @@ function aboutPanel() {
     backend.note ? section('What the secret store protects', {}, el('p', { class: 'panel-lede', text: backend.note })) : null,
     section('Where Zelos stands', {}, [
       el('ul', { class: 'plain-list' }, [
-        el('li', { text: 'The server binds 127.0.0.1 and nothing else. Every API call carries a session token minted at launch; no CORS header is ever sent, so a page in another tab cannot read one.' }),
+        el('li', { text: 'The server binds 127.0.0.1 and nothing else. Every API call carries a session token minted at launch; no CORS header is ever sent, so a page in another tab cannot read one. The one exception is /api/mcp, the read-only channel an AI client uses: it is off until you switch it on in AI access, and it carries the separate AI token you mint there rather than the session token — that one is meant to outlive a restart, and it lasts until you turn AI access off or revoke it.' }),
         el('li', { text: 'The only outbound connections are the ones you configured: your IMAP host, your calendar address, your model endpoint.' }),
         el('li', { text: 'Mail is attacker-controlled input, and so is anything the model writes after reading it. Zelos never executes, shells out to, or navigates to anything derived from either. It renders them, and you click.' }),
         el('li', { text: 'Drafts are drafts. Zelos has no send path at all — not a disabled button, no code.' }),

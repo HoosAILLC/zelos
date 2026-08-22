@@ -48,9 +48,15 @@ jobs:
         shell: bash
         run: node --test --test-timeout=180000 test/*.test.mjs
 
+      # The commit is stamped into the packaged app's package.json, where
+      # desktop/main.js reads it for About and the "shell ready" log line —
+      # without it every build is "Zelos <version>" and "which build do you
+      # have?" has no answer. The whole sha, not the short one: a short sha
+      # that happens to be all digits reaches electron-builder's argument
+      # parser as a number; main.js shows the first seven.
       - name: Build
         working-directory: desktop
-        run: npm run ${{ matrix.script }}
+        run: npm run ${{ matrix.script }} -- -c.extraMetadata.commit=${{ github.sha }}
         env:
           # Unsigned on purpose. macOS builds are ad-hoc signed by the config
           # (identity "-"), Windows is unsigned; both are documented in

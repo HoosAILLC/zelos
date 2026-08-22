@@ -85,7 +85,7 @@ function portOf(url) {
  * time rather than captured, because the window is created before the server
  * has finished binding on a first run.
  */
-export function guardWebContents(contents, { getPort, openExternal, logger, onInternalPopup = null }) {
+export function guardWebContents(contents, { getPort, openExternal, logger }) {
   const decide = (raw) => classifyTarget(raw, { port: getPort() });
 
   const handleNavigation = (event, raw) => {
@@ -109,13 +109,18 @@ export function guardWebContents(contents, { getPort, openExternal, logger, onIn
     if (verdict.action === 'external') {
       logger.info('desktop: opening a new-window link in the system browser', { url: verdict.url });
       openExternal(verdict.url);
-    } else if (verdict.action === 'internal') {
-      // The board has no popups of its own. If one ever appears, it belongs in
-      // the window that is already open — a second window would be a second
-      // copy of the same board with none of this window's settings.
-      onInternalPopup?.(verdict.url);
     } else {
-      logger.warn('desktop: refused a new window', { url: verdict.url, reason: verdict.reason });
+      // The board itself is refused here too — not routed into the window that
+      // is already open, which is what used to happen. The board has no popups
+      // of its own, so a new-window request for its own origin can only be a
+      // link somebody else wrote: every item link renders target=_blank, and a
+      // feed's `<link>/?t=x</link>` resolves against the board's address into
+      // exactly this origin. Loading that in the main window handed the page a
+      // `?t=` it stored in place of the live session token, and every call
+      // 401ed until "Reload board". Nothing is lost by denying it: the board's
+      // own same-window navigations are hash routes, and those never get here.
+      const reason = verdict.action === 'internal' ? 'the board opens no popups of its own' : verdict.reason;
+      logger.warn('desktop: refused a new window', { url: verdict.url, reason });
     }
     return { action: 'deny' };
   });

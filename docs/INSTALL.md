@@ -547,8 +547,10 @@ this machine.
 
 **Where did the app go when I closed the window?**
 It is in the tray (macOS: the menu bar, top right). That is where **Sweep now**,
-**Open Zelos** and **Quit** live. On Windows and Linux this only happens when
-automatic sweeps are switched on; with them off, closing the window quits.
+**Open Zelos** and **Quit** live. On Windows this only happens when automatic
+sweeps are switched on; with them off, closing the window quits. On Linux,
+closing the window quits even with sweeps on, unless you have set
+`ZELOS_TRAY_RESIDENT=1` — see "What the shell adds" above for why.
 
 **Something is wrong and I want to see why.**
 Run `zelos doctor` first. If you want the raw record after that:

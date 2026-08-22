@@ -676,3 +676,46 @@ describe('the calendar probes that belong to a connector', () => {
     assert.equal(asked[0].pass, null);
   });
 });
+
+/* ================================================================== *
+ * 7. Where doctor looks
+ * ================================================================== */
+
+describe('where doctor looks for the home', () => {
+  /**
+   * core/config.mjs `homeDir()` has treated the literal strings "undefined"
+   * and "null" as no override since one of them became a live data directory
+   * named undefined/ in the cwd — they are what `ZELOS_HOME=${home}` becomes
+   * when `home` is unset. doctor's own reader had no such guard, so
+   * `ZELOS_HOME=undefined zelos doctor` reported on $PWD/undefined while the
+   * app it was diagnosing used ~/.zelos. The home directory is redirected to
+   * scratch for the duration, so the test never looks at the real one.
+   */
+  test('REGRESSION: a ZELOS_HOME that is the word "undefined" or "null" is no override here, as it is for the app', async () => {
+    const fakeUserHome = path.join(SCRATCH, 'fake-user-home');
+    fs.mkdirSync(fakeUserHome, { recursive: true });
+    const saved = { ZELOS_HOME: process.env.ZELOS_HOME, HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+    const restore = (key, value) => { if (value === undefined) delete process.env[key]; else process.env[key] = value; };
+    try {
+      process.env.HOME = fakeUserHome;
+      process.env.USERPROFILE = fakeUserHome;
+      assert.equal(os.homedir(), fakeUserHome, 'this platform did not follow the redirected home, so the test cannot run safely');
+      const expected = path.join(fakeUserHome, '.zelos');
+      for (const junk of ['undefined', 'null', 'NULL', '  undefined  ', '   ']) {
+        process.env.ZELOS_HOME = junk;
+        const home = byId(await diagnose({ deps: SILENT_DEPS }), 'home');
+        assert.ok(home.detail.startsWith(expected), `ZELOS_HOME=${JSON.stringify(junk)}: doctor looked at ${home.detail}`);
+        if (junk.trim()) {
+          assert.ok(!home.detail.includes(path.join(process.cwd(), junk.trim())), 'doctor reported on a folder in the working directory');
+        }
+      }
+      // A real override is still honoured exactly as before.
+      const real = freshHome();
+      assert.ok(byId(await diagnose({ deps: SILENT_DEPS }), 'home').detail.startsWith(real));
+    } finally {
+      restore('ZELOS_HOME', saved.ZELOS_HOME);
+      restore('HOME', saved.HOME);
+      restore('USERPROFILE', saved.USERPROFILE);
+    }
+  });
+});
