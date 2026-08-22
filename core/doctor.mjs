@@ -98,10 +98,18 @@ export function compareVersions(a, b) {
  * Where Zelos lives, worked out WITHOUT creating anything. `paths()` would be
  * the obvious call, but it mkdirs and chmods on the way — which is exactly the
  * condition the home check exists to observe.
+ *
+ * The literal strings "undefined" and "null" are no override, exactly as in
+ * core/config.mjs `homeDir()` — they are what `ZELOS_HOME=${home}` becomes
+ * with `home` unset. This reader lacked that guard, so `ZELOS_HOME=undefined
+ * zelos doctor` reported on $PWD/undefined while the app it was diagnosing
+ * used ~/.zelos. A doctor has to look where the patient lives.
  */
 function homeDirPath() {
   const override = process.env.ZELOS_HOME;
-  return override && override.trim() ? path.resolve(override) : path.join(os.homedir(), '.zelos');
+  const trimmed = override ? override.trim() : '';
+  const garbage = trimmed.toLowerCase() === 'undefined' || trimmed.toLowerCase() === 'null';
+  return trimmed && !garbage ? path.resolve(override) : path.join(os.homedir(), '.zelos');
 }
 
 /* ------------------------------------------------------------------ *

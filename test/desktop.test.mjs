@@ -95,7 +95,6 @@ describe('guardWebContents', () => {
   function harness({ port = 7777 } = {}) {
     const opened = [];
     const warned = [];
-    const popups = [];
     const handlers = new Map();
     const contents = {
       on(event, handler) {
@@ -108,7 +107,6 @@ describe('guardWebContents', () => {
       getPort: () => port,
       openExternal: (url) => opened.push(url),
       logger: { info() {}, warn: (msg, meta) => warned.push(meta?.url ?? msg) },
-      onInternalPopup: (url) => popups.push(url),
     });
     const navigate = (url) => {
       let prevented = false;
@@ -116,7 +114,7 @@ describe('guardWebContents', () => {
       for (const handler of handlers.get('will-navigate')) handler(event, url);
       return prevented;
     };
-    return { contents, opened, warned, popups, navigate, handlers };
+    return { contents, opened, warned, navigate, handlers };
   }
 
   it('lets the board navigate itself and nothing else', () => {
@@ -147,10 +145,29 @@ describe('guardWebContents', () => {
     assert.deepEqual(h.opened, ['https://example.com/docs']);
 
     assert.deepEqual(h.contents.windowOpen({ url: 'http://127.0.0.1:7777/#/ask' }), { action: 'deny' });
-    assert.deepEqual(h.popups, ['http://127.0.0.1:7777/#/ask']);
+    assert.equal(h.opened.length, 1, 'the board itself is never handed to the system browser');
 
     assert.deepEqual(h.contents.windowOpen({ url: 'file:///etc/hosts' }), { action: 'deny' });
     assert.equal(h.opened.length, 1);
+  });
+
+  it('REGRESSION: a new-window link onto the board itself is refused and logged, not routed into the open window', () => {
+    /* Every item link renders target=_blank, so a click lands here and never
+       in will-navigate; and ui/lib/items.js resolves a feed's `<link>` against
+       the board's own address, so `<link>/?t=x</link>` arrives as this origin
+       carrying a `?t=`. The internal branch used to hand that URL to an
+       onInternalPopup hook wired to mainWindow.loadURL; the page then stored
+       `x` in place of the live session token and every API call 401ed until
+       "Reload board" (a localhost spelling loaded the board on a second origin
+       with no token at all). The board opens no popups of its own, so there is
+       nothing for an internal verdict to carry: it is refused and logged like
+       any other new window, and the window keeps the page it has. */
+    const h = harness();
+    for (const url of ['http://127.0.0.1:7777/?t=garbage', 'http://localhost:7777/?t=garbage', 'http://[::1]:7777/#/settings']) {
+      assert.deepEqual(h.contents.windowOpen({ url }), { action: 'deny' });
+      assert.ok(h.warned.includes(url), `${url} was not logged as refused`);
+    }
+    assert.equal(h.opened.length, 0, 'none of them belongs in the system browser either');
   });
 
   it('refuses a webview', () => {
@@ -742,6 +759,69 @@ describe('the shell, booted against a stub Electron', () => {
     assert.equal(recorded.external.length, before + 1);
 
     assert.deepEqual(contents.windowOpenHandler({ url: 'https://example.com/' }), { action: 'deny' });
+  });
+
+  it('REGRESSION: a popup onto the board carrying a ?t= is denied, and the window keeps the URL it was opened at', () => {
+    // The pure guard is covered above; this is the wiring. main.js used to
+    // pass an onInternalPopup that called mainWindow.loadURL, so the verdict
+    // was "deny" and the window navigated anyway.
+    const win = recorded.windows[0];
+    const loadedBefore = [...win.loaded];
+    const externalBefore = recorded.external.length;
+    assert.deepEqual(win.webContents.windowOpenHandler({ url: `${booted.zelos.url}?t=garbage` }), { action: 'deny' });
+    assert.deepEqual(win.loaded, loadedBefore, 'a connector-supplied URL was loaded into the board window');
+    assert.equal(recorded.external.length, externalBefore, 'and it is not a link for the system browser either');
+  });
+
+  it('shows the build commit next to the version when the package carries one, and just the version when it does not', () => {
+    /* The operator's Aug 9 app, the site's dbbd584 installers and a HEAD
+       build were all "Zelos 1.0.0" in About and shared a filename, so "which
+       build do you have?" had no answer while one of them predated every fix.
+       CI stamps the commit into the packaged package.json; this is the reader,
+       the label, and the dialog that shows it. */
+    assert.equal(main.versionLabel('1.1.0', 'a1b2c3d'), '1.1.0 (a1b2c3d)');
+    assert.equal(main.versionLabel('1.1.0', 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678'), '1.1.0 (a1b2c3d)',
+      'CI stamps the whole sha; the label shows what a person compares with git log');
+    assert.equal(main.versionLabel('1.1.0', ''), '1.1.0');
+    assert.equal(main.versionLabel('1.1.0'), '1.1.0');
+
+    const stamped = path.join(sandbox, 'stamped');
+    fs.mkdirSync(stamped, { recursive: true });
+    fs.writeFileSync(path.join(stamped, 'package.json'),
+      JSON.stringify({ name: 'zelos-desktop', version: '1.1.0', commit: 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678' }));
+    assert.equal(main.readBuildCommit(stamped), 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678');
+    const about = main.aboutText({ version: '1.1.0', commit: main.readBuildCommit(stamped), url: 'http://127.0.0.1:1/', home: '/x' });
+    assert.equal(about.message, 'Zelos 1.1.0 (a1b2c3d)');
+    assert.match(about.detail, /Board   http:\/\/127\.0\.0\.1:1\//);
+
+    // Unstamped, junk, or no package at all: the plain version, never a throw.
+    const unstamped = path.join(sandbox, 'unstamped');
+    fs.mkdirSync(unstamped, { recursive: true });
+    fs.writeFileSync(path.join(unstamped, 'package.json'), JSON.stringify({ version: '1.1.0' }));
+    assert.equal(main.readBuildCommit(unstamped), '');
+    fs.writeFileSync(path.join(unstamped, 'package.json'), JSON.stringify({ version: '1.1.0', commit: 'not a sha; $(rm -rf /)' }));
+    assert.equal(main.readBuildCommit(unstamped), '', 'a stamp that is not a sha is not shown');
+    fs.writeFileSync(path.join(unstamped, 'package.json'), JSON.stringify({ version: '1.1.0', commit: 1234567 }));
+    assert.equal(main.readBuildCommit(unstamped), '', 'the argument parser turned an all-digit stamp into a number once; that is no stamp');
+    assert.equal(main.readBuildCommit(path.join(sandbox, 'nowhere')), '');
+    assert.equal(main.aboutText({ version: '1.1.0', commit: '' }).message, 'Zelos 1.1.0');
+
+    // The two ends of the contract: CI writes the field main.js reads.
+    const workflow = fs.readFileSync(path.join(REPO, '.github', 'workflows', 'desktop.yml'), 'utf8');
+    assert.match(workflow, /-c\.extraMetadata\.commit=\$\{\{ github\.sha \}\}/,
+      'the workflow no longer stamps the commit the shell reads');
+  });
+
+  it('the About dialog is built from the stamp the shell read at launch', () => {
+    const before = recorded.messageBoxes.length;
+    booted.actions.about();
+    assert.equal(recorded.messageBoxes.length, before + 1, 'About showed no dialog');
+    const shown = recorded.messageBoxes.at(-1);
+    // A source checkout carries no stamp, and has to read as the plain version.
+    const commit = main.readBuildCommit(path.join(REPO, 'desktop'));
+    assert.equal(commit, '', 'desktop/package.json in the checkout must not carry a commit — that field is CI\'s to write');
+    assert.equal(shown.message, 'Zelos 1.0.0');
+    assert.deepEqual(shown, main.aboutText({ version: '1.0.0', commit, url: booted.zelos.url, home }));
   });
 
   it('cancels any request from the board that is not the board, on every scheme', () => {

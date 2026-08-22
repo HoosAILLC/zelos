@@ -2110,3 +2110,81 @@ test('REGRESSION: a failed sweep on an unconfigured home still offers "Choose a 
   // something, and "Sweep again" there is real advice.
   assert.match(banner[0], /trouble === 'whole' \? missingSetup\(\) : null/);
 });
+
+test('REGRESSION: the secrets copy names the store in use — on the encrypted-file store they are in the folder it says to copy', async () => {
+  stubBrowserGlobals();
+  const settings = await import(fileUrl(UI, 'views/settings.js'));
+  const src = fs.readFileSync(path.join(UI, 'views/settings.js'), 'utf8');
+
+  // Three hints said "your OS keychain" unconditionally, one of them under
+  // the `rm -rf` block that follows "back it up by copying it". On the
+  // encrypted-file store, secrets.enc and .seed both sit inside the home, and
+  // a plain cp -R of it yields every credential in the clear from the copy.
+  const file = settings.secretStoreNotes('encrypted-file');
+  assert.match(file.data, /secrets\.enc/);
+  assert.match(file.data, /\.seed/);
+  assert.match(file.data, /copy of the folder is a copy of the credentials plus their key/);
+  assert.doesNotMatch(file.data, /not in that directory/);
+  for (const [slot, text] of Object.entries(file)) {
+    assert.doesNotMatch(text, /keychain/i, `${slot} still promises a keychain on the file store`);
+    assert.match(text, /secrets\.enc/, `${slot} does not say where the secret goes`);
+  }
+
+  // A real keychain keeps the wording it had; so does "not loaded yet".
+  for (const name of ['macos-keychain', 'windows-credential-manager', 'libsecret', undefined, 'unknown']) {
+    const notes = settings.secretStoreNotes(name);
+    assert.match(notes.data, /OS keychain/, String(name));
+    assert.match(notes.data, /not in that directory/, String(name));
+    assert.match(notes.field, /OS keychain/, String(name));
+    assert.match(notes.password, /OS keychain/, String(name));
+  }
+
+  // All three sites read the store the health document reports — the same
+  // field aboutPanel reads — and none keeps a literal of its own.
+  const read = /secretStoreNotes\(state\.health\?\.backend\?\.name\)/;
+  const data = /function dataPanel\(\)[\s\S]*?\n\}/m.exec(src);
+  assert.ok(data, 'dataPanel is missing');
+  assert.match(data[0], /secretStoreNotes\(state\.health\?\.backend\?\.name\)\.data/, 'the note under rm -rf is not branched on the store');
+  assert.doesNotMatch(data[0], /OS keychain/, 'dataPanel still carries the unconditional keychain sentence');
+  const cred = /export function credentialControl\([\s\S]*?\n\}/m.exec(src);
+  assert.ok(cred, 'credentialControl is missing');
+  assert.match(cred[0], /secretStoreNotes\(state\.health\?\.backend\?\.name\)\.field/, 'the connector credential hint is not branched on the store');
+  assert.doesNotMatch(cred[0], /OS keychain/);
+  const mail = /function mailForm\(account, \{ onSaved, onCancel \}\)[\s\S]*?\n\}/m.exec(src);
+  assert.ok(mail, 'mailForm is missing');
+  assert.match(mail[0], /secretStoreNotes\(state\.health\?\.backend\?\.name\)\.password/, 'the mail password hint is not branched on the store');
+  assert.doesNotMatch(mail[0], /straight to your OS keychain/);
+  assert.ok(read.test(src));
+});
+
+test('REGRESSION: the Now view sends a failed sweep to the terminal or desktop.log, never to a log file nothing writes', () => {
+  const src = fs.readFileSync(path.join(UI, 'views/now.js'), 'utf8');
+  // The default logger goes to stderr only; the one file logger in the tree
+  // is the desktop shell's and is named desktop.log. The empty state under a
+  // failed run pointed at "the log in your Zelos home", which is an empty
+  // directory — the same wrong answer core/server.mjs's 500 detail used to
+  // give, and corrected there first.
+  assert.doesNotMatch(src, /zelos\.log/);
+  assert.doesNotMatch(src, /The log in your Zelos home/);
+  const failed = /title: 'The last sweep did not finish',\n\s*detail: ([^\n]+)/.exec(src);
+  assert.ok(failed, 'the failed-sweep empty state is missing');
+  assert.match(failed[1], /terminal/, 'the CLI case has to say the reason went to the terminal');
+  assert.match(failed[1], /desktop\.log/, 'the desktop case has to name the file that exists');
+  assert.match(failed[1], /no log file of its own/);
+});
+
+test('REGRESSION: the About panel names /api/mcp as the one call that does not carry the session token', () => {
+  const src = fs.readFileSync(path.join(UI, 'views/settings.js'), 'utf8');
+  // --help and the README already say it. The Settings view is where the AI
+  // token is minted, and its "Where Zelos stands" list said "every API call
+  // carries a session token minted at launch" with no exception — the
+  // sentence somebody reads before deciding whether to switch AI access on.
+  const about = /function aboutPanel\(\)[\s\S]*?\n\}/m.exec(src);
+  assert.ok(about, 'aboutPanel is missing');
+  const line = /session token minted at launch[^\n]*/.exec(about[0]);
+  assert.ok(line, 'the session-token sentence is gone');
+  assert.match(line[0], /\/api\/mcp/, 'the panel does not mention the one route the session gate skips');
+  assert.match(line[0], /AI token/, 'and it has to say which token that route carries instead');
+  assert.match(line[0], /outlive a restart|survives? a restart|until you turn/,
+    'the exception is only useful if it says the AI token is not per-launch');
+});
