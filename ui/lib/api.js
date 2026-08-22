@@ -87,9 +87,19 @@ export async function request(path, { method = 'GET', body = undefined, signal }
   }
 
   if (!res.ok) {
-    const message = parsed && typeof parsed.error === 'string'
+    let message = parsed && typeof parsed.error === 'string'
       ? parsed.error
       : `${method} ${path} failed (${res.status})`;
+    // A 500's `error` is the two words "internal error" — the server keeps an
+    // unexpected error's text out of the response on purpose — and its
+    // `detail` is the one thing it does say: where the reason was written.
+    // Every view renders `err.message` and nothing reads `.detail`, so that
+    // pointer never reached the screen. Joined for 5xx only: a 4xx's `error`
+    // already names the caller's mistake, and its `detail` is structured
+    // (the 409's running-sweep status), not prose.
+    if (res.status >= 500 && parsed && typeof parsed.error === 'string' && typeof parsed.detail === 'string') {
+      message = `${parsed.error} — ${parsed.detail}`;
+    }
     throw new ApiError(message, { status: res.status, detail: parsed?.detail ?? null, path });
   }
   return parsed;

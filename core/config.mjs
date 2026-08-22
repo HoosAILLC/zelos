@@ -311,10 +311,25 @@ export function newId(prefix) {
  *    `zelos doctor` tells the user to edit config.json by hand and a typo there
  *    must not brick the app that is supposed to report the typo.
  *
- * `mail` and `calendars` need no entry here: `normalizeAccounts` already
- * replaces a non-array with an empty one.
+ * `mail`, `calendars` and `sources` need no entry here: `normalizeAccounts`
+ * already replaces a non-array with an empty one. That is the right repair for
+ * a FILE and the wrong one for a PATCH — see ACCOUNT_LISTS.
  */
 const SECTIONS = ['identity', 'model', 'sweep', 'ui', 'privacy'];
+
+/**
+ * The three sections that hold a list of accounts. A patch naming one of them
+ * must carry an array of objects, and is refused otherwise — the same rule
+ * SECTIONS applies to the object sections, for the same reason, and it was
+ * missing here because `normalizeAccounts` made the nonsense disappear instead
+ * of surfacing it: `{"mail": "nope"}` (or null, or `{}`) merged over the file,
+ * normalised to `mail: []`, and was written with a 200 and `errors: []`. Every
+ * configured account was gone, the secrets that belonged to them were left
+ * orphaned in the store, and the only thing the caller was told was "Saved."
+ *
+ * `loadConfig` keeps coercing, because a hand-edited file must still load.
+ */
+const ACCOUNT_LISTS = ['mail', 'calendars', 'sources'];
 
 /** Which of the five sections are not objects. Names only — never values. */
 function malformedSections(cfg) {
@@ -444,6 +459,15 @@ export function saveConfig(patch = {}) {
   // somewhere further in with no clue whose fault it was.
   if (!isPlainObject(patch)) {
     throw new TypeError(`saveConfig: patch must be an object, got ${patch === null ? 'null' : typeof patch}`);
+  }
+  // Checked on the PATCH, before the merge, because after it there is nothing
+  // left to check: `normalizeAccounts` would have turned the nonsense into an
+  // empty list that loads back perfectly. See ACCOUNT_LISTS.
+  for (const key of ACCOUNT_LISTS) {
+    if (!Object.hasOwn(patch, key)) continue;
+    if (!Array.isArray(patch[key]) || patch[key].some((entry) => !isPlainObject(entry))) {
+      throw new TypeError(`config: ${key} must be an array of objects — nothing was written`);
+    }
   }
   const { configFile } = paths();
   // Merge over what is ON DISK, not over the resolved config, so runtime-filled
@@ -592,6 +616,24 @@ function checkRef(errors, at, value, { allowNull = false } = {}) {
   }
 }
 
+/**
+ * Every key a config.json may carry at the top level. DEFAULTS holds the ones
+ * this file owns; `ai` (core/ai-access.mjs, core/mcp.mjs) and `oauth`
+ * (core/sources/oauth.mjs) are written and read by their own modules, which is
+ * why neither has a block in `validateConfig` — they are not unknown, they are
+ * somebody else's.
+ *
+ * A key outside this set is REPORTED, never dropped and never refused. Doctor
+ * tells people to edit config.json by hand, and a `"sweeps"` typed beside the
+ * real `sweep` (or a `"privacy "` with a trailing space) merged, saved, echoed
+ * back and did nothing, while doctor called the file valid — the setting the
+ * user thought they had changed was inert and nothing said so. Refusing it
+ * would be worse than keeping it: a file written by a newer build carries keys
+ * this one has never heard of, and a TypeError on those would block every
+ * later save — including the one that removes the key.
+ */
+const KNOWN_TOP_LEVEL = new Set([...Object.keys(DEFAULTS), 'ai', 'oauth']);
+
 /** -> {ok, errors:[{path, message}]} */
 export function validateConfig(cfg) {
   const errors = [];
@@ -600,6 +642,10 @@ export function validateConfig(cfg) {
   const leaked = [];
   stripSecrets(cfg, '', leaked);
   for (const p of leaked) errors.push({ path: p, message: 'credentials must live in the secret store, not in config.json' });
+
+  for (const key of Object.keys(cfg)) {
+    if (!KNOWN_TOP_LEVEL.has(key)) errors.push({ path: key, message: 'is not a setting Zelos knows — check the spelling' });
+  }
 
   if (!isInt(cfg.version, 1, 1000)) errors.push({ path: 'version', message: 'must be a positive integer' });
 
