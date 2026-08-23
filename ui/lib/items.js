@@ -179,11 +179,15 @@ function moreControls(item) {
     snooze.panel,
   ]);
 
+  // Three dots are a picture, not a name. "More" is the name, in the tooltip
+  // a pointer hovers and in the label a screen reader speaks — with the
+  // headline after it, so a list of rows does not read as a list of "More".
   const toggle = el('button', {
     type: 'button',
     class: 'disclosure',
     'aria-expanded': 'false',
-    'aria-label': `More options for ${item.headline || 'this item'}`,
+    title: 'More',
+    'aria-label': `More — ${item.headline || 'this item'}`,
     onclick() {
       const open = this.getAttribute('aria-expanded') === 'true';
       this.setAttribute('aria-expanded', open ? 'false' : 'true');

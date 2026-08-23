@@ -4,6 +4,13 @@
  * The whole discipline of this view is subtraction. One hero, at most four
  * others, and everything else folded away. core/triage.mjs already clamps `now`
  * to four in code; this view is what that clamp is for.
+ *
+ * A word on words. The code says "sweep" and "model" because those are the
+ * names the engine uses; the screen says "check" and "AI" because those are
+ * the names a person uses, and the audit's reader heard a broom in the first
+ * and a model car in the second. Nothing on this screen names an address the
+ * person did not type: a failure on a fresh install says no AI has been chosen,
+ * not the URL of the provider it would have asked.
  */
 
 import { el, button, meander, section } from '../lib/dom.js';
@@ -17,17 +24,21 @@ const MAX_NOW_ROWS = 4;
 /**
  * What a sweep on this home is missing before it can succeed at all — 'model',
  * 'sources' — or null. One rule, read by the empty state and by the failure
- * banner, so the two cannot disagree about whether "Sweep again" is advice.
+ * banner, so the two cannot disagree about whether "Check again" is advice.
  */
 function missingSetup() {
   if (!state.health?.model?.configured) return 'model';
-  // Mail, calendars, and the connector sources in Settings → Sources: a home
-  // reading only GitHub is a home with something to read, and under a whole
-  // failure the banner must offer "Sweep again", not "Connect a source".
+  // Mail, calendars, and the connector sources in Settings → Other things it
+  // can read: a home reading only GitHub is a home with something to read, and
+  // under a whole failure the banner must offer "Check again", not "Connect an
+  // email account".
   const hasSources = (state.config?.mail?.length || 0) + (state.config?.calendars?.length || 0)
     + (state.config?.sources?.length || 0) > 0;
   return hasSources ? null : 'sources';
 }
+
+/** The one sentence for a home with no AI, shared by the empty state and the banner. */
+const NO_AI_YET = 'Zelos can’t read anything yet because no AI has been chosen.';
 
 /**
  * Why the board is empty is a different screen every time, and each one has to
@@ -40,35 +51,35 @@ function emptyForContext(navigate) {
 
   if (missing === 'model') {
     return emptyState({
-      title: 'No model yet',
-      detail: 'Zelos reads your mail and calendar and thinks about them with a model you choose — including one running on this machine. Nothing happens until you pick one.',
-      action: button('Choose a model', { class: 'btn solid', onClick: () => navigate('#/settings/model') }),
+      title: 'No AI chosen yet',
+      detail: `${NO_AI_YET} Zelos reads your mail and calendar and thinks about them with an AI you choose — including one running on this computer.`,
+      action: button('Choose an AI', { class: 'btn solid', onClick: () => navigate('#/settings/model') }),
     });
   }
   if (missing === 'sources') {
     return emptyState({
       title: 'Nothing to read yet',
-      detail: 'Connect a mailbox or a calendar and Zelos will have something to think about. Both stay on this machine.',
-      action: button('Connect a source', { class: 'btn solid', onClick: () => navigate('#/settings/mail') }),
+      detail: 'Connect an email account or a calendar and Zelos will have something to think about. Both stay on this computer.',
+      action: button('Connect an email account', { class: 'btn solid', onClick: () => navigate('#/settings/mail') }),
     });
   }
   if (!last) {
     return emptyState({
-      title: 'Ready for the first sweep',
-      detail: 'A sweep fetches your recent mail and calendar, then asks your model what actually needs you.',
-      action: button('Sweep now', { class: 'btn solid', onClick: () => startSweep('full') }),
+      title: 'Ready for the first check',
+      detail: 'Zelos will fetch your recent mail and calendar, then ask the AI what actually needs you.',
+      action: button('Check now', { class: 'btn solid', onClick: () => startSweep('full') }),
     });
   }
   if (last.ok === false) {
     return emptyState({
-      title: 'The last sweep did not finish',
+      title: 'The last check did not finish',
       detail: last.error || 'It failed without saying why. Run from a terminal, the reason is in that terminal — Zelos keeps no log file of its own. In the desktop app it is in desktop.log, under Board → Show logs.',
       action: button('Try again', { class: 'btn solid', onClick: () => startSweep('full') }),
     });
   }
   return emptyState({
     title: 'Nothing needs you.',
-    detail: `Swept ${humanDelta(last.ended_at || last.started_at)}. ${sweepSummary(last)}`.trim(),
+    detail: `Last checked ${humanDelta(last.ended_at || last.started_at)}. ${sweepSummary(last)}`.trim(),
   });
 }
 
@@ -99,7 +110,7 @@ function sweepTrouble() {
 /**
  * The failed-sweep banner. Persistent, specific, and it names the source.
  *
- * Two failures, two tones, two sentences. "The last sweep failed" over a run
+ * Two failures, two tones, two sentences. "The last check failed" over a run
  * that read four sources out of five is a lie in the alarming direction, and it
  * would send the reader looking for a broken app instead of a dead password.
  */
@@ -107,21 +118,22 @@ function failureBanner(trouble, navigate) {
   const last = state.board.runs?.last;
   const live = state.sweep.error;
   // Under a whole failure on a home with no model or nothing to read,
-  // "Sweep again" is the failure again: the one action on the screen ran the
+  // "Check again" is the failure again: the one action on the screen ran the
   // same run that wrote the banner. What is missing is a setting, so the
-  // action opens it.
+  // action opens it — and the sentence is about the setting, never about the
+  // address the engine would have called.
   const missing = trouble === 'whole' ? missingSetup() : null;
   const failedSources = (last?.stats?.sources || []).filter((s) => s && s.ok === false);
   const counted = Math.max(failedSources.length, Number(last?.stats?.sourcesFailed) || 0);
   const whole = trouble === 'whole';
   const message = whole
-    ? (live || last?.error || 'The last sweep failed.')
-    : `${plural(counted, 'source')} could not be read. Everything else on the board is from this sweep — whatever those hold is not.`;
+    ? (missing === 'model' ? NO_AI_YET : (live || last?.error || 'The last check failed.'))
+    : `${counted === 1 ? 'One account or calendar' : `${counted} accounts or calendars`} could not be read. Everything else on the board is from this check — whatever those hold is not.`;
 
   return el('div', { class: `banner ${whole ? 'banner-bad' : 'banner-warn'}`, role: 'status' }, [
     el('h3', {
       class: 'banner-title',
-      text: whole ? 'The last sweep failed' : 'The last sweep could not read everything',
+      text: whole ? 'The last check failed' : 'The last check could not read everything',
     }),
     el('p', { class: 'banner-detail', text: message }),
     failedSources.length
@@ -130,10 +142,10 @@ function failureBanner(trouble, navigate) {
       : null,
     el('div', { class: 'banner-actions' }, [
       missing === 'model'
-        ? button('Choose a model', { class: 'btn solid', onClick: () => navigate('#/settings/model') })
+        ? button('Choose an AI', { class: 'btn solid', onClick: () => navigate('#/settings/model') })
         : missing === 'sources'
-          ? button('Connect a source', { class: 'btn solid', onClick: () => navigate('#/settings/mail') })
-          : button('Sweep again', { class: 'btn solid', onClick: () => startSweep('full') }),
+          ? button('Connect an email account', { class: 'btn solid', onClick: () => navigate('#/settings/mail') })
+          : button('Check again', { class: 'btn solid', onClick: () => startSweep('full') }),
     ]),
   ]);
 }
@@ -163,7 +175,7 @@ export function renderNow(ctx) {
     // retry. Repeating both in the empty state — same fact, two boxes, two
     // buttons — reads like the app panicking, so under a banner the empty
     // state is just the plain shell. After a PARTIAL failure the sweep did
-    // finish, so "the board fills in when a sweep finishes" would be the
+    // finish, so "the board fills in when a check finishes" would be the
     // reassurance this whole banner exists to withdraw.
     //
     // The title has to carry that too, not only the detail. Branching the
@@ -175,9 +187,9 @@ export function renderNow(ctx) {
     // different states of the world.
     //
     // The one case the plain shell gets wrong: a WHOLE failure on a home with
-    // no model, or nothing to read. "The board fills in when a sweep finishes"
-    // is a promise about a sweep that cannot, and the context-aware empty
-    // state — the only place "Choose a model" lives — went missing the moment
+    // no model, or nothing to read. "The board fills in when a check finishes"
+    // is a promise about a check that cannot, and the context-aware empty
+    // state — the only place "Choose an AI" lives — went missing the moment
     // the first scheduled run failed, which on such a home is thirty minutes
     // in. So there it comes back under the banner, which has already swapped
     // its own action to match.
@@ -188,12 +200,12 @@ export function renderNow(ctx) {
         ? emptyState(trouble === 'partial'
           ? {
             title: 'Nothing on the board — and not everything was read',
-            detail: 'Nothing Zelos could read needs you. The sources named above went unread, '
+            detail: 'Nothing Zelos could read needs you. The accounts named above went unread, '
               + 'and whatever they hold is not on this board.',
           }
           : {
             title: 'Nothing on the board yet.',
-            detail: 'The board fills in when a sweep finishes.',
+            detail: 'The board fills in when a check finishes.',
           })
         : emptyForContext(navigate));
     }

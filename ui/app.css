@@ -740,6 +740,39 @@ textarea.input, .draft-body, .ask-field, .capture-field {
 }
 .fold:hover { color: var(--ink); background: var(--ground-2); }
 
+/* --- a collapsed drawer: "Advanced", "For experts", "More choices" ------- */
+
+/*
+   The one control that keeps expert text off a first-timer's screen without
+   deleting it. Built by fold() in ui/views/settings.js; the body hides with
+   [hidden], so the rule at the top of this file is what makes it collapse.
+   The caret turns rather than swapping glyphs, so the label never moves.
+*/
+.unfold { display: grid; gap: 0.6rem; }
+.unfold-toggle {
+  justify-self: start;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-height: var(--tap);
+  padding: 0.3rem 0.2rem;
+  font: inherit;
+  font-size: 0.875rem;
+  color: var(--ink-2);
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+.unfold-toggle:hover { color: var(--ink); }
+.unfold-caret { display: inline-block; font-size: 0.75rem; transition: transform 0.15s ease; }
+.unfold-toggle[aria-expanded="true"] .unfold-caret { transform: rotate(90deg); }
+.unfold-body {
+  display: grid;
+  gap: 0.9rem;
+  padding-left: 0.9rem;
+  border-left: 2px solid var(--line);
+}
+
 /* --- worth knowing ------------------------------------------------------- */
 
 .worth-toggle {

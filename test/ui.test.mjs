@@ -350,9 +350,10 @@ test('carriedFor says nothing until a thing is genuinely stale', () => {
   const today = '2026-08-11';
   assert.equal(fmt.carriedFor({ first_seen: '2026-08-11T09:00:00-04:00' }, today), null);
   assert.equal(fmt.carriedFor({ first_seen: '2026-08-08T09:00:00-04:00' }, today), null); // 3 days
-  assert.equal(fmt.carriedFor({ first_seen: '2026-08-07T09:00:00-04:00' }, today), 'carried 4 days');
-  assert.equal(fmt.carriedFor({ first_seen: '2026-07-21T09:00:00-04:00' }, today), 'carried 3 weeks');
-  assert.equal(fmt.carriedFor({ first_seen: '2026-05-01T09:00:00-04:00' }, today), 'carried 3 months');
+  // "waiting", not "carried": carried where? was the audit's reaction.
+  assert.equal(fmt.carriedFor({ first_seen: '2026-08-07T09:00:00-04:00' }, today), 'waiting 4 days');
+  assert.equal(fmt.carriedFor({ first_seen: '2026-07-21T09:00:00-04:00' }, today), 'waiting 3 weeks');
+  assert.equal(fmt.carriedFor({ first_seen: '2026-05-01T09:00:00-04:00' }, today), 'waiting 3 months');
   assert.equal(fmt.carriedFor({}, today), null);
 });
 
@@ -408,12 +409,19 @@ test('every bucket has a label a person can read without decoding', () => {
 });
 
 test('sweepSummary reads as a sentence, and survives a run with no stats', () => {
+  // In a person's words — emails, appointments — and without the duration,
+  // which reads as a machine readout beside them and lives in the hover title.
   assert.equal(
     fmt.sweepSummary({ stats: { messages: 1, events: 2, items: 3, ms: 8_430 } }),
-    '1 message · 2 events · 3 items · 8.4s',
+    '1 email · 2 appointments · 3 items',
   );
+  assert.equal(fmt.sweepSummary({ stats: { messages: 214, events: 28 } }), '214 emails · 28 appointments');
   assert.equal(fmt.sweepSummary({ stats: {} }), '');
   assert.equal(fmt.sweepSummary(null), '');
+  assert.equal(fmt.sweepDetail({ stats: { ms: 41_800 } }), 'took 41.8s');
+  assert.equal(fmt.sweepDetail({ stats: { ms: 40 } }), '', 'a run that died in milliseconds must not say "took 0.0s"');
+  assert.equal(fmt.sweepDetail({ stats: {} }), '');
+  assert.equal(fmt.sweepDetail(null), '');
 });
 
 /* -------------------------------------------------------- 3. source guards */
@@ -918,12 +926,12 @@ test('a sweep that lost one source says so, and does not call the run failed', (
 
   const banner = /function failureBanner\(trouble, navigate\)[\s\S]*?\n\}/m.exec(src);
   assert.ok(banner, 'failureBanner is missing');
-  // Its own tone and its own sentence. "The last sweep failed" over a run that
+  // Its own tone and its own sentence. "The last check failed" over a run that
   // read four sources out of five is a lie in the alarming direction, and it
   // sends the reader looking for a broken app instead of a dead password.
-  assert.match(banner[0], /The last sweep could not read everything/);
+  assert.match(banner[0], /The last check could not read everything/);
   assert.match(banner[0], /banner-warn/);
-  assert.match(banner[0], /The last sweep failed/);
+  assert.match(banner[0], /The last check failed/);
 
   const render = /export function renderNow\(ctx\)[\s\S]*?\n\}/m.exec(src);
   assert.ok(render, 'renderNow is missing');
@@ -971,7 +979,7 @@ test('the first screen paints its action row whether or not it is in the documen
   // three minutes, so it emptied itself with nobody touching it.
   assert.ok(!/isConnected/.test(paint[0]),
     'paintActions must not gate on the row being in the document');
-  assert.match(src, /Try it with sample data/);
+  assert.match(src, /Look around with made-up data first/);
   const start = /function startScreen\(rerender, navigate\)[\s\S]*?\n\}/m.exec(src);
   assert.ok(start, 'startScreen is missing');
   assert.match(start[0], /\n {2}paintActions\(\);\n/,
@@ -1695,8 +1703,10 @@ test('the mail editor can set requireTls, and the test connects under the same r
   assert.match(form[0], /await saveConfig\(patch\)/, 'the assembled patch must actually be saved');
 
   // The blank a new account opens on is the config module's blank. A literal
-  // `false` here would excuse cleartext for a host nobody has named yet.
-  const blank = /editor\.replaceChildren\(mailForm\(\{[\s\S]*?\}, \{/m.exec(src);
+  // `false` here would excuse cleartext for a host nobody has named yet. The
+  // literal moved into the simple form when the full one started opening
+  // beneath its card rather than in its place.
+  const blank = /expertSlot\.replaceChildren\(mailForm\(\{[\s\S]*?\}, \{/m.exec(src);
   assert.ok(blank, 'the new-account literal is missing');
   assert.match(blank[0], /requireTls: null/, 'a new account must start on "decide from the address"');
 });
@@ -2180,11 +2190,16 @@ test('REGRESSION: a failed sweep on an unconfigured home still offers "Choose a 
 
   const banner = /function failureBanner\(trouble, navigate\)[\s\S]*?\n\}/m.exec(src);
   assert.ok(banner, 'failureBanner is missing');
-  assert.match(banner[0], /button\('Choose a model', \{[^}]*navigate\('#\/settings\/model'\)/,
+  assert.match(banner[0], /button\('Choose an AI', \{[^}]*navigate\('#\/settings\/model'\)/,
     'the banner on a modelless home does not open the model settings');
-  assert.match(banner[0], /button\('Connect a source', \{[^}]*navigate\('#\/settings\/mail'\)/,
+  assert.match(banner[0], /button\('Connect an email account', \{[^}]*navigate\('#\/settings\/mail'\)/,
     'the banner on a sourceless home does not open the mail settings');
-  assert.match(banner[0], /button\('Sweep again'/, 'a configured home still gets the retry');
+  assert.match(banner[0], /button\('Check again'/, 'a configured home still gets the retry');
+  // And on a home with no AI the sentence is about the choice, not about the
+  // address the engine would have called — the one thing the audit's reader
+  // had never typed and saw named in red.
+  assert.match(banner[0], /missing === 'model' \? NO_AI_YET/, 'the whole-failure copy on a modelless home still repeats the engine\'s error');
+  assert.match(src, /const NO_AI_YET = 'Zelos can’t read anything yet because no AI has been chosen\.'/);
   // The swap is on the whole-failure kind only: a partial failure read
   // something, and "Sweep again" there is real advice.
   assert.match(banner[0], /trouble === 'whole' \? missingSetup\(\) : null/);
@@ -2245,7 +2260,7 @@ test('REGRESSION: the Now view sends a failed sweep to the terminal or desktop.l
   // give, and corrected there first.
   assert.doesNotMatch(src, /zelos\.log/);
   assert.doesNotMatch(src, /The log in your Zelos home/);
-  const failed = /title: 'The last sweep did not finish',\n\s*detail: ([^\n]+)/.exec(src);
+  const failed = /title: 'The last check did not finish',\n\s*detail: ([^\n]+)/.exec(src);
   assert.ok(failed, 'the failed-sweep empty state is missing');
   assert.match(failed[1], /terminal/, 'the CLI case has to say the reason went to the terminal');
   assert.match(failed[1], /desktop\.log/, 'the desktop case has to name the file that exists');
@@ -2281,24 +2296,42 @@ test('REGRESSION: the About panel names /api/mcp as the one call that does not c
  * source because the forms need a layout engine; the sequence itself runs for
  * real against a fake fetch, two tests down.
  */
-test('Add a mailbox opens the simple form, and the simple form reaches the full one', () => {
+test('Add an email account opens the simple form, and the simple form reaches the full one beneath its card', () => {
   const src = fs.readFileSync(path.join(UI, 'views/settings.js'), 'utf8');
-  const simple = /export function simpleMailForm\(\{ onSaved, onCancel, onAdvanced \}\)[\s\S]*?\n\}/m.exec(src);
+  const simple = /export function simpleMailForm\(\{ onSaved, onCancel \}\)[\s\S]*?\n\}/m.exec(src);
   assert.ok(simple, 'simpleMailForm is missing');
 
-  // The Add path builds the simple form, and its Advanced hands the full form
-  // the blank the Add path always built — on the same id and keyRef, so a
-  // password Connect already stored is the one the full form saves.
+  // The Add path builds the simple form. The full form is the simple form's
+  // own: "Server settings (for experts)" opens it in a slot BENEATH the card
+  // — on the same id and keyRef, so a password Connect already stored is the
+  // one the full form saves — and its Cancel empties that slot, leaving the
+  // address and the card where they were. The old Advanced replaced the
+  // whole card and threw the typed address away.
   const panel = /export function mailPanel\([\s\S]*?\n\}/m.exec(src);
   assert.ok(panel, 'mailPanel is missing');
-  const add = /const addButton = button\('Add a mailbox'[\s\S]*?\n  \}\);/m.exec(panel[0]);
+  const add = /const addButton = button\('Add an email account'[\s\S]*?\n  \}\);/m.exec(panel[0]);
   assert.ok(add, 'the Add button is missing');
-  assert.match(add[0], /editor\.replaceChildren\(simpleMailForm\(\{/, 'Add a mailbox no longer opens the simple form');
-  assert.match(add[0], /onAdvanced: \(prefill\) => editor\.replaceChildren\(mailForm\(\{/, 'Advanced does not open the full form');
-  assert.match(add[0], /keyRef: prefill\.keyRef/, 'the full form opens on a different keyRef, so the stored password is lost');
-  assert.match(add[0], /\.\.\.prefill,/, 'what the guess found never reaches the full form');
+  assert.match(add[0], /editor\.replaceChildren\(simpleMailForm\(\{/, 'Add an email account no longer opens the simple form');
+  assert.ok(!/onAdvanced/.test(panel[0]), 'the panel still swaps the card for the full form');
+  const open = /async function openAdvanced\(\)[\s\S]*?\n  \}/m.exec(simple[0]);
+  assert.ok(open, 'openAdvanced is missing');
+  assert.match(open[0], /expertSlot\.replaceChildren\(mailForm\(\{/, 'the expert form does not open beneath the card');
+  assert.match(open[0], /\.\.\.prefill\(\),/, 'what the guess found never reaches the full form');
+  assert.match(open[0], /onCancel: \(\) => expertSlot\.replaceChildren\(\),/, 'closing the full form must leave the card, not the editor, behind');
+  assert.match(open[0], /if \(expertSlot\.children\.length\) \{ expertSlot\.replaceChildren\(\); return; \}/, 'pressing the expert button again must close the drawer');
+  const prefill = /const prefill = \(\) => \(\{[\s\S]*?\}\);/m.exec(simple[0]);
+  assert.ok(prefill, 'prefill is missing');
+  assert.match(prefill[0], /keyRef,/, 'the full form opens on a different keyRef, so the stored password is lost');
+  // The card and the slot are both in the returned form, slot after card.
+  const returned = /return el\('div', \{ class: 'account-form' \}, \[[\s\S]*?\]\);\n\}/m.exec(simple[0]);
+  assert.ok(returned, 'the simple form returns nothing');
+  assert.ok(returned[0].indexOf('card,') < returned[0].indexOf('expertSlot,'), 'the expert slot is not beneath the card');
   // Editing an account keeps the full form.
   assert.match(panel[0], /editor\.replaceChildren\(mailForm\(account, \{/, 'editing an account no longer uses the full form');
+  // The button says what it is, and there are exactly two: under the address
+  // before a card is up, and in the card after.
+  assert.equal(simple[0].split("'Server settings (for experts)'").length - 1, 2, 'one expert button under the address and one in the card — no third');
+  assert.ok(!/button\('Advanced'/.test(simple[0]), 'a bare "Advanced" is the label the audit\'s reader pressed hoping for help');
 
   // The guess comes from the server, by POST: the address travels in a body,
   // never in a query string.
@@ -2312,13 +2345,17 @@ test('Add a mailbox opens the simple form, and the simple form reaches the full 
   assert.match(simple[0], /\/\^https:\\\/\\\/\/\.test\(guess\.appPasswordUrl \|\| ''\)/, 'a non-https page would be linked');
   assert.match(simple[0], /el\('a', \{ class: 'btn', href: guess\.appPasswordUrl, target: '_blank', rel: 'noopener noreferrer', text: 'Get an app password' \}\)/);
 
-  // Nothing typed and nothing stored is refused in the full form's words,
-  // before anything goes out.
+  // Nothing typed and nothing stored is refused by the full form's rule,
+  // before anything goes out — in the card's own words, about the box the
+  // card has just opened: the old refusal said "paste it above" about a
+  // password box that was still folded away.
   assert.match(simple[0], /const passwordMissing = \(\) => !passInput\.value && !storedHere\.has\(keyRef\)/);
   const connect = /async function connect\(\)[\s\S]*?\n  \}/m.exec(simple[0]);
   assert.ok(connect, 'connect() is missing');
-  const guard = connect[0].indexOf('status.bad(NEEDS_PASSWORD)');
+  const guard = connect[0].indexOf('status.bad(needsPassword(guess))');
   assert.ok(guard > 0 && guard < connect[0].indexOf('connectSimpleMail('), 'Connect goes ahead with no password');
+  const reveal = connect[0].indexOf('revealPassword();');
+  assert.ok(reveal > 0 && reveal < guard, 'the password box must be opened before the card asks for a paste into it');
 
   // Microsoft's personal domains get the existing sign-in block, not a copy.
   assert.match(simple[0], /microsoft = microsoftSignIn\(\{/, 'the xoauth2 branch does not reuse the sign-in block');
@@ -2341,9 +2378,11 @@ test('Add a mailbox opens the simple form, and the simple form reaches the full 
  * dom.js's el()/replace() skip it; the fix is to paint the card through
  * replace(). The rest is what the server now says about HOW it knows.
  */
-test('the provider card prints no null, says how it knows, and keeps one route to the full form', () => {
+test('the provider card prints no null, says how it knows, and keeps one route to the full form', async () => {
+  stubBrowserGlobals();
+  const settings = await import(fileUrl(UI, 'views/settings.js'));
   const src = fs.readFileSync(path.join(UI, 'views/settings.js'), 'utf8');
-  const simple = /export function simpleMailForm\(\{ onSaved, onCancel, onAdvanced \}\)[\s\S]*?\n\}/m.exec(src);
+  const simple = /export function simpleMailForm\(\{ onSaved, onCancel \}\)[\s\S]*?\n\}/m.exec(src);
   assert.ok(simple, 'simpleMailForm is missing');
   assert.match(src, /import \{[^}]*\breplace\b[^}]*\} from '\.\.\/lib\/dom\.js'/, 'replace() is not imported from dom.js');
 
@@ -2352,16 +2391,17 @@ test('the provider card prints no null, says how it knows, and keeps one route t
   assert.match(dom, /function append\(node, children\) \{\n  if \(children === null \|\| children === undefined \|\| children === false\) return;/);
   assert.match(dom, /export function replace\(node, children\) \{\n  node\.replaceChildren\(\);\n  append\(node, children\);/);
 
-  // No native replaceChildren call in the simple form carries a child that
+  // No native replaceChildren call that paints the CARD carries a child that
   // can be null: walk each call to its closing paren and look for a ternary
-  // or && that yields one.
+  // or && that yields one. (The expert slot's call opens the full form on an
+  // account literal, whose `requireTls: null` is a value, not a child.)
   const calls = [];
   let from = 0;
   for (;;) {
-    const at = simple[0].indexOf('.replaceChildren(', from);
+    const at = simple[0].indexOf('card.replaceChildren(', from);
     if (at < 0) break;
     let depth = 0;
-    let end = at + '.replaceChildren('.length - 1;
+    let end = at + 'card.replaceChildren('.length - 1;
     for (; end < simple[0].length; end += 1) {
       if (simple[0][end] === '(') depth += 1;
       else if (simple[0][end] === ')') { depth -= 1; if (depth === 0) break; }
@@ -2373,30 +2413,42 @@ test('the provider card prints no null, says how it knows, and keeps one route t
   for (const call of calls) {
     assert.ok(!/:\s*null\b/.test(call) && !/&&\s*el\(/.test(call), `a native replaceChildren carries a child that can be null — the card prints "null":\n${call}`);
   }
-  // The password branch — the one with the optional link — goes through replace().
-  assert.match(simple[0], /replace\(card, \[\n\s+head,\n\s+note,\n\s+page \? el\('div', \{ class: 'row-inline' \}, \[page\]\) : null,/, 'the app-password link is not painted through replace()');
+  // The password branch — the one with the optional link — goes through
+  // replace(), and the optional link is built into the password path with el(),
+  // which skips a null child too.
+  assert.match(simple[0], /replace\(card, \[\n\s+head,\n\s+note,\n\s+passwordPath,/, 'the app-password path is not painted through replace()');
+  assert.match(simple[0], /const passwordPath = el\('div', \{ class: 'stack' \}, \[\n\s+page \? el\('div', \{ class: 'row-inline' \}, \[page\]\) : null,/, 'the optional link is not built through el()');
 
-  // The mono line says how the server knows, for a domain it looked up.
+  // The mono line says how the server knows, for a domain it looked up — and
+  // only for one it looked up. A recognised provider shows its name and not
+  // "imap.gmail.com:993", which read to the audit's reader as an address to
+  // check; the server's own line is kept one drawer down.
   const paint = /function paintCard\(\)[\s\S]*?\n  \}/m.exec(simple[0]);
   assert.ok(paint, 'paintCard is missing');
   assert.match(paint[0], /guess\.via === 'mx' \? ' · found through your domain\\'s mail records'/, 'an MX hit does not say so');
   assert.match(paint[0], /guess\.via === 'srv' \? ' · advertised by your domain'/, 'an SRV hit does not say so');
-  assert.match(paint[0], /text: `\$\{guess\.host\}:\$\{guess\.port\}\$\{via\}`/, 'the via line is built but not shown');
-  assert.match(paint[0], /We guessed \$\{guess\.host\}/, 'a plain guess no longer says it is guessing');
-  assert.match(paint[0], /guess\.known \|\| guess\.via === 'srv'\n\s+\? guess\.note/, 'an SRV answer is described as a guess');
+  assert.match(paint[0], /guess\.host && !guess\.known \? el\('span', \{ class: 'mono account-host', text: `\$\{guess\.host\}:\$\{guess\.port\}\$\{via\}` \}\) : null/, 'the via line is shown for a recognised provider, or not shown for a guess');
+  assert.match(paint[0], /text: `\$\{guess\.host\}:\$\{guess\.port\}\$\{via\}\. \$\{guess\.note\}`/, 'the server\'s own note and host are gone rather than folded');
+  assert.match(paint[0], /const note = el\('p', \{ class: 'quiet-note', text: plainProviderNote\(guess\) \}\)/, 'the card\'s note is not the plain one');
+  // A plain guess still says it is guessing, in plainProviderNote's words.
+  assert.match(settings.plainProviderNote({ host: 'imap.hale.example', port: 993, known: false }), /We guessed imap\.hale\.example — Connect will tell you if that is right/);
+  assert.match(settings.plainProviderNote({ host: 'imap.gmail.com', port: 993, known: true, label: 'Gmail', signIn: 'google', clientReady: false }), /16-letter password/);
+  assert.match(settings.plainProviderNote({ host: 'imap.mail.me.com', port: 993, known: true, label: 'iCloud Mail' }), /^iCloud needs a special password/);
 
-  // One route to the full form: the card's Advanced, and nothing added on failure.
+  // One route to the full form: the card's expert button, and nothing added on failure.
   const connect = /async function connect\(\)[\s\S]*?\n  \}/m.exec(simple[0]);
   assert.ok(connect, 'connect() is missing');
   assert.ok(!/openAdvanced/.test(connect[0]), 'connect() builds its own way to the full form');
   assert.ok(!/\bfallback\b/.test(simple[0]), 'the failure-path container is still there');
-  assert.equal(simple[0].split("button('Advanced'").length - 1, 2, 'one Advanced under the address (hidden once a card is up) and one in the card — no third');
+  assert.equal(simple[0].split("'Server settings (for experts)'").length - 1, 2, 'one expert button under the address (hidden once a card is up) and one in the card — no third');
   // And the password a failed Connect stored still carries over.
   assert.match(connect[0], /storedHere\.add\(keyRef\)/);
-  assert.match(simple[0], /if \(storedHere\.size\) await loadConfig\(\)\.catch\(\(\) => \{\}\);\n\s+onAdvanced\(prefill\(\)\);/);
+  assert.match(simple[0], /if \(storedHere\.size\) await loadConfig\(\)\.catch\(\(\) => \{\}\);\n\s+expertSlot\.replaceChildren\(mailForm\(\{/);
 
-  // The hint under the address says what goes to DNS: the domain, never the address.
-  assert.match(simple[0], /hint: 'Zelos works out the provider from it\. The address goes to the Zelos server on this machine and nowhere else\. For a domain Zelos does not recognise, it asks your DNS resolver who handles mail for the domain — the domain only, never the address\.'/);
+  // The hint under the address is one sentence, and it is about the person,
+  // not about DNS. (What goes to the resolver — the domain, never the address
+  // — is still true, still in core/sources/imap.mjs, and pinned there.)
+  assert.match(simple[0], /hint: 'Your address stays on this computer\.'/);
 });
 
 test('Connect stores, tests, reads the sent folder and saves — in that order and no other', () => {
@@ -2554,9 +2606,9 @@ test('Sign in with Google has the shape of Sign in with Microsoft, and opens Goo
   assert.ok(!/href:[^\n]*address\(\)/.test(flow) && !/href:[^\n]*email/.test(flow), 'the address is put in a URL');
 });
 
-test('a Gmail address is offered Google first, and the app password stays one link beneath', () => {
+test('a Gmail address is offered Google first when Zelos can sign in, and the app password first when it cannot', () => {
   const src = fs.readFileSync(path.join(UI, 'views/settings.js'), 'utf8');
-  const simple = /export function simpleMailForm\(\{ onSaved, onCancel, onAdvanced \}\)[\s\S]*?\n\}/m.exec(src);
+  const simple = /export function simpleMailForm\(\{ onSaved, onCancel \}\)[\s\S]*?\n\}/m.exec(src);
   assert.ok(simple, 'simpleMailForm is missing');
   const paint = /function paintCard\(\)[\s\S]*?\n  \}/m.exec(simple[0]);
   assert.ok(paint, 'paintCard is missing');
@@ -2564,22 +2616,33 @@ test('a Gmail address is offered Google first, and the app password stays one li
   // The Google branch comes before the password one, reuses the one block,
   // and paints through replace() like the password branch (a null page link).
   const google = paint[0].indexOf("if (guess.signIn === 'google') {");
-  const password = paint[0].indexOf('replace(card, [\n      head,\n      note,\n      page ?');
+  const password = paint[0].indexOf('replace(card, [\n      head,\n      note,\n      passwordPath,');
   assert.ok(google > 0, 'no branch for a provider that signs in with Google');
   assert.ok(password > google, 'the password card is painted before the Google one is considered');
-  assert.match(paint[0], /google = googleSignIn\(\{\n\s+keyRef,\n\s+email,\n\s+clientReady: guess\.clientReady === true,/, 'the card does not reuse the Google block, or does not pass the server\'s clientReady');
+  assert.match(paint[0], /const ready = guess\.clientReady === true;/, 'the card does not read the server\'s clientReady');
+  assert.match(paint[0], /google = googleSignIn\(\{\n\s+keyRef,\n\s+email,\n\s+clientReady: ready,/, 'the card does not reuse the Google block, or does not pass the server\'s clientReady');
   const branch = paint[0].slice(google, password);
-  assert.match(branch, /replace\(card, \[\n\s+head,\n\s+note,\n\s+google\.node,\n\s+usePassword,\n\s+passwordPath,/, 'the Google block is not first, or the password path is not beneath it');
+  // With a client: Google first, password one link beneath. Without one —
+  // which is every build until Google's review is done — the app password IS
+  // the card, and the sign-in with its "paste your own client" fields is a
+  // drawer a developer opens. The audit's reader met the sign-in first, was
+  // told it did not work yet, and was asked for a Google Cloud client.
+  assert.match(branch, /replace\(card, ready\n\s+\? \[\n\s+head,\n\s+note,\n\s+google\.node,\n\s+usePassword,\n\s+passwordPath,/, 'with a client the Google block is not first, or the password path is not beneath it');
+  assert.match(branch, /: \[\n\s+head,\n\s+note,\n\s+passwordPath,\n[\s\S]*?fold\('For developers', google\.node\),/, 'without a client the password path is not the card, or the sign-in is not folded under For developers');
 
   // The password path is the existing nodes, hidden with [hidden] until the
-  // link is pressed, and the link is the only thing that reveals it.
+  // link is pressed when a sign-in is on offer — and on screen from the start
+  // when it is the only way in. Connect opens it too, before it asks for a
+  // paste into it.
   assert.match(branch, /button\('Use an app password instead', \{\n\s+class: 'link',/, 'there is no "Use an app password instead" link');
-  assert.match(branch, /passwordPath\.hidden = true;/, 'the password path is on screen before anyone asked for it');
+  assert.match(branch, /passwordPath\.hidden = ready;/, 'the password path is hidden when it is the only way in, or shown when a sign-in is on offer');
+  assert.match(branch, /usePassword\.hidden = !ready;/, 'the link to a hidden path is offered when nothing is hidden');
   assert.match(branch, /onClick: \(\) => \{ passwordPath\.hidden = false; usePassword\.hidden = true; \}/, 'the link does not reveal the password path');
-  assert.match(branch, /field\('App password', passInput,/, 'the password path is a second password field, not the existing one');
+  assert.match(branch, /revealPassword = \(\) => \{ passwordPath\.hidden = false; usePassword\.hidden = true; \};/, 'Connect has no way to open the password box');
+  assert.match(paint[0], /field\('App password', passInput,/, 'the password path is a second password field, not the existing one');
   // Still exactly one route to the full form, and the simple form still
   // makes none of the OAuth calls itself.
-  assert.equal(simple[0].split("button('Advanced'").length - 1, 2, 'the Google card added a route to the full form');
+  assert.equal(simple[0].split("'Server settings (for experts)'").length - 1, 2, 'the Google card added a route to the full form');
   for (const call of ['beginMailOAuth', 'mailOAuthStatus', 'cancelMailOAuth']) {
     assert.ok(!simple[0].includes(`api.${call}(`), `the simple form carries its own api.${call}`);
   }
@@ -2587,10 +2650,11 @@ test('a Gmail address is offered Google first, and the app password stays one li
   for (const stop of ['microsoft?.stop();\n    google?.stop();', 'microsoft?.stop(); google?.stop(); onCancel();']) {
     assert.ok(simple[0].includes(stop), `a Google poll outlives its card: ${stop}`);
   }
-  // The onboarding step no longer promises that Gmail refuses everything but a paste.
+  // The onboarding step promises nothing about providers; the card does the
+  // explaining once the address is typed.
   const onboarding = fs.readFileSync(path.join(UI, 'views/onboarding.js'), 'utf8');
   assert.ok(!/Gmail, iCloud and Yahoo will all refuse your normal password/.test(onboarding), 'onboarding still says Gmail only takes an app password');
-  assert.match(onboarding, /Gmail and Outlook sign you in with the provider itself/, 'onboarding does not say Gmail signs in');
+  assert.match(onboarding, /Type your email address and Zelos will show you the next step\./, 'the email step does not say the one thing it needs to');
 });
 
 test('the Google client secret is typed into a password field, sent once and not kept', () => {
@@ -2678,7 +2742,7 @@ test('Connect on a mailbox signed in with Google saves an OAuth account and stor
   // this: a guess that said "password" becomes xoauth2 once the sign-in has
   // landed, with the block's own oauth() and no password.
   const src = fs.readFileSync(path.join(UI, 'views/settings.js'), 'utf8');
-  const simple = /export function simpleMailForm\(\{ onSaved, onCancel, onAdvanced \}\)[\s\S]*?\n\}/m.exec(src);
+  const simple = /export function simpleMailForm\(\{ onSaved, onCancel \}\)[\s\S]*?\n\}/m.exec(src);
   assert.ok(simple, 'simpleMailForm is missing');
   assert.match(simple[0], /const viaGoogle = \(\) => guess\?\.signIn === 'google' && signedIn;/, 'the form cannot tell a Google sign-in has landed');
   const connect = /async function connect\(\)[\s\S]*?\n  \}/m.exec(simple[0]);
@@ -2734,19 +2798,37 @@ test('the Microsoft registration form is hidden when the server ships the client
   const src = fs.readFileSync(path.join(UI, 'views/settings.js'), 'utf8');
   const flow = /\nfunction microsoftSignIn\(\{ keyRef, user, clientId = '', tenantId = 'common', clientReady = false,[\s\S]*?\n\}/m.exec(src);
   assert.ok(flow, 'microsoftSignIn does not take clientReady');
-  // Hidden with [hidden], so the CSS rule every disclosure relies on applies;
-  // the fields stay, because a tenant of one's own is typed into them.
+  // Folded under "For work accounts (advanced)" and hidden with [hidden], so
+  // the CSS rule every disclosure relies on applies; the fields stay, because
+  // a tenant of one's own is typed into them. A shipped client hides the
+  // whole drawer; without one the drawer is there, closed, and the button
+  // above it is still the first thing.
   assert.match(flow[0], /const registration = el\('div', \{ class: 'stack' \}, \[\n\s+field\('Application \(client\) ID', clientIdInput,/, 'the fields are not wrapped to be hidden');
-  assert.match(flow[0], /registration\.hidden = clientReady;/, 'the registration form is not hidden for a shipped client');
+  assert.match(flow[0], /const workAccounts = fold\('For work accounts \(advanced\)', registration\);/, 'the registration fields are on the card rather than in a drawer');
+  assert.match(flow[0], /workAccounts\.hidden = clientReady;/, 'the registration drawer is not hidden for a shipped client');
   // The id is required only when there is no client to fall back on, and is
-  // sent only when typed — the provider is always named.
-  assert.match(flow[0], /if \(!clientReady && !clientIdInput\.value\.trim\(\)\)/, 'a shipped client still demands a client id');
+  // sent only when typed — the provider is always named. And when it is
+  // missing, the big button answers with the page that walks through the
+  // one-time setup, never with a sentence about an "application (client) ID".
+  assert.match(flow[0], /if \(!clientReady && !clientIdInput\.value\.trim\(\)\) \{/, 'a shipped client still demands a client id');
+  const missing = /if \(!clientReady && !clientIdInput\.value\.trim\(\)\) \{[\s\S]*?\n {6}return;\n {4}\}/.exec(flow[0]);
+  assert.ok(missing, 'the missing-client branch is gone');
+  assert.ok(!/is required/.test(missing[0]), 'the button still answers "…ID is required"');
+  assert.match(missing[0], /setupLink\(setupUrl\)/, 'the button does not route to the setup page');
+  assert.match(src, /function setupLink\(href\)[\s\S]*?text: 'Show me how ↗'/, 'there is no Show me how link');
+  // The page itself is the server's (GET /api/guides): ui/ names no remote host.
+  assert.ok(!/github\.com|OAUTH\.md#/.test(src.replace(/^\s*(\*|\/\/).*$/gm, '')), 'the setup page is spelled out in ui/');
+  const server = fs.readFileSync(path.join(ROOT, 'core/server.mjs'), 'utf8');
+  assert.match(server, /microsoftSetup: 'https:\/\/github\.com\/HoosAILLC\/zelos\/blob\/main\/docs\/OAUTH\.md#microsoft/, 'the server does not point at the OAuth doc\'s Microsoft section');
   assert.match(flow[0], /api\.beginMailOAuth\(\{\n\s+provider: 'microsoft',\n\s+keyRef,\n\s+\.\.\.\(chosen\.clientId \? \{ clientId: chosen\.clientId \} : \{\}\),/, 'the Microsoft flow does not name its provider, or sends an empty client id');
   assert.match(flow[0], /const oauth = \(\) => \(\{ provider: 'microsoft', clientId:/, 'a Microsoft account is saved without its provider');
-  // And the simple form passes the server's word for it.
-  const simple = /export function simpleMailForm\(\{ onSaved, onCancel, onAdvanced \}\)[\s\S]*?\n\}/m.exec(src);
+  // And the simple form passes the server's word for it, and puts the setup
+  // page on the card before the button when there is no client to press it with.
+  const simple = /export function simpleMailForm\(\{ onSaved, onCancel \}\)[\s\S]*?\n\}/m.exec(src);
   assert.ok(simple, 'simpleMailForm is missing');
   assert.match(simple[0], /microsoft = microsoftSignIn\(\{\n\s+keyRef,\n\s+user: email,[\s\S]*?clientReady: guess\.clientReady === true,/, 'the card does not pass clientReady to the Microsoft block');
+  assert.match(simple[0], /guess\.clientReady \? null : el\('div', \{ class: 'row-inline' \}, \[setupLink\(guess\.setupUrl\)\]\)/, 'a Hotmail card with no client does not show the way to the one-time setup');
+  assert.match(simple[0], /Promise\.all\(\[api\.guessMail\(address\), guideLinks\(\)\]\)/, 'the card does not ask the server for the setup page');
 });
 
 test('beginMailOAuth names the provider and carries the secret and address, and an old caller sends what it always sent', async (t) => {
@@ -2781,3 +2863,682 @@ test('beginMailOAuth names the provider and carries the secret and address, and 
 function reqPathHolds(reqPath, text) {
   return String(reqPath).includes(encodeURIComponent(text)) || String(reqPath).includes(text);
 }
+
+/* ------------------------------------------------- 7. plain words */
+
+/**
+ * A persona audit — a 70-year-old who has never heard of IMAP — stopped at
+ * the first screen ("Nothing answered on the four ports"), at the AI step
+ * ("Base URL", "OS keychain", "config.json"), at the mail card ("over IMAP",
+ * "DNS resolver", "Entra app registration"), at the calendar step ("CalDAV",
+ * ".ics", "webcal://") and at Settings → Data (`rm -rf`). Every one of those
+ * words is still in the product, under a control that says "Advanced" or
+ * "for experts"; none of them may be on the screen before that control is
+ * pressed.
+ *
+ * These tests RENDER the screens against a small DOM and read what is not
+ * hidden, rather than grepping the source: a source grep cannot tell a word
+ * under a closed drawer from one on the card. The DOM is the same fifty
+ * lines the connector-seam suite uses — ui/lib/dom.js is createElement and
+ * textContent and nothing else, so "enough DOM" is genuinely small. It is
+ * swapped in for the duration of each test and swapped back, because
+ * stubBrowserGlobals() above installs a document whose createElement throws,
+ * on purpose, for the tests that must not build one.
+ */
+class PlainNode {
+  constructor(tag) {
+    this.tag = tag;
+    this.attributes = {};
+    this.children = [];
+    this.dataset = {};
+    this.listeners = new Map();
+    this.textContent = '';
+    this.value = '';
+    this.checked = false;
+    this.disabled = false;
+    this.hidden = false;
+    this.parentNode = null;
+    this.style = { setProperty() {}, height: '', width: '' };
+    this.classList = { add() {}, remove() {}, toggle() {} };
+  }
+
+  get firstChild() { return this.children[0] ?? null; }
+
+  get isConnected() { return true; }
+
+  /** A `value` attribute is an input's default value, which a browser reflects as `.value` until someone types. */
+  setAttribute(key, value) {
+    this.attributes[key] = String(value);
+    if (key === 'value') this.value = String(value);
+  }
+
+  getAttribute(key) { return this.attributes[key] ?? null; }
+
+  removeAttribute(key) { delete this.attributes[key]; }
+
+  toggleAttribute(key, force) {
+    const on = force === undefined ? !(key in this.attributes) : Boolean(force);
+    if (on) this.attributes[key] = ''; else delete this.attributes[key];
+    return on;
+  }
+
+  addEventListener(type, fn) {
+    if (!this.listeners.has(type)) this.listeners.set(type, []);
+    this.listeners.get(type).push(fn);
+  }
+
+  removeEventListener() {}
+
+  appendChild(child) { child.parentNode = this; this.children.push(child); return child; }
+
+  replaceChildren(...kids) {
+    for (const kid of kids) kid.parentNode = this;
+    this.children = kids;
+  }
+
+  replaceWith(other) {
+    const p = this.parentNode;
+    if (!p) return;
+    p.children = p.children.map((c) => (c === this ? other : c));
+    other.parentNode = p;
+  }
+
+  remove() {}
+
+  focus() {}
+
+  click() { this.fire('click'); }
+
+  scrollIntoView() {}
+
+  closest(selector) {
+    const cls = selector.replace(/^\./, '');
+    for (let n = this; n; n = n.parentNode) {
+      if ((n.attributes.class || '').split(/\s+/).includes(cls)) return n;
+    }
+    return null;
+  }
+
+  querySelectorAll() { return []; }
+
+  /** Fire a listener the way a browser would: `this` is the node, as is the target. */
+  fire(type) {
+    for (const fn of this.listeners.get(type) ?? []) fn.call(this, { target: this, currentTarget: this, preventDefault() {} });
+  }
+}
+
+function withPlainDom(t) {
+  stubBrowserGlobals();
+  const realDoc = globalThis.document;
+  const realNode = globalThis.Node;
+  const realRaf = globalThis.requestAnimationFrame;
+  globalThis.Node = PlainNode;
+  globalThis.document = {
+    documentElement: { style: { setProperty() {} } },
+    visibilityState: 'visible',
+    addEventListener() {},
+    removeEventListener() {},
+    createElement: (tag) => new PlainNode(tag),
+    createTextNode: (text) => {
+      const node = new PlainNode('#text');
+      node.textContent = String(text);
+      return node;
+    },
+    body: new PlainNode('body'),
+    activeElement: null,
+  };
+  globalThis.requestAnimationFrame = (fn) => { fn(); return 0; };
+  t.after(() => {
+    globalThis.document = realDoc;
+    globalThis.Node = realNode;
+    globalThis.requestAnimationFrame = realRaf;
+  });
+}
+
+const plainWalk = (node, out = []) => {
+  out.push(node);
+  for (const child of node.children ?? []) plainWalk(child, out);
+  return out;
+};
+
+/** True when the node or any ancestor is hidden — by property or by attribute. */
+const plainHidden = (node) => {
+  for (let n = node; n; n = n.parentNode) {
+    if (n.hidden === true || 'hidden' in (n.attributes || {})) return true;
+  }
+  return false;
+};
+
+/** Every string a person can SEE in a rendered tree: text, placeholders, labels — not what is folded away. */
+const onScreen = (root) => plainWalk(root)
+  .filter((n) => !plainHidden(n))
+  .flatMap((n) => [n.textContent, n.attributes?.placeholder, n.attributes?.['aria-label'], n.attributes?.title])
+  .filter(Boolean)
+  .join(' | ');
+
+/** Every string in a rendered tree, hidden or not. */
+const anywhere = (root) => plainWalk(root).map((n) => n.textContent).filter(Boolean).join(' | ');
+
+/** A node's own text plus its descendants' — a button built by dom.js carries its label as a text-node child. */
+const textOf = (n) => [n.textContent, ...(n.children ?? []).map(textOf)].filter(Boolean).join('');
+const findButton = (root, label) => plainWalk(root).find((n) => n.tag === 'button' && textOf(n) === label);
+const findButtons = (root, re) => plainWalk(root).filter((n) => n.tag === 'button' && re.test(textOf(n)));
+const findInput = (root, pred) => plainWalk(root).find((n) => (n.tag === 'input' || n.tag === 'select' || n.tag === 'textarea') && pred(n));
+
+/**
+ * The words a first-timer must not meet. Each is a protocol, a file name, a
+ * port, a token, or the engine's own vocabulary ("model", "sweep",
+ * "runtime", "source"); all of them are still in the product, one drawer
+ * down. `\b` keeps "important" and "support" from tripping "port".
+ */
+const JARGON = /\b(IMAP|CalDAV|endpoints?|keychain|config\.json|DNS|ports?|tokens?|models?|sweeps?|sweeping|swept|runtimes?|OAuth|XOAUTH2|SMTP|TLS|STARTTLS|PKCE|MCP|Entra|tenant|SRV|MX|API|URL|webcal|base url|client id|protocol)\b|secrets\.enc|\.seed/i;
+
+/** The real presets, so the guided cards are tested against what the server would send. */
+const llmPresets = async () => (await import(fileUrl(ROOT, 'core/llm.mjs'))).PRESETS;
+const connectorManifests = async () => JSON.parse(JSON.stringify((await import(fileUrl(ROOT, 'core/connectors/index.mjs'))).describe()));
+
+/**
+ * A fetch for the screens under test. Every route the onboarding and the
+ * Settings panels call, answered with the server's real shapes; anything
+ * else throws, so a screen that reaches somewhere new says so.
+ */
+function plainFetch({ probe = [], guesses = {}, presets, manifests, guides = GUIDES, calls = [] } = {}) {
+  const ok = (body, status = 200) => ({ ok: status < 400, status, text: async () => JSON.stringify(body) });
+  let config = { identity: { name: '', email: '' }, model: {}, mail: [], calendars: [], sources: [], sweep: { intervalMinutes: 30, activeHours: [6, 23], auto: true }, privacy: { sendBodies: true, bodyChars: 4000, maxItemsPerSweep: 150 } };
+  return async (reqPath, init = {}) => {
+    const body = init.body ? JSON.parse(init.body) : null;
+    calls.push({ method: init.method || 'GET', path: reqPath, body });
+    if (reqPath === '/api/local/probe') return ok(probe);
+    if (reqPath === '/api/model/presets') return ok(presets);
+    if (reqPath === '/api/guides') return ok(guides);
+    if (reqPath === '/api/sample-data') return ok({ installed: false, summary: 'A made-up week.' });
+    if (reqPath === '/api/connectors') return ok({ connectors: manifests });
+    if (reqPath === '/api/mail/guess') {
+      const found = guesses[body.email];
+      return found ? ok(found) : ok({ error: 'no guess' }, 400);
+    }
+    if (reqPath === '/api/secrets') return ok({ ok: true });
+    if (reqPath === '/api/model/test') return ok({ ok: true, ms: 12, sample: 'Hello.' });
+    if (reqPath === '/api/config') {
+      if ((init.method || 'GET') === 'PUT') config = { ...config, ...body };
+      return ok({ config, errors: [], secretRefs: [] });
+    }
+    if (reqPath === '/api/health') return ok({ model: { configured: false }, home: '/tmp/zelos-home', backend: { name: 'encrypted-file', writable: true, note: 'This does NOT protect against a process already running as this user.' } });
+    if (reqPath === '/api/state') return ok({ items: [], events: [], notes: [], counts: {}, runs: {} });
+    if (reqPath.startsWith('/api/ai')) return ok({ error: 'not found' }, 404);
+    throw new Error(`unexpected ${init.method || 'GET'} ${reqPath}`);
+  };
+}
+
+/** What GET /api/guides answers — the shape core/server.mjs serves, with reserved hosts. */
+const GUIDES = {
+  microsoftSetup: 'https://docs.example/oauth#microsoft',
+  calendars: {
+    google: { settings: 'https://calendar.example/settings' },
+    icloud: { caldav: 'https://caldav.example/', appPasswords: 'https://appleid.example/manage' },
+    outlook: { calendar: 'https://outlook.example/calendar/' },
+  },
+};
+
+const GUESSES = {
+  'frank@gmail.com': { label: 'Gmail', host: 'imap.gmail.com', port: 993, secure: true, auth: 'password', signIn: 'google', clientReady: false, appPasswordUrl: 'https://myaccount.google.com/apppasswords', note: '"Sign in with Google" connects this mailbox in one step. Gmail requires 2-Step Verification plus a 16-character App Password. This provider does not accept your normal password over IMAP.', known: true },
+  'frank@hotmail.com': { label: 'Outlook / Microsoft', host: 'outlook.office365.com', port: 993, secure: true, auth: 'xoauth2', signIn: 'microsoft', clientReady: false, appPasswordUrl: null, note: 'Microsoft switched password sign-in off for personal Outlook, Hotmail, Live and MSN accounts on 16 September 2024. Zelos asks you to register a free app in your own Microsoft account.', known: true },
+  'frank@icloud.com': { label: 'iCloud Mail', host: 'imap.mail.me.com', port: 993, secure: true, auth: 'password', signIn: null, clientReady: false, appPasswordUrl: 'https://account.apple.com/account/manage', note: 'iCloud Mail requires an app-specific password. This provider does not accept your normal password over IMAP.', known: true },
+};
+
+test('no screen in onboarding, and no mail card, shows a first-timer a protocol word', async (t) => {
+  withPlainDom(t);
+  const calls = [];
+  globalThis.fetch = plainFetch({ presets: await llmPresets(), manifests: await connectorManifests(), guesses: GUESSES, calls });
+  t.after(() => { delete globalThis.fetch; });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const onboarding = await import(fileUrl(UI, 'views/onboarding.js'));
+  store.state.config = { identity: {}, model: {}, mail: [], calendars: [], sources: [] };
+  store.state.health = { model: { configured: false }, backend: { name: 'encrypted-file' } };
+  store.state.secretRefs = [];
+
+  let view = null;
+  const ctx = { navigate() {}, rerender() { view = onboarding.renderOnboarding(ctx); } };
+  ctx.rerender();
+  const stepButton = (n) => plainWalk(view).filter((b) => b.tag === 'button' && (b.attributes.class || '').includes('ob-step-btn'))[n - 1];
+  const goTo = (n) => { stepButton(n).fire('click'); };
+
+  // 1. Welcome: the names of all five steps, the count, the two buttons, no probe text.
+  let seen = onScreen(view);
+  assert.match(seen, /Step 1 of 5/);
+  for (const name of ['Welcome', 'AI', 'Email', 'Calendar', 'Done']) assert.match(seen, new RegExp(`\\b${name}\\b`), `step name ${name} is not on the first screen`);
+  assert.match(seen, /Zelos reads your email and calendar, and tells you what needs you\./);
+  assert.match(seen, /It never sends, moves or deletes anything\. Everything stays on this computer\./);
+  assert.ok(findButton(view, 'Set up Zelos'), 'no "Set up Zelos" button');
+  await settle();
+  assert.ok(findButton(view, 'Look around with made-up data first'), 'no "Look around with made-up data first" button');
+  assert.doesNotMatch(onScreen(view), JARGON, `the welcome screen: ${onScreen(view).match(JARGON)?.[0]}`);
+  assert.ok(!calls.some((c) => c.path === '/api/local/probe'), 'the welcome screen must not probe for a local runtime');
+
+  // 2. AI: two named cards, then a guided card with one button and one key box.
+  goTo(2);
+  await settle();
+  seen = onScreen(view);
+  assert.match(seen, /Step 2 of 5/);
+  assert.match(seen, /Pick the AI that reads your mail\./);
+  assert.ok(findButtons(view, /^Claude, by Anthropic — Recommended/).length === 1, 'no Claude card');
+  assert.ok(findButtons(view, /^OpenAI, who make ChatGPT/).length === 1, 'no OpenAI card');
+  assert.doesNotMatch(seen, JARGON, `the AI step before a choice: ${seen.match(JARGON)?.[0]}`);
+  assert.doesNotMatch(seen, /Nothing answered|four ports/, 'the probe sentence is on the AI step');
+  assert.match(anywhere(view), /Ollama on 11434/, 'the probe sentence is gone rather than folded');
+  findButtons(view, /^Claude, by Anthropic/)[0].fire('click');
+  seen = onScreen(view);
+  assert.match(seen, /1\. Open.*Anthropic’s key page ↗.*they may ask you to sign in or make an account/);
+  assert.match(seen, /2\. Press Create Key and copy it\./);
+  assert.match(seen, /3\. Paste it here\./);
+  assert.match(seen, /Pay-as-you-go\. You can set a monthly spending cap on their site\./);
+  assert.doesNotMatch(seen, /[$€£]\s?\d|\d\s?(a|per) month/i, 'a price was invented');
+  assert.ok(findButton(view, 'Check it works'), 'no "Check it works" button');
+  assert.doesNotMatch(seen, JARGON, `the guided AI card: ${seen.match(JARGON)?.[0]}`);
+  assert.match(anywhere(view), /Base URL/, 'the expert form is gone rather than folded');
+  // Pressing the button with nothing pasted says so, in the service's name.
+  findButton(view, 'Check it works').fire('click');
+  await settle();
+  assert.match(onScreen(view), /Paste the key first — Claude will not answer without one\./);
+  assert.doesNotMatch(onScreen(view), JARGON, `the refusal: ${onScreen(view).match(JARGON)?.[0]}`);
+
+  // 3. Email: the address, then the card — Gmail without a client, Hotmail without a client, iCloud.
+  goTo(3);
+  seen = onScreen(view);
+  assert.match(seen, /Step 3 of 5/);
+  assert.match(seen, /Connect your email\./);
+  assert.doesNotMatch(seen, JARGON, `the email step: ${seen.match(JARGON)?.[0]}`);
+  findButton(view, 'Add an email account').fire('click');
+  seen = onScreen(view);
+  assert.match(seen, /Your address stays on this computer\./);
+  assert.ok(findButton(view, 'Server settings (for experts)'), 'no expert button under the address');
+  assert.doesNotMatch(seen, JARGON, `the empty email form: ${seen.match(JARGON)?.[0]}`);
+  const emailInput = findInput(view, (n) => n.attributes.type === 'email');
+  for (const [address, expect] of [
+    ['frank@gmail.com', /Google does not let other programs use your normal password[\s\S]*16-letter password just for Zelos[\s\S]*2-Step Verification/],
+    ['frank@hotmail.com', /Hotmail and Outlook\.com need a one-time setup at Microsoft’s website first — about ten minutes/],
+    ['frank@icloud.com', /iCloud needs a special password made just for Zelos/],
+  ]) {
+    emailInput.value = address;
+    emailInput.fire('change');
+    await settle();
+    seen = onScreen(view);
+    assert.match(seen, expect, `${address}: the card does not say the plain thing`);
+    assert.doesNotMatch(seen, JARGON, `${address}: ${seen.match(JARGON)?.[0]}`);
+    assert.doesNotMatch(seen, /imap\.|outlook\.office365|:993/, `${address}: the card shows a host`);
+    // The server's own note — host, port and all — appears with the expert
+    // form, which opens BENEATH the card and closes back to it. The card and
+    // the address survive the round trip; the old Advanced replaced both.
+    assert.doesNotMatch(anywhere(view), /over IMAP|register a free app/, `${address}: the server's note is on screen before anyone asked`);
+    const expert = findButtons(view, /^Server settings \(for experts\)$/).find((b) => !plainHidden(b));
+    assert.ok(expert, `${address}: no expert button on the card`);
+    expert.fire('click');
+    await settle();
+    assert.match(anywhere(view), /over IMAP|register a free app/, `${address}: the server's own note is gone rather than folded`);
+    assert.match(onScreen(view), new RegExp(GUESSES[address].host.replace(/\./g, '\\.')), `${address}: the expert form does not show the host`);
+    expert.fire('click');
+    await settle();
+    assert.doesNotMatch(onScreen(view), /IMAP host/, `${address}: the expert form did not close`);
+    assert.equal(emailInput.value, address, `${address}: closing the expert form lost the address`);
+    assert.match(onScreen(view), expect, `${address}: closing the expert form lost the card`);
+  }
+  // Gmail: Connect with nothing pasted opens the password box and says what to paste.
+  emailInput.value = 'frank@gmail.com';
+  emailInput.fire('change');
+  await settle();
+  assert.match(onScreen(view), /Google opens in a new tab and may ask you to sign in\. Type a name like ‘Zelos’, press Create, copy the 16 letters, then come back here and paste them\./);
+  assert.ok(plainWalk(view).some((n) => n.tag === 'a' && textOf(n) === 'Get an app password' && !plainHidden(n)), 'the app-password link is not on screen');
+  assert.ok(!plainWalk(view).some((n) => n.tag === 'button' && textOf(n) === 'Sign in with Google' && !plainHidden(n)), 'a Google sign-in with no client is on screen');
+  assert.match(anywhere(view), /For developers/, 'the developer drawer is missing');
+  findButton(view, 'Connect').fire('click');
+  await settle();
+  assert.match(onScreen(view), /Paste the 16-letter app password from Google here\. Don’t have one yet\? Press Get an app password\./);
+  assert.ok(!plainHidden(findInput(view, (n) => n.attributes.type === 'password')), 'Connect asked for a paste into a hidden box');
+  // Hotmail: the big button routes to the setup page and never demands an ID.
+  emailInput.value = 'frank@hotmail.com';
+  emailInput.fire('change');
+  await settle();
+  assert.ok(plainWalk(view).some((n) => n.tag === 'a' && textOf(n) === 'Show me how ↗' && !plainHidden(n)), 'no "Show me how" link on the Hotmail card');
+  assert.ok(plainHidden(findInput(view, (n) => n.attributes.placeholder === '00000000-0000-0000-0000-000000000000')), 'the client-id field is on the card');
+  findButton(view, 'Sign in with Microsoft').fire('click');
+  await settle();
+  seen = onScreen(view);
+  assert.doesNotMatch(seen, /is required/, 'the button still answers "…ID is required"');
+  assert.match(seen, /One more step first/);
+  assert.doesNotMatch(seen, JARGON, `after pressing Sign in with Microsoft: ${seen.match(JARGON)?.[0]}`);
+  assert.ok(!calls.some((c) => c.path === '/api/mail/oauth'), 'a sign-in was started with no client');
+
+  // 4. Calendar: four named choices; iCloud is guided with the address already in.
+  goTo(4);
+  seen = onScreen(view);
+  assert.match(seen, /Step 4 of 5/);
+  assert.match(seen, /Add your calendar\./);
+  for (const name of ['Google Calendar', 'iPhone or Mac (iCloud)', 'Outlook', 'Something else']) {
+    assert.ok(findButtons(view, new RegExp(`^${name.replace(/[()]/g, '\\$&')}`)).length === 1, `no "${name}" choice`);
+  }
+  assert.doesNotMatch(seen, JARGON, `the calendar step: ${seen.match(JARGON)?.[0]}`);
+  findButtons(view, /^iPhone or Mac/)[0].fire('click');
+  await settle();
+  seen = onScreen(view);
+  assert.match(seen, /appleid\.apple\.com ↗.*Sign-In and Security → App-Specific Passwords → name it Zelos/);
+  assert.match(seen, /Your Apple ID email/);
+  assert.ok(findButton(view, 'Check it works and save'), 'no one-button finish on the guided calendar');
+  assert.doesNotMatch(seen, JARGON, `the iCloud card: ${seen.match(JARGON)?.[0]}`);
+  const addr = findInput(view, (n) => n.value === GUIDES.calendars.icloud.caldav);
+  assert.ok(addr, 'the iCloud address is not filled in');
+  assert.ok(plainHidden(addr), 'the iCloud address is on the card rather than under Advanced');
+  assert.match(anywhere(view), /CalDAV/, 'the expert kind picker is gone rather than folded');
+  findButtons(view, /^Google Calendar/)[0].fire('click');
+  await settle();
+  seen = onScreen(view);
+  assert.match(seen, /1\. Open.*Google Calendar on the web ↗/);
+  assert.match(seen, /3\. Scroll to ‘Secret address in iCal format’ and copy it\./);
+  assert.doesNotMatch(seen, JARGON, `the Google Calendar card: ${seen.match(JARGON)?.[0]}`);
+
+  // 5. Done: what is still missing, by step number, and the one button.
+  goTo(5);
+  seen = onScreen(view);
+  assert.match(seen, /Step 5 of 5/);
+  assert.match(seen, /Read my mail for the first time\./);
+  assert.match(seen, /Zelos can’t read anything yet — it still needs an AI \(step 2\) and an email account \(step 3\)\./);
+  const read = findButton(view, 'Read my mail now');
+  assert.ok(read, 'no "Read my mail now" button');
+  assert.equal(read.attributes.disabled, '', 'the button is pressable with nothing to read');
+  assert.doesNotMatch(seen, JARGON, `the last step: ${seen.match(JARGON)?.[0]}`);
+  assert.equal(onboarding.notReadyLine({ model: true }), 'Zelos can’t read anything yet — it still needs an AI (step 2).');
+  assert.equal(onboarding.notReadyLine({ sources: true }), 'Zelos can’t read anything yet — it still needs an email account (step 3).');
+  assert.equal(onboarding.notReadyLine({}), '');
+
+  // The step is module state: leave it where a fresh page starts, while the
+  // DOM stub is still in place to render it.
+  goTo(1);
+});
+
+test('the guided AI card stores the key, tests, picks the model itself, saves and moves on — in that order', async (t) => {
+  withPlainDom(t);
+  const calls = [];
+  const presets = await llmPresets();
+  globalThis.fetch = plainFetch({ presets, calls });
+  t.after(() => { delete globalThis.fetch; });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const settings = await import(fileUrl(UI, 'views/settings.js'));
+  store.state.config = { identity: {}, model: {}, mail: [], calendars: [], sources: [] };
+  store.state.health = { model: { configured: false }, backend: { name: 'encrypted-file' } };
+  store.state.secretRefs = [];
+
+  // The defaults are read off the presets, never invented here.
+  const anthropic = presets.find((p) => p.id === 'anthropic');
+  const openai = presets.find((p) => p.id === 'openai');
+  assert.equal(settings.pickDefaultModel(anthropic), 'claude-sonnet-5');
+  assert.ok(anthropic.suggestedModels.includes('claude-sonnet-5'), 'the guided default is not a model the preset names');
+  assert.equal(settings.pickDefaultModel(openai), openai.suggestedModels[0]);
+  assert.equal(settings.pickDefaultModel({ id: 'anthropic', suggestedModels: ['x'] }), 'x', 'a preferred id not on the list must fall back to the list');
+  assert.equal(settings.pickDefaultModel({ suggestedModels: [] }), '');
+  assert.equal(settings.pickDefaultModel(null), '');
+  assert.doesNotMatch(settings.COST_LINE, /\d|[$€£]/, 'the cost line must never carry a number');
+
+  let done = 0;
+  const panel = settings.modelPanel({ compact: true, onDone: () => { done += 1; } });
+  await settle();
+  findButtons(panel, /^Claude, by Anthropic/)[0].fire('click');
+  const key = findInput(panel, (n) => n.attributes.type === 'password');
+  assert.ok(key && !plainHidden(key), 'the key box is not on the guided card');
+  key.value = 'sk-ant-not-a-real-key';
+  findButton(panel, 'Check it works').fire('click');
+  await settle();
+  await settle();
+
+  const wire = calls.filter((c) => c.method !== 'GET').map((c) => `${c.method} ${c.path}`);
+  assert.deepEqual(wire, ['POST /api/secrets', 'POST /api/model/test', 'PUT /api/config'], `the wire was ${wire.join(', ')}`);
+  assert.deepEqual(calls.find((c) => c.path === '/api/secrets').body, { ref: 'model.default', value: 'sk-ant-not-a-real-key' });
+  const tested = calls.find((c) => c.path === '/api/model/test').body;
+  assert.equal(tested.model, 'claude-sonnet-5', 'the test did not carry the model the card picked');
+  assert.equal(tested.baseUrl, anthropic.baseUrl);
+  const saved = calls.find((c) => c.path === '/api/config').body.model;
+  assert.deepEqual(saved, { protocol: 'anthropic', label: 'Anthropic', baseUrl: anthropic.baseUrl, model: 'claude-sonnet-5', keyRef: 'model.default' });
+  assert.equal(key.value, '', 'the key is still in the box after it was stored');
+  assert.match(onScreen(panel), /Working\. Zelos will use Claude\./);
+  assert.equal(done, 1, 'onDone did not fire, so onboarding would not advance');
+
+  // A fresh home. core/config.mjs's DEFAULTS pre-select the Anthropic preset
+  // with an empty model id, so the panel opens on the Claude card already —
+  // and that card has to have picked its model, or the first press of "Check
+  // it works" refuses with "could not pick a model". Found by driving the app.
+  const { DEFAULTS } = await import(fileUrl(ROOT, 'core/config.mjs'));
+  assert.equal(DEFAULTS.model.baseUrl, anthropic.baseUrl, 'the premise: a fresh home points at Anthropic');
+  assert.equal(DEFAULTS.model.model, '', 'the premise: with no model chosen');
+  calls.length = 0;
+  store.state.config = { ...store.state.config, model: { ...DEFAULTS.model } };
+  const fresh = settings.modelPanel({ compact: true });
+  await settle();
+  assert.match(onScreen(fresh), /1\. Open.*Anthropic’s key page ↗/, 'a fresh home does not open on the Claude card');
+  const freshKey = findInput(fresh, (n) => n.attributes.type === 'password');
+  freshKey.value = 'sk-ant-not-a-real-key';
+  findButton(fresh, 'Check it works').fire('click');
+  await settle();
+  await settle();
+  assert.doesNotMatch(onScreen(fresh), /could not pick a model/, 'the restored card has no model');
+  assert.equal(calls.find((c) => c.path === '/api/model/test')?.body.model, 'claude-sonnet-5', 'the restored card did not pick the default model');
+  assert.match(onScreen(fresh), /Working\. Zelos will use Claude\./);
+  store.state.config = { ...store.state.config, model: {} };
+
+  // A runtime on this machine is offered first, as "Most private", and only when found.
+  calls.length = 0;
+  globalThis.fetch = plainFetch({ presets, calls, probe: [{ label: 'Ollama', baseUrl: 'http://127.0.0.1:11434/v1', models: [{ id: 'llama3.2' }] }] });
+  const withLocal = settings.modelPanel({ compact: true });
+  await settle();
+  const local = findButtons(withLocal, /^An AI program on this computer — Ollama/);
+  assert.equal(local.length, 1, 'a found runtime is not offered by name');
+  assert.match(textOf(local[0]), /Most private/);
+  const order = plainWalk(withLocal).filter((n) => n.tag === 'button');
+  assert.ok(order.indexOf(local[0]) < order.indexOf(findButtons(withLocal, /^Claude/)[0]), 'the local card is not first');
+  assert.doesNotMatch(onScreen(withLocal), JARGON, `the AI panel with a local runtime: ${onScreen(withLocal).match(JARGON)?.[0]}`);
+  local[0].fire('click');
+  assert.match(onScreen(withLocal), /Zelos found Ollama running on this computer\. Nothing you read will leave this computer\./);
+  assert.doesNotMatch(onScreen(withLocal), JARGON, `the local guided card: ${onScreen(withLocal).match(JARGON)?.[0]}`);
+});
+
+test('Settings opens on Email, reads in plain words, keeps every route, and puts Colour last', async (t) => {
+  withPlainDom(t);
+  globalThis.fetch = plainFetch({ presets: await llmPresets() });
+  t.after(() => { delete globalThis.fetch; });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const settings = await import(fileUrl(UI, 'views/settings.js'));
+  store.state.config = { identity: {}, model: {}, mail: [], calendars: [], sources: [], sweep: { intervalMinutes: 30, activeHours: [6, 23], auto: true }, privacy: { sendBodies: true, bodyChars: 4000, maxItemsPerSweep: 150 } };
+  store.state.health = { model: { configured: false }, home: '/tmp/zelos-home', backend: { name: 'encrypted-file', note: 'It does NOT protect against a process already running as this user.' } };
+  store.state.secretRefs = [];
+  store.state.configErrors = [];
+  store.state.board = { items: [], events: [], notes: [], counts: {}, runs: {}, tokens: null };
+
+  const view = settings.renderSettings({ sub: null, navigate() {}, rerender() {} });
+  const panel = plainWalk(view).find((n) => n.attributes.role === 'tabpanel');
+  assert.equal(panel.attributes.id, 'settings-panel-mail', 'Settings no longer opens on Email');
+  assert.equal(settings.DEFAULT_PANEL, 'mail');
+  const tabs = plainWalk(view).filter((n) => n.attributes.role === 'tab').map(textOf);
+  assert.deepEqual(tabs, ['You', 'AI', 'Email', 'Calendars', 'Schedule', 'Privacy', 'Other things it can read (optional)', 'Share with another AI (advanced)', 'Your data', 'About', 'Colour']);
+  // The routes are the ids they always were: every deep link keeps working.
+  const src = fs.readFileSync(path.join(UI, 'views/settings.js'), 'utf8');
+  const ids = [...src.matchAll(/\{ id: '([a-z]+)', label: '[^']+' \}/g)].map((m) => m[1]);
+  for (const id of ['you', 'model', 'mail', 'calendars', 'sources', 'sweep', 'privacy', 'ai', 'data', 'about']) {
+    assert.ok(ids.includes(id), `#/settings/${id} no longer routes anywhere`);
+  }
+  // The colour picker is no longer the first thing on the screen.
+  assert.ok(!plainWalk(view).some((n) => (n.attributes.class || '').includes('accent-swatch')), 'the colour picker is still in the Settings header');
+  const colour = settings.renderSettings({ sub: 'appearance', navigate() {}, rerender() {} });
+  assert.ok(plainWalk(colour).some((n) => (n.attributes.class || '').includes('accent-swatch')), 'the Colour tab has no picker');
+
+  // Share with another AI opens with the sentence that keeps it from being mistaken for the AI tab.
+  const share = settings.renderSettings({ sub: 'ai', navigate() {}, rerender() {} });
+  const first = plainWalk(share).find((n) => n.attributes.role === 'tabpanel').children[0];
+  assert.match(textOf(first), /^This is NOT where you choose the AI that reads your mail — that is under AI\. Leave this off unless you know what it is\./);
+
+  // Other things it can read opens by telling most people to leave.
+  const other = settings.renderSettings({ sub: 'sources', navigate() {}, rerender() {} });
+  assert.match(onScreen(other), /Most people need nothing here\. If you use any of these work tools, add them\./);
+
+  // You: the address is "yours", and a blank name is explained in terms of the replies.
+  const you = settings.renderSettings({ sub: 'you', navigate() {}, rerender() {} });
+  assert.match(onScreen(you), /The address Zelos treats as yours \(usually the same as your mailbox\)/);
+  assert.match(onScreen(you), /If you leave this blank, the replies Zelos writes for you will not be signed\./);
+  assert.doesNotMatch(onScreen(you), /prompt/, 'the You tab still talks about prompts');
+
+  // Privacy: two sentences and one switch on the card; the two numbers under Advanced.
+  const privacy = settings.renderSettings({ sub: 'privacy', navigate() {}, rerender() {} });
+  assert.match(onScreen(privacy), /Zelos only talks to the AI service you chose\. It sends nothing to us and nothing to anyone else\./);
+  assert.match(onScreen(privacy), /Let the AI read the full text of your emails \(recommended — it does a better job\)/);
+  assert.doesNotMatch(onScreen(privacy), /Characters of each|Most items per|telemetry|endpoint/, 'the expert numbers are on the Privacy card');
+  assert.match(anywhere(privacy), /Characters of each email sent to the AI/, 'the expert numbers are gone rather than folded');
+
+  // About: one plain line on passwords, the spend as "AI usage this session", the essay folded and un-shouted.
+  const about = settings.renderSettings({ sub: 'about', navigate() {}, rerender() {} });
+  assert.match(onScreen(about), /Your passwords are locked in an encrypted file on this computer\./);
+  assert.match(onScreen(about), /AI usage this session/);
+  assert.doesNotMatch(onScreen(about), /AES|0600|\.seed|attacker|does NOT protect/, 'the security essay is on the About card');
+  assert.match(anywhere(about), /does not protect against a process/, 'the store note is gone, or still in capitals');
+  assert.match(anywhere(about), /Security details/);
+});
+
+test('the schedule speaks am/pm and stores the 24-hour numbers config validates', async (t) => {
+  withPlainDom(t);
+  const calls = [];
+  globalThis.fetch = plainFetch({ calls });
+  t.after(() => { delete globalThis.fetch; });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const settings = await import(fileUrl(UI, 'views/settings.js'));
+
+  assert.equal(settings.hourLabel(0), '12 am');
+  assert.equal(settings.hourLabel(6), '6 am');
+  assert.equal(settings.hourLabel(12), '12 pm');
+  assert.equal(settings.hourLabel(13), '1 pm');
+  assert.equal(settings.hourLabel(23), '11 pm');
+  assert.equal(settings.hourLabel(24), '', '24 is not an hour config accepts');
+  assert.equal(settings.HOUR_CHOICES.length, 24);
+  assert.equal(settings.HOUR_CHOICES[0].value, '0');
+  // The end picker stops at 11 pm: core/config.mjs wants 0–23 with start < end,
+  // and the old number box wrote a 24 that validateConfig then refused.
+  assert.equal(settings.END_HOUR_CHOICES[0].value, '1');
+  assert.equal(settings.END_HOUR_CHOICES.at(-1).value, '23');
+  assert.ok(settings.END_HOUR_CHOICES.every((c) => Number(c.value) >= 1 && Number(c.value) <= 23));
+
+  store.state.config = { identity: {}, model: {}, mail: [], calendars: [], sources: [], sweep: { intervalMinutes: 30, activeHours: [6, 23], auto: true } };
+  store.state.health = { model: { configured: false } };
+  store.state.configErrors = [];
+  const view = settings.renderSettings({ sub: 'sweep', navigate() {}, rerender() {} });
+  const seen = onScreen(view);
+  assert.match(seen, /Check my mail every \(minutes\)/);
+  assert.match(seen, /Check my mail automatically/);
+  assert.doesNotMatch(seen, /re-derives|staleness|\bsweep/i, 'the staleness essay is on the Schedule card');
+  assert.match(anywhere(view), /re-derives what is stale/, 'the essay is gone rather than folded');
+  const selects = plainWalk(view).filter((n) => n.tag === 'select');
+  assert.equal(selects.length, 2);
+  assert.equal(selects[0].value, '6');
+  assert.equal(selects[1].value, '23');
+  assert.ok(plainWalk(selects[0]).some((o) => o.tag === 'option' && o.textContent === '6 am'));
+  assert.ok(plainWalk(selects[1]).some((o) => o.tag === 'option' && o.textContent === '11 pm'));
+  selects[0].value = '8';
+  selects[1].value = '21';
+  findButton(view, 'Save').fire('click');
+  await settle();
+  const saved = calls.find((c) => c.method === 'PUT' && c.path === '/api/config').body.sweep;
+  assert.deepEqual(saved.activeHours, [8, 21], 'the pickers did not store the 24-hour numbers');
+  assert.equal(saved.intervalMinutes, 30);
+});
+
+test('Your data shows the folder and says "drag it to the Trash"; the command is under For experts', async (t) => {
+  withPlainDom(t);
+  globalThis.fetch = plainFetch({});
+  t.after(() => { delete globalThis.fetch; delete globalThis.window.zelos; });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const settings = await import(fileUrl(UI, 'views/settings.js'));
+  store.state.config = { identity: {}, model: {}, mail: [], calendars: [], sources: [] };
+  store.state.health = { model: { configured: false }, home: '/Users/nemo/Library/Zelos', backend: { name: 'encrypted-file' } };
+  store.state.configErrors = [];
+
+  // In a browser tab: copy the path, and the one sentence that turns it into a window.
+  delete globalThis.window.zelos;
+  let view = settings.renderSettings({ sub: 'data', navigate() {}, rerender() {} });
+  let seen = onScreen(view);
+  assert.match(seen, /To erase everything: quit Zelos, then drag this folder to the Trash and empty the Trash\./);
+  assert.match(seen, /Your saved passwords are in this folder too, encrypted\. If you back the folder up, keep the backup somewhere private\./);
+  assert.doesNotMatch(seen, /rm -rf|stray web page|secrets\.enc|\.seed|JSON/, 'the expert text is on the Your data card');
+  assert.match(anywhere(view), /rm -rf "\/Users\/nemo\/Library\/Zelos"/, 'the command is gone rather than folded');
+  assert.match(anywhere(view), /For experts/);
+  assert.ok(findButton(view, 'Copy the folder path'), 'a browser tab has no way to the folder');
+  assert.ok(!findButton(view, 'Show the Zelos folder'), 'a browser tab offers a button only the desktop shell can honour');
+  assert.equal(settings.folderHint('darwin'), 'In Finder press ⌘⇧G, paste, and press Return.');
+  assert.match(settings.folderHint('win32'), /File Explorer/);
+  assert.match(settings.folderHint('linux'), /Ctrl\+L/);
+
+  // In the desktop shell: the button, through the one bridge the preload exposes.
+  let shown = 0;
+  globalThis.window.zelos = { desktop: true, platform: 'darwin', showHome: async () => { shown += 1; return true; } };
+  view = settings.renderSettings({ sub: 'data', navigate() {}, rerender() {} });
+  const show = findButton(view, 'Show the Zelos folder');
+  assert.ok(show, 'the desktop shell has no "Show the Zelos folder" button');
+  show.fire('click');
+  await settle();
+  assert.equal(shown, 1, 'the button did not ask the shell');
+  assert.doesNotMatch(onScreen(view), JARGON, `the Your data card: ${onScreen(view).match(JARGON)?.[0]}`);
+
+  // The keychain stores say where the passwords are instead, in the same register.
+  assert.match(settings.plainSecretNotes('macos-keychain').data, /not in this folder/);
+  assert.doesNotMatch(settings.plainSecretNotes('macos-keychain').data, /keychain|com\.zelos/i);
+  for (const name of ['encrypted-file', 'macos-keychain', undefined]) {
+    assert.doesNotMatch(Object.values(settings.plainSecretNotes(name)).join(' '), JARGON, String(name));
+  }
+});
+
+test('no user-facing failure names an address the person did not type, and the board speaks of checks and AIs', () => {
+  // core/llm.mjs's empty-model error and core/sweep.mjs's stand-down reasons
+  // reach the board's banner verbatim. Neither may interpolate the base URL.
+  const llm = fs.readFileSync(path.join(ROOT, 'core/llm.mjs'), 'utf8');
+  const noModel = /throw new LLMError\(('[^']*No AI has been chosen yet[^']*'), \{ address \}\)/.exec(llm);
+  assert.ok(noModel, 'core/llm.mjs no longer throws the plain empty-model error with the address on the side');
+  assert.ok(!/\$\{/.test(noModel[1]), 'the empty-model sentence interpolates something');
+  assert.ok(!/No model selected for \$\{address\}/.test(llm), 'the old sentence naming the address is back');
+  const sweep = fs.readFileSync(path.join(ROOT, 'core/sweep.mjs'), 'utf8');
+  const reason = /async function modelNotReadyReason\([\s\S]*?\n\}/m.exec(sweep);
+  assert.ok(reason, 'modelNotReadyReason is missing');
+  assert.ok(!/\$\{model\.baseUrl\}/.test(reason[0]), 'the stand-down reason names the base URL');
+  assert.match(reason[0], /'No AI has been chosen yet — open Settings → AI and pick one'/);
+  assert.match(reason[0], /'No key has been saved for the AI you chose — open Settings → AI and paste one'/);
+  assert.ok(!/Settings → Model/.test(reason[0]) && !/Settings → Model/.test(llm), 'a tab that is now labelled "AI" is still named "Model"');
+
+  // The board: "check", "AI", "Promises", "Add a reminder", "Not checked yet", "More".
+  const app = fs.readFileSync(path.join(UI, 'app.js'), 'utf8');
+  assert.match(app, /button\('Check now', \{/);
+  assert.match(app, /state\.sweep\.running \? 'Checking…' : 'Check now'/);
+  assert.match(app, /if \(!last\) return 'Not checked yet';/);
+  assert.match(app, /return `Last checked \$\{humanDelta\(last\.ended_at \|\| last\.started_at\)\}/);
+  assert.match(app, /label: 'Promises', render: renderOwed/);
+  assert.match(app, /button\('Add a reminder', \{/);
+  assert.match(app, /class: 'btn solid', text: 'Save' \}/);
+  assert.match(app, /: 'no AI chosen yet' \}/);
+  // Tokens and duration left the line for its hover title and the About panel.
+  assert.ok(!/tokenNode/.test(app), 'the token line is still painted beside the header');
+  assert.match(app, /parts\.node\.setAttribute\('title', title\)/, 'the duration and spend have no hover title');
+  assert.match(app, /export function sweepLineTitle\(last, tokens, todayKeyStr\)[\s\S]*?sweepDetail\(last\), tokenLine\(tokens, todayKeyStr\)/);
+  for (const word of ['Sweep now', 'Sweeping…', 'Never swept', "'Owed'", "'Note'", 'Keep it', 'no model yet']) {
+    assert.ok(!app.includes(word), `ui/app.js still says ${word}`);
+  }
+  const items = fs.readFileSync(path.join(UI, 'lib/items.js'), 'utf8');
+  assert.match(items, /title: 'More',\n\s+'aria-label': `More — \$\{item\.headline \|\| 'this item'\}`/, 'the ··· button has no name');
+  const owed = fs.readFileSync(path.join(UI, 'views/owed.js'), 'utf8');
+  assert.match(owed, /section\('Replies it wrote for you', \{/);
+  assert.match(owed, /note: 'Open one in your email program, check it, and press send there\./);
+  assert.match(owed, /button\('Copy the text', \{/);
+  assert.ok(!/section\('Ready to send'/.test(owed), '"Ready to send" is back beside "never sends mail"');
+  const today = fs.readFileSync(path.join(UI, 'views/today.js'), 'utf8');
+  assert.match(today, /section\('Money', \{ count: money\.length, note: 'Bills and invoices found in your mail\.' \}/);
+  assert.match(today, /button\('Choose an AI'/);
+  assert.match(today, /button\('Check now'/);
+  const now = fs.readFileSync(path.join(UI, 'views/now.js'), 'utf8');
+  for (const word of ['Sweep now', 'Sweep again', 'Choose a model', 'Connect a source', 'The last sweep', 'Swept ']) {
+    assert.ok(!now.includes(word), `ui/views/now.js still says ${word}`);
+  }
+  const storeSrc = fs.readFileSync(path.join(UI, 'lib/store.js'), 'utf8');
+  for (const word of ["'Sweeping…'", "'Sweep finished'", "'Sweep failed'", "'the sweep failed'"]) {
+    assert.ok(!storeSrc.includes(word), `ui/lib/store.js still says ${word}`);
+  }
+  assert.match(storeSrc, /message: 'Checking your mail…'/);
+});

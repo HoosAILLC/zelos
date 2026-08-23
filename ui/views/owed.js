@@ -79,20 +79,20 @@ function draftCard(draft, itemsById) {
     item ? el('p', { class: 'draft-because', text: item.headline }) : null,
     area,
     el('div', { class: 'draft-actions' }, [
-      button('Copy', {
+      button('Copy the text', {
         class: 'btn solid',
         onClick: async (e) => {
           const ok = await copyText(area.value);
           const btn = e.currentTarget;
           btn.textContent = ok ? 'Copied' : 'Copy failed';
-          setTimeout(() => { btn.textContent = 'Copy'; }, 1_600);
+          setTimeout(() => { btn.textContent = 'Copy the text'; }, 1_600);
         },
       }),
       draft.to_email
         ? el('a', {
           class: 'btn quiet',
           href: `mailto:${encodeURIComponent(draft.to_email)}?subject=${encodeURIComponent(draft.subject || '')}`,
-          text: 'Open in mail',
+          text: 'Open in your email program',
         })
         : null,
       button('Discard', {
@@ -122,14 +122,17 @@ export function renderOwed(ctx) {
   if (!drafts.length && !promised.length && !waiting.length) {
     body.appendChild(emptyState({
       title: 'Nobody is waiting on anybody',
-      detail: 'When a sweep finds a reply you owe, a promise you made, or a question of yours that went unanswered, it lands here — with a draft where a draft helps.',
+      detail: 'When a check finds a reply you owe, a promise you made, or a question of yours that went unanswered, it lands here — with a reply already written where one helps.',
     }));
     return body;
   }
 
-  body.appendChild(section('Ready to send', {
+  // "Ready to send" and "never sends mail" in one breath was the audit's
+  // complaint; the heading now says whose words these are and the note says
+  // where the sending happens.
+  body.appendChild(section('Replies it wrote for you', {
     count: drafts.length,
-    note: 'Zelos never sends mail. Read it, change what you want, copy it out.',
+    note: 'Open one in your email program, check it, and press send there. Zelos never sends anything itself.',
   }, drafts.length
     ? el('div', { class: 'stack' }, drafts.map((d) => draftCard(d, itemsById)))
     : el('p', { class: 'quiet-note', text: 'No drafts waiting.' })));

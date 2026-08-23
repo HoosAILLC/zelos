@@ -1219,6 +1219,33 @@ function handlePresets(ctx) {
 }
 
 /**
+ * The pages a first-timer is sent to by the guided setup cards, and nothing
+ * else: where Google Calendar keeps its secret address, where Apple makes an
+ * app-specific password and the CalDAV host iCloud publishes, where Outlook
+ * publishes a calendar, and the section of docs/OAUTH.md that walks a Hotmail
+ * or Outlook.com person through the one-time Microsoft setup.
+ *
+ * They live here, not in ui/, for the same reason PRESETS' `keyUrl` and the
+ * mail guess's `appPasswordUrl` do: ui/ names no remote host at all — three
+ * suites assert it — so the page works offline and the only addresses it
+ * ever shows are ones this server handed it. A build without this route
+ * (an older server under a newer page) leaves the cards' links as plain
+ * text, which is honest and still usable.
+ */
+const GUIDES = Object.freeze({
+  microsoftSetup: 'https://github.com/HoosAILLC/zelos/blob/main/docs/OAUTH.md#microsoft--register-zeloss-multi-tenant-public-client',
+  calendars: Object.freeze({
+    google: Object.freeze({ settings: 'https://calendar.google.com/calendar/r/settings' }),
+    icloud: Object.freeze({ caldav: 'https://caldav.icloud.com/', appPasswords: 'https://account.apple.com/account/manage' }),
+    outlook: Object.freeze({ calendar: 'https://outlook.live.com/calendar/' }),
+  }),
+});
+
+function handleGuides(ctx) {
+  sendJSON(ctx.res, 200, GUIDES);
+}
+
+/**
  * Every connector this build has, as the JSON-safe half of its manifest.
  *
  * This route exists because the Settings screen has to render a picker, a set of
@@ -2757,6 +2784,7 @@ const ROUTES = [
   ['POST', /^\/api\/model\/test$/, handleModelTest],
   ['GET', /^\/api\/model\/list$/, handleModelList],
   ['GET', /^\/api\/model\/presets$/, handlePresets],
+  ['GET', /^\/api\/guides$/, handleGuides],
   ['GET', /^\/api\/local\/probe$/, handleLocalProbe],
   ['GET', /^\/api\/connectors$/, handleConnectors],
   ['POST', /^\/api\/mail\/guess$/, handleMailGuess],

@@ -51,9 +51,11 @@ export function carriedFor(item, todayKeyStr) {
   if (!seen || !todayKeyStr) return null;
   const days = daysBetweenKeys(seen, todayKeyStr);
   if (days === null || days < 4) return null;
-  if (days >= 60) return `carried ${Math.round(days / 30)} months`;
-  if (days >= 14) return `carried ${Math.floor(days / 7)} weeks`;
-  return `carried ${days} days`;
+  // "waiting", not "carried": carried where? was the audit's reaction, and the
+  // fact the badge states is how long this has been waiting on you.
+  if (days >= 60) return `waiting ${Math.round(days / 30)} months`;
+  if (days >= 14) return `waiting ${Math.floor(days / 7)} weeks`;
+  return `waiting ${days} days`;
 }
 
 /**
@@ -246,16 +248,31 @@ export function conflictsFirst(entries) {
     || (a.start - b.start));
 }
 
-/** "3 messages · 2 events" — the sweep's own numbers, in a readable line. */
+/**
+ * "3 emails · 2 appointments" — the sweep's own numbers, in the words a
+ * person uses for them. The run's duration is deliberately not here: "41.8s"
+ * beside the counts read as a machine readout, and it lives in the hover
+ * title the header gives the line (sweepDetail below) rather than on it.
+ */
 export function sweepSummary(run) {
   if (!run) return '';
   const s = run.stats || {};
   const bits = [];
-  if (s.messages) bits.push(`${s.messages} message${s.messages === 1 ? '' : 's'}`);
-  if (s.events) bits.push(`${s.events} event${s.events === 1 ? '' : 's'}`);
+  if (s.messages) bits.push(`${s.messages} email${s.messages === 1 ? '' : 's'}`);
+  if (s.events) bits.push(`${s.events} appointment${s.events === 1 ? '' : 's'}`);
   if (s.items) bits.push(`${s.items} item${s.items === 1 ? '' : 's'}`);
-  if (s.ms) bits.push(`${(s.ms / 1000).toFixed(1)}s`);
   return bits.join(' · ');
+}
+
+/**
+ * "took 41.8s" — the duration, for a tooltip, or '' when the run has none.
+ * A run that died in a few milliseconds — no AI chosen, nothing fetched — is
+ * not "took 0.0s"; under a tenth of a second there is nothing worth saying.
+ */
+export function sweepDetail(run) {
+  const ms = Number(run?.stats?.ms);
+  if (!Number.isFinite(ms) || ms < 100) return '';
+  return `took ${(ms / 1000).toFixed(1)}s`;
 }
 
 export function plural(n, one, many = `${one}s`) {

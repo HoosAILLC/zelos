@@ -321,7 +321,9 @@ export function watchSweeps() {
             if (event === 'hello') {
               state.sweep = { ...state.sweep, running: Boolean(data?.running) };
             } else if (event === 'started') {
-              state.sweep = { running: true, phase: 'start', message: 'Sweeping…', done: 0, total: 0, error: null, lastResult: null };
+              // "Checking", never "sweeping": a sweep is the code's word for
+              // it, and it made the audit's reader think of a broom.
+              state.sweep = { running: true, phase: 'start', message: 'Checking your mail…', done: 0, total: 0, error: null, lastResult: null };
             } else if (event === 'progress') {
               state.sweep = {
                 ...state.sweep,
@@ -332,17 +334,17 @@ export function watchSweeps() {
                 total: Number(data?.total) || 0,
               };
             } else if (event === 'done') {
-              state.sweep = { running: false, phase: 'done', message: 'Sweep finished', done: 0, total: 0, error: null, lastResult: data || null };
+              state.sweep = { running: false, phase: 'done', message: 'Finished checking', done: 0, total: 0, error: null, lastResult: data || null };
               refreshBoard();
               loadHealth().catch(() => {});
             } else if (event === 'failed') {
               state.sweep = {
                 running: false,
                 phase: 'failed',
-                message: 'Sweep failed',
+                message: 'The check failed',
                 done: 0,
                 total: 0,
-                error: String(data?.error || 'the sweep failed'),
+                error: String(data?.error || 'the check failed'),
                 lastResult: data || null,
               };
               refreshBoard();

@@ -545,11 +545,17 @@ function buildChatRequest(opts, { stream }) {
   // empty model id, so on a home nobody has set up the first thing missing is
   // the choice, not the credential — and the key check ran first, so every run
   // row, the SSE relay and the board banner named a missing API key on an
-  // install where the real next step was picking a model. Same sentence the
-  // doctor uses, so the CLI, the doctor and the board agree.
+  // install where the real next step was picking a model.
+  //
+  // The address is carried on the error and kept OUT of the sentence. This is
+  // the one failure a fresh install meets on its first press of the button,
+  // and it used to read "No model selected for https://api.anthropic.com" —
+  // an address the person had never typed, which read as the program having
+  // gone somewhere without asking. The tab it names is the one the Settings
+  // strip now labels "AI"; the sweep scheduler's stand-down says the same.
   const model = typeof opts.model === 'string' ? opts.model.trim() : '';
   if (!model) {
-    throw new LLMError(`No model selected for ${address} — open Settings → Model and pick one`, { address });
+    throw new LLMError('No AI has been chosen yet — open Settings → AI and pick one', { address });
   }
   const apiKey = requireKey(opts.apiKey, address);
 

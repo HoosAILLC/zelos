@@ -632,7 +632,16 @@ export const session = {
 export const shell = {
   openExternal(url) { recorded.external.push(url); return Promise.resolve(''); },
   openPath(target) { recorded.openedPaths.push(target); return Promise.resolve(''); },
+  showItemInFolder(target) { recorded.revealed.push(target); },
 };
+
+// The one channel the preload may invoke. Recorded by name so a test can
+// call the handler the shell registered, with a sender of its choosing.
+export const ipcMain = {
+  handle(channel, handler) { recorded.ipcHandlers.set(channel, handler); },
+};
+recorded.revealed = [];
+recorded.ipcHandlers = new Map();
 `;
 
 describe('the shell, booted against a stub Electron', () => {
@@ -721,6 +730,36 @@ describe('the shell, booted against a stub Electron', () => {
     assert.equal(webPreferences.spellcheck, false);
     assert.equal(webPreferences.preload, path.join(REPO, 'desktop', 'preload.js'));
     assert.ok(fs.existsSync(webPreferences.preload));
+  });
+
+  it('reveals the data folder when the board asks, and for nobody else', () => {
+    /* Settings → Your data says "drag this folder to the Trash", and a sentence
+       about "this folder" has to be able to show it. The bridge is one channel,
+       takes no argument, reveals only the shell's own home, and answers only
+       the board's window — any other sender gets false and nothing happens. */
+    const handler = recorded.ipcHandlers.get(main.SHOW_HOME_CHANNEL);
+    assert.ok(handler, `no handler registered on ${main.SHOW_HOME_CHANNEL}`);
+    const board = recorded.windows[0].webContents;
+
+    recorded.revealed.length = 0;
+    assert.equal(handler({ sender: board }), true);
+    assert.deepEqual(recorded.revealed, [booted.zelos.paths.home], 'the shell must reveal its own data home and nothing else');
+
+    recorded.revealed.length = 0;
+    assert.equal(handler({ sender: {} }), false, 'a sender that is not the board must be refused');
+    assert.equal(handler(undefined), false);
+    assert.deepEqual(recorded.revealed, []);
+
+    // The page's half names the same channel, by the same string, and sends
+    // nothing with it. Pinned at the source because the preload runs only
+    // inside Electron's sandbox loader.
+    const preload = fs.readFileSync(path.join(REPO, 'desktop', 'preload.js'), 'utf8');
+    const channel = /const SHOW_HOME_CHANNEL = '([^']+)'/.exec(preload);
+    assert.ok(channel, 'the preload no longer names its channel in one place');
+    assert.equal(channel[1], main.SHOW_HOME_CHANNEL, 'the preload and the shell disagree about the channel name');
+    assert.match(preload, /showHome: \(\) => ipcRenderer\.invoke\(SHOW_HOME_CHANNEL\)/, 'showHome must invoke the channel with no argument');
+    assert.ok(!/ipcRenderer\.(on|send|sendSync)\(/.test(preload), 'the preload must expose nothing but the one invoke');
+    assert.ok(!/require\('(fs|child_process|path)'\)/.test(preload), 'the preload must not reach into Node');
   });
 
   it('serves the board and refuses the API without the token', async () => {

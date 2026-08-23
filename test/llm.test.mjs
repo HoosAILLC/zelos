@@ -1451,7 +1451,12 @@ test('bad options fail with an LLMError that names the address', async () => {
   await assert.rejects(
     () => complete({ protocol: 'openai', baseUrl: mock.origin, model: '', messages: [{ role: 'user', content: 'hi' }] }),
     (err) => {
-      assert.match(err.message, /No model selected for http:\/\/127\.0\.0\.1/);
+      // The address rides on the error, not in the sentence: the board shows
+      // this one verbatim, and a URL the person never typed read as the
+      // program having gone somewhere on its own.
+      assert.match(err.message, /No AI has been chosen yet/);
+      assert.doesNotMatch(err.message, /127\.0\.0\.1/);
+      assert.equal(err.address, mock.origin);
       return true;
     },
   );
@@ -1478,10 +1483,16 @@ test('REGRESSION: a blank install is told to pick a model, not that a key is mis
     () => complete({ protocol: 'anthropic', baseUrl: FAKE_ORIGIN, model: '', messages: [{ role: 'user', content: 'hi' }] }),
     (err) => {
       assert.ok(err instanceof LLMError);
-      assert.match(err.message, /No model selected for https:\/\/api\.example\.invalid/);
+      assert.match(err.message, /No AI has been chosen yet/);
       assert.doesNotMatch(err.message, /API key/, 'a missing key is named before the missing choice that comes first');
-      // The doctor's sentence, so the CLI, the doctor and the board agree.
-      assert.match(err.message, /Settings → Model/);
+      // Never the address. This sentence reaches the board's banner on a
+      // fresh install, and "for https://api.anthropic.com" named a place the
+      // person had never typed. It rides on the error for the log instead.
+      assert.doesNotMatch(err.message, /api\.example\.invalid|https?:/);
+      assert.equal(err.address, FAKE_ORIGIN);
+      // The tab by the label it wears: the Settings strip says "AI", and the
+      // scheduler's stand-down in core/sweep.mjs says the same words.
+      assert.match(err.message, /Settings → AI/);
       return true;
     },
   );
