@@ -33,6 +33,10 @@ import tls from 'node:tls';
 import { imapDate, instant } from '../time.mjs';
 import { log as defaultLog } from '../log.mjs';
 import { getSecret, setSecret, deleteSecret } from '../secrets.mjs';
+/* The one provider table. Google's authorization and token endpoints are
+   read from it rather than restated here, so the calendar plumbing and the
+   mail sign-in can never disagree about where a Google token comes from. */
+import { PROVIDERS as OAUTH_PROVIDERS } from './oauth.mjs';
 import {
   decodeCharset,
   decodeTransfer,
@@ -1543,10 +1547,27 @@ function specialUseOf(name, flags) {
  * client that refuses to run a web server is the same shape of problem.
  *
  * Everything here is inert without a registration: no client id, no request.
+ *
+ * Google is the other way round, and the difference is Google's, not ours:
+ * Google has no device grant that reaches IMAP, but its "Desktop app" clients
+ * accept a loopback redirect on any port. So "Sign in with Google" is the PKCE
+ * flow in core/sources/oauth.mjs, received on the Zelos server's own port by
+ * core/server.mjs — and what lands here is only the part the two providers
+ * share: the stored grant, its refresh, and the bearer token on the wire.
+ * `accessTokenFor` branches on `provider`; an account written before that
+ * field existed has none and is Microsoft, because nothing else was possible.
  */
 
 /** The only origin outside loopback that a refresh token may be spent against. */
 export const MS_LOGIN_ORIGIN = 'https://login.microsoftonline.com';
+
+/**
+ * Where a Google refresh token may be spent, read off the provider table. The
+ * same rule as `assertTokenEndpoint` below — this origin, spelled exactly, or
+ * loopback for the test rig — and for the same reason: a config that could
+ * name its own token endpoint would be a one-field exfiltration route.
+ */
+export const GOOGLE_TOKEN_ORIGIN = new URL(OAUTH_PROVIDERS.google.tokenUrl).origin;
 
 /**
  * The delegated permission that buys IMAP, plus the one that makes the grant
@@ -1685,6 +1706,51 @@ function endpointFor(base, tenant, leaf) {
   return `${assertTokenEndpoint(base)}/${tenant}/oauth2/v2.0/${leaf}`;
 }
 
+/**
+ * Google's token URL, or a loopback one. Unlike Microsoft's, the path is kept:
+ * Google's endpoint is `/token` on its own host rather than a tenant segment
+ * built here, and a loopback mock has whatever path it has.
+ */
+export function assertGoogleTokenEndpoint(base) {
+  let url;
+  try {
+    url = new URL(String(base ?? '') || OAUTH_PROVIDERS.google.tokenUrl);
+  } catch {
+    throw new ImapOAuthError(`oauth: ${JSON.stringify(String(base ?? '').slice(0, 80))} is not a URL`, {
+      code: 'bad_endpoint',
+    });
+  }
+  if (url.origin === GOOGLE_TOKEN_ORIGIN || isLoopbackHost(url.hostname)) return url.toString();
+  throw new ImapOAuthError(
+    `oauth: refusing to send a refresh token to ${url.origin} — the only Google endpoint Zelos will use is ${GOOGLE_TOKEN_ORIGIN}`,
+    { code: 'bad_endpoint' },
+  );
+}
+
+/**
+ * A Google client id is `<number>-<hash>.apps.googleusercontent.com`, not a
+ * GUID, so `normalizeClientId` would refuse every real one. The shape is not
+ * pinned beyond "one token with no whitespace": Google has changed the
+ * suffix before and a paste that is merely unusual should reach Google, whose
+ * refusal names the problem better than a regex here would.
+ */
+export function normalizeGoogleClientId(clientId) {
+  const raw = String(clientId ?? '').trim();
+  if (!raw) {
+    throw new ImapOAuthError(
+      'oauth: this account has no Google client ID, so there is no registration to sign in against',
+      { code: 'not_configured' },
+    );
+  }
+  if (raw.length > 200 || /[\s\x00-\x1f\x7f]/.test(raw)) {
+    throw new ImapOAuthError(
+      `oauth: ${JSON.stringify(raw.slice(0, 60))} is not a Google client ID`,
+      { code: 'not_configured' },
+    );
+  }
+  return raw;
+}
+
 const TOKEN_TIMEOUT_MS = 30_000;
 
 /**
@@ -1724,13 +1790,19 @@ async function readCapped(res) {
  * a redirect chain is a way for the first host to hand the credential in the
  * body to the twentieth. There is no legitimate redirect on a token endpoint.
  *
- * A public client sends no secret, so `client_secret` is deleted from the body
- * on the way out — structurally, not by everyone remembering.
+ * `client_secret` is deleted from the body on the way out — structurally, not
+ * by everyone remembering — and put back only from `clientSecret`, which a
+ * caller fills from the secret store. Microsoft's device client has none.
+ * Google's "Desktop app" client has one and is refused at `/token` without it,
+ * while Google documents it as not confidential for an installed app.
  */
-async function postForm(url, form, { timeoutMs = TOKEN_TIMEOUT_MS, signal = null, fetchImpl = null } = {}) {
+async function postForm(url, form, {
+  timeoutMs = TOKEN_TIMEOUT_MS, signal = null, fetchImpl = null, clientSecret = '',
+} = {}) {
   const doFetch = fetchImpl || globalThis.fetch;
   const body = new URLSearchParams(form);
   body.delete('client_secret');
+  if (typeof clientSecret === 'string' && clientSecret) body.set('client_secret', clientSecret);
 
   const deadline = AbortSignal.timeout(Math.max(1, Number(timeoutMs) || TOKEN_TIMEOUT_MS));
   let res;
@@ -1909,6 +1981,11 @@ export async function pollForDeviceToken(pending, {
     // Before the first request, not after it: the user has not had time to open
     // a browser, and RFC 8628 §3.5 asks for the wait between polls in any case.
     await sleep(interval);
+    // Checked again on the way out of the sleep, which is where a cancel almost
+    // always lands: carried into the POST instead, an already-aborted signal
+    // reads as "could not reach the sign-in endpoint" — a network failure the
+    // panel would show for a button the person just pressed.
+    if (signal?.aborted) throw new ImapOAuthError('oauth: the sign-in was cancelled', { code: 'cancelled' });
 
     let payload;
     try {
@@ -2089,6 +2166,56 @@ export async function refreshAccessToken({
 }
 
 /**
+ * Spend a Google refresh token for a new access token.
+ *
+ * Google does not rotate: the response carries no `refresh_token`, and
+ * `normalizeTokenSet`'s `previous` keeps the one that was sent. The errors are
+ * the same vocabulary as Microsoft's — `invalid_grant` when the user revoked
+ * access or the Testing-mode consent aged out — so RECONNECT_CODES applies
+ * unchanged and a dead grant rests the account the same way.
+ */
+export async function refreshGoogleAccessToken({
+  clientId,
+  clientSecret = '',
+  refreshToken,
+  tokenUrl = null,
+  timeoutMs = TOKEN_TIMEOUT_MS,
+  signal = null,
+  fetchImpl = null,
+  now = Date.now(),
+  previous = null,
+} = {}) {
+  const id = normalizeGoogleClientId(clientId);
+  if (!refreshToken) {
+    throw new ImapOAuthError(
+      'oauth: there is no stored sign-in for this account, so it has to be connected again',
+      { code: 'no_refresh_token', reconnect: true },
+    );
+  }
+  const payload = await postForm(assertGoogleTokenEndpoint(tokenUrl), {
+    grant_type: 'refresh_token',
+    client_id: id,
+    refresh_token: String(refreshToken),
+  }, { timeoutMs, signal, fetchImpl, clientSecret });
+
+  const tokens = normalizeTokenSet(payload, { now, previous: previous || { refreshToken: String(refreshToken) } });
+  if (!tokens.accessToken) {
+    throw new ImapOAuthError('oauth: the sign-in endpoint answered without an access token', { code: 'bad_response' });
+  }
+  return tokens;
+}
+
+/** The secret a Google client may carry, or '' when nothing is filed under the ref. */
+async function clientSecretUnder(ref) {
+  if (!ref) return '';
+  try {
+    return (await getSecret(ref)) || '';
+  } catch {
+    return '';
+  }
+}
+
+/**
  * A usable access token for one mail account: load the grant, refresh it if the
  * stored token is spent, write the result back.
  *
@@ -2098,13 +2225,23 @@ export async function refreshAccessToken({
  * access token without storing the new refresh token would work exactly once and
  * then hand the same dead token to Microsoft on every sweep after it, for an
  * `invalid_grant` the user has no way to interpret.
+ *
+ * `provider` picks the refresh: `google` spends the grant at Google's token
+ * endpoint with the client's secret, if one is filed under `clientSecretRef`;
+ * anything else is Microsoft, which is what every account connected before
+ * the field existed is. Both read and write the same stored shape under the
+ * same ref, and the cached token is honoured the same way — a fresh one is
+ * returned without a request, a spent one (expiry minus a minute) is renewed.
  */
 export async function accessTokenFor({
+  provider = 'microsoft',
   clientId,
+  clientSecretRef = null,
   tenantId = 'common',
   tokenRef,
   scopes = MS_IMAP_SCOPES,
   endpoint = MS_LOGIN_ORIGIN,
+  tokenUrl = null,
   timeoutMs = TOKEN_TIMEOUT_MS,
   signal = null,
   fetchImpl = null,
@@ -2112,13 +2249,14 @@ export async function accessTokenFor({
   skewMs = 60_000,
 } = {}) {
   if (!tokenRef) throw new TypeError('oauth: accessTokenFor needs the ref the grant is stored under');
-  const id = normalizeClientId(clientId);
-  const tenant = normalizeTenant(tenantId);
+  const google = String(provider ?? '').trim().toLowerCase() === 'google';
+  const id = google ? normalizeGoogleClientId(clientId) : normalizeClientId(clientId);
+  const tenant = google ? null : normalizeTenant(tenantId);
 
   const stored = await loadOAuthTokens(tokenRef);
   if (!stored) {
     throw new ImapOAuthError(
-      'oauth: this account has not been connected to Microsoft on this machine — connect it from Settings',
+      `oauth: this account has not been connected to ${google ? 'Google' : 'Microsoft'} on this machine — connect it from Settings`,
       { code: 'not_connected', reconnect: true },
     );
   }
@@ -2126,18 +2264,30 @@ export async function accessTokenFor({
     return { accessToken: stored.accessToken, expiresAt: stored.expiresAt, refreshed: false, ref: tokenRef };
   }
 
-  const next = await refreshAccessToken({
-    clientId: id,
-    tenantId: tenant,
-    refreshToken: stored.refreshToken,
-    scopes,
-    endpoint,
-    timeoutMs,
-    signal,
-    fetchImpl,
-    now,
-    previous: stored,
-  });
+  const next = google
+    ? await refreshGoogleAccessToken({
+      clientId: id,
+      clientSecret: await clientSecretUnder(clientSecretRef || 'oauth.google.clientSecret'),
+      refreshToken: stored.refreshToken,
+      tokenUrl,
+      timeoutMs,
+      signal,
+      fetchImpl,
+      now,
+      previous: stored,
+    })
+    : await refreshAccessToken({
+      clientId: id,
+      tenantId: tenant,
+      refreshToken: stored.refreshToken,
+      scopes,
+      endpoint,
+      timeoutMs,
+      signal,
+      fetchImpl,
+      now,
+      previous: stored,
+    });
   await saveOAuthTokens(tokenRef, next);
   return { accessToken: next.accessToken, expiresAt: next.expiresAt, refreshed: true, ref: tokenRef };
 }
@@ -2265,7 +2415,8 @@ export async function fetchRecent({
   // nothing except a longer window for the server's idle timer to fire.
   let bearer = accessToken;
   if (method === 'xoauth2' && !bearer) {
-    progress({ phase: 'connect', message: 'Renewing the Microsoft sign-in', done: 0, total: 0 });
+    const who = String(oauth?.provider ?? '').toLowerCase() === 'google' ? 'Google' : 'Microsoft';
+    progress({ phase: 'connect', message: `Renewing the ${who} sign-in`, done: 0, total: 0 });
     ({ accessToken: bearer } = await accessTokenFor({ ...(oauth || {}), signal }));
   }
 
@@ -2482,8 +2633,13 @@ const PROVIDERS = [
     host: 'imap.gmail.com',
     port: 993,
     secure: true,
+    /* `signIn` is the one-button path and `auth` stays `password`: a Gmail
+       account still takes an app password, and a person who would rather not
+       sign in through a browser keeps that door. Microsoft's personal domains
+       have no such door, which is why that row says `auth: 'xoauth2'`. */
+    signIn: 'google',
     appPasswordUrl: 'https://myaccount.google.com/apppasswords',
-    note: `Gmail requires 2-Step Verification plus a 16-character App Password (myaccount.google.com → Security → App passwords). ${APP_PASSWORD_NOTE}`,
+    note: `"Sign in with Google" connects this mailbox in one step. If you would rather use a password: Gmail requires 2-Step Verification plus a 16-character App Password (myaccount.google.com → Security → App passwords). ${APP_PASSWORD_NOTE}`,
   },
   {
     domains: ['icloud.com', 'me.com', 'mac.com'],
@@ -2511,6 +2667,7 @@ const PROVIDERS = [
     port: 993,
     secure: true,
     auth: 'xoauth2',
+    signIn: 'microsoft',
     appPasswordUrl: null,
     /* Written in the past tense on purpose. The previous version of this note
        said Microsoft "is retiring" password IMAP and suggested an app password
@@ -2620,13 +2777,22 @@ export function describeProvider(email) {
     port: guess.port,
     secure: guess.secure,
     auth: 'password',
+    signIn: null,
     appPasswordUrl: null,
     note: guess.note,
     known: false,
   };
 }
 
-/** The simple form's answer for one row of PROVIDERS. */
+/**
+ * The simple form's answer for one row of PROVIDERS.
+ *
+ * `signIn` names the browser sign-in the form can offer — `google` or
+ * `microsoft` — and is null for every provider that has only a password. It
+ * is a separate field from `auth` because the two answer different questions:
+ * `auth` is what the account will be saved as if the person types a password,
+ * `signIn` is the button that spares them one.
+ */
 function answerFor(provider) {
   return {
     label: provider.label,
@@ -2634,6 +2800,7 @@ function answerFor(provider) {
     port: provider.port,
     secure: provider.secure,
     auth: provider.bridge ? 'bridge' : (provider.auth || 'password'),
+    signIn: provider.signIn || null,
     appPasswordUrl: provider.appPasswordUrl || null,
     note: provider.note,
     known: true,
@@ -2775,6 +2942,7 @@ export async function discoverProvider(email, {
         port,
         secure: true,
         auth: 'password',
+        signIn: null,
         appPasswordUrl: null,
         note: `Your domain advertises an IMAP server (${target.host}:${port}) — Connect will tell you if it answers. Many providers want an app-specific password rather than your normal one.`,
         known: false,

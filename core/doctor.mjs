@@ -640,24 +640,33 @@ function storedGrant(raw) {
  */
 function oauthTrouble(account, grant, name) {
   const clientId = String(account.oauth?.clientId ?? '').trim();
+  // Absent is Microsoft: the field postdates the first connected accounts.
+  const google = String(account.oauth?.provider ?? '').trim().toLowerCase() === 'google';
+  const who = google ? 'Google' : 'Microsoft';
   if (!clientId) {
     return {
-      detail: `${name} is set to sign in with Microsoft, but no application (client) ID is stored, so there is no app registration to sign in against.`,
-      action: 'Open Settings → Mail, edit this account and follow the steps under "Sign in with Microsoft" — '
-        + 'they end with an application (client) ID and a directory (tenant) ID to paste in. Zelos ships no registration of its own, by design.',
+      detail: `${name} is set to sign in with ${who}, but no client ID is stored, so there is no registration to sign in against.`,
+      action: google
+        ? 'Open Settings → Mail, edit this account and press "Sign in with Google" again — the client Zelos signed in through is saved on the account when the sign-in finishes.'
+        : 'Open Settings → Mail, edit this account and follow the steps under "Sign in with Microsoft" — '
+          + 'they end with an application (client) ID and a directory (tenant) ID to paste in.',
     };
   }
   if (!grant) {
     return {
-      detail: `${name} has an app registration but has never been signed in on this machine, so there is no token to open the mailbox with.`,
-      action: 'Open Settings → Mail, edit this account and press "Sign in with Microsoft". '
-        + 'Zelos shows a code, you type it at microsoft.com/devicelogin, and the panel finishes on its own.',
+      detail: `${name} has a registration but has never been signed in on this machine, so there is no token to open the mailbox with.`,
+      action: google
+        ? 'Open Settings → Mail, edit this account and press "Sign in with Google". A browser tab opens, you approve access, and the panel finishes on its own.'
+        : 'Open Settings → Mail, edit this account and press "Sign in with Microsoft". '
+          + 'Zelos shows a code, you type it at microsoft.com/devicelogin, and the panel finishes on its own.',
     };
   }
   if (!grant.refreshToken) {
     return {
-      detail: `${name} is signed in to Microsoft, but the stored grant has no refresh token, so it will stop working within the hour.`,
-      action: 'The app registration has to request the offline_access scope. Add it under API permissions, then sign in again from Settings → Mail.',
+      detail: `${name} is signed in to ${who}, but the stored grant has no refresh token, so it will stop working within the hour.`,
+      action: google
+        ? 'Sign in again from Settings → Mail and approve access when Google asks — a consent screen that was skipped is what leaves the refresh token out.'
+        : 'The app registration has to request the offline_access scope. Add it under API permissions, then sign in again from Settings → Mail.',
     };
   }
   return null;
@@ -722,6 +731,8 @@ async function checkMailAccount(account, deps, { timeoutMs }) {
     auth: oauth ? 'xoauth2' : 'password',
     oauth: oauth
       ? {
+        // Absent is Microsoft: the field postdates the first connected accounts.
+        provider: String(account.oauth?.provider ?? '').trim().toLowerCase() || 'microsoft',
         clientId: String(account.oauth?.clientId ?? '').trim(),
         tenantId: String(account.oauth?.tenantId ?? '').trim() || 'common',
         tokenRef: account.keyRef,
@@ -810,9 +821,10 @@ async function checkMailAccount(account, deps, { timeoutMs }) {
      whole check exists because a config can say one thing while the sweep does
      another, and "Signed in" without saying HOW is the sentence that let that go
      unnoticed for a release. */
+  const signedWith = String(account.oauth?.provider ?? '').toLowerCase() === 'google' ? ' with Google' : ' with Microsoft';
   return check(
     id, label, 'pass',
-    `Signed in to ${account.host}${oauth ? ' with Microsoft' : ''} · ${names.size} folder${names.size === 1 ? '' : 's'} · reading ${wanted.join(', ')}${sent ? '' : ' · no sent folder is set, so nothing you wrote is read'}`,
+    `Signed in to ${account.host}${oauth ? signedWith : ''} · ${names.size} folder${names.size === 1 ? '' : 's'} · reading ${wanted.join(', ')}${sent ? '' : ' · no sent folder is set, so nothing you wrote is read'}`,
   );
 }
 

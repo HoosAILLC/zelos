@@ -60,16 +60,10 @@ npm pack --dry-run
 
 **49 files, about 430 kB packed, 1.3 MB unpacked** at the time of writing — run
 the command rather than trusting the number, since editing these very documents
-moves it. Two things are deliberately *excluded*. `core/sources/oauth.mjs`, 989
-lines of Google and Microsoft *calendar* OAuth that nothing in the app imports —
-see [OAUTH.md](OAUTH.md); no Google sign-in code ships. (The Microsoft *mail*
-sign-in is not in that file and does ship: a device-code flow in
-`core/sources/imap.mjs` § 6, reached from **Settings → Mail → Sign in with
-Microsoft**, which needs an app you register in your own Entra tenant with
-"Allow public client flows" switched on.) And `assets/icon.png`, the
+moves it. One thing is deliberately *excluded*: `assets/icon.png`, the
 1024px app icon, which is 290 kB and was briefly 40% of this download: it is
 read only by the desktop shell (`desktop/main.js`, and electron-builder), and
-`desktop/` is not in the package, so it was shipping to nobody. The web UI's
+`desktop/` is not in the package, so it was shipping to nobody. `core/sources/oauth.mjs` *does* ship now: it carries **Sign in with Google** for mail (PKCE, loopback callback on the Zelos port) and the calendar OAuth plumbing — see [OAUTH.md](OAUTH.md). The Microsoft *mail* sign-in is the device-code flow in `core/sources/imap.mjs` § 6; both reach the app from **Settings → Mail**. The web UI's
 icon is `assets/icon.svg`, which is 22 kB and does ship.
 
 > The npm name is **`zelos-app`** (`zelos` was taken), and as of this writing

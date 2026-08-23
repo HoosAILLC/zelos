@@ -408,8 +408,8 @@ export function renderOnboarding(ctx) {
   if (step === 'mail') {
     return shell(rerender, navigate, {
       title: 'Point it at a mailbox.',
-      lede: 'Gmail, iCloud and Yahoo will all refuse your normal password here — you paste a separate app password instead, one your provider makes for you and that you can revoke on its own. '
-        + 'Type your address, and the button that appears opens your provider’s own page for making one; Connect then proves it works before you move on.',
+      lede: 'Gmail and Outlook sign you in with the provider itself; iCloud, Yahoo and everyone else take a separate app password — one your provider makes for you and that you can revoke on its own. '
+        + 'Type your address, and the button that appears opens your provider’s own sign-in page, or its page for making an app password; Connect then proves it works before you move on.',
       body: mailPanel({ compact: true, rerender, onDone: () => rerender() }),
       primary: button('Next', { class: 'btn solid', onClick: () => next(rerender) }),
     });

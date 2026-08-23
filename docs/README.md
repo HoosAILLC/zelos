@@ -227,24 +227,34 @@ IMAP command that fetches a message without marking it as read, so nothing in
 your inbox changes because Zelos looked at it. It never deletes, never moves,
 never sends.
 
-Most big providers **will not accept your normal password** for this. They want
-an "app password" — a long generated password that works only for mail apps and
-that you can revoke on its own without changing anything else. This is a good
-thing, and it takes two minutes.
-
 **The short way.** Under **Settings → Mail → Add a mailbox**, type your email
-address. Zelos recognises the provider (Gmail, iCloud, Yahoo, AOL, Fastmail,
-Zoho — and a custom domain hosted on Google Workspace or Microsoft 365, which
-it recognises through the domain's own DNS records) and shows one button,
+address. Zelos recognises the provider — Gmail, iCloud, Yahoo, AOL, Fastmail,
+Zoho, Outlook, and a custom domain hosted on Google Workspace or Microsoft 365,
+which it recognises through the domain's own DNS records — and shows one
+button.
+
+For **Gmail and Google Workspace** the button is **Sign in with Google**: it
+opens Google's consent page in your browser, you approve, the browser comes back
+to Zelos on `127.0.0.1`, and the mailbox is connected — no app password, nothing
+to register. For **Outlook, Hotmail, Live, MSN and Microsoft 365** it is **Sign
+in with Microsoft**: Zelos shows a short code, you type it at microsoft.com in a
+browser you already trust, and it connects. Microsoft no longer accepts passwords
+of any kind from a mail app on personal accounts, so there this is the only
+door. Both sign-ins run against a client Zelos ships, so you register nothing;
+[OAUTH.md](OAUTH.md) has what that took and what each one sends where. Until
+Google finishes reviewing Zelos, Google sign-in is limited to the accounts on
+its test list and asks you to sign in again every seven days — the app-password
+path below has neither limit.
+
+For **everyone else** — and for Gmail too, if you prefer it — the button is
 **Get an app password**, which opens the exact page on your provider's site
-where you create one. Copy it, paste it into Zelos, and press **Connect**: Zelos
-tests the connection, finds your sent folder, and saves the account in one go.
-If the server refuses, Zelos repeats what it said, and **Advanced** opens the
-full form with everything filled in. Personal
-Outlook, Hotmail, Live and MSN addresses get **Sign in with Microsoft** instead,
-because Microsoft no longer accepts passwords of any kind for them; Proton
-addresses go to the full form, because Proton Bridge supplies its own host,
-port and password.
+where you create one: a long generated password that works only for mail apps
+and that you can revoke on its own without changing anything else. Copy it,
+paste it into Zelos, and press **Connect**: Zelos tests the connection, finds
+your sent folder, and saves the account in one go. If the server refuses, Zelos
+repeats what it said, and **Advanced** opens the full form with everything
+filled in. Proton addresses go to the full form, because Proton Bridge supplies
+its own host, port and password.
 
 The rest of this section is the long way — the same settings, entered by hand
 under **Advanced** — and what each provider's app-password page asks for.
@@ -278,7 +288,7 @@ password is unaffected.
 
 | Provider | Server | Port | Note |
 | --- | --- | --- | --- |
-| Outlook / Hotmail | `outlook.office365.com` | 993 | Microsoft is retiring password IMAP for personal accounts. If sign-in fails, check IMAP is still enabled on your account. Work accounts often need your IT department to allow it. |
+| Outlook / Hotmail | `outlook.office365.com` | 993 | **Sign in with Microsoft** — a personal account accepts no password of any kind from a mail app any more. A work account may need your IT department to allow IMAP, or to consent to the app. |
 | Yahoo | `imap.mail.yahoo.com` | 993 | Account Security → Generate app password. |
 | Fastmail | `imap.fastmail.com` | 993 | Settings → Privacy & Security → App passwords, with the **Mail (IMAP)** scope. |
 | Proton | `127.0.0.1` | 1143 | Proton encrypts mail on their servers, so IMAP only works through **Proton Bridge** running on your machine. Use the host, port and password Bridge shows you — not your Proton password. |
@@ -360,9 +370,11 @@ things, all of them from **Settings → Sources**:
 | **A WhatsApp export** | A chat you exported yourself |
 
 Every one of them is a credential **you** mint in your own account, or a file on
-your own disk. Zelos publishes no OAuth app anywhere — there is no client id, no
-consent screen and no "Connect with…" button, because there is no server for one
-to call back to. All of them are read-only, and that is enforced by the shape of
+your own disk. For these eight, Zelos publishes no OAuth app — no client id, no
+consent screen, no "Connect with…" button. The two it does publish are for mail
+— Google and Microsoft sign-in, [OAUTH.md](OAUTH.md) — and they need no server
+either: the Google one comes back to the Zelos port on `127.0.0.1`, and the
+Microsoft one is a code you type. All of them are read-only, and that is enforced by the shape of
 the interface rather than by convention.
 
 **[SOURCES.md](SOURCES.md)** is the page for these: one section each, with where
@@ -556,7 +568,7 @@ these still exists in the file this table says it is in.
 | `core/llm.mjs` | `requestWithRetry` | the model — the address you chose |
 | `core/doctor.mjs` | `DEFAULT_DEPS.fetchImpl` | the one `fetch` `zelos doctor` uses, to try your model endpoint and your calendar address — both from your settings |
 | `core/connectors/http.mjs` | `createHttp` | **every source in Settings → Sources**, through one transport: GitHub, Slack, Linear, Todoist, Fireflies and a feed each reach the host their connector declares in `origins` (`core/connectors/*.mjs`), plus any address you typed into that source's own fields. Anything else is refused before a socket exists |
-| `core/sources/oauth.mjs` | `postForm` | nothing — the file is not imported by anything in the program, and `"!core/sources/oauth.mjs"` in `package.json` keeps it out of the package; see [OAUTH.md](OAUTH.md) |
+| `core/sources/oauth.mjs` | `postForm` | `oauth2.googleapis.com`, and only for a mailbox you set to **Sign in with Google** — the code exchange when you sign in, and the token refresh before a sweep; see [OAUTH.md](OAUTH.md) |
 
 Every one of them goes to an address that came from your own settings. There is
 no twelfth. The one directory in that table that grows is `core/connectors/`,
@@ -661,7 +673,11 @@ port and prints the one it took. Check the URL in the banner; it may be 7778.
 **Mail sign-in fails.** Nine times in ten this is the app password. Your normal
 password will not work for Gmail, iCloud or Yahoo. See [Connecting your
 mail](#connecting-your-mail). Zelos shows you the server's own words for why
-it refused, which is usually specific enough to act on.
+it refused, which is usually specific enough to act on. If you signed in with
+Google or Microsoft instead, the usual cause is a sign-in that expired or was
+revoked — Settings → Mail says so and offers **Connect again**. A Google sign-in
+made while Zelos is still in Google's testing tier expires every seven days;
+that is Google's rule, not a fault.
 
 **The model test fails.** The error names the address it tried. If that address
 is `127.0.0.1`, your local model isn't running — start Ollama, or press Start
@@ -726,13 +742,13 @@ docs/                SPEC.md (what it must do), SECURITY.md (what it defends),
                      that needs none)
 ```
 
-Two notes on that list. `core/sources/oauth.mjs` — the Google half, and the
-Microsoft *calendar* half — is **not wired to anything**: 989 lines with no
-importer outside its own test, excluded from the published package;
-[OAUTH.md](OAUTH.md) says exactly what is missing. The Microsoft *mail*
-sign-in is a different thing and does ship: a device-code flow in
-`core/sources/imap.mjs` § 6, reached from **Settings → Mail → Sign in with
-Microsoft**, against an app you register in your own Entra tenant. And `desktop/` is
+Two notes on that list. `core/sources/oauth.mjs` is the Google sign-in — PKCE,
+the callback on the Zelos port, the code exchange and the refresh, with the
+grant filed in the keychain; its calendar scopes are still wired to no reader.
+The Microsoft *mail* sign-in is a device-code flow in
+`core/sources/imap.mjs` § 6. Both are reached from **Settings → Mail → Add a
+mailbox** and run against the client ids Zelos ships; [OAUTH.md](OAUTH.md) has
+the registrations and the review behind them. And `desktop/` is
 the only directory with a `node_modules`: Electron and electron-builder, both
 `devDependencies` of the shell, neither reaching the core.
 

@@ -69,6 +69,8 @@ export function oauthFor(account) {
   const block = account?.oauth;
   if (!block || typeof block !== 'object') return null;
   return {
+    // Absent is Microsoft: the field postdates the first connected accounts.
+    provider: typeof block.provider === 'string' && block.provider.trim() ? block.provider.trim().toLowerCase() : 'microsoft',
     clientId: typeof block.clientId === 'string' ? block.clientId.trim() : '',
     tenantId: typeof block.tenantId === 'string' && block.tenantId.trim() ? block.tenantId.trim() : 'common',
     tokenRef: account?.keyRef ?? '',

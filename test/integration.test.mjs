@@ -16,6 +16,7 @@
 
 import test, { after, before, describe } from 'node:test';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
@@ -81,20 +82,29 @@ function fetchLine({ seq, uid, items = '', section, payload }) {
 /**
  * Serves a different message list per mailbox, so the sweep's INBOX/Sent split
  * — and therefore its in/out direction rule — is exercised for real.
+ *
+ * With `xoauth2: {user, isValid}` it is a Google-shaped server instead: it
+ * advertises AUTH=XOAUTH2, refuses LOGIN the way Gmail refuses a password on
+ * an OAuth account, and accepts exactly the SASL payload for `user` carrying a
+ * bearer token `isValid` vouches for. `sasl` is every decoded payload it was
+ * offered, so a test can assert on the token that actually went over the wire.
  */
-function startMockImap(mailboxes) {
+function startMockImap(mailboxes, { xoauth2 = null } = {}) {
   const commandLog = [];
+  const sasl = [];
   const sockets = new Set();
+  const capability = `IMAP4rev1${xoauth2 ? ' AUTH=XOAUTH2' : ''}`;
 
   const server = net.createServer((socket) => {
     sockets.add(socket);
     socket.setNoDelay(true);
     socket.on('error', () => {});
     socket.on('close', () => sockets.delete(socket));
-    socket.write('* OK [CAPABILITY IMAP4rev1] Zelos integration mock\r\n');
+    socket.write(`* OK [CAPABILITY ${capability}] Zelos integration mock\r\n`);
 
     let selected = 'INBOX';
     let buffer = '';
+    let saslTag = null;
     socket.on('data', (chunk) => {
       buffer += chunk.toString('latin1');
       let idx;
@@ -102,6 +112,17 @@ function startMockImap(mailboxes) {
         const line = buffer.slice(0, idx);
         buffer = buffer.slice(idx + 2);
         commandLog.push(line);
+
+        if (saslTag) {
+          // The line after `AUTHENTICATE XOAUTH2` is the base64 SASL payload, not a command.
+          const decoded = Buffer.from(line, 'base64').toString('utf8');
+          sasl.push(decoded);
+          const m = /^user=([^\x01]*)\x01auth=Bearer ([^\x01]*)\x01\x01$/.exec(decoded);
+          const ok = Boolean(m) && m[1] === xoauth2.user && xoauth2.isValid(m[2]);
+          socket.write(ok ? `${saslTag} OK AUTHENTICATE completed\r\n` : `${saslTag} NO AUTHENTICATE failed.\r\n`);
+          saslTag = null;
+          continue;
+        }
 
         const parts = line.split(' ');
         const tag = parts[0] || '';
@@ -117,10 +138,27 @@ function startMockImap(mailboxes) {
 
         switch (verb) {
           case 'CAPABILITY':
-            send(`* CAPABILITY IMAP4rev1\r\n${tag} OK CAPABILITY completed\r\n`);
+            send(`* CAPABILITY ${capability}\r\n${tag} OK CAPABILITY completed\r\n`);
             break;
           case 'LOGIN':
-            send(`${tag} OK LOGIN completed\r\n`);
+            send(xoauth2
+              ? `${tag} NO [AUTHENTICATIONFAILED] Invalid credentials (Failure)\r\n`
+              : `${tag} OK LOGIN completed\r\n`);
+            break;
+          case 'AUTHENTICATE':
+            if (xoauth2 && /^XOAUTH2$/i.test(args.trim())) {
+              saslTag = tag;
+              send('+ \r\n');
+            } else {
+              send(`${tag} NO unsupported mechanism\r\n`);
+            }
+            break;
+          case 'LIST':
+            send(
+              '* LIST (\\HasNoChildren) "/" "INBOX"\r\n'
+              + '* LIST (\\HasNoChildren \\Sent) "/" "Sent"\r\n'
+              + `${tag} OK LIST completed\r\n`,
+            );
             break;
           case 'SELECT':
           case 'EXAMINE': {
@@ -173,6 +211,7 @@ function startMockImap(mailboxes) {
     server.listen(0, '127.0.0.1', () => resolve({
       port: server.address().port,
       commandLog,
+      sasl,
       async close() {
         for (const s of sockets) s.destroy();
         await new Promise((done) => server.close(done));
@@ -1518,5 +1557,232 @@ describe('a sweep and the first Ask of the day book against the same day', () =>
     assert.equal(after.modelRuns, 1);
     assert.equal(after.lifetime.tokensIn, afterSweep.lifetime.tokensIn + Number(done.usage.input),
       'and the lifetime total never resets, whichever day it is');
+  });
+});
+
+/* ================================================================== *
+ * Sign in with Google: server.mjs -> oauth.mjs -> imap.mjs §6 -> sweep.mjs
+ *
+ * The whole mass-market path, with nothing stubbed at a module boundary: a
+ * Google-shaped authorization server and a Gmail-shaped IMAP server, both
+ * real sockets on 127.0.0.1; the real HTTP server the browser talks to; the
+ * real secret store in the temp home; and the real sweep over the real
+ * connector, reading the grant the callback filed.
+ * ================================================================== */
+
+const GOOGLE_CLIENT = '4242-zelos-test.apps.googleusercontent.com';
+
+/**
+ * Google, as the flow sees it. The exchange answers with an access token that
+ * is already inside the minute of skew — `expiresIn: 30` — so the first thing
+ * to spend the grant has to renew it, which is the second grant type. The
+ * renewal is good for an hour, so the sweep after it uses the cache.
+ */
+function startMockGoogle({ expiresIn = 30, refreshExpiresIn = 3600 } = {}) {
+  const seen = [];
+  const byCode = new Map();
+  const live = new Set();
+  let issued = 0;
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url, 'http://127.0.0.1');
+    const send = (status, payload) => {
+      const text = JSON.stringify(payload);
+      res.writeHead(status, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(text) });
+      res.end(text);
+    };
+    if (req.method === 'GET' && url.pathname === '/auth') {
+      const q = Object.fromEntries(url.searchParams.entries());
+      seen.push({ kind: 'auth', query: q });
+      const code = `4/code-${Math.random().toString(16).slice(2)}`;
+      byCode.set(code, { challenge: q.code_challenge, method: q.code_challenge_method, redirectUri: q.redirect_uri, scope: q.scope });
+      const back = new URL(q.redirect_uri);
+      back.searchParams.set('code', code);
+      back.searchParams.set('state', q.state);
+      res.writeHead(302, { Location: back.toString(), 'Content-Length': 0 });
+      res.end();
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/token') {
+      let body = '';
+      req.on('data', (d) => { body += d; });
+      req.on('end', () => {
+        const form = Object.fromEntries(new URLSearchParams(body).entries());
+        seen.push({ kind: 'token', form });
+        if (form.client_id !== GOOGLE_CLIENT) { send(401, { error: 'invalid_client' }); return; }
+        const mint = (extra) => {
+          issued += 1;
+          const token = `ya29.access-${issued}`;
+          live.add(token);
+          send(200, { access_token: token, token_type: 'Bearer', scope: 'https://mail.google.com/', ...extra });
+        };
+        if (form.grant_type === 'authorization_code') {
+          const record = byCode.get(form.code);
+          const derived = crypto.createHash('sha256').update(String(form.code_verifier), 'ascii').digest('base64url');
+          if (!record || record.method !== 'S256' || derived !== record.challenge || record.redirectUri !== form.redirect_uri) {
+            send(400, { error: 'invalid_grant' });
+            return;
+          }
+          byCode.delete(form.code);
+          mint({ refresh_token: '1//refresh-fixture', expires_in: expiresIn });
+          return;
+        }
+        if (form.grant_type === 'refresh_token' && form.refresh_token === '1//refresh-fixture') {
+          mint({ expires_in: refreshExpiresIn });
+          return;
+        }
+        send(400, { error: 'invalid_grant', error_description: 'Token has been expired or revoked.' });
+      });
+      return;
+    }
+    res.writeHead(404, { 'Content-Length': 0 });
+    res.end();
+  });
+  return new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', () => {
+      const { port } = server.address();
+      resolve({
+        seen,
+        live,
+        authorizeUrl: `http://127.0.0.1:${port}/auth`,
+        tokenUrl: `http://127.0.0.1:${port}/token`,
+        tokenRequests: () => seen.filter((s) => s.kind === 'token'),
+        close: () => new Promise((r) => server.close(() => r())),
+      });
+    });
+  });
+}
+
+describe('Sign in with Google: server.mjs -> oauth.mjs -> imap.mjs -> sweep.mjs, over real sockets', () => {
+  const user = 'nemo.the.operator@workspace-shaped.example';
+  const keyRef = 'mail.m_google1';
+  let google;
+  let gmail;
+  let gdb;
+  let gconfig;
+  let gserver;
+  let gbase;
+  let secrets;
+
+  before(async () => {
+    secrets = await import('../core/secrets.mjs');
+    await secrets.deleteSecret(keyRef).catch(() => {});
+    google = await startMockGoogle();
+    gmail = await startMockImap({ INBOX, Sent: SENT }, { xoauth2: { user, isValid: (token) => google.live.has(token) } });
+
+    gdb = openDb(path.join(home, 'google.db'));
+    migrate(gdb);
+
+    gconfig = structuredClone(DEFAULTS);
+    gconfig.identity = { name: 'Nemo Hale', email: user, timezone: 'America/New_York' };
+    gconfig.sweep.auto = false;
+    // The operator's own registration, until Zelos ships one.
+    gconfig.oauth = { clients: { google: { clientId: GOOGLE_CLIENT } } };
+    gconfig.mail = [{
+      id: 'm_google1', enabled: true, label: 'Workspace',
+      host: '127.0.0.1', port: gmail.port, secure: false,
+      user, keyRef, auth: 'xoauth2', oauth: { provider: 'google', clientId: GOOGLE_CLIENT },
+      mailboxes: ['INBOX'], sentMailbox: 'Sent',
+      lookbackDays: 400, maxMessages: 50,
+    }];
+
+    gserver = createServer({
+      db: gdb,
+      config: gconfig,
+      token: FIXED_TOKEN,
+      heartbeatMs: 50,
+      browserAuth: { authorizeUrl: google.authorizeUrl, tokenUrl: google.tokenUrl },
+      dns: {
+        resolveMx: async () => [{ priority: 10, exchange: 'aspmx.l.google.com.' }],
+        resolveSrv: async () => [],
+      },
+    });
+    gbase = (await listen(gserver, { port: 0 })).url.replace(/\/$/, '');
+  });
+
+  after(async () => {
+    await new Promise((done) => gserver.close(done));
+    closeDb(gdb);
+    await Promise.all([google.close(), gmail.close()]);
+    await secrets.deleteSecret(keyRef).catch(() => {});
+  });
+
+  test('one address, one button: the browser round trip files a grant the test button and the sweep both spend', async () => {
+    const headers = { 'X-Zelos-Token': FIXED_TOKEN, 'Content-Type': 'application/json' };
+    const post = async (route, body) => {
+      const res = await fetch(`${gbase}${route}`, { method: 'POST', headers, body: JSON.stringify(body) });
+      return { status: res.status, json: await res.json() };
+    };
+    const get = async (route) => {
+      const res = await fetch(`${gbase}${route}`, { headers });
+      return { status: res.status, json: await res.json() };
+    };
+
+    // The form asks who hosts the address: a Workspace domain, Google underneath, and a client ready to run.
+    const guess = await post('/api/mail/guess', { email: user });
+    assert.equal(guess.status, 200);
+    assert.equal(guess.json.via, 'mx');
+    assert.equal(guess.json.signIn, 'google');
+    assert.equal(guess.json.clientReady, true);
+
+    // One button. The client id comes from config; the page is told which.
+    const began = await post('/api/mail/oauth', { provider: 'google', keyRef, email: user });
+    assert.equal(began.status, 200, JSON.stringify(began.json));
+    assert.equal(began.json.provider, 'google');
+    assert.equal(began.json.status, 'pending');
+    assert.equal(began.json.clientId, GOOGLE_CLIENT);
+    const authUrl = new URL(began.json.authUrl);
+    assert.equal(authUrl.searchParams.get('redirect_uri'), `${gbase}/oauth/callback`);
+    assert.equal(authUrl.searchParams.get('scope'), 'https://mail.google.com/');
+    assert.ok(!began.json.authUrl.includes('nemo'), 'the address is not in the URL the browser opens');
+
+    // The browser: Google, then back to Zelos.
+    const hop = await fetch(began.json.authUrl, { redirect: 'manual' });
+    assert.equal(hop.status, 302);
+    const back = hop.headers.get('location');
+    assert.ok(back.startsWith(`${gbase}/oauth/callback?`), back);
+    const landing = await fetch(back, { redirect: 'manual' });
+    const page = await landing.text();
+    assert.equal(landing.status, 200, page);
+    assert.match(page, /Signed in\./);
+    assert.ok(!page.includes('ya29') && !page.includes('refresh-fixture') && !page.includes('@') && !/<script/i.test(page));
+
+    const connected = await get(`/api/mail/oauth/${began.json.id}`);
+    assert.equal(connected.json.status, 'connected');
+    assert.equal(connected.json.keyRef, keyRef);
+    const stored = JSON.parse(await secrets.getSecret(keyRef));
+    assert.equal(stored.kind, 'xoauth2');
+    assert.equal(stored.refreshToken, '1//refresh-fixture');
+    assert.equal(stored.accessToken, 'ya29.access-1');
+
+    // The test button. The token Google minted at the exchange is inside the
+    // minute of skew, so the button has to renew it — the second grant type —
+    // and the renewed token is what reaches the mail server.
+    const tested = await post('/api/mail/test', {
+      host: '127.0.0.1', port: gmail.port, secure: false, user, keyRef,
+      auth: 'xoauth2', oauth: { provider: 'google', clientId: GOOGLE_CLIENT },
+    });
+    assert.equal(tested.status, 200);
+    assert.equal(tested.json.ok, true, tested.json.error);
+    assert.ok(tested.json.mailboxes.some((m) => (typeof m === 'string' ? m : m.name) === 'INBOX'));
+    assert.deepEqual(google.tokenRequests().map((r) => r.form.grant_type), ['authorization_code', 'refresh_token']);
+    assert.deepEqual(gmail.sasl, [`user=${user}\x01auth=Bearer ya29.access-2\x01\x01`]);
+    assert.ok(gmail.commandLog.some((l) => /AUTHENTICATE XOAUTH2/i.test(l)));
+    assert.ok(!gmail.commandLog.some((l) => /\bLOGIN\b/i.test(l)), 'no password was ever offered');
+    assert.equal(JSON.parse(await secrets.getSecret(keyRef)).accessToken, 'ya29.access-2', 'the renewal was written back');
+
+    // The sweep: the real connector, the real reader, the real store — and the
+    // one injected dependency every sweep test injects, pointed at the store
+    // the callback wrote to. The renewed token is fresh, so no third request.
+    const run = await runSweep({ db: gdb, config: gconfig, mode: 'light', deps: { getSecret: secrets.getSecret } });
+    assert.equal(run.ok, true, run.error);
+    const mail = run.stats.sources.filter((s) => s.kind === 'mail');
+    assert.ok(mail.length >= 1, JSON.stringify(run.stats.sources));
+    assert.ok(mail.every((s) => s.ok), JSON.stringify(mail));
+    assert.equal(google.tokenRequests().length, 2, 'the sweep spent the cached token');
+    assert.ok(gmail.sasl.length >= 2 && gmail.sasl.every((p) => p.endsWith('Bearer ya29.access-2\x01\x01')));
+    const messages = listMessages(gdb, { limit: 50 });
+    assert.ok(messages.some((m) => m.uid === 101), 'the inbox fixture arrived over XOAUTH2');
+    assert.equal(JSON.parse(await secrets.getSecret(keyRef)).refreshToken, '1//refresh-fixture',
+      'Google does not rotate, and the sweep did not lose the grant');
   });
 });

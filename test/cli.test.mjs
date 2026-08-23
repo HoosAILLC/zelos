@@ -165,15 +165,13 @@ describe('package.json is ready to publish as zelos-app', () => {
     // allowlist is read by people as the definition of what ships, and a file
     // that ships without appearing in it makes the list a half-truth.
     //
-    // There are two negations, and both are the same argument: a file nothing
-    // in the published package can reach should not be in the published
-    // package.
+    // There is one negation, and the argument for it is: a file nothing in
+    // the published package can reach should not be in the published package.
     //
-    // core/sources/oauth.mjs — 989 lines of OAuth that no production code path
-    // can reach (no config key holds it, no Settings surface offers it, and
-    // CALENDAR_KINDS has no google or microsoft branch for a token to hang
-    // off). It stays in the repo, with its test, because the research is real
-    // and the wiring may yet happen.
+    // core/sources/oauth.mjs used to be the other one — OAuth that no
+    // production code path reached. "Sign in with Google" changed that:
+    // core/server.mjs and core/sources/imap.mjs import it now, so a package
+    // without it would not start.
     //
     // assets/icon.png — the 1024px app icon, 290 kB, read only by the desktop
     // shell (desktop/main.js, and electron-builder's mac and win blocks).
@@ -183,10 +181,10 @@ describe('package.json is ready to publish as zelos-app', () => {
     // assets/icon.svg, which is 22 kB and does ship — ui/index.html asks for
     // it by name, so excluding the directory instead would break the favicon.
     //
-    // That both negations still work is checked against a real tarball further
+    // That the negation still works is checked against a real tarball further
     // down, not here.
     assert.deepEqual(pkg.files,
-      ['core/', '!core/sources/oauth.mjs', 'ui/', 'assets/', '!assets/icon.png', 'docs/*.md', 'zelos.mjs', 'README.md', 'LICENSE']);
+      ['core/', 'ui/', 'assets/', '!assets/icon.png', 'docs/*.md', 'zelos.mjs', 'README.md', 'LICENSE']);
   });
 });
 
@@ -392,23 +390,18 @@ describe('npm pack produces a tarball that runs', { skip: PACK_SKIP }, () => {
       'the home lock is not in the tarball, so an installed zelos cannot take it');
   });
 
-  test('it leaves out the OAuth module nothing can reach', () => {
-    /* core/sources/oauth.mjs is 989 lines with no production importer: no
-       DEFAULTS key holds `oauth`, Settings has no surface for it,
-       desktop/runtime.js loads a hardcoded five-module list, and the calendar
-       kinds are ics/caldav/file with no google or microsoft branch — so even a
-       hand-written config.json could not put a token on a calendar row. The
-       research is real and the wiring may yet happen, which is why the module
-       and its 851-line test stay in the repo; what should not happen is
-       publishing a thousand lines of unreachable network code to everyone who
-       types `npm i zelos-app`. `files` carries `core/` and then takes this one
-       file back out — hence a `!` entry in an otherwise plain allowlist, and
-       hence this test, because a negation with nothing watching it is exactly
-       the kind of line a later edit drops without noticing. */
-    assert.ok(!entries.includes('core/sources/oauth.mjs'),
-      'the unreachable OAuth module is being published');
-    assert.ok(entries.some((e) => e.startsWith('core/sources/')),
-      'the negation took the rest of core/sources/ with it');
+  test('it ships the OAuth module the mail sign-in imports', () => {
+    /* core/sources/oauth.mjs used to be negated out of `files`: it had no
+       production importer, and publishing a thousand lines of unreachable
+       network code to everyone who types `npm i zelos-app` was the wrong
+       default. "Sign in with Google" gave it two importers — core/server.mjs
+       builds the authorization URL and exchanges the code through it, and
+       core/sources/imap.mjs reads Google's token endpoint off its provider
+       table — so a tarball without it fails at import, before the first
+       request. This test is the old one turned round: the line that would
+       quietly drop it is the one nothing was watching. */
+    assert.ok(entries.includes('core/sources/oauth.mjs'),
+      'the OAuth module the server imports is not being published');
   });
 
   test('it leaves out the desktop-only app icon, and keeps the one the UI asks for', () => {

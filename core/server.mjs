@@ -77,8 +77,23 @@ import {
   testConnection as testMailConnection,
   connectDeviceCode,
   discoverProvider,
+  isLoopbackHost,
+  saveOAuthTokens,
   MS_LOGIN_ORIGIN,
 } from './sources/imap.mjs';
+/* "Sign in with Google": the PKCE material and the token exchange come from
+   the one provider table, and the grant is filed by core/sources/imap.mjs
+   above in the exact shape the Microsoft flow files its own. */
+import {
+  oauthClient,
+  createState,
+  createVerifier,
+  challengeFor,
+  statesMatch,
+  buildAuthUrl,
+  exchangeCode,
+  MAIL_CALLBACK_PATH,
+} from './sources/oauth.mjs';
 import {
   testConnection as testCalDavConnection,
   invalidate as forgetCalDavLayouts,
@@ -1256,8 +1271,14 @@ function requireTlsFrom(body) {
  *
  * `tokenRef` is not read either: it is `keyRef`, always, because that is where
  * core/sources/imap.mjs §6 files a grant so that removing the account removes it.
+ *
+ * `provider` picks which of the two shapes the block is read as. Absent is
+ * Microsoft — the field did not exist when the first accounts were connected.
+ * A Google block may leave `clientId` out and take the client `oauthClient()`
+ * resolves from config or the shipped default, which is what lets the test
+ * button work before the account has been saved.
  */
-function mailAuthFrom(body, keyRef) {
+function mailAuthFrom(body, keyRef, config = null) {
   const method = body?.auth === undefined || body?.auth === null ? 'password' : body.auth;
   if (method !== 'password' && method !== 'xoauth2') {
     throw new HttpError(400, 'auth must be "password" or "xoauth2"');
@@ -1268,9 +1289,28 @@ function mailAuthFrom(body, keyRef) {
   if (!block || typeof block !== 'object' || Array.isArray(block)) {
     throw new HttpError(400, 'oauth must be an object with clientId and tenantId when auth is xoauth2');
   }
+  const provider = mailProviderFrom(block, 'oauth.provider');
+  if (provider === 'google') {
+    const client = oauthClient(config, 'google');
+    const clientId = requireString(block, 'clientId', { max: 200, required: false }).trim() || client.clientId;
+    if (!clientId) throw new HttpError(400, 'oauth.clientId is required — no Google client is configured');
+    return { method, oauth: { provider, clientId, clientSecretRef: client.clientSecretRef, tokenRef: keyRef } };
+  }
   const clientId = requireString(block, 'clientId', { max: 64 });
   const tenantId = requireString(block, 'tenantId', { max: 128, required: false }) || 'common';
-  return { method, oauth: { clientId, tenantId, tokenRef: keyRef } };
+  return { method, oauth: { provider, clientId, tenantId, tokenRef: keyRef } };
+}
+
+/**
+ * `body.provider`: `google` or `microsoft`; absent is Microsoft, anything else
+ * is a 400 naming the field — `label` is how the 400 spells it, so a block
+ * nested under `oauth` is reported as `oauth.provider`.
+ */
+function mailProviderFrom(body, label = 'provider') {
+  const raw = body?.provider;
+  if (raw === undefined || raw === null || raw === '') return 'microsoft';
+  if (raw !== 'google' && raw !== 'microsoft') throw new HttpError(400, `${label} must be "google" or "microsoft"`);
+  return raw;
 }
 
 /**
@@ -1292,7 +1332,14 @@ async function handleMailGuess(ctx) {
   const body = await readJSON(ctx.req);
   const email = requireString(body, 'email', { max: 320 });
   if (!email.trim()) throw new HttpError(400, 'email is required');
-  sendJSON(ctx.res, 200, await discoverProvider(email, ctx.dns));
+  const answer = await discoverProvider(email, ctx.dns);
+  /* `signIn` is the provider's, `clientReady` is this install's: whether a
+     client id exists to run that sign-in against, from config or the shipped
+     default. The form shows the button only when both are true, and tells the
+     person what to paste when only the first is. */
+  const signIn = answer.signIn ?? null;
+  const clientReady = signIn ? oauthClient(ctx.config(), signIn).source !== 'none' : false;
+  sendJSON(ctx.res, 200, { ...answer, signIn, clientReady });
 }
 
 async function handleMailTest(ctx) {
@@ -1303,7 +1350,7 @@ async function handleMailTest(ctx) {
   const port = Number(body.port ?? 993);
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new HttpError(400, 'port must be a port number');
   const requireTls = requireTlsFrom(body);
-  const { method, oauth } = mailAuthFrom(body, keyRef);
+  const { method, oauth } = mailAuthFrom(body, keyRef, ctx.config());
 
   /* An OAuth account has no password to be missing, and asking for one here is
      how the button would report "save it first with POST /api/secrets" about an
@@ -1329,7 +1376,8 @@ async function handleMailTest(ctx) {
     user,
     pass,
     auth: method,
-    oauth: oauth ? { ...oauth, endpoint: ctx.deviceSignIns.endpoint } : null,
+    // Both seams are forwarded; `accessTokenFor` reads the one its provider uses.
+    oauth: oauth ? { ...oauth, endpoint: ctx.deviceSignIns.endpoint, tokenUrl: ctx.browserSignIns.tokenUrl } : null,
     requireTls,
     timeoutMs: 30_000,
   });
@@ -1391,11 +1439,19 @@ class DeviceSignInPad {
     }
   }
 
-  /** What a caller may see: never the device code, never the tokens. */
+  /**
+   * What a caller may see: never the device code, never the tokens.
+   *
+   * `status` repeats `state` and `provider` is constant, so that the two
+   * sign-ins read back as one shape — GET /api/mail/oauth/:id answers for
+   * either pad — without renaming the field the first one shipped with.
+   */
   static #view(flow) {
     return {
       id: flow.id,
+      provider: 'microsoft',
       state: flow.state,
+      status: flow.state,
       keyRef: flow.keyRef,
       userCode: flow.userCode,
       verificationUri: flow.verificationUri,
@@ -1537,24 +1593,312 @@ function mailRefFrom(body) {
   return keyRef;
 }
 
+/* ------------------------------------------------- "Sign in with Google"
+ *
+ * Authorization Code with PKCE (RFC 7636), received on this server's own port.
+ * Google has no device grant that reaches IMAP, but its "Desktop app" clients
+ * accept `http://127.0.0.1:<any port>/<path>` as a redirect — so the browser is
+ * sent to Google with a one-time `state` and a PKCE challenge, and Google sends
+ * it back to GET /oauth/callback on whatever port Zelos bound. The verifier
+ * never leaves this process except in the one POST that trades the code for
+ * tokens, and the code is never read until the state has matched.
+ *
+ * The callback carries no session token — a browser redirect cannot — which is
+ * why it sits outside the session gate, like the handoff. What stands in for
+ * the token is the state: 32 random bytes that only the page which began the
+ * flow has ever been shown, compared in constant time, spent once. Anything
+ * else a page on this machine could send to that path is answered with the
+ * same generic page and nothing is exchanged.
+ */
+
+/** How long a browser sign-in waits for the person to come back. */
+const BROWSER_FLOW_TTL_MS = 10 * 60_000;
+
+/**
+ * The two pages a browser can land on, static to the byte. Nothing from the
+ * query string — not the state, not the code, not Google's error text — is
+ * ever written into them, and there is no script to carry anything off.
+ */
+const CALLBACK_STYLE = 'body{background:#0b0d10;color:#e8e6e3;font:16px/1.6 ui-sans-serif,system-ui,sans-serif;display:grid;place-items:center;height:100vh;margin:0}main{max-width:28rem;padding:2rem;text-align:center}h1{font-size:1.25rem;font-weight:600;margin:0 0 .5rem}p{margin:0;color:#a6a29d}';
+const SIGNED_IN_PAGE = `<!doctype html><meta charset="utf-8"><title>Signed in</title>
+<style>${CALLBACK_STYLE}</style>
+<main><h1>Signed in.</h1><p>You can close this tab and go back to Zelos.</p></main>`;
+const REFUSED_PAGE = `<!doctype html><meta charset="utf-8"><title>Refused</title>
+<style>${CALLBACK_STYLE}</style>
+<main><h1>Zelos refused that callback.</h1><p>It did not match a sign-in Zelos started, so nothing was exchanged. Start again from Zelos.</p></main>`;
+
+function sendPage(res, status, body) {
+  res.writeHead(status, {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Content-Length': Buffer.byteLength(body),
+    'Cache-Control': 'no-store',
+    'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'",
+    'X-Content-Type-Options': 'nosniff',
+    'Referrer-Policy': 'no-referrer',
+    'X-Frame-Options': 'DENY',
+  });
+  res.end(body);
+}
+
+/**
+ * The browser sign-ins one server has in flight. Per-server, like
+ * DeviceSignInPad, and with the same linger and the same cap.
+ */
+class BrowserSignInPad {
+  constructor({
+    authorizeUrl = null, tokenUrl = null, fetchImpl = null, ttlMs = BROWSER_FLOW_TTL_MS,
+    boundPort = () => null, logger = log,
+  } = {}) {
+    this.authorizeUrl = authorizeUrl;
+    this.tokenUrl = tokenUrl;
+    this.fetchImpl = fetchImpl;
+    this.ttlMs = ttlMs;
+    this.boundPort = boundPort;
+    this.logger = logger;
+    this.flows = new Map();
+  }
+
+  /** Expire what nobody came back for; forget what finished long enough ago. */
+  #sweep(now = Date.now()) {
+    for (const [id, flow] of this.flows) {
+      if (flow.state === 'pending' && now >= flow.expiresAtMs) {
+        flow.state = 'expired';
+        flow.error = 'the sign-in was not finished in time — start again from Zelos';
+        flow.code = 'expired_token';
+        flow.nonce = null;
+        flow.verifier = null;
+        flow.finishedAt = now;
+      }
+      if (flow.finishedAt && now - flow.finishedAt > DEVICE_FLOW_LINGER_MS) this.flows.delete(id);
+    }
+  }
+
+  /** What a caller may see: never the state, never the verifier, never the tokens. */
+  static #view(flow) {
+    return {
+      id: flow.id,
+      provider: 'google',
+      state: flow.state,
+      status: flow.state,
+      keyRef: flow.keyRef,
+      clientId: flow.clientId,
+      expiresAt: flow.expiresAt,
+      scope: flow.scope,
+      error: flow.error,
+      reconnect: flow.reconnect,
+    };
+  }
+
+  begin({ keyRef, clientId, clientSecretRef }) {
+    this.#sweep();
+    const live = [...this.flows.values()].filter((f) => f.state === 'pending').length;
+    if (live >= MAX_DEVICE_SIGNINS) {
+      throw new HttpError(429, `${live} Google sign-ins are already waiting for a browser — finish or cancel one first`);
+    }
+    /* The port the server actually bound, not the one config asked for: the
+       launcher walks up from 7777 when it is taken, and a redirect to the
+       wrong port is a sign-in that lands on nothing. */
+    const port = this.boundPort();
+    if (!Number.isInteger(port) || port <= 0) {
+      throw new HttpError(500, 'this server is not listening yet, so there is no port for Google to send the browser back to');
+    }
+
+    const nonce = createState();
+    const verifier = createVerifier();
+    const redirectUri = `http://${HOST}:${port}${MAIL_CALLBACK_PATH}`;
+    let authUrl;
+    try {
+      authUrl = buildAuthUrl({
+        provider: 'google',
+        clientId,
+        redirectUri,
+        state: nonce,
+        challenge: challengeFor(verifier),
+        purpose: 'mail',
+        authorizeUrl: this.authorizeUrl,
+      });
+    } catch (err) {
+      throw new HttpError(err?.code === 'not_configured' || err?.code === 'bad_scope' ? 400 : 500, err.message);
+    }
+
+    const now = Date.now();
+    const flow = {
+      id: crypto.randomBytes(8).toString('hex'),
+      state: 'pending',
+      keyRef,
+      clientId,
+      clientSecretRef,
+      nonce,
+      verifier,
+      redirectUri,
+      expiresAt: new Date(now + this.ttlMs).toISOString(),
+      expiresAtMs: now + this.ttlMs,
+      scope: '',
+      error: null,
+      code: null,
+      reconnect: false,
+      finishedAt: 0,
+    };
+    this.flows.set(flow.id, flow);
+    this.logger.info('server: started a Google sign-in', { keyRef });
+    return { ...BrowserSignInPad.#view(flow), authUrl };
+  }
+
+  read(id) {
+    this.#sweep();
+    const flow = this.flows.get(id);
+    return flow ? BrowserSignInPad.#view(flow) : null;
+  }
+
+  cancel(id) {
+    const flow = this.flows.get(id);
+    if (!flow) return null;
+    if (flow.state === 'pending') {
+      flow.state = 'cancelled';
+      flow.nonce = null;
+      flow.verifier = null;
+      flow.finishedAt = Date.now();
+    }
+    return BrowserSignInPad.#view(flow);
+  }
+
+  /** The pending flow whose state this is, compared in constant time, or null. */
+  #flowFor(state) {
+    let found = null;
+    for (const flow of this.flows.values()) {
+      // Every candidate is compared, so the answer's timing does not say
+      // which position in the table matched.
+      if (flow.state === 'pending' && statesMatch(flow.nonce, state) && !found) found = flow;
+    }
+    return found;
+  }
+
+  /**
+   * The browser came back. Resolves `{status, body}` for the page; everything
+   * the panel needs to know is written onto the flow.
+   *
+   * Awaited to the end on purpose: the browser is told "signed in" only once
+   * the grant is in the secret store, so the page a person reads is never
+   * ahead of the truth.
+   */
+  async callback({ state = '', code = '', error = '' } = {}) {
+    this.#sweep();
+    const flow = state ? this.#flowFor(state) : null;
+    if (!flow) {
+      this.logger.warn('server: refused a sign-in callback that matched no pending flow');
+      return { status: 400, body: REFUSED_PAGE };
+    }
+    // Spent. A second arrival under the same state is a stranger's.
+    flow.nonce = null;
+
+    const fail = (message, reason, { reconnect = false } = {}) => {
+      flow.state = 'failed';
+      flow.error = message;
+      flow.code = reason;
+      flow.reconnect = reconnect;
+      flow.verifier = null;
+      flow.finishedAt = Date.now();
+      this.logger.warn('server: a Google sign-in failed', { keyRef: flow.keyRef, code: reason });
+      return { status: 400, body: REFUSED_PAGE };
+    };
+
+    if (error) {
+      /* Google's own `error` is kept as the code, capped; the sentence is ours
+         and generic, because the one thing a person can do is try again. */
+      return fail(
+        'Google did not complete the sign-in — access was declined or the request was refused. Start again from Zelos.',
+        String(error).slice(0, 80) || 'denied',
+      );
+    }
+    if (!code) return fail('the sign-in came back without an authorization code', 'no_code');
+
+    try {
+      const tokens = await exchangeCode({
+        provider: 'google',
+        clientId: flow.clientId,
+        clientSecret: (await secretFor(flow.clientSecretRef)) || '',
+        code,
+        verifier: flow.verifier,
+        redirectUri: flow.redirectUri,
+        tokenUrl: this.tokenUrl,
+        fetchImpl: this.fetchImpl,
+      });
+      flow.verifier = null;
+      if (!tokens.refreshToken) {
+        /* `access_type=offline` plus `prompt=consent` asks for one every time,
+           so its absence means the consent screen was not shown — which
+           happens when a Testing-mode project's user list does not include the
+           account. Working for an hour and then stopping is worse than saying
+           so now. */
+        return fail(
+          'Google returned no refresh token, so this connection would stop working within the hour — sign in again and approve access when asked',
+          'no_refresh_token',
+          { reconnect: true },
+        );
+      }
+      await saveOAuthTokens(flow.keyRef, tokens);
+      flow.state = 'connected';
+      flow.scope = tokens.scope || '';
+      flow.finishedAt = Date.now();
+      this.logger.info('server: a mailbox was connected to Google', { keyRef: flow.keyRef });
+      return { status: 200, body: SIGNED_IN_PAGE };
+    } catch (err) {
+      /* The message verbatim, for the same reason DeviceSignInPad echoes its
+         own: the module that knows what went wrong wrote it for a person, and
+         the only thing it can quote is the token endpoint's `error` and
+         `error_description`, capped — an endpoint that is Google or loopback. */
+      return fail(err?.message || 'the sign-in failed', err?.code || 'oauth_error', { reconnect: true });
+    }
+  }
+
+  /** Every flow, abandoned. Called when the server closes. */
+  closeAll() {
+    this.flows.clear();
+  }
+}
+
 async function handleMailOAuthBegin(ctx) {
   const body = await readJSON(ctx.req);
   const keyRef = mailRefFrom(body);
-  const clientId = requireString(body, 'clientId', { max: 64 });
-  const tenantId = requireString(body, 'tenantId', { max: 128, required: false }) || 'common';
+  const provider = mailProviderFrom(body);
+  if (provider === 'google') {
+    const client = oauthClient(ctx.config(), 'google');
+    const clientId = requireString(body, 'clientId', { max: 200, required: false }).trim() || client.clientId;
+    if (!clientId) {
+      throw new HttpError(400, 'no Google client is configured — paste the client ID from your own Google Cloud project, or use a Zelos build that ships one');
+    }
+    /* The secret goes to the store before anything else happens, under the
+       one ref the refresh will read it back from — the same write the
+       Settings "save secret" button would make, and it is the only way the
+       value reaches this process. Validated as a string like every other
+       field, and never echoed. */
+    const clientSecret = requireString(body, 'clientSecret', { max: 200, required: false });
+    if (clientSecret) await setSecret(client.clientSecretRef, clientSecret);
+    /* `email` is accepted so the UI can send what it knows, and then not used:
+       putting it on the authorization URL as `login_hint` would put an
+       address in a URL this server builds, and Google asks which account
+       anyway. */
+    requireString(body, 'email', { max: 320, required: false });
+    sendJSON(ctx.res, 200, ctx.browserSignIns.begin({ keyRef, clientId, clientSecretRef: client.clientSecretRef }));
+    return;
+  }
+  const client = oauthClient(ctx.config(), 'microsoft');
+  const clientId = requireString(body, 'clientId', { max: 64, required: false }) || client.clientId;
+  if (!clientId) throw new HttpError(400, 'clientId is required');
+  const tenantId = requireString(body, 'tenantId', { max: 128, required: false }) || client.tenantId || 'common';
   sendJSON(ctx.res, 200, await ctx.deviceSignIns.begin({ keyRef, clientId, tenantId }));
 }
 
 function handleMailOAuthStatus(ctx, [id]) {
-  const flow = ctx.deviceSignIns.read(id);
+  const flow = ctx.deviceSignIns.read(id) ?? ctx.browserSignIns.read(id);
   if (!flow) throw new HttpError(404, 'no sign-in is waiting under that id — it finished, expired, or this server was restarted');
   sendJSON(ctx.res, 200, flow);
 }
 
 function handleMailOAuthCancel(ctx, [id]) {
-  const flow = ctx.deviceSignIns.cancel(id);
+  const flow = ctx.deviceSignIns.cancel(id) ?? ctx.browserSignIns.cancel(id);
   if (!flow) throw new HttpError(404, 'no sign-in is waiting under that id');
-  sendJSON(ctx.res, 200, { ...flow, state: 'cancelled' });
+  sendJSON(ctx.res, 200, { ...flow, state: 'cancelled', status: 'cancelled' });
 }
 
 /** Read a fetch Response body with a hard byte cap, so a huge .ics cannot OOM us. */
@@ -2525,6 +2869,14 @@ export function createServer({
    */
   deviceAuth = {},
   /**
+   * The same two seams for "Sign in with Google", plus two more: `authorizeUrl`
+   * and `tokenUrl` point the flow at a loopback mock, `fetchImpl` is how the
+   * token exchange reaches it, and `ttlMs` is how long a flow waits for the
+   * browser — ten minutes in production, and a test of "it expires" cannot
+   * wait ten minutes. None is reachable from a request.
+   */
+  browserAuth = {},
+  /**
    * The resolver POST /api/mail/guess asks about a domain PROVIDERS does not
    * list: `resolveMx` and `resolveSrv`, node:dns's own when absent. A seam for
    * the blunter of `deviceAuth`'s two reasons — the alternative is a test that
@@ -2575,6 +2927,15 @@ export function createServer({
   const deviceSignIns = new DeviceSignInPad({
     endpoint: deviceAuth.endpoint ?? MS_LOGIN_ORIGIN,
     sleep: deviceAuth.sleep,
+    logger,
+  });
+  const browserSignIns = new BrowserSignInPad({
+    authorizeUrl: browserAuth.authorizeUrl ?? null,
+    tokenUrl: browserAuth.tokenUrl ?? null,
+    fetchImpl: browserAuth.fetchImpl ?? null,
+    ttlMs: browserAuth.ttlMs ?? BROWSER_FLOW_TTL_MS,
+    // Read at begin(), by which time `server` below exists and is listening.
+    boundPort: () => server.address()?.port ?? null,
     logger,
   });
   const dueForTouch = (id) => {
@@ -2634,6 +2995,38 @@ export function createServer({
         'Content-Length': 0,
       });
       res.end();
+      return;
+    }
+
+    /* The Google redirect. Outside the session gate for the handoff's reason —
+       a browser navigation carries no token — and behind the same Host and
+       Origin checks. The socket's own peer is checked too, not only the Host
+       header: the server binds loopback and nothing else can reach it, but a
+       check that costs nothing is worth having where a credential changes
+       hands. What authenticates the request is the `state`, which the pad
+       matches before anything reads the code. */
+    if (url.pathname === MAIL_CALLBACK_PATH) {
+      if (req.method !== 'GET') {
+        sendText(res, 405, 'Method not allowed', { Allow: 'GET' });
+        return;
+      }
+      if (!isLoopbackHost(req.socket?.remoteAddress)) {
+        sendText(res, 403, 'Zelos only answers to 127.0.0.1');
+        return;
+      }
+      try {
+        const got = url.searchParams;
+        const { status, body } = await browserSignIns.callback({
+          state: got.get('state') || '',
+          code: got.get('code') || '',
+          error: got.get('error') || '',
+        });
+        sendPage(res, status, body);
+      } catch (err) {
+        logger.error('server: the sign-in callback failed', { error: err.stack || err.message });
+        if (!res.headersSent) sendPage(res, 500, REFUSED_PAGE);
+        else res.end();
+      }
       return;
     }
 
@@ -2705,6 +3098,7 @@ export function createServer({
       config: () => current,
       setConfig: (next) => { current = next; },
       deviceSignIns,
+      browserSignIns,
       dns,
     };
 
@@ -2732,7 +3126,10 @@ export function createServer({
      token endpoint every five seconds for the fifteen minutes a device code
      lives, which in a test run means a socket opened after `t.after` tore the
      mock server down. */
-  server.on('close', () => deviceSignIns.closeAll());
+  server.on('close', () => {
+    deviceSignIns.closeAll();
+    browserSignIns.closeAll();
+  });
 
   server.sessionToken = token;
   server.zelos = {
