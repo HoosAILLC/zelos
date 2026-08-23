@@ -84,7 +84,7 @@ node zelos.mjs
 You will see something like this:
 
 ```
-  ZELOS 1.4.0
+  ZELOS 1.5.0
   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   Open   http://127.0.0.1:7777/?t=fb52ad7d…a43da8be
