@@ -307,7 +307,7 @@ could phone home behind Zelos's back. You can verify it with `lsof -i` or
 Little Snitch or `tcpdump` and count the conversations against your own
 settings.
 
-Four footnotes, because "three destinations" is nearly true rather than exactly
+Five footnotes, because "three destinations" is nearly true rather than exactly
 true.
 
 1. **A server you configured can redirect, and Zelos follows one hop** — so a
@@ -347,6 +347,14 @@ true.
    test *no connector reaches the network except through ctx.http* in
    `test/repo.test.mjs`, which fails the build on a connector that calls
    `fetch` itself rather than through the transport that enforces the list.
+5. **One DNS question, during mail setup.** When you type an address into
+   **Add a mailbox** and its domain is not one Zelos lists, Zelos asks your
+   system resolver who handles that domain's mail — its MX record, then the
+   `_imaps._tcp` SRV record — so a custom domain on Google Workspace or
+   Microsoft 365 is recognised rather than guessed at. The domain goes to the
+   resolver; the address does not, and nothing is logged. Every other name
+   Zelos resolves is a host you typed (`discoverProvider` in
+   `core/sources/imap.mjs`, behind `POST /api/mail/guess`).
 
 ### `privacy.sendBodies`
 
@@ -731,7 +739,7 @@ connection means using the credential:
 | Route | What it does with a stored secret |
 | --- | --- |
 | `POST /api/model/test`, `GET /api/model/list` | sends the model key to the `baseUrl` **in the request** |
-| `POST /api/mail/guess` | nothing — it names a provider from the address’s domain and reads no secret |
+| `POST /api/mail/guess` | nothing — it names a provider from the address’s domain and reads no secret. For a domain its table does not list it may send the **domain** of the address (never the address) to the system DNS resolver, for its MX and then its SRV record, and nothing else |
 | `POST /api/mail/test` | sends the mail password to the `host`/`port` **in the request** |
 | `POST /api/calendar/test` | sends the calendar password to the `url` **in the request** |
 

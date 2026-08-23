@@ -76,7 +76,7 @@ import { safeUrl, screenContent, cap, wrapUntrusted, scrubForPrompt, SafetyError
 import {
   testConnection as testMailConnection,
   connectDeviceCode,
-  describeProvider,
+  discoverProvider,
   MS_LOGIN_ORIGIN,
 } from './sources/imap.mjs';
 import {
@@ -1282,12 +1282,17 @@ function mailAuthFrom(body, keyRef) {
  * is somebody's email address. The handler writes nothing to the log for the
  * same reason — the 400s name the field, never its value — and the answer is
  * a property of the domain, so a session token is as much as it needs.
+ *
+ * For a domain the table does not know, the DOMAIN — never the address — goes
+ * to the system resolver, for its MX and then its SRV record
+ * (`discoverProvider` in core/sources/imap.mjs); the resolver is the one seam
+ * in `createServer({dns})`, so a test never asks a real one.
  */
 async function handleMailGuess(ctx) {
   const body = await readJSON(ctx.req);
   const email = requireString(body, 'email', { max: 320 });
   if (!email.trim()) throw new HttpError(400, 'email is required');
-  sendJSON(ctx.res, 200, describeProvider(email));
+  sendJSON(ctx.res, 200, await discoverProvider(email, ctx.dns));
 }
 
 async function handleMailTest(ctx) {
@@ -2519,6 +2524,14 @@ export function createServer({
    * nothing and gets `https://login.microsoftonline.com` and a real timer.
    */
   deviceAuth = {},
+  /**
+   * The resolver POST /api/mail/guess asks about a domain PROVIDERS does not
+   * list: `resolveMx` and `resolveSrv`, node:dns's own when absent. A seam for
+   * the blunter of `deviceAuth`'s two reasons — the alternative is a test that
+   * sends a domain to the system resolver and waits for the internet to
+   * answer. Not reachable from a request; production passes nothing.
+   */
+  dns = {},
 } = {}) {
   if (!db) throw new TypeError('createServer needs an open database (core/db.mjs open())');
 
@@ -2692,6 +2705,7 @@ export function createServer({
       config: () => current,
       setConfig: (next) => { current = next; },
       deviceSignIns,
+      dns,
     };
 
     try {

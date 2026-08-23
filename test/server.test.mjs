@@ -1797,7 +1797,10 @@ test('POST /api/mail/guess names the provider, wants the token, and never writes
   const lines = [];
   const record = (lvl) => (msg, meta) => { lines.push(`${lvl} ${msg} ${meta === undefined ? '' : JSON.stringify(meta)}`); };
   const logger = { debug: record('debug'), info: record('info'), warn: record('warn'), error: record('error'), child() { return this; } };
-  const ctx = await startServer(t, { logger });
+  // The resolver is the test's: an unknown domain would otherwise go to the real one.
+  const asked = [];
+  const nxdomain = async (name) => { asked.push(name); throw Object.assign(new Error('queryMx ENOTFOUND'), { code: 'ENOTFOUND' }); };
+  const ctx = await startServer(t, { logger, dns: { resolveMx: nxdomain, resolveSrv: nxdomain } });
   const address = 'marcus.aurelius.stoic@gmail.com';
 
   const gmail = await call(ctx, 'POST', '/api/mail/guess', { body: { email: address } });
@@ -1812,6 +1815,9 @@ test('POST /api/mail/guess names the provider, wants the token, and never writes
   assert.equal(guessed.status, 200);
   assert.equal(guessed.json.known, false);
   assert.equal(guessed.json.host, 'imap.deco-associates.example');
+  assert.equal(guessed.json.via, 'guess');
+  // Only the unknown domain was asked about — MX, then SRV — and never the address.
+  assert.deepEqual(asked, ['deco-associates.example', '_imaps._tcp.deco-associates.example']);
 
   // The same gate as every other route, and only the one verb.
   assert.equal((await call(ctx, 'POST', '/api/mail/guess', { token: null, body: { email: address } })).status, 401);
@@ -1833,6 +1839,48 @@ test('POST /api/mail/guess names the provider, wants the token, and never writes
   // And the address is on none of them, at any level.
   const leaked = lines.filter((l) => l.includes(address) || l.includes('deco-associates'));
   assert.deepEqual(leaked, [], 'the address was written to the log');
+});
+
+/**
+ * The operator's own mailbox: a custom domain on Google Workspace. The table
+ * cannot know it, so the route asks the resolver who hosts the domain's mail
+ * — through `createServer({dns})`, the way `deviceAuth` keeps Microsoft out
+ * of the test run — and answers with the Gmail row under the Workspace name.
+ * The resolver sees the domain; the log sees nothing.
+ */
+test('POST /api/mail/guess discovers a Workspace domain through its MX, and the address reaches neither DNS nor the log', async (t) => {
+  const lines = [];
+  const record = (lvl) => (msg, meta) => { lines.push(`${lvl} ${msg} ${meta === undefined ? '' : JSON.stringify(meta)}`); };
+  const logger = { debug: record('debug'), info: record('info'), warn: record('warn'), error: record('error'), child() { return this; } };
+  const asked = [];
+  const dns = {
+    resolveMx: async (name) => {
+      asked.push(name);
+      return [{ priority: 20, exchange: 'alt1.aspmx.l.google.com.' }, { priority: 10, exchange: 'aspmx.l.google.com.' }];
+    },
+    resolveSrv: async (name) => { asked.push(name); return []; },
+  };
+  const ctx = await startServer(t, { logger, dns });
+  const address = 'nemo.the.operator@workspace-shaped.example';
+
+  const res = await call(ctx, 'POST', '/api/mail/guess', { body: { email: address } });
+  assert.equal(res.status, 200);
+  assert.equal(res.json.known, true);
+  assert.equal(res.json.via, 'mx');
+  assert.equal(res.json.mx, 'aspmx.l.google.com');
+  assert.equal(res.json.label, 'Google Workspace');
+  assert.equal(res.json.host, 'imap.gmail.com');
+  assert.equal(res.json.port, 993);
+  assert.equal(res.json.auth, 'password');
+  assert.equal(res.json.appPasswordUrl, 'https://myaccount.google.com/apppasswords');
+
+  assert.deepEqual(asked, ['workspace-shaped.example'], 'the domain, once, and nothing after a hit');
+  assert.ok(asked.every((name) => !name.includes('@')), 'the address went to the resolver');
+
+  await call(ctx, 'GET', '/api/health', { headers: { Origin: 'http://evil.example' } });
+  assert.ok(lines.some((l) => l.includes('refused a request from a foreign origin')), 'the test logger is not the one the server writes to');
+  const leaked = lines.filter((l) => l.includes(address) || l.includes('workspace-shaped') || l.includes('aspmx'));
+  assert.deepEqual(leaked, [], 'the address, the domain or the exchange was written to the log');
 });
 
 test('/api/calendar/test reads an ics feed and refuses a dangerous url', async (t) => {

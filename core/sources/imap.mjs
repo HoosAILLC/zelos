@@ -26,6 +26,7 @@
  * `login()`, and every other byte of the session is the same session.
  */
 
+import dns from 'node:dns';
 import net from 'node:net';
 import tls from 'node:tls';
 
@@ -2610,18 +2611,7 @@ export function describeProvider(email) {
   const address = String(email ?? '').trim().toLowerCase();
   const domain = address.includes('@') ? address.slice(address.lastIndexOf('@') + 1) : '';
   const provider = domain ? PROVIDERS.find((p) => p.domains.includes(domain)) : null;
-  if (provider) {
-    return {
-      label: provider.label,
-      host: provider.host,
-      port: provider.port,
-      secure: provider.secure,
-      auth: provider.bridge ? 'bridge' : (provider.auth || 'password'),
-      appPasswordUrl: provider.appPasswordUrl || null,
-      note: provider.note,
-      known: true,
-    };
-  }
+  if (provider) return answerFor(provider);
   const guess = guessImapHost(email);
   return {
     // No host means no usable domain — there is nothing to name.
@@ -2634,4 +2624,166 @@ export function describeProvider(email) {
     note: guess.note,
     known: false,
   };
+}
+
+/** The simple form's answer for one row of PROVIDERS. */
+function answerFor(provider) {
+  return {
+    label: provider.label,
+    host: provider.host,
+    port: provider.port,
+    secure: provider.secure,
+    auth: provider.bridge ? 'bridge' : (provider.auth || 'password'),
+    appPasswordUrl: provider.appPasswordUrl || null,
+    note: provider.note,
+    known: true,
+  };
+}
+
+/**
+ * Who hosts a domain's mail, read off the domain's lowest-priority MX.
+ *
+ * A custom domain on Google Workspace or Microsoft 365 is the commonest
+ * mailbox there is for anyone with a business, and PROVIDERS cannot list it:
+ * the domain is theirs, not Google's. What the domain does publish is where
+ * its mail is delivered, and that exchange carries the host's name —
+ * `aspmx.l.google.com` for Workspace, `*.mail.protection.outlook.com` for 365
+ * — so the suffix is enough to name the provider. Each row points at a
+ * PROVIDERS entry by its `host`, and the host, port, sign-in and app-password
+ * page are that entry's; only the label and, where the note would otherwise
+ * talk about a consumer mailbox, the note are this table's own.
+ *
+ * Suffixes checked live on 2026-08-22: a Workspace domain → `aspmx.l.google.com`
+ * (`alt1.`–`alt4.` behind it), microsoft.com →
+ * `microsoft-com.mail.protection.outlook.com`, fastmail.com → an
+ * `in1-….messagingengine.com` host, zoho.com → an inbound host under
+ * `.zoho.com` (customer domains get `mx.zoho.com`, hence the whole suffix),
+ * proton.me → `mail.protonmail.ch`.
+ */
+const MX_HOSTS = [
+  {
+    suffixes: ['.google.com', '.googlemail.com'],
+    host: 'imap.gmail.com',
+    label: 'Google Workspace',
+    note: (entry) => `Your domain's mail is hosted by Google, so this is Gmail underneath. ${entry.note}`,
+  },
+  {
+    suffixes: ['.mail.protection.outlook.com'],
+    host: 'outlook.office365.com',
+    label: 'Microsoft 365',
+    note: () => 'Your domain\'s mail is hosted by Microsoft 365. Work and school accounts connect with "Sign in with Microsoft" — Zelos asks you to register a free app in your own Microsoft account and then hands you a code to type into microsoft.com/devicelogin. Some tenants still allow a password, if your administrator has left IMAP on; Advanced is where that goes.',
+  },
+  { suffixes: ['.messagingengine.com'], host: 'imap.fastmail.com' },
+  { suffixes: ['.zoho.com', '.zoho.eu'], host: 'imap.zoho.com' },
+  { suffixes: ['.protonmail.ch'], host: '127.0.0.1' },
+  { suffixes: ['.mail.icloud.com'], host: 'imap.mail.me.com' },
+  { suffixes: ['.yahoodns.net'], host: 'imap.mail.yahoo.com' },
+];
+
+const DOMAIN_SHAPE = /^[a-z0-9.-]+\.[a-z]{2,}$/;
+
+/** A DNS answer, or a rejection once `ms` has passed — and the timer is always cleared. */
+function withTimeout(work, ms) {
+  let timer = null;
+  const clock = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error('timed out')), ms);
+  });
+  return Promise.race([Promise.resolve().then(work), clock]).finally(() => clearTimeout(timer));
+}
+
+/** A host name off the wire, lower-cased and without its trailing dot — or '' if it is not one. */
+function hostName(value) {
+  const name = String(value ?? '').trim().toLowerCase().replace(/\.$/, '');
+  return DOMAIN_SHAPE.test(name) ? name : '';
+}
+
+/**
+ * `describeProvider`, and then the domain's own records for a domain nobody
+ * here knows.
+ *
+ * Three answers, in order. PROVIDERS first, with no lookup at all — a Gmail
+ * address has nothing to ask DNS about. Then the domain's MX, matched against
+ * MX_HOSTS, which is how a Workspace or 365 domain comes back `known: true`
+ * with the right host, sign-in and app-password page instead of
+ * `imap.<domain>` and a refusal. Then the SRV record RFC 6186 lets a domain
+ * publish for its own IMAP server, `_imaps._tcp.<domain>`, which stays
+ * `known: false` because a host is all it says. Otherwise the same guess
+ * `describeProvider` makes. `via` says which — `mx`, `srv` or `guess` — so
+ * the form can say how it knows.
+ *
+ * Only the DOMAIN goes to the resolver, never the address, and the resolver
+ * is the system's: MX and SRV are public records, and this is the one
+ * moment at which Zelos asks about a name you did not type as a host. A
+ * resolver that errors, answers NODATA, or takes longer than `timeoutMs`
+ * makes this the guess it would have been anyway — nothing is thrown and
+ * nothing is logged, at any level, because the one thing to log would be
+ * the domain.
+ */
+export async function discoverProvider(email, {
+  resolveMx = dns.promises.resolveMx,
+  resolveSrv = dns.promises.resolveSrv,
+  timeoutMs = 3000,
+} = {}) {
+  const described = describeProvider(email);
+  if (described.known) return described;
+  const fallback = { ...described, via: 'guess' };
+  if (!described.host) return fallback;
+
+  const address = String(email ?? '').trim().toLowerCase();
+  const domain = address.slice(address.lastIndexOf('@') + 1);
+  if (!DOMAIN_SHAPE.test(domain)) return fallback;
+
+  try {
+    const records = await withTimeout(() => resolveMx(domain), timeoutMs);
+    const exchanges = (Array.isArray(records) ? records : [])
+      .map((r) => ({ priority: Number(r?.priority) || 0, exchange: hostName(r?.exchange) }))
+      .filter((r) => r.exchange)
+      .sort((a, b) => a.priority - b.priority);
+    const exchange = exchanges[0]?.exchange;
+    if (exchange) {
+      const row = MX_HOSTS.find((m) => m.suffixes.some((suffix) => exchange.endsWith(suffix)));
+      const entry = row ? PROVIDERS.find((p) => p.host === row.host) : null;
+      if (entry) {
+        const answer = answerFor(entry);
+        return {
+          ...answer,
+          label: row.label ?? answer.label,
+          note: row.note ? row.note(entry) : `Your domain's mail is hosted by ${answer.label}. ${answer.note}`,
+          known: true,
+          via: 'mx',
+          mx: exchange,
+        };
+      }
+    }
+  } catch {
+    /* ENOTFOUND, ENODATA, a refusing resolver, a slow one: the guess below. */
+  }
+
+  try {
+    const records = await withTimeout(() => resolveSrv(`_imaps._tcp.${domain}`), timeoutMs);
+    const targets = (Array.isArray(records) ? records : [])
+      .map((r) => ({ priority: Number(r?.priority) || 0, host: hostName(r?.name), port: Number(r?.port) }))
+      // RFC 2782: a target of "." means the service is deliberately absent.
+      .filter((r) => r.host)
+      .sort((a, b) => a.priority - b.priority);
+    const target = targets[0];
+    if (target) {
+      const port = Number.isInteger(target.port) && target.port > 0 && target.port < 65536 ? target.port : 993;
+      return {
+        label: domain,
+        host: target.host,
+        port,
+        secure: true,
+        auth: 'password',
+        appPasswordUrl: null,
+        note: `Your domain advertises an IMAP server (${target.host}:${port}) — Connect will tell you if it answers. Many providers want an app-specific password rather than your normal one.`,
+        known: false,
+        via: 'srv',
+      };
+    }
+  } catch {
+    /* Same as above. */
+  }
+
+  return fallback;
 }

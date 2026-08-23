@@ -2327,8 +2327,76 @@ test('Add a mailbox opens the simple form, and the simple form reaches the full 
   }
   // Proton goes to the full form with Bridge's address already in it.
   assert.match(simple[0], /guess\.auth === 'bridge'/, 'Proton Bridge is not recognised');
-  // A failed Connect offers the full form on the spot.
-  assert.match(connect[0], /button\('Show advanced'/, 'a failure leaves the user with no way forward');
+  // A failed Connect leaves the card's own Advanced as the way to the full
+  // form, and adds no second one under the error.
+  assert.ok(!/Show advanced/.test(simple[0]), 'a failure adds a second route to the full form');
+});
+
+/**
+ * The operator's screenshot, v1.2.0, his own Workspace address: the card read
+ * "A provider Zelos does not know · imap.<his domain>:993", printed a literal
+ * "null" where the app-password link goes, and after Connect failed there
+ * were two buttons to the full form. The null came from the DOM's own
+ * replaceChildren, which turns a null child into the text "null" where
+ * dom.js's el()/replace() skip it; the fix is to paint the card through
+ * replace(). The rest is what the server now says about HOW it knows.
+ */
+test('the provider card prints no null, says how it knows, and keeps one route to the full form', () => {
+  const src = fs.readFileSync(path.join(UI, 'views/settings.js'), 'utf8');
+  const simple = /export function simpleMailForm\(\{ onSaved, onCancel, onAdvanced \}\)[\s\S]*?\n\}/m.exec(src);
+  assert.ok(simple, 'simpleMailForm is missing');
+  assert.match(src, /import \{[^}]*\breplace\b[^}]*\} from '\.\.\/lib\/dom\.js'/, 'replace() is not imported from dom.js');
+
+  // dom.js's contract, which the card relies on: a null child is skipped.
+  const dom = fs.readFileSync(path.join(UI, 'lib/dom.js'), 'utf8');
+  assert.match(dom, /function append\(node, children\) \{\n  if \(children === null \|\| children === undefined \|\| children === false\) return;/);
+  assert.match(dom, /export function replace\(node, children\) \{\n  node\.replaceChildren\(\);\n  append\(node, children\);/);
+
+  // No native replaceChildren call in the simple form carries a child that
+  // can be null: walk each call to its closing paren and look for a ternary
+  // or && that yields one.
+  const calls = [];
+  let from = 0;
+  for (;;) {
+    const at = simple[0].indexOf('.replaceChildren(', from);
+    if (at < 0) break;
+    let depth = 0;
+    let end = at + '.replaceChildren('.length - 1;
+    for (; end < simple[0].length; end += 1) {
+      if (simple[0][end] === '(') depth += 1;
+      else if (simple[0][end] === ')') { depth -= 1; if (depth === 0) break; }
+    }
+    calls.push(simple[0].slice(at, end + 1));
+    from = end;
+  }
+  assert.ok(calls.length > 0, 'the card is never painted');
+  for (const call of calls) {
+    assert.ok(!/:\s*null\b/.test(call) && !/&&\s*el\(/.test(call), `a native replaceChildren carries a child that can be null — the card prints "null":\n${call}`);
+  }
+  // The password branch — the one with the optional link — goes through replace().
+  assert.match(simple[0], /replace\(card, \[\n\s+head,\n\s+note,\n\s+page \? el\('div', \{ class: 'row-inline' \}, \[page\]\) : null,/, 'the app-password link is not painted through replace()');
+
+  // The mono line says how the server knows, for a domain it looked up.
+  const paint = /function paintCard\(\)[\s\S]*?\n  \}/m.exec(simple[0]);
+  assert.ok(paint, 'paintCard is missing');
+  assert.match(paint[0], /guess\.via === 'mx' \? ' · found through your domain\\'s mail records'/, 'an MX hit does not say so');
+  assert.match(paint[0], /guess\.via === 'srv' \? ' · advertised by your domain'/, 'an SRV hit does not say so');
+  assert.match(paint[0], /text: `\$\{guess\.host\}:\$\{guess\.port\}\$\{via\}`/, 'the via line is built but not shown');
+  assert.match(paint[0], /We guessed \$\{guess\.host\}/, 'a plain guess no longer says it is guessing');
+  assert.match(paint[0], /guess\.known \|\| guess\.via === 'srv'\n\s+\? guess\.note/, 'an SRV answer is described as a guess');
+
+  // One route to the full form: the card's Advanced, and nothing added on failure.
+  const connect = /async function connect\(\)[\s\S]*?\n  \}/m.exec(simple[0]);
+  assert.ok(connect, 'connect() is missing');
+  assert.ok(!/openAdvanced/.test(connect[0]), 'connect() builds its own way to the full form');
+  assert.ok(!/\bfallback\b/.test(simple[0]), 'the failure-path container is still there');
+  assert.equal(simple[0].split("button('Advanced'").length - 1, 2, 'one Advanced under the address (hidden once a card is up) and one in the card — no third');
+  // And the password a failed Connect stored still carries over.
+  assert.match(connect[0], /storedHere\.add\(keyRef\)/);
+  assert.match(simple[0], /if \(storedHere\.size\) await loadConfig\(\)\.catch\(\(\) => \{\}\);\n\s+onAdvanced\(prefill\(\)\);/);
+
+  // The hint under the address says what goes to DNS: the domain, never the address.
+  assert.match(simple[0], /hint: 'Zelos works out the provider from it\. The address goes to the Zelos server on this machine and nowhere else\. For a domain Zelos does not recognise, it asks your DNS resolver who handles mail for the domain — the domain only, never the address\.'/);
 });
 
 test('Connect stores, tests, reads the sent folder and saves — in that order and no other', () => {

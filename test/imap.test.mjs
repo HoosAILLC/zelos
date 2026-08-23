@@ -46,6 +46,7 @@ const {
   connectDeviceCode,
   describeProvider,
   describeXOAuth2Challenge,
+  discoverProvider,
   fetchRecent,
   guessImapHost,
   isLoopbackHost,
@@ -1621,6 +1622,169 @@ test('describeProvider guesses for a domain it does not know, and says that it i
     assert.equal(got.appPasswordUrl, null, JSON.stringify(bad));
     assert.ok(got.note.length > 0, 'the user is always told what to do next');
   }
+});
+
+/* ------------------------------------------------------------------ *
+ * discoverProvider
+ * ------------------------------------------------------------------ */
+
+/**
+ * The operator's own address: a custom domain on Google Workspace, which
+ * describeProvider's table cannot list because the domain is his. On v1.2.0
+ * the card said "A provider Zelos does not know · imap.<his domain>:993" and
+ * Connect failed with ENOTFOUND. The domain's MX says who hosts its mail,
+ * and the answer is the Gmail row of the one table — host, port, page and
+ * all — under the name Workspace users know it by.
+ */
+const nxdomain = (code = 'ENOTFOUND') => async () => { throw Object.assign(new Error(`queryMx ${code}`), { code }); };
+const never = () => new Promise(() => {});
+
+test('discoverProvider answers a known consumer domain from the table and never asks DNS', async () => {
+  const asked = [];
+  const spy = async (name) => { asked.push(name); return []; };
+  for (const address of ['nemo@gmail.com', 'Nemo@ICLOUD.com', 'nemo@hotmail.com', 'nemo@pm.me', 'nemo@fastmail.com']) {
+    const got = await discoverProvider(address, { resolveMx: spy, resolveSrv: spy });
+    assert.deepEqual(got, describeProvider(address), `${address}: the table's answer, unchanged`);
+    assert.equal(got.via, undefined, `${address}: no via on a table answer`);
+  }
+  assert.deepEqual(asked, [], 'a consumer domain went to the resolver');
+});
+
+test('discoverProvider reads a Google Workspace domain off its lowest-priority MX', async () => {
+  const asked = [];
+  const resolveMx = async (name) => {
+    asked.push(name);
+    // Out of order and with the backups first, so the sort is what picks.
+    return [
+      { priority: 20, exchange: 'alt1.aspmx.l.google.com.' },
+      { priority: 30, exchange: 'alt2.aspmx.l.google.com.' },
+      { priority: 10, exchange: 'aspmx.l.google.com.' },
+    ];
+  };
+  const resolveSrv = async (name) => { asked.push(name); return []; };
+  const got = await discoverProvider('Nemo@Workspace-Shaped.example', { resolveMx, resolveSrv });
+  const gmail = describeProvider('nemo@gmail.com');
+
+  assert.equal(got.known, true);
+  assert.equal(got.via, 'mx');
+  assert.equal(got.mx, 'aspmx.l.google.com', 'the lowest priority, lower-cased, no trailing dot');
+  assert.equal(got.label, 'Google Workspace');
+  assert.equal(got.host, gmail.host);
+  assert.equal(got.port, gmail.port);
+  assert.equal(got.secure, gmail.secure);
+  assert.equal(got.auth, 'password');
+  assert.equal(got.appPasswordUrl, gmail.appPasswordUrl, 'the app-password page is Google\'s, from the one table');
+  assert.match(got.note, /^Your domain's mail is hosted by Google, so this is Gmail underneath\. /);
+  assert.ok(got.note.endsWith(gmail.note), 'the Gmail note follows, not a copy of it');
+
+  // Only the domain went out: lower-cased, and with no address in it.
+  assert.deepEqual(asked, ['workspace-shaped.example']);
+  for (const name of asked) assert.ok(!name.includes('@'), `the address went to the resolver: ${name}`);
+});
+
+test('discoverProvider names Microsoft 365, Fastmail, Zoho, Proton, iCloud and Yahoo by their MX hosts', async () => {
+  const cases = [
+    ['contoso-com.mail.protection.outlook.com', 'Microsoft 365', 'nemo@hotmail.com', 'xoauth2'],
+    ['in1-smtp.messagingengine.com', 'Fastmail', 'nemo@fastmail.com', 'password'],
+    ['mx.zoho.com', 'Zoho Mail', 'nemo@zoho.com', 'password'],
+    ['mx.zoho.eu', 'Zoho Mail', 'nemo@zoho.com', 'password'],
+    ['mail.protonmail.ch', 'Proton Mail', 'nemo@proton.me', 'bridge'],
+    ['mx01.mail.icloud.com', 'iCloud Mail', 'nemo@icloud.com', 'password'],
+    ['mta5.am0.yahoodns.net', 'Yahoo Mail', 'nemo@yahoo.com', 'password'],
+  ];
+  for (const [exchange, label, twin, auth] of cases) {
+    const got = await discoverProvider('nemo@custom.example', {
+      resolveMx: async () => [{ priority: 10, exchange }],
+      resolveSrv: never,
+    });
+    const entry = describeProvider(twin);
+    assert.equal(got.known, true, exchange);
+    assert.equal(got.via, 'mx', exchange);
+    assert.equal(got.mx, exchange);
+    assert.equal(got.label, label, exchange);
+    assert.equal(got.auth, auth, exchange);
+    assert.deepEqual(
+      { host: got.host, port: got.port, secure: got.secure, appPasswordUrl: got.appPasswordUrl },
+      { host: entry.host, port: entry.port, secure: entry.secure, appPasswordUrl: entry.appPasswordUrl },
+      `${exchange}: where to connect and where the password is made come from the table`,
+    );
+    assert.match(got.note, /^Your domain's mail is hosted by /, exchange);
+  }
+  // Microsoft's note is the work-account one: sign in with Microsoft, and a
+  // password only where the tenant still allows IMAP — the same rule the
+  // consumer note ends on.
+  const m365 = await discoverProvider('nemo@custom.example', {
+    resolveMx: async () => [{ priority: 10, exchange: 'contoso-com.mail.protection.outlook.com' }],
+    resolveSrv: never,
+  });
+  assert.match(m365.note, /Sign in with Microsoft/);
+  assert.match(m365.note, /administrator has left IMAP on/);
+  assert.ok(!/16 September 2024/.test(m365.note), 'the consumer shut-off date is not the story for a tenant');
+});
+
+test('discoverProvider falls through to an RFC 6186 SRV record when the MX says nothing it knows', async () => {
+  const asked = [];
+  const resolveMx = async (name) => { asked.push(name); return [{ priority: 10, exchange: 'mail.deco-associates.example' }]; };
+  const resolveSrv = async (name) => {
+    asked.push(name);
+    return [
+      { priority: 10, weight: 0, port: 1993, name: 'backup.deco-associates.example' },
+      { priority: 0, weight: 1, port: 993, name: 'Mail.Deco-Associates.example.' },
+    ];
+  };
+  const got = await discoverProvider('marcus@deco-associates.example', { resolveMx, resolveSrv });
+  assert.deepEqual(asked, ['deco-associates.example', '_imaps._tcp.deco-associates.example']);
+  assert.equal(got.known, false, 'a host is all an SRV record says');
+  assert.equal(got.via, 'srv');
+  assert.equal(got.label, 'deco-associates.example');
+  assert.equal(got.host, 'mail.deco-associates.example');
+  assert.equal(got.port, 993);
+  assert.equal(got.secure, true);
+  assert.equal(got.auth, 'password');
+  assert.equal(got.appPasswordUrl, null);
+  assert.match(got.note, /^Your domain advertises an IMAP server \(mail\.deco-associates\.example:993\)/);
+
+  // RFC 2782: a target of "." is a domain saying "no such service".
+  const refused = await discoverProvider('marcus@deco-associates.example', {
+    resolveMx: nxdomain('ENODATA'),
+    resolveSrv: async () => [{ priority: 0, weight: 0, port: 0, name: '.' }],
+  });
+  assert.equal(refused.via, 'guess');
+  assert.equal(refused.host, 'imap.deco-associates.example');
+});
+
+test('discoverProvider makes the same guess describeProvider does when DNS has nothing, errors or stalls', async () => {
+  const address = 'marcus@deco-associates.example';
+  const guess = { ...describeProvider(address), via: 'guess' };
+  const shapes = {
+    'NXDOMAIN on both': { resolveMx: nxdomain('ENOTFOUND'), resolveSrv: nxdomain('ENOTFOUND') },
+    'NODATA on both': { resolveMx: nxdomain('ENODATA'), resolveSrv: nxdomain('ENODATA') },
+    'a resolver that throws synchronously': { resolveMx: () => { throw new Error('boom'); }, resolveSrv: () => { throw new Error('boom'); } },
+    'empty answers': { resolveMx: async () => [], resolveSrv: async () => [] },
+    'answers that are not arrays': { resolveMx: async () => null, resolveSrv: async () => 'nope' },
+    'an MX nobody here knows and no SRV': { resolveMx: async () => [{ priority: 10, exchange: 'mail.deco-associates.example' }], resolveSrv: nxdomain('ENODATA') },
+    'an exchange that is not a host name': { resolveMx: async () => [{ priority: 10, exchange: 'not a host' }], resolveSrv: async () => [] },
+  };
+  for (const [name, resolvers] of Object.entries(shapes)) {
+    assert.deepEqual(await discoverProvider(address, resolvers), guess, name);
+  }
+
+  // A resolver that never answers: the timer wins, and the timer is cleared —
+  // proved by the call returning in well under the 3 s default.
+  const started = Date.now();
+  const stalled = await discoverProvider(address, { resolveMx: never, resolveSrv: never, timeoutMs: 20 });
+  assert.deepEqual(stalled, guess, 'a stalled resolver is a guess, not a hang');
+  assert.ok(Date.now() - started < 1000, 'the timeout is the injected one');
+
+  // Nothing to ask about: no usable domain means no lookup at all.
+  const asked = [];
+  const spy = async (name) => { asked.push(name); return []; };
+  for (const bad of ['', null, 'not-an-email', 'a@localhost', '@', 'a@']) {
+    const got = await discoverProvider(bad, { resolveMx: spy, resolveSrv: spy });
+    assert.equal(got.host, '', JSON.stringify(bad));
+    assert.equal(got.via, 'guess', JSON.stringify(bad));
+  }
+  assert.deepEqual(asked, [], 'an address with no domain went to the resolver');
 });
 
 /* ================================================================== *
