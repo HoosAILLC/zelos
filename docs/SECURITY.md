@@ -307,7 +307,7 @@ could phone home behind Zelos's back. You can verify it with `lsof -i` or
 Little Snitch or `tcpdump` and count the conversations against your own
 settings.
 
-Five footnotes, because "three destinations" is nearly true rather than exactly
+Six footnotes, because "three destinations" is nearly true rather than exactly
 true.
 
 1. **A server you configured can redirect, and Zelos follows one hop** — so a
@@ -355,6 +355,23 @@ true.
    resolver; the address does not, and nothing is logged. Every other name
    Zelos resolves is a host you typed (`discoverProvider` in
    `core/sources/imap.mjs`, behind `POST /api/mail/guess`).
+
+6. **Two hosts while you sign in, and on each refresh.** A mailbox connected
+   with **Sign in with Google** talks to `accounts.google.com` — in your
+   browser, for the consent page — and to `oauth2.googleapis.com`, from
+   Zelos, once to exchange the sign-in code and then about hourly while
+   sweeping to trade the refresh token for an access token. **Sign in with
+   Microsoft** does the same against the one host in footnote 4,
+   `login.microsoftonline.com`. Neither flow touches a Zelos server; there is
+   none, and the Google redirect comes back to the Zelos port on `127.0.0.1`
+   (section 6). What travels is the client id, a PKCE challenge, an opaque
+   `state`, then the code and the refresh token — never your password, never
+   mail, never the session token. The refresh token can be spent against that
+   one host and no other: both modules refuse any other origin before a socket
+   exists (`assertTokenEndpoint` in `core/sources/imap.mjs`; the token URL is
+   a constant of the provider in `core/sources/oauth.mjs`). Mail then comes
+   from `imap.gmail.com` or `outlook.office365.com` exactly as with a
+   password, under item 1. [OAUTH.md](OAUTH.md) has the table of every step.
 
 ### `privacy.sendBodies`
 
@@ -435,6 +452,21 @@ protection:
   The token does land in the address bar for the instant before the page strips
   it with `history.replaceState` — the same exposure the printed launch URL has
   always had, and the reason the token is per-launch.
+- `GET /oauth/callback` is the other route outside `/api/*`, and it hands out
+  nothing. It is where Google's sign-in redirect lands, and a browser redirect
+  cannot carry the session token, so the route takes none and is held to other
+  things instead: the connection must come from `127.0.0.1` (not merely a
+  loopback `Host`); `state` must equal, byte for byte, the one minted for a
+  sign-in that is still pending, and anything else — unknown, already spent,
+  expired, absent — is the same generic `400`; the `code` is exchanged at once
+  with the PKCE verifier held in this process and never stored; and the reply is
+  one sentence of HTML with no script, no token and no address in it, so there
+  is nothing for a cache, an extension or a screenshot to carry away. `?error=`
+  marks the flow failed with a generic reason and draws the same kind of page.
+  A page open in your browser cannot start a flow (that takes the token, at
+  `POST /api/mail/oauth`), cannot guess a `state`, and cannot read the
+  verifier; the most it can do is spend one redirect it did not mint, which
+  fails the `state` check. The `Host` and `Origin` checks apply to it unchanged.
 - Static file serving resolves the path and asserts the *real* path is inside
   `ui/`, so `..`, `%2e%2e`, `%252e%252e`, overlong UTF-8, backslashes and
   symlinks pointing out of the root all fail. The same parsed pathname drives
@@ -734,7 +766,8 @@ response, the config file, and the log for them.
 
 **But "no read route" is not the same as "your keys cannot leave", and the
 difference matters.** Four routes exist to test a connection, and testing a
-connection means using the credential:
+connection means using the credential — and two more, at the bottom of the
+table, are where a sign-in *creates* one:
 
 | Route | What it does with a stored secret |
 | --- | --- |
@@ -742,6 +775,8 @@ connection means using the credential:
 | `POST /api/mail/guess` | nothing — it names a provider from the address’s domain and reads no secret. For a domain its table does not list it may send the **domain** of the address (never the address) to the system DNS resolver, for its MX and then its SRV record, and nothing else |
 | `POST /api/mail/test` | sends the mail password to the `host`/`port` **in the request** |
 | `POST /api/calendar/test` | sends the calendar password to the `url` **in the request** |
+| `POST /api/mail/oauth` | starts a sign-in and reads no stored secret. **Microsoft** (`provider: 'microsoft'`): asks `login.microsoftonline.com` for a device code and, when you finish in your browser, stores the refresh token under the account's `keyRef`; the device code stays in this process and the page sees only the user code. **Google** (`provider: 'google'`): mints a PKCE verifier and a `state`, answers with the `accounts.google.com` URL for the page to open, and stores nothing until the callback below lands. A `clientSecret` in the body is written to the store under `oauth.google.clientSecret` before it is used and is never echoed; `GET /api/mail/oauth/:id` answers with the state of the flow and nothing credential-shaped |
+| `GET /oauth/callback` | the one route that takes no session token (section 6). Reads no stored secret; **writes** one — it trades the `code` and the PKCE verifier at `oauth2.googleapis.com` (with the client id, and the client secret when the client has one) and files the refresh token under the flow's `keyRef`. Refuses anything not from `127.0.0.1` or whose `state` does not match a pending flow, with one generic `400`. The page it returns contains no token and no address |
 
 That is not a bug — it is what "test this connection" means, and during first-run
 setup the address you are testing is by definition not saved yet. But it does

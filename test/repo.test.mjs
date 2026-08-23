@@ -1245,3 +1245,68 @@ test('docs/README.md counts the outbound calls with a recipe that still matches 
       `docs/README.md says ${fn} in ${file} opens a connection, and no such name appears in that file`);
   }
 });
+
+/* ================================================================== *
+ * The sign-in documentation is pinned to the code it describes
+ * ================================================================== */
+
+test('the sign-in docs name the exact hosts the code spends a token against', async () => {
+  /* docs/SECURITY.md § 5 tells the reader they can watch Zelos with tcpdump
+     and see only what they configured, and OAUTH.md's table says which hosts a
+     sign-in adds to that picture. Both are prose, and prose drifts: the
+     previous OAUTH.md said Gmail sign-in did not exist, a week after the code
+     for it was written. So the hosts are read off the modules that hold the
+     endpoints — the Google pair from `PROVIDERS` in core/sources/oauth.mjs and
+     the Microsoft one from `MS_LOGIN_ORIGIN` in core/sources/imap.mjs — and
+     every page that claims to list egress has to name each of them. A new
+     provider, or a moved endpoint, fails here until the pages catch up. */
+  const { PROVIDERS } = await import('../core/sources/oauth.mjs');
+  const { MS_LOGIN_ORIGIN } = await import('../core/sources/imap.mjs');
+  const hosts = [...new Set([
+    new URL(PROVIDERS.google.authorizeUrl).host,
+    new URL(PROVIDERS.google.tokenUrl).host,
+    new URL(MS_LOGIN_ORIGIN).host,
+  ])].sort();
+  assert.deepEqual(hosts, ['accounts.google.com', 'login.microsoftonline.com', 'oauth2.googleapis.com'],
+    'the sign-in endpoints moved — update docs/OAUTH.md, docs/SECURITY.md § 5 and README.md before this list');
+
+  for (const rel of ['docs/OAUTH.md', 'docs/SECURITY.md', 'README.md']) {
+    const text = fs.readFileSync(path.join(ROOT, rel), 'utf8');
+    for (const host of hosts) {
+      assert.ok(text.includes(host),
+        `${rel} never names ${host}, which a sign-in talks to — the page claims to list what leaves the machine`);
+    }
+  }
+});
+
+test('docs/VERIFICATION.md is the Google submission kit, and the pages that need it can find it', () => {
+  /* Google's restricted-scope review asks for three things Zelos can write
+     down ahead of time — the scope justification, the demo shot list and the
+     CASA answers — and the review recurs every year, so the kit has to stay
+     where the next person will look: linked from README.md's docs table and
+     from OAUTH.md, carrying the scope it justifies and the Limited Use sentence
+     Google's FAQ gives as the model disclosure. docs/SECURITY.md § 7 has to
+     carry a row for each route the sign-in added, because that table is what
+     the kit cites for how the callback handles a credential. */
+  const kit = path.join(ROOT, 'docs', 'VERIFICATION.md');
+  assert.ok(fs.existsSync(kit), 'docs/VERIFICATION.md is missing');
+  const text = fs.readFileSync(kit, 'utf8');
+  assert.ok(text.includes('https://mail.google.com/'), 'the kit does not name the scope it justifies');
+  // The kit is prose wrapped at 100 columns inside a blockquote, so the sentence
+  // is matched with its line breaks and quote markers folded back to spaces.
+  const folded = text.replace(/\s*\n>?\s*/g, ' ');
+  assert.match(folded,
+    /use of information received from Google APIs will adhere to (the )?Google API Services User Data Policy, including the Limited Use requirements/,
+    'the kit has lost the Limited Use disclosure sentence');
+
+  assert.ok(fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8').includes('docs/VERIFICATION.md'),
+    'README.md\'s docs table does not link docs/VERIFICATION.md');
+  assert.ok(fs.readFileSync(path.join(ROOT, 'docs', 'OAUTH.md'), 'utf8').includes('VERIFICATION.md'),
+    'docs/OAUTH.md does not point at the kit');
+
+  const security = fs.readFileSync(path.join(ROOT, 'docs', 'SECURITY.md'), 'utf8');
+  for (const route of ['GET /oauth/callback', 'POST /api/mail/oauth']) {
+    assert.ok(security.includes(`| \`${route}\` |`),
+      `docs/SECURITY.md's table of what each route does with a secret has no row for ${route}`);
+  }
+});
