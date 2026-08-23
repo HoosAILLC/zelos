@@ -2074,6 +2074,32 @@ test('REGRESSION: a config save refetches health, so a model just saved is a mod
   assert.match(failed[0], /loadHealth\(\)/, 'a failed sweep leaves the health document where it was');
 });
 
+test('REGRESSION: the mail editor refuses to save or test a password account with no password anywhere', () => {
+  // The operator's first real mailbox went in with no secret and said
+  // "Saved."; the sweep then reported "No password stored" forever. The
+  // model panel gained this guard in the round before; the mail form had not.
+  const src = fs.readFileSync(path.join(UI, 'views/settings.js'), 'utf8');
+  const form = /function mailForm\(account, \{ onSaved, onCancel \}\)[\s\S]*?\n\}/m.exec(src);
+  assert.ok(form, 'mailForm is missing');
+  const body = form[0];
+  assert.match(body, /const passwordMissing = \(\) => authMethod\(\) === 'password' && !passInput\.value && !passwordStored\(\)/,
+    'the rule: password auth, nothing typed, nothing stored');
+  assert.match(body, /storedHere\.add\(draft\.keyRef\)/, 'a password stored on the way into Test must count at Save');
+  // Both buttons ask before they act, and before "Saving…"/"Connecting…" is shown.
+  const save = body.indexOf("button('Save account'");
+  const test = body.indexOf("button('Test the connection'");
+  assert.ok(save > 0 && test > save);
+  const saveBody = body.slice(save, test);
+  const testBody = body.slice(test);
+  assert.ok(saveBody.indexOf('passwordMissing()') > 0 && saveBody.indexOf('passwordMissing()') < saveBody.indexOf("status.working('Saving…')"),
+    'Save must refuse before it says Saving…');
+  assert.ok(testBody.indexOf('passwordMissing()') > 0 && testBody.indexOf('passwordMissing()') < testBody.indexOf('status.working('),
+    'Test must refuse before it says Connecting…');
+  assert.match(body, /app password, not the account one/, 'the refusal names what Gmail and Yahoo actually want');
+  // Microsoft sign-in carries no password, so the guard must not fire there.
+  assert.match(body, /authMethod\(\) === 'password' &&/, 'xoauth2 accounts are exempt');
+});
+
 test('REGRESSION: Test and List store the key in the field first, and Save refuses a hosted endpoint with no key', () => {
   const src = fs.readFileSync(path.join(UI, 'views/settings.js'), 'utf8');
   const panel = /export function modelPanel\([\s\S]*?\n\}/m.exec(src);

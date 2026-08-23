@@ -829,11 +829,27 @@ function mailForm(account, { onSaved, onCancel }) {
   // password goes out under rules the user was never shown.
   const requireTls = () => requireTlsFor(tlsSelect.value);
 
+  // Refs this form has stored itself since it was drawn — `state.secretRefs`
+  // is refreshed by a config save, not by POST /api/secrets, so a password
+  // stored on the way into "Test the connection" would otherwise still read
+  // as missing when Save is pressed a moment later. Same shape as modelPanel.
+  const storedHere = new Set();
+  const passwordStored = () => state.secretRefs.includes(draft.keyRef) || storedHere.has(draft.keyRef);
+
   async function persistPassword() {
     if (!passInput.value) return;
     await api.setSecret(draft.keyRef, passInput.value);
+    storedHere.add(draft.keyRef);
     passInput.value = '';
   }
+
+  // Said before the save, about the field it is about. Without this the
+  // account went in with no secret and said "Saved." — and every sweep after
+  // it reported "No password stored", which is true, after the fact, and the
+  // one moment nobody was looking at Settings. The operator's own mailbox
+  // shipped this way on the first evening.
+  const NEEDS_PASSWORD = 'This account needs a password — paste it above. Gmail and Yahoo want an app password, not the account one.';
+  const passwordMissing = () => authMethod() === 'password' && !passInput.value && !passwordStored();
 
   /* ---------------------------------------------------------------- *
    * "Sign in with Microsoft"
@@ -1009,6 +1025,10 @@ function mailForm(account, { onSaved, onCancel }) {
             status.bad('A host and a username are both required.');
             return;
           }
+          if (passwordMissing()) {
+            status.bad(NEEDS_PASSWORD);
+            return;
+          }
           status.working('Saving…');
           try {
             await persistPassword();
@@ -1039,6 +1059,10 @@ function mailForm(account, { onSaved, onCancel }) {
       button('Test the connection', {
         class: 'btn quiet',
         onClick: async () => {
+          if (passwordMissing()) {
+            status.bad(NEEDS_PASSWORD);
+            return;
+          }
           status.working(`Connecting to ${draft.host}…`);
           try {
             await persistPassword();
