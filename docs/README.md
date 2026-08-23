@@ -234,11 +234,13 @@ thing, and it takes two minutes.
 
 **The short way.** Under **Settings → Mail → Add a mailbox**, type your email
 address. Zelos recognises the provider (Gmail, iCloud, Yahoo, AOL, Fastmail,
-Zoho) and shows one button, **Get an app password**, which opens the exact page
-on your provider's site where you create one. Copy it, paste it into Zelos, and
-press **Connect**: Zelos tests the connection, finds your sent folder, and saves
-the account in one go. If the server refuses, Zelos repeats what it said, and
-**Show advanced** opens the full form with everything filled in. Personal
+Zoho — and a custom domain hosted on Google Workspace or Microsoft 365, which
+it recognises through the domain's own DNS records) and shows one button,
+**Get an app password**, which opens the exact page on your provider's site
+where you create one. Copy it, paste it into Zelos, and press **Connect**: Zelos
+tests the connection, finds your sent folder, and saves the account in one go.
+If the server refuses, Zelos repeats what it said, and **Advanced** opens the
+full form with everything filled in. Personal
 Outlook, Hotmail, Live and MSN addresses get **Sign in with Microsoft** instead,
 because Microsoft no longer accepts passwords of any kind for them; Proton
 addresses go to the full form, because Proton Bridge supplies its own host,

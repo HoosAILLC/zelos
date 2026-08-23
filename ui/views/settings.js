@@ -12,7 +12,7 @@
  * is unconditionally true, so it goes at the top, not in an "advanced" drawer.
  */
 
-import { el, button, meander, section, copyText } from '../lib/dom.js';
+import { el, button, meander, section, copyText, replace } from '../lib/dom.js';
 /* `request` rather than a named method on `api`: this panel is the only reader
    of /api/connectors, and a one-line wrapper in ui/lib/api.js would be a second
    place to look for a call that has exactly one call site. */
@@ -1221,9 +1221,9 @@ export async function connectSimpleMail({ id, keyRef, email, password = '', gues
  * saves in one go.
  *
  * The full form is never far. "Advanced" opens it prefilled with whatever the
- * guess found, and a failed Connect offers it on the spot — on the same
- * account id and keyRef, so a password Connect already stored is the password
- * the full form saves. Microsoft's personal domains get the same sign-in
+ * guess found, and stays where it is when Connect fails — one button, on the
+ * same account id and keyRef, so a password Connect already stored is the
+ * password the full form saves. Microsoft's personal domains get the same sign-in
  * block the full form shows, since there is no password to paste; Proton gets
  * its Bridge note and the full form, because Bridge's own host, port and
  * password are the whole of that setup.
@@ -1251,7 +1251,6 @@ export function simpleMailForm({ onSaved, onCancel, onAdvanced }) {
   });
   const card = el('div', { class: 'chosen' });
   card.hidden = true;
-  const fallback = el('div', { class: 'row-inline' });
 
   const email = () => emailInput.value.trim();
 
@@ -1308,7 +1307,6 @@ export function simpleMailForm({ onSaved, onCancel, onAdvanced }) {
       status.bad('Sign in with Microsoft above first — a personal Microsoft mailbox has no password to paste.');
       return;
     }
-    fallback.replaceChildren();
     status.working(`Connecting to ${guess.host}…`);
     try {
       const password = passInput.value;
@@ -1329,9 +1327,11 @@ export function simpleMailForm({ onSaved, onCancel, onAdvanced }) {
         passInput.value = '';
         passInput.placeholder = 'a password is stored — paste a new one to replace it';
       }
+      // The card's own Advanced is still on screen, and it is the one way to
+      // the full form: a second button under the error would be the two
+      // "Advanced"s paintCard avoids, one line apart.
       if (!outcome.ok) {
         status.bad(outcome.error);
-        fallback.replaceChildren(button('Show advanced', { class: 'btn quiet', onClick: openAdvanced }));
         return;
       }
       const sent = outcome.sentMailbox ? `sent folder “${outcome.sentMailbox}”` : 'no sent folder flagged';
@@ -1340,7 +1340,6 @@ export function simpleMailForm({ onSaved, onCancel, onAdvanced }) {
       onSaved();
     } catch (err) {
       status.bad(err.message);
-      fallback.replaceChildren(button('Show advanced', { class: 'btn quiet', onClick: openAdvanced }));
     }
   }
 
@@ -1350,7 +1349,6 @@ export function simpleMailForm({ onSaved, onCancel, onAdvanced }) {
     microsoft?.stop();
     microsoft = null;
     signedIn = false;
-    fallback.replaceChildren();
     card.hidden = !guess;
     // One route to the full form at a time: before a guess it is the link under
     // the address; once a card is up, the card carries its own. Two "Advanced"
@@ -1358,11 +1356,16 @@ export function simpleMailForm({ onSaved, onCancel, onAdvanced }) {
     formAdvanced.hidden = Boolean(guess);
     if (!guess) { card.replaceChildren(); return; }
 
+    // How the server knows: a custom domain on Workspace or 365 is named
+    // from its mail records, and a domain with an IMAP SRV record from that.
+    const via = guess.via === 'mx' ? ' · found through your domain\'s mail records'
+      : guess.via === 'srv' ? ' · advertised by your domain'
+        : '';
     const head = el('div', { class: 'chosen-head' }, [
       el('span', { class: 'chosen-label', text: guess.known ? guess.label : (guess.host ? 'A provider Zelos does not know' : 'Not an address Zelos can read') }),
-      guess.host ? el('span', { class: 'mono account-host', text: `${guess.host}:${guess.port}` }) : null,
+      guess.host ? el('span', { class: 'mono account-host', text: `${guess.host}:${guess.port}${via}` }) : null,
     ]);
-    const note = el('p', { class: 'quiet-note', text: guess.known
+    const note = el('p', { class: 'quiet-note', text: guess.known || guess.via === 'srv'
       ? guess.note
       : `We guessed ${guess.host} — Connect will tell you if that is right. Many providers want an app-specific password rather than your normal one.` });
 
@@ -1405,7 +1408,10 @@ export function simpleMailForm({ onSaved, onCancel, onAdvanced }) {
     const page = /^https:\/\//.test(guess.appPasswordUrl || '')
       ? el('a', { class: 'btn', href: guess.appPasswordUrl, target: '_blank', rel: 'noopener noreferrer', text: 'Get an app password' })
       : null;
-    card.replaceChildren(
+    // Through dom.js's replace(), not the DOM's own replaceChildren: a null
+    // child is skipped there and is the text "null" here, which is what the
+    // card printed where this link goes for every provider without a page.
+    replace(card, [
       head,
       note,
       page ? el('div', { class: 'row-inline' }, [page]) : null,
@@ -1414,7 +1420,7 @@ export function simpleMailForm({ onSaved, onCancel, onAdvanced }) {
         button('Connect', { class: 'btn solid', onClick: connect }),
         advanced,
       ]),
-    );
+    ]);
   }
 
   emailInput.addEventListener('change', lookUp);
@@ -1427,11 +1433,10 @@ export function simpleMailForm({ onSaved, onCancel, onAdvanced }) {
 
   return el('div', { class: 'account-form' }, [
     field('Your email address', emailInput, {
-      hint: 'Zelos works out the provider from it. The address goes to the Zelos server on this machine and nowhere else.',
+      hint: 'Zelos works out the provider from it. The address goes to the Zelos server on this machine and nowhere else. For a domain Zelos does not recognise, it asks your DNS resolver who handles mail for the domain — the domain only, never the address.',
     }),
     card,
     status.node,
-    fallback,
     el('div', { class: 'row-inline' }, [
       formAdvanced,
       button('Cancel', { class: 'btn quiet', onClick: () => { microsoft?.stop(); onCancel(); } }),
