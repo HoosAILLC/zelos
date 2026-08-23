@@ -158,9 +158,9 @@ export const api = {
   testMail: (account) => request('/api/mail/test', { method: 'POST', body: account }),
   testCalendar: (calendar) => request('/api/calendar/test', { method: 'POST', body: calendar }),
 
-  /* "Sign in with Microsoft" — a device authorization grant, and three calls
-     from this page's point of view: start one, ask whether the person has
-     finished in their browser, give up.
+  /* "Sign in with Microsoft" and "Sign in with Google" — three calls from this
+     page's point of view: start a sign-in, ask whether the person has finished
+     in their browser, give up.
 
      There is deliberately no timing here. RFC 8628 §3.5 pins the poll interval
      and the `slow_down` back-off, core/sources/imap.mjs implements both under
@@ -172,9 +172,19 @@ export const api = {
      The device code never comes back here. Whoever holds it collects the tokens,
      so it stays in the server process — what this gets is the USER code, which
      is meant for a human to read aloud off a screen, and the address to type it
-     at. */
-  beginMailOAuth: ({ keyRef, clientId, tenantId }) =>
-    request('/api/mail/oauth', { method: 'POST', body: { keyRef, clientId, tenantId } }),
+     at. Google's flow hands back an authorization URL for the browser instead;
+     the code Google returns lands on the server's own loopback callback, and
+     the page only ever learns that the flow is `connected`.
+
+     `provider` defaults on the server to Microsoft, so a caller that sends what
+     it always sent still gets what it always got. `clientId`, `clientSecret`
+     and `email` ride along only when the caller set them — JSON.stringify
+     drops an undefined field, so the wire body of an old call is unchanged.
+     The one secret in here, Google's client secret, is typed by the user for
+     their own Cloud project, goes once to the server on this machine, and is
+     kept in the secret store under `oauth.google.clientSecret` from then on. */
+  beginMailOAuth: ({ provider, keyRef, clientId, clientSecret, tenantId, email }) =>
+    request('/api/mail/oauth', { method: 'POST', body: { provider, keyRef, clientId, clientSecret, tenantId, email } }),
   mailOAuthStatus: (id) => request(`/api/mail/oauth/${encodeURIComponent(id)}`),
   cancelMailOAuth: (id) =>
     request(`/api/mail/oauth/${encodeURIComponent(id)}`, { method: 'DELETE' }),

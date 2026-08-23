@@ -44,7 +44,7 @@ const nextId = (prefix) => `${prefix}-${(uid += 1)}`;
  * those providers require, which users otherwise read as "Zelos is broken".
  */
 export const IMAP_HINTS = [
-  { host: 'imap.gmail.com', label: 'Gmail', note: 'Gmail needs an app password, not your account password.' },
+  { host: 'imap.gmail.com', label: 'Gmail', note: 'Gmail takes “Sign in with Google” below, or an app password — never your account password.' },
   { host: 'imap.mail.me.com', label: 'iCloud', note: 'iCloud needs an app-specific password.' },
   /* This preset shipped with no note at all, which read as "nothing special
      here" — the one provider where that is furthest from true. Microsoft ended
@@ -82,14 +82,17 @@ export const IMAP_HINTS = [
 /**
  * How a mail account signs in.
  *
- * Two, and the second exists because Microsoft removed the first for personal
- * Outlook, Hotmail, Live and MSN on 16 September 2024 — app passwords included.
- * The values are the ones core/config.mjs validates (`MAIL_AUTH_METHODS`) and
- * core/connectors/imap.mjs reads off the account; a third option would need all
- * three to agree, which is why they are not spelled out anywhere else in ui/.
+ * Three choices, two stored values. `password` and `xoauth2` are what
+ * core/config.mjs validates (`MAIL_AUTH_METHODS`) and core/connectors/imap.mjs
+ * reads off the account. "Sign in with Google" is not a third method on the
+ * wire — it is `xoauth2` with `oauth.provider: 'google'` — so its picker value
+ * is translated by the form (`authMethod()`), never written to config. That is
+ * why the Microsoft entry keeps the bare `xoauth2` value it always had: an
+ * account written before `provider` existed has none, and is Microsoft.
  */
 export const MAIL_AUTH_CHOICES = [
   { value: 'password', label: 'A password (everything except personal Microsoft mail)' },
+  { value: 'google', label: 'Sign in with Google' },
   { value: 'xoauth2', label: 'Sign in with Microsoft' },
 ];
 
@@ -784,6 +787,17 @@ export function sentMailboxFromTest(mailboxes, current = '') {
 const NEEDS_PASSWORD = 'This account needs a password — paste it above. Gmail and Yahoo want an app password, not the account one.';
 
 /**
+ * Where a sign-in flow stands, read off whatever the server called it.
+ *
+ * The Microsoft device flow has always answered `state`; the route that grew
+ * Google answers `status` for both providers. Reading either here means the
+ * two blocks below do not care which build of the server they are talking
+ * to, and a rename on the wire cannot leave a panel spinning on a flow that
+ * finished.
+ */
+const flowStatus = (flow) => flow?.status ?? flow?.state;
+
+/**
  * "Sign in with Microsoft"
  *
  * Microsoft stopped accepting passwords for personal Outlook, Hotmail, Live
@@ -791,12 +805,14 @@ const NEEDS_PASSWORD = 'This account needs a password — paste it above. Gmail 
  * preset in IMAP_HINTS above was, until this existed, an instruction to do
  * something impossible, offered during onboarding.
  *
- * The client ID and tenant are the USER'S. Zelos ships neither, and cannot:
- * an application id belonging to Zelos would need Microsoft publisher
- * verification, which is a vendor approving a published app — the same wall
- * that keeps Gmail out (docs/OAUTH.md). What a person registers in their own
- * Entra tenant needs no approval from anybody, which is the whole reason this
- * flow is reachable at all.
+ * The client ID and tenant are the USER'S until Zelos ships its own
+ * registration. `clientReady` is the server's word (POST /api/mail/guess)
+ * that a client exists — Zelos's own, or one pasted into config — and when it
+ * does, the registration form is hidden rather than removed: the fields are
+ * still the way a person with their own tenant overrides the shipped one, and
+ * a block with one shape is one block to test. Until then, what a person
+ * registers in their own Entra tenant needs no approval from anybody, which
+ * is the whole reason this flow was reachable at all.
  *
  * No timing lives here. The server runs the RFC 8628 poll loop with its
  * back-off; this asks "has anything changed" on a fixed two seconds, which is
@@ -810,10 +826,13 @@ const NEEDS_PASSWORD = 'This account needs a password — paste it above. Gmail 
  * the client id and tenant the person typed, which is what the account has to
  * be saved with; `onConnected` fires when Microsoft has handed over a grant.
  */
-function microsoftSignIn({ keyRef, user, clientId = '', tenantId = 'common', onStart = null, onConnected = null }) {
+function microsoftSignIn({ keyRef, user, clientId = '', tenantId = 'common', clientReady = false, onStart = null, onConnected = null }) {
   const clientIdInput = input({ value: clientId, placeholder: '00000000-0000-0000-0000-000000000000', autocomplete: 'off' });
   const tenantInput = input({ value: tenantId || 'common', placeholder: 'common', autocomplete: 'off' });
-  const oauth = () => ({ clientId: clientIdInput.value.trim(), tenantId: tenantInput.value.trim() || 'common' });
+  // `provider` travels with the account from here on, so a sweep can tell a
+  // Microsoft grant from a Google one; an account saved before it existed has
+  // none, and the sweep reads that as Microsoft.
+  const oauth = () => ({ provider: 'microsoft', clientId: clientIdInput.value.trim(), tenantId: tenantInput.value.trim() || 'common' });
 
   const signInStatus = statusLine();
   const codeBox = el('div', { class: 'device-code' });
@@ -829,10 +848,10 @@ function microsoftSignIn({ keyRef, user, clientId = '', tenantId = 'common', onS
     stopPolling();
     flowId = null;
     codeBox.replaceChildren();
-    if (flow.state === 'connected') {
+    if (flowStatus(flow) === 'connected') {
       signInStatus.good('Signed in. The token is in your keychain; Zelos will refresh it on its own.');
       onConnected?.();
-    } else if (flow.state === 'cancelled') {
+    } else if (flowStatus(flow) === 'cancelled') {
       signInStatus.bad('Sign-in cancelled.');
     } else {
       signInStatus.bad(flow.error || flow.message || 'Microsoft refused the sign-in.');
@@ -865,25 +884,28 @@ function microsoftSignIn({ keyRef, user, clientId = '', tenantId = 'common', onS
 
   async function start() {
     if (!user()) { signInStatus.bad('Fill in the username first — it is the mailbox being signed in to.'); return; }
-    if (!clientIdInput.value.trim()) { signInStatus.bad('The application (client) ID from your Entra app registration is required.'); return; }
+    // With a shipped client the id is optional: an empty one tells the server
+    // to use its own. Without one it is the whole flow, and it is required.
+    if (!clientReady && !clientIdInput.value.trim()) { signInStatus.bad('The application (client) ID from your Entra app registration is required.'); return; }
     const chosen = oauth();
     onStart?.(chosen);
     stopPolling();
     signInStatus.working('Asking Microsoft for a code…');
     try {
       const flow = await api.beginMailOAuth({
+        provider: 'microsoft',
         keyRef,
-        clientId: chosen.clientId,
+        ...(chosen.clientId ? { clientId: chosen.clientId } : {}),
         tenantId: chosen.tenantId,
       });
       flowId = flow.id;
-      if (flow.state !== 'pending') { landed(flow); return; }
+      if (flowStatus(flow) !== 'pending') { landed(flow); return; }
       signInStatus.working('Waiting for you to finish in the browser…');
       showCode(flow);
       poll = setInterval(async () => {
         try {
           const now = await api.mailOAuthStatus(flowId);
-          if (now.state === 'pending') { showCode(now); return; }
+          if (flowStatus(now) === 'pending') { showCode(now); return; }
           landed(now);
         } catch (err) {
           // A 404 means the server restarted or the flow expired; either way
@@ -899,13 +921,22 @@ function microsoftSignIn({ keyRef, user, clientId = '', tenantId = 'common', onS
     }
   }
 
-  const node = el('div', { class: 'stack' }, [
+  // Hidden, not dropped, when the server has a client of its own: the same
+  // two fields are how a tenant of one's own overrides it, and `[hidden]` is
+  // what every collapsed thing in ui/ uses, so the CSS rule that makes it
+  // stick covers this one too.
+  const registration = el('div', { class: 'stack' }, [
     field('Application (client) ID', clientIdInput, {
-      hint: 'From your own app registration in Microsoft Entra — Zelos ships no client ID, because one belonging to Zelos would need Microsoft to verify a published app, and this whole flow exists to avoid asking a vendor for permission. Register an app, switch on “Allow public client flows”, and paste its Application (client) ID here.',
+      hint: 'From your own app registration in Microsoft Entra. Register an app, switch on “Allow public client flows”, and paste its Application (client) ID here.',
     }),
     field('Directory (tenant) ID', tenantInput, {
       hint: 'Leave it as “common” for a personal Outlook, Hotmail, Live or MSN account. A work or school mailbox needs the tenant its administrator gives you.',
     }),
+  ]);
+  registration.hidden = clientReady;
+
+  const node = el('div', { class: 'stack' }, [
+    registration,
     el('div', { class: 'row-inline' }, [
       button('Sign in with Microsoft', { class: 'btn solid', onClick: start }),
     ]),
@@ -918,6 +949,184 @@ function microsoftSignIn({ keyRef, user, clientId = '', tenantId = 'common', onS
     oauth,
     /** Stop asking the server about a sign-in nobody is looking at any more. */
     stop() { stopPolling(); codeBox.replaceChildren(); },
+  };
+}
+
+/**
+ * "Sign in with Google"
+ *
+ * The same shape as microsoftSignIn — `{ node, oauth(), stop() }` — built once
+ * and shown by either mail form, so the Google flow exists in one place. The
+ * grant is different underneath: Google has no device code, so the server
+ * mints an authorization URL (PKCE, loopback redirect) and this opens it in a
+ * NEW tab. An `<a target="_blank">` rather than window.open, for two reasons.
+ * The desktop shell's guard (desktop/guard.js) routes every new-window request
+ * for an https address — anchor or window.open alike — to the system browser
+ * and denies it in the board's own window, so either would work there; but the
+ * anchor is also a real link a person can press if the automatic open was
+ * swallowed by a popup blocker, and it is the convention the app-password
+ * button in the simple form already uses. The code Google sends back lands on
+ * the server's own /oauth/callback; nothing about it ever reaches this page,
+ * which only asks "is it done yet" and is told the address it signed in as.
+ *
+ * `clientReady` is the server's word (POST /api/mail/guess) that a Google
+ * client exists: Zelos's own once it ships one, or one pasted into config.
+ * Without it the block says so in a sentence and offers, collapsed, the two
+ * fields of a Google Cloud client of the person's own. The secret among them
+ * is typed into a password field, read once when the button is pressed, sent
+ * once to the server on this machine — which files it in the secret store —
+ * and cleared from the field before the request is even answered; it is never
+ * in `oauth()` and never in the saved account.
+ *
+ * `email` is read when the button is pressed, like microsoftSignIn's `user`.
+ * `signedInAs` is the address an already-connected account is signed in as,
+ * so editing one reads "Signed in · you@…" with a way to sign in again.
+ */
+function googleSignIn({ keyRef, email, clientReady = false, clientId = '', signedInAs = '', onStart = null, onConnected = null }) {
+  const clientIdInput = input({ value: clientId, placeholder: '…apps.googleusercontent.com', autocomplete: 'off' });
+  const secretInput = el('input', { class: 'input', type: 'password', autocomplete: 'off', placeholder: 'client secret' });
+  const oauth = () => ({ provider: 'google', clientId: clientIdInput.value.trim() });
+  const address = () => (typeof email === 'function' ? email() : String(email || '')).trim();
+
+  const signInStatus = statusLine();
+  const flowBox = el('div', { class: 'device-code' });
+  let poll = null;
+  let flowId = null;
+
+  const stopPolling = () => { if (poll) { clearInterval(poll); poll = null; } };
+
+  const landed = (flow) => {
+    stopPolling();
+    flowId = null;
+    flowBox.replaceChildren();
+    const status = flowStatus(flow);
+    if (status === 'connected') {
+      signInStatus.good(flow.user
+        ? `Signed in as ${flow.user}. The token is in your keychain; Zelos will refresh it on its own.`
+        : 'Signed in. The token is in your keychain; Zelos will refresh it on its own.');
+      onConnected?.({ keyRef, provider: 'google', clientId: oauth().clientId, user: flow.user || '' });
+    } else if (status === 'cancelled') {
+      signInStatus.bad('Sign-in cancelled.');
+    } else if (status === 'expired') {
+      signInStatus.bad('The sign-in ran out of time before it finished — press the button to start again.');
+    } else {
+      signInStatus.bad(flow.error || flow.message || 'Google refused the sign-in.');
+    }
+  };
+
+  const cancel = async () => {
+    const id = flowId;
+    stopPolling();
+    flowId = null;
+    flowBox.replaceChildren();
+    signInStatus.working('Sign-in cancelled.');
+    if (id) await api.cancelMailOAuth(id).catch(() => {});
+  };
+
+  /* The authorization URL is the server's: it holds a client id, a PKCE
+     challenge and a `state` nonce, and nothing that is anybody's secret or
+     address. https only, like the app-password link — a page that is not
+     Google's is not a page to send a person to. */
+  const openSignIn = (flow) => {
+    const page = /^https:\/\//.test(flow.authUrl || '')
+      ? el('a', { class: 'btn', href: flow.authUrl, target: '_blank', rel: 'noopener noreferrer', text: 'Open Google’s sign-in page' })
+      : null;
+    replace(flowBox, [
+      el('p', { class: 'quiet-note', text: page
+        ? 'Finish in the tab that just opened — if nothing opened, press the button. Leave this panel open.'
+        : 'The server sent no sign-in page to open.' }),
+      el('div', { class: 'row-inline' }, [
+        page,
+        button('Give up', { class: 'btn quiet', onClick: cancel }),
+      ]),
+    ]);
+    // Opened from the click that started the flow, while that click still
+    // counts as the user's own gesture; a browser that disagrees leaves the
+    // link on screen to press by hand.
+    page?.click();
+  };
+
+  async function start() {
+    if (!address()) { signInStatus.bad('Fill in the address first — it is the mailbox being signed in to.'); return; }
+    const chosen = oauth();
+    if (!clientReady && !chosen.clientId) { signInStatus.bad('Zelos has no Google client to sign in with yet — paste your own under “Use your own Google Cloud client”, or use an app password instead.'); return; }
+    // Read once, then gone from the DOM: the field is empty before the
+    // request is answered, so nothing on this screen holds the secret after
+    // the one moment it is needed.
+    const clientSecret = secretInput.value;
+    secretInput.value = '';
+    onStart?.(chosen);
+    stopPolling();
+    signInStatus.working('Asking Google for a sign-in page…');
+    try {
+      const flow = await api.beginMailOAuth({
+        provider: 'google',
+        keyRef,
+        email: address(),
+        ...(chosen.clientId ? { clientId: chosen.clientId } : {}),
+        ...(clientSecret ? { clientSecret } : {}),
+      });
+      flowId = flow.id;
+      if (flowStatus(flow) !== 'pending') { landed(flow); return; }
+      signInStatus.working('Waiting for you to finish in the browser…');
+      openSignIn(flow);
+      poll = setInterval(async () => {
+        try {
+          const now = await api.mailOAuthStatus(flowId);
+          if (flowStatus(now) === 'pending') return;
+          landed(now);
+        } catch (err) {
+          // A 404 means the server restarted or the flow expired; either way
+          // there is nothing left to wait for.
+          stopPolling();
+          flowBox.replaceChildren();
+          signInStatus.bad(err.message || 'The sign-in is no longer waiting.');
+        }
+      }, 1500);
+    } catch (err) {
+      signInStatus.bad(err.message || 'Could not start the sign-in.');
+    }
+  }
+
+  const signInButton = el('div', { class: 'row-inline' }, [
+    button(signedInAs ? 'Sign in again' : 'Sign in with Google', { class: 'btn solid', onClick: start }),
+  ]);
+
+  // A client of the person's own, collapsed under one link. With Zelos's own
+  // client ready the fields are not offered at all: there is nothing to
+  // explain and one button is the whole block.
+  const ownClient = el('div', { class: 'stack' }, [
+    field('Client ID', clientIdInput, {
+      hint: 'From a Google Cloud project of your own: an OAuth client of type “Desktop app”, with the Gmail API switched on. Paste its client ID here.',
+    }),
+    field('Client secret', secretInput, {
+      hint: 'Google issues desktop apps one and documents it as not actually secret. It goes once to the Zelos server on this machine, into your secret store, and is never shown again.',
+    }),
+    signInButton,
+  ]);
+  ownClient.hidden = !clientId;
+  const reveal = button('Use your own Google Cloud client', {
+    class: 'link',
+    onClick: () => { ownClient.hidden = false; reveal.hidden = true; },
+  });
+  reveal.hidden = !ownClient.hidden;
+
+  const node = el('div', { class: 'stack' }, clientReady
+    ? [signInButton, signInStatus.node, flowBox]
+    : [
+      el('p', { class: 'quiet-note', text: 'Zelos’s own Google app is not registered yet, so signing in with Google needs a client of your own until it is.' }),
+      reveal,
+      ownClient,
+      signInStatus.node,
+      flowBox,
+    ]);
+  if (signedInAs) signInStatus.good(`Signed in · ${signedInAs}`);
+
+  return {
+    node,
+    oauth,
+    /** Stop asking the server about a sign-in nobody is looking at any more. */
+    stop() { stopPolling(); flowBox.replaceChildren(); },
   };
 }
 
@@ -993,19 +1202,63 @@ function mailForm(account, { onSaved, onCancel }) {
   // stored. Microsoft sign-in carries no password and is exempt.
   const passwordMissing = () => authMethod() === 'password' && !passInput.value && !passwordStored();
 
-  const authSelect = select(MAIL_AUTH_CHOICES, { value: draft.auth === 'xoauth2' ? 'xoauth2' : 'password' });
-  const authMethod = () => (authSelect.value === 'xoauth2' ? 'xoauth2' : 'password');
+  // The picker has three entries and config has two methods: "Sign in with
+  // Google" is `xoauth2` with `oauth.provider: 'google'`, so the picker value
+  // is translated here and `draft.auth` only ever holds a value config
+  // validates. An account with no `provider` predates Google and is Microsoft.
+  const googleAccount = () => draft.auth === 'xoauth2' && draft.oauth?.provider === 'google';
+  const authSelect = select(MAIL_AUTH_CHOICES, {
+    value: draft.auth === 'xoauth2' ? (googleAccount() ? 'google' : 'xoauth2') : 'password',
+  });
+  const authMethod = () => (authSelect.value === 'password' ? 'password' : 'xoauth2');
+  const provider = () => (authSelect.value === 'google' ? 'google' : 'microsoft');
 
   // "Sign in with Microsoft" — the one device flow, shared with the simple
   // form; see microsoftSignIn above. What it learns lands on the draft.
   const microsoft = microsoftSignIn({
     keyRef: draft.keyRef,
     user: () => draft.user,
-    clientId: draft.oauth?.clientId || '',
+    clientId: draft.oauth?.provider === 'google' ? '' : draft.oauth?.clientId || '',
     tenantId: draft.oauth?.tenantId || 'common',
     onStart: (oauth) => { draft.oauth = oauth; },
     onConnected: () => { draft.auth = 'xoauth2'; },
   });
+
+  // "Sign in with Google" — the same block the simple form shows, built when
+  // the picker first lands on it. Whether Zelos has a Google client to sign
+  // in with is the server's answer, not this page's guess: the default client
+  // is a constant in core/sources/oauth.mjs, and POST /api/mail/guess is the
+  // one route that reports it (`clientReady`). The answer is a property of
+  // the server's config, not of any address, so it is asked about a Gmail
+  // placeholder rather than the account's own — a Workspace domain whose
+  // records do not resolve would otherwise read as "no client" when the
+  // client is fine — and asked once.
+  let google = null;
+  let googleReady = null;
+  const buildGoogle = () => googleSignIn({
+    keyRef: draft.keyRef,
+    email: () => draft.user,
+    clientReady: googleReady === true,
+    clientId: googleAccount() ? draft.oauth?.clientId || '' : '',
+    signedInAs: googleAccount() ? draft.user : '',
+    onStart: (oauth) => { draft.oauth = oauth; },
+    onConnected: (oauth) => { draft.auth = 'xoauth2'; draft.oauth = { provider: 'google', clientId: oauth.clientId }; },
+  });
+  const activeOAuth = () => (provider() === 'google' ? google?.oauth() ?? draft.oauth : microsoft.oauth());
+  async function paintGoogle() {
+    if (googleReady === null) {
+      credentialSlot.replaceChildren(el('p', { class: 'quiet-note', text: 'Checking whether Zelos can sign in to Google on this machine…' }));
+      try {
+        googleReady = (await api.guessMail('you@gmail.com')).clientReady === true;
+      } catch {
+        googleReady = false;
+      }
+      // The picker moved on while the question was out.
+      if (authMethod() !== 'xoauth2' || provider() !== 'google') return;
+    }
+    google = google || buildGoogle();
+    credentialSlot.replaceChildren(google.node);
+  }
 
   const passwordBlock = el('div', { class: 'stack' }, [
     field('Password', passInput, {
@@ -1016,9 +1269,12 @@ function mailForm(account, { onSaved, onCancel }) {
   const credentialSlot = el('div', {});
   const paintCredential = () => {
     const xo = authMethod() === 'xoauth2';
-    credentialSlot.replaceChildren(xo ? microsoft.node : passwordBlock);
+    const viaGoogle = xo && provider() === 'google';
+    if (viaGoogle) paintGoogle();
+    else credentialSlot.replaceChildren(xo ? microsoft.node : passwordBlock);
     tlsSelect.closest('.field')?.toggleAttribute('hidden', xo);
-    if (!xo) microsoft.stop();
+    if (!xo || viaGoogle) microsoft.stop();
+    if (!viaGoogle) google?.stop();
   };
   authSelect.addEventListener('change', () => {
     draft.auth = authMethod();
@@ -1039,7 +1295,7 @@ function mailForm(account, { onSaved, onCancel }) {
     }),
     field('Username', userInput),
     field('How Zelos signs in', authSelect, {
-      hint: 'Microsoft stopped accepting passwords for personal Outlook, Hotmail, Live and MSN mail on 16 September 2024, and app passwords stopped working with them. Everything else on this list still takes a password — Gmail and Yahoo want an app password rather than your account one.',
+      hint: 'Gmail and Google Workspace can sign in with Google; Microsoft stopped accepting passwords for personal Outlook, Hotmail, Live and MSN mail on 16 September 2024, and app passwords stopped working with them. Everything else takes a password — Gmail and Yahoo want an app password rather than your account one.',
     }),
     credentialSlot,
     el('div', { class: 'grid-2' }, [
@@ -1110,6 +1366,10 @@ function mailForm(account, { onSaved, onCancel }) {
               user: draft.user,
               keyRef: draft.keyRef,
               requireTls: requireTls(),
+              // And how it signs in, or the button tests a password account
+              // that does not exist: a signed-in mailbox has no password to
+              // be missing, and the sweep will use the grant.
+              ...(authMethod() === 'xoauth2' ? { auth: 'xoauth2', oauth: activeOAuth() } : {}),
             });
             if (result.ok) {
               const seen = `Connected. ${plural((result.mailboxes || []).length, 'mailbox', 'mailboxes')} visible.`;
@@ -1210,14 +1470,14 @@ export async function connectSimpleMail({ id, keyRef, email, password = '', gues
 /**
  * Connecting a mailbox as one field, one button, one paste and Connect.
  *
- * People expect "Sign in with Google". Zelos cannot offer it: reading Gmail
- * is a Google restricted scope, which means a paid security audit every year
- * or a Cloud project per user (docs/OAUTH.md) — either of which is worse than
- * the app password this replaces. So the app-password path is made to feel
- * like sign-in instead. The address is typed once; the server says which
- * provider it is (POST /api/mail/guess, so the address never sits in a URL);
- * one button opens the exact page where that provider creates an app
- * password; the password is pasted; Connect tests, finds the sent folder and
+ * People expect "Sign in with Google", and for Gmail and Google Workspace it
+ * is what they get — first, above the app-password path, which stays one
+ * link away because it is the floor: a provider that offers nothing else
+ * (iCloud, Yahoo, Fastmail, a server of one's own) still connects with one.
+ * The address is typed once; the server says which provider it is and
+ * whether it signs in (POST /api/mail/guess, so the address never sits in a
+ * URL); one button opens the provider's own sign-in page, or the exact page
+ * where it creates an app password; Connect tests, finds the sent folder and
  * saves in one go.
  *
  * The full form is never far. "Advanced" opens it prefilled with whatever the
@@ -1234,7 +1494,13 @@ export function simpleMailForm({ onSaved, onCancel, onAdvanced }) {
   const status = statusLine();
   let guess = null;        // the server's answer, for the address it was asked about
   let microsoft = null;    // the sign-in block, once the guess says xoauth2
+  let google = null;       // the sign-in block, once the guess says signIn: 'google'
   let signedIn = false;
+  // Whichever sign-in block the card is showing; at most one is built.
+  const signInBlock = () => google || microsoft;
+  // A Google sign-in that finished is the account's auth, whatever the guess
+  // said about passwords; nothing else changes what the guess said.
+  const viaGoogle = () => guess?.signIn === 'google' && signedIn;
 
   const emailInput = input({
     type: 'email',
@@ -1269,11 +1535,12 @@ export function simpleMailForm({ onSaved, onCancel, onAdvanced }) {
     host: guess?.host || '',
     port: guess?.port || 993,
     secure: guess ? guess.secure !== false : true,
-    ...(guess?.auth === 'xoauth2' ? { auth: 'xoauth2', oauth: microsoft?.oauth() ?? null } : {}),
+    ...(guess?.auth === 'xoauth2' || viaGoogle() ? { auth: 'xoauth2', oauth: signInBlock()?.oauth() ?? null } : {}),
   });
 
   async function openAdvanced() {
     microsoft?.stop();
+    google?.stop();
     // A password Connect already stored has to count in the full form, whose
     // passwordStored() reads state.secretRefs. One GET /api/config is what
     // makes that true; its failure leaves the form to ask again, which is
@@ -1299,7 +1566,8 @@ export function simpleMailForm({ onSaved, onCancel, onAdvanced }) {
   async function connect() {
     if (!guess || guess.for !== email()) await lookUp();
     if (!guess || !guess.host) return;
-    if (guess.auth === 'password' && passwordMissing()) {
+    const auth = viaGoogle() ? 'xoauth2' : guess.auth;
+    if (auth === 'password' && passwordMissing()) {
       status.bad(NEEDS_PASSWORD);
       return;
     }
@@ -1309,15 +1577,17 @@ export function simpleMailForm({ onSaved, onCancel, onAdvanced }) {
     }
     status.working(`Connecting to ${guess.host}…`);
     try {
-      const password = passInput.value;
+      // A signed-in mailbox carries no password, whatever was pasted before
+      // the sign-in finished.
+      const password = auth === 'xoauth2' ? '' : passInput.value;
       const outcome = await connectSimpleMail({
         id,
         keyRef,
         email: email(),
         password,
         guess,
-        auth: guess.auth,
-        oauth: microsoft?.oauth() ?? null,
+        auth,
+        oauth: auth === 'xoauth2' ? signInBlock()?.oauth() ?? null : null,
       });
       // Whatever the server said about the connection, the password it was
       // said about is stored now; a retry with the field left empty must
@@ -1348,6 +1618,8 @@ export function simpleMailForm({ onSaved, onCancel, onAdvanced }) {
   function paintCard() {
     microsoft?.stop();
     microsoft = null;
+    google?.stop();
+    google = null;
     signedIn = false;
     card.hidden = !guess;
     // One route to the full form at a time: before a guess it is the link under
@@ -1393,6 +1665,9 @@ export function simpleMailForm({ onSaved, onCancel, onAdvanced }) {
       microsoft = microsoftSignIn({
         keyRef,
         user: email,
+        // The shipped client, when the server has one: the registration form
+        // is hidden and the button is the whole block.
+        clientReady: guess.clientReady === true,
         onConnected: () => { signedIn = true; },
       });
       card.replaceChildren(head, note, microsoft.node, el('div', { class: 'row-inline' }, [
@@ -1408,6 +1683,41 @@ export function simpleMailForm({ onSaved, onCancel, onAdvanced }) {
     const page = /^https:\/\//.test(guess.appPasswordUrl || '')
       ? el('a', { class: 'btn', href: guess.appPasswordUrl, target: '_blank', rel: 'noopener noreferrer', text: 'Get an app password' })
       : null;
+
+    // Gmail and Workspace: sign in first, and the app password one link
+    // beneath. The password path is the same nodes the branch below paints,
+    // hidden until asked for — and hidden again once a sign-in has landed,
+    // because Connect will use the grant and a password field under a
+    // "Signed in" line reads as a second thing to do.
+    if (guess.signIn === 'google') {
+      const passwordPath = el('div', { class: 'stack' }, [
+        page ? el('div', { class: 'row-inline' }, [page]) : null,
+        field('App password', passInput, { hint: secretStoreNotes(state.health?.backend?.name).password }),
+      ]);
+      passwordPath.hidden = true;
+      const usePassword = button('Use an app password instead', {
+        class: 'link',
+        onClick: () => { passwordPath.hidden = false; usePassword.hidden = true; },
+      });
+      google = googleSignIn({
+        keyRef,
+        email,
+        clientReady: guess.clientReady === true,
+        onConnected: () => { signedIn = true; passwordPath.hidden = true; usePassword.hidden = true; },
+      });
+      replace(card, [
+        head,
+        note,
+        google.node,
+        usePassword,
+        passwordPath,
+        el('div', { class: 'row-inline' }, [
+          button('Connect', { class: 'btn solid', onClick: connect }),
+          advanced,
+        ]),
+      ]);
+      return;
+    }
     // Through dom.js's replace(), not the DOM's own replaceChildren: a null
     // child is skipped there and is the text "null" here, which is what the
     // card printed where this link goes for every provider without a page.
@@ -1439,7 +1749,7 @@ export function simpleMailForm({ onSaved, onCancel, onAdvanced }) {
     status.node,
     el('div', { class: 'row-inline' }, [
       formAdvanced,
-      button('Cancel', { class: 'btn quiet', onClick: () => { microsoft?.stop(); onCancel(); } }),
+      button('Cancel', { class: 'btn quiet', onClick: () => { microsoft?.stop(); google?.stop(); onCancel(); } }),
     ]),
   ]);
 }
