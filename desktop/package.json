@@ -1,7 +1,7 @@
 {
   "name": "zelos-desktop",
   "productName": "Zelos",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "The Electron shell for Zelos — a local-first second brain. The core it runs is dependency-free; Electron lives only in this package.",
   "author": {
     "name": "Zelos"
