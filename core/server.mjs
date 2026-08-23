@@ -72,6 +72,7 @@ import {
 import { handle as mcpHandle } from './mcp.mjs';
 import { sampleStatus, seedSampleData, clearSampleData } from './sample-data.mjs';
 import { complete, stream, listModels, probeLocal, isLocalAddress, PRESETS } from './llm.mjs';
+import { helpLinks, platformName, HELP_STEPS } from './help.mjs';
 import { safeUrl, screenContent, cap, wrapUntrusted, scrubForPrompt, SafetyError } from './safety.mjs';
 import {
   testConnection as testMailConnection,
@@ -1243,6 +1244,44 @@ const GUIDES = Object.freeze({
 
 function handleGuides(ctx) {
   sendJSON(ctx.res, 200, GUIDES);
+}
+
+/**
+ * "Ask Claude to walk me through this." The message core/help.mjs writes for
+ * one setup screen, and the two links that open a chat with it already typed.
+ *
+ * POST, so nothing about the person sits in a URL on this side either: the
+ * body names a step and, at most, what the app calls the provider. The
+ * platform is this process's own — `process.platform`, never the body's —
+ * because the message says "They are on a Mac" and the one thing a client
+ * cannot be trusted to state is what it is running on. Whatever else the body
+ * carries (an address pasted in by a confused caller, say) is dropped here and
+ * never reaches help.mjs, whose own closed lists would refuse it anyway; the
+ * suite sends one and hunts for it in the answer.
+ *
+ * Behind the session token like every /api route: the message is no secret,
+ * but a stranger has no business asking this server anything.
+ */
+async function handleHelp(ctx) {
+  const body = await readJSON(ctx.req);
+  const step = typeof body.step === 'string' ? body.step : '';
+  if (!HELP_STEPS.includes(step)) {
+    throw new HttpError(400, `step must be one of ${HELP_STEPS.join(', ')}`);
+  }
+  const provider = typeof body.provider === 'string' ? body.provider.slice(0, 80) : null;
+  const signIn = typeof body.signIn === 'string' ? body.signIn.slice(0, 20) : null;
+  sendJSON(ctx.res, 200, {
+    step,
+    platform: platformName(process.platform),
+    ...helpLinks({
+      step,
+      provider,
+      signIn,
+      clientReady: body.clientReady === true,
+      platform: process.platform,
+      guides: GUIDES,
+    }),
+  });
 }
 
 /**
@@ -2785,6 +2824,7 @@ const ROUTES = [
   ['GET', /^\/api\/model\/list$/, handleModelList],
   ['GET', /^\/api\/model\/presets$/, handlePresets],
   ['GET', /^\/api\/guides$/, handleGuides],
+  ['POST', /^\/api\/help$/, handleHelp],
   ['GET', /^\/api\/local\/probe$/, handleLocalProbe],
   ['GET', /^\/api\/connectors$/, handleConnectors],
   ['POST', /^\/api\/mail\/guess$/, handleMailGuess],

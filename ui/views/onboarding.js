@@ -26,7 +26,7 @@
  */
 
 import { el, button, meander } from '../lib/dom.js';
-import { modelPanel, mailPanel, calendarPanel } from './settings.js';
+import { modelPanel, mailPanel, calendarPanel, askClaude } from './settings.js';
 import {
   state, subscribe, startSweep, markOnboarded, refresh, notify,
 } from '../lib/store.js';
@@ -93,8 +93,13 @@ export function stepLine(current = step) {
  * `actions` overrides the default row wholesale — the welcome screen swaps its
  * own in once the sample-data probe lands, because whether the second button
  * loads the made-up week or clears it depends on what came back.
+ *
+ * `help` names the screen for the "Stuck? Ask Claude" line under the
+ * actions — 'general' on Welcome, 'first-check' on Done. The three middle
+ * steps pass nothing: each mounts a Settings panel, and the panel carries
+ * its own line, about the provider once it knows one.
  */
-function shell(rerender, navigate, { title, lede, body, primary = null, skip = 'Do this later', actions = null }) {
+function shell(rerender, navigate, { title, lede, body, primary = null, skip = 'Do this later', actions = null, help = null }) {
   return el('div', { class: 'view view-onboarding' }, [
     el('header', { class: 'ob-head' }, [
       el('p', { class: 'ob-mark', title: 'Zelos, in Greek', text: 'ΖΗΛΟΣ' }),
@@ -112,6 +117,7 @@ function shell(rerender, navigate, { title, lede, body, primary = null, skip = '
         : skip && button(skip, { class: 'btn quiet', onClick: () => next(rerender) }),
       button('Skip the rest', { class: 'link', onClick: () => finish(navigate) }),
     ]),
+    help ? askClaude({ step: help }) : null,
   ]);
 }
 
@@ -248,6 +254,7 @@ function startScreen(rerender, navigate) {
       ]),
     ]),
     actions,
+    help: 'general',
   });
 }
 
@@ -370,5 +377,6 @@ export function renderOnboarding(ctx) {
         await refresh({ silent: true });
       },
     }),
+    help: 'first-check',
   });
 }
