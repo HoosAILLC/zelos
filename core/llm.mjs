@@ -573,7 +573,14 @@ function buildChatRequest(opts, { stream }) {
 
   let url;
   const body = { model, max_tokens: maxTokens };
-  if (Number.isFinite(opts.temperature)) body.temperature = opts.temperature;
+  // Sampling knobs go to the OpenAI protocol only. Anthropic's current models
+  // (Sonnet 5, Opus 5, and the 4.7+ family) reject `temperature`, `top_p` and
+  // `top_k` outright — a 400 reading "temperature is deprecated for this
+  // model" — and the config default of 0 was riding on every request, so the
+  // first sweep after pasting a working key failed on a field nobody set.
+  // Older Claude models accept the field but sample fine without it; the
+  // local runtimes and hosted OpenAI-protocol providers still honour it.
+  if (protocol !== 'anthropic' && Number.isFinite(opts.temperature)) body.temperature = opts.temperature;
 
   if (protocol === 'anthropic') {
     url = anthropicPath(address, 'messages');

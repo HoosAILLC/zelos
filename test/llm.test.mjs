@@ -607,6 +607,36 @@ test('anthropic complete() sends the documented request and parses the reply', a
   assert.equal(result.model, 'mock-anthropic-model');
 });
 
+test('REGRESSION: an anthropic request carries no temperature — Sonnet 5 and Opus 5 refuse it', async () => {
+  // The operator's first real sweep after pasting a working key: 400,
+  // "`temperature` is deprecated for this model". The config default (0)
+  // was on every Anthropic request; the OpenAI protocol keeps it.
+  mock.reset?.();
+  await complete({
+    protocol: 'anthropic',
+    baseUrl: mock.origin,
+    apiKey: 'sk-ant-test-key',
+    model: 'claude-sonnet-5',
+    messages: [{ role: 'user', content: 'hi' }],
+    temperature: 0,
+    retries: 0,
+  });
+  const req = mock.last();
+  assert.equal(req.path, '/v1/messages');
+  assert.equal(req.body.temperature, undefined, 'anthropic must not be sent temperature');
+  assert.ok(!('top_p' in req.body) && !('top_k' in req.body), 'nor any other sampling knob');
+
+  await complete({
+    protocol: 'openai',
+    baseUrl: mock.origin,
+    model: 'llama3.2',
+    messages: [{ role: 'user', content: 'hi' }],
+    temperature: 0,
+    retries: 0,
+  });
+  assert.equal(mock.last().body.temperature, 0, 'the OpenAI protocol still carries it');
+});
+
 test('anthropic does not double up /v1 when the base URL already has it', async () => {
   await complete({
     protocol: 'anthropic',
