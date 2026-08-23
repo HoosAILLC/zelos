@@ -35,7 +35,9 @@ wc -l test/*.mjs | tail -1
 
 **Not a programmer?** Download the Mac or Windows app from
 [zelos-app.netlify.app](https://zelos-app.netlify.app/#download) and skip this section. The site
-says what to click the first time your computer warns you about it.
+says what to click the first time your computer warns you about it, and if you get stuck on any
+step, [zelos-app.netlify.app/help](https://zelos-app.netlify.app/help) has a message written for
+Claude that walks you through that step.
 
 ```bash
 node zelos.mjs
