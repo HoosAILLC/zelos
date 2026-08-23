@@ -469,6 +469,7 @@ Routes (JSON in/out unless noted):
 | GET | `/api/model/list` | `?protocol&baseUrl&keyRef` | `[{id,label}]` |
 | GET | `/api/model/presets` | | `PRESETS` |
 | GET | `/api/local/probe` | | detected local runtimes |
+| POST | `/api/mail/guess` | `{email}` — POST so the address is never in a URL | `{label, host, port, secure, auth, appPasswordUrl, note, known}` |
 | POST | `/api/mail/test` | mail account | `{ok, mailboxes, error}` |
 | POST | `/api/calendar/test` | calendar | `{ok, calendars, error}` |
 | POST | `/api/ask` | `{question}` | **SSE** streamed answer grounded in FTS5 hits |
@@ -483,7 +484,7 @@ Routes (JSON in/out unless noted):
 | DELETE | `/api/ai/tokens/:id` | | updated state |
 | POST | `/api/ai/test` | `{token, …}` | runs the real tool layer the way a client would |
 
-**That is 27 rows and it must stay exact.** `test/security.test.mjs` and
+**That is 28 rows and it must stay exact.** `test/security.test.mjs` and
 `test/ai-security.test.mjs` no longer restate this list — they parse `ROUTES` out of
 `core/server.mjs` (`test/router-table.mjs`) and attack whatever is in it. This table drifting
 was the upstream cause of eight routes going unattacked, `/api/sample-data` among them; keeping

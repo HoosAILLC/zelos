@@ -1837,9 +1837,15 @@ test('the Outlook note tells the user to press something that exists', async () 
   assert.match(form[0], /field\('How Zelos signs in', authSelect/, 'the sign-in picker is built but never placed');
   assert.match(form[0], /credentialSlot/, 'the credential block has nowhere to render');
 
-  // And all three ends of the device flow are reachable from here.
+  // And all three ends of the device flow are reachable from here. The flow
+  // itself moved out of the form into `microsoftSignIn` when the simple mail
+  // form learned to show the same block, so the assertion follows it: the
+  // form builds the block through the factory, and the factory makes the calls.
+  assert.match(form[0], /const microsoft = microsoftSignIn\(\{/, 'the form no longer builds the sign-in block');
+  const flow = /\nfunction microsoftSignIn\([\s\S]*?\n\}/m.exec(src);
+  assert.ok(flow, 'microsoftSignIn is missing');
   for (const call of ['beginMailOAuth', 'mailOAuthStatus', 'cancelMailOAuth']) {
-    assert.match(form[0], new RegExp(`api\\.${call}\\(`), `the form never calls api.${call}`);
+    assert.match(flow[0], new RegExp(`api\\.${call}\\(`), `the sign-in block never calls api.${call}`);
   }
   const apiSrc = fs.readFileSync(path.join(UI, 'lib/api.js'), 'utf8');
   for (const call of ['beginMailOAuth', 'mailOAuthStatus', 'cancelMailOAuth']) {
@@ -2095,7 +2101,10 @@ test('REGRESSION: the mail editor refuses to save or test a password account wit
     'Save must refuse before it says Saving…');
   assert.ok(testBody.indexOf('passwordMissing()') > 0 && testBody.indexOf('passwordMissing()') < testBody.indexOf('status.working('),
     'Test must refuse before it says Connecting…');
-  assert.match(body, /app password, not the account one/, 'the refusal names what Gmail and Yahoo actually want');
+  // The wording moved up to module level when the simple form learned to
+  // refuse with it too: one constant, two forms, one rule.
+  assert.match(src, /\nconst NEEDS_PASSWORD = '[^']*app password, not the account one/, 'the refusal names what Gmail and Yahoo actually want');
+  assert.match(body, /status\.bad\(NEEDS_PASSWORD\)/, 'the mail editor no longer refuses with it');
   // Microsoft sign-in carries no password, so the guard must not fire there.
   assert.match(body, /authMethod\(\) === 'password' &&/, 'xoauth2 accounts are exempt');
 });
@@ -2257,4 +2266,167 @@ test('REGRESSION: the About panel names /api/mcp as the one call that does not c
   assert.match(line[0], /AI token/, 'and it has to say which token that route carries instead');
   assert.match(line[0], /outlive a restart|survives? a restart|until you turn/,
     'the exception is only useful if it says the AI token is not per-launch');
+});
+
+/* ------------------------------------------------- 4. simple mail setup */
+
+/**
+ * The operator's first real mailbox took: know the IMAP host, find the
+ * app-password page, paste, Test, Save, fix the sent folder — and it went in
+ * with no password. "Sign in with Google" is what people expect, and Zelos
+ * cannot ship it (docs/OAUTH.md: reading Gmail is a restricted scope, which
+ * is an annual audit). So the app-password path is made to feel like sign-in:
+ * one address, one button to the provider's own page, one paste, one Connect
+ * that tests, finds the sent folder and saves. The wiring is pinned at the
+ * source because the forms need a layout engine; the sequence itself runs for
+ * real against a fake fetch, two tests down.
+ */
+test('Add a mailbox opens the simple form, and the simple form reaches the full one', () => {
+  const src = fs.readFileSync(path.join(UI, 'views/settings.js'), 'utf8');
+  const simple = /export function simpleMailForm\(\{ onSaved, onCancel, onAdvanced \}\)[\s\S]*?\n\}/m.exec(src);
+  assert.ok(simple, 'simpleMailForm is missing');
+
+  // The Add path builds the simple form, and its Advanced hands the full form
+  // the blank the Add path always built — on the same id and keyRef, so a
+  // password Connect already stored is the one the full form saves.
+  const panel = /export function mailPanel\([\s\S]*?\n\}/m.exec(src);
+  assert.ok(panel, 'mailPanel is missing');
+  const add = /const addButton = button\('Add a mailbox'[\s\S]*?\n  \}\);/m.exec(panel[0]);
+  assert.ok(add, 'the Add button is missing');
+  assert.match(add[0], /editor\.replaceChildren\(simpleMailForm\(\{/, 'Add a mailbox no longer opens the simple form');
+  assert.match(add[0], /onAdvanced: \(prefill\) => editor\.replaceChildren\(mailForm\(\{/, 'Advanced does not open the full form');
+  assert.match(add[0], /keyRef: prefill\.keyRef/, 'the full form opens on a different keyRef, so the stored password is lost');
+  assert.match(add[0], /\.\.\.prefill,/, 'what the guess found never reaches the full form');
+  // Editing an account keeps the full form.
+  assert.match(panel[0], /editor\.replaceChildren\(mailForm\(account, \{/, 'editing an account no longer uses the full form');
+
+  // The guess comes from the server, by POST: the address travels in a body,
+  // never in a query string.
+  assert.match(simple[0], /api\.guessMail\(address\)/, 'the provider is never looked up');
+  const apiSrc = fs.readFileSync(path.join(UI, 'lib/api.js'), 'utf8');
+  assert.match(apiSrc, /guessMail: \(email\) => request\('\/api\/mail\/guess', \{ method: 'POST', body: \{ email \} \}\)/,
+    'the address has to travel in a body, never in a query string');
+
+  // The one button is a real link to the provider's own page — https only,
+  // target=_blank, which is what desktop/guard.js hands to the system browser.
+  assert.match(simple[0], /\/\^https:\\\/\\\/\/\.test\(guess\.appPasswordUrl \|\| ''\)/, 'a non-https page would be linked');
+  assert.match(simple[0], /el\('a', \{ class: 'btn', href: guess\.appPasswordUrl, target: '_blank', rel: 'noopener noreferrer', text: 'Get an app password' \}\)/);
+
+  // Nothing typed and nothing stored is refused in the full form's words,
+  // before anything goes out.
+  assert.match(simple[0], /const passwordMissing = \(\) => !passInput\.value && !storedHere\.has\(keyRef\)/);
+  const connect = /async function connect\(\)[\s\S]*?\n  \}/m.exec(simple[0]);
+  assert.ok(connect, 'connect() is missing');
+  const guard = connect[0].indexOf('status.bad(NEEDS_PASSWORD)');
+  assert.ok(guard > 0 && guard < connect[0].indexOf('connectSimpleMail('), 'Connect goes ahead with no password');
+
+  // Microsoft's personal domains get the existing sign-in block, not a copy.
+  assert.match(simple[0], /microsoft = microsoftSignIn\(\{/, 'the xoauth2 branch does not reuse the sign-in block');
+  for (const call of ['beginMailOAuth', 'mailOAuthStatus', 'cancelMailOAuth']) {
+    assert.ok(!simple[0].includes(`api.${call}(`), `the simple form carries its own api.${call} — the device flow now exists twice`);
+  }
+  // Proton goes to the full form with Bridge's address already in it.
+  assert.match(simple[0], /guess\.auth === 'bridge'/, 'Proton Bridge is not recognised');
+  // A failed Connect offers the full form on the spot.
+  assert.match(connect[0], /button\('Show advanced'/, 'a failure leaves the user with no way forward');
+});
+
+test('Connect stores, tests, reads the sent folder and saves — in that order and no other', () => {
+  const src = fs.readFileSync(path.join(UI, 'views/settings.js'), 'utf8');
+  const fn = /export async function connectSimpleMail\([\s\S]*?\n\}/m.exec(src);
+  assert.ok(fn, 'connectSimpleMail is missing');
+  const at = (needle) => {
+    const i = fn[0].indexOf(needle);
+    assert.ok(i >= 0, `${needle} is missing from connectSimpleMail`);
+    return i;
+  };
+  const stored = at('api.setSecret(');
+  const tested = at('api.testMail(');
+  const sent = at('sentMailboxFromTest(result.mailboxes');
+  const saved = at('await saveConfig(patch)');
+  assert.ok(stored < tested, 'the test goes out naming a ref that holds nothing yet');
+  assert.ok(tested < sent, 'the sent folder is read before the server has listed it');
+  assert.ok(sent < saved, 'the account is saved before its sent folder is known');
+  // The test and the saved account carry the TLS rule the full form's Test
+  // sends for a new account, and adopt the address by the full form's rule.
+  assert.match(fn[0], /const requireTls = requireTlsFor\('auto'\)/);
+  assert.match(fn[0], /patch\.identity = \{ email: adopted \}/);
+  assert.match(fn[0], /!known &&/, 'an address the user already chose must not be overwritten');
+});
+
+test('Connect with a passing test saves an account whose sent folder is the one the server flags', async (t) => {
+  stubBrowserGlobals();
+  const settings = await import(fileUrl(UI, 'views/settings.js'));
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+
+  const calls = [];
+  let config = { identity: { name: '', email: '' }, mail: [] };
+  const ok = (body) => ({ ok: true, status: 200, text: async () => JSON.stringify(body) });
+  const answer = async (reqPath, init = {}) => {
+    const body = init.body ? JSON.parse(init.body) : null;
+    calls.push({ method: init.method || 'GET', path: reqPath, body });
+    if (reqPath === '/api/secrets') return ok({ ok: true });
+    if (reqPath === '/api/mail/test') {
+      return ok({ ok: true, capabilities: [], error: null, mailboxes: [
+        { name: 'INBOX', specialUse: 'inbox' },
+        { name: '[Gmail]/Sent Mail', specialUse: 'sent' },
+        { name: '[Gmail]/Drafts', specialUse: 'drafts' },
+      ] });
+    }
+    if (reqPath === '/api/config') {
+      config = { ...config, ...body, identity: { ...config.identity, ...(body.identity || {}) } };
+      return ok({ config, errors: [], secretRefs: ['mail.m_1'] });
+    }
+    if (reqPath === '/api/health') return ok({ model: { configured: false } });
+    throw new Error(`unexpected ${reqPath}`);
+  };
+  globalThis.fetch = answer;
+  t.after(() => { delete globalThis.fetch; });
+  store.state.config = config;
+
+  const guess = { label: 'Gmail', host: 'imap.gmail.com', port: 993, secure: true, auth: 'password', appPasswordUrl: 'https://example.com/app', note: '', known: true };
+  const outcome = await settings.connectSimpleMail({ id: 'm_1', keyRef: 'mail.m_1', email: 'nemo@gmail.com', password: 'abcd efgh ijkl mnop', guess });
+
+  assert.equal(outcome.ok, true);
+  assert.equal(outcome.sentMailbox, '[Gmail]/Sent Mail');
+  assert.equal(outcome.mailboxes, 3);
+  assert.equal(outcome.adopted, 'nemo@gmail.com', 'the first mailbox becomes who you are, as it does in the full form');
+
+  // The wire, in order: the password, then the test naming its ref, then the save.
+  assert.deepEqual(calls.map((c) => `${c.method} ${c.path}`).slice(0, 3), ['POST /api/secrets', 'POST /api/mail/test', 'PUT /api/config']);
+  assert.deepEqual(calls[0].body, { ref: 'mail.m_1', value: 'abcd efgh ijkl mnop' });
+  assert.deepEqual(calls[1].body, { host: 'imap.gmail.com', port: 993, secure: true, user: 'nemo@gmail.com', keyRef: 'mail.m_1', requireTls: null });
+
+  const saved = calls[2].body;
+  assert.equal(saved.mail.length, 1);
+  const account = saved.mail[0];
+  assert.equal(account.sentMailbox, '[Gmail]/Sent Mail', 'the stored default "Sent" does not exist on Gmail');
+  assert.equal(account.user, 'nemo@gmail.com');
+  assert.equal(account.keyRef, 'mail.m_1');
+  assert.equal(account.auth, 'password');
+  assert.equal(account.requireTls, null);
+  assert.equal(account.label, 'Gmail');
+  assert.deepEqual(account.mailboxes, ['INBOX']);
+  assert.equal(account.lookbackDays, 14);
+  assert.equal(account.maxMessages, 400);
+  assert.deepEqual(saved.identity, { email: 'nemo@gmail.com' });
+  assert.ok(!JSON.stringify(saved).includes('abcd efgh'), 'the password reached the config');
+
+  // A refused connection saves nothing and says what the server said.
+  calls.length = 0;
+  globalThis.fetch = async (reqPath, init) => (reqPath === '/api/mail/test'
+    ? ok({ ok: false, mailboxes: [], error: 'imap.gmail.com: [AUTHENTICATIONFAILED] Invalid credentials' })
+    : answer(reqPath, init));
+  const refused = await settings.connectSimpleMail({ id: 'm_2', keyRef: 'mail.m_2', email: 'nemo@gmail.com', password: 'wrong', guess });
+  assert.equal(refused.ok, false);
+  assert.match(refused.error, /AUTHENTICATIONFAILED/, 'the server\'s own words, verbatim');
+  assert.ok(!calls.some((c) => c.method === 'PUT' && c.path === '/api/config'), 'a refused account was saved anyway');
+
+  // A retry with the field left empty does not overwrite the stored password with nothing.
+  calls.length = 0;
+  globalThis.fetch = answer;
+  await settings.connectSimpleMail({ id: 'm_3', keyRef: 'mail.m_3', email: 'nemo@gmail.com', password: '', guess });
+  assert.ok(!calls.some((c) => c.path === '/api/secrets'), 'an empty field was stored over the password');
+  // And the address is not adopted twice: it was set by the first save.
+  assert.equal(calls.find((c) => c.path === '/api/config').body.identity, undefined);
 });

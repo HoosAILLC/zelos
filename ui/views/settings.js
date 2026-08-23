@@ -17,7 +17,7 @@ import { el, button, meander, section, copyText } from '../lib/dom.js';
    of /api/connectors, and a one-line wrapper in ui/lib/api.js would be a second
    place to look for a call that has exactly one call site. */
 import { api, request } from '../lib/api.js';
-import { state, saveConfig, setAccent, applyAccent, currentAccent, DEFAULT_ACCENT, markOnboarded } from '../lib/store.js';
+import { state, saveConfig, loadConfig, setAccent, applyAccent, currentAccent, DEFAULT_ACCENT, markOnboarded } from '../lib/store.js';
 import { plural } from '../lib/format.js';
 import { aiAccessPanel } from './ai-access.js';
 
@@ -775,6 +775,152 @@ export function sentMailboxFromTest(mailboxes, current = '') {
   return flagged || chosen;
 }
 
+// Said before the save, about the field it is about. Without this the
+// account went in with no secret and said "Saved." — and every sweep after
+// it reported "No password stored", which is true, after the fact, and the
+// one moment nobody was looking at Settings. The operator's own mailbox
+// shipped this way on the first evening. Module-level because both mail
+// forms refuse with it, and a refusal worded two ways is two rules.
+const NEEDS_PASSWORD = 'This account needs a password — paste it above. Gmail and Yahoo want an app password, not the account one.';
+
+/**
+ * "Sign in with Microsoft"
+ *
+ * Microsoft stopped accepting passwords for personal Outlook, Hotmail, Live
+ * and MSN on 16 September 2024, and app passwords went with them — so the
+ * preset in IMAP_HINTS above was, until this existed, an instruction to do
+ * something impossible, offered during onboarding.
+ *
+ * The client ID and tenant are the USER'S. Zelos ships neither, and cannot:
+ * an application id belonging to Zelos would need Microsoft publisher
+ * verification, which is a vendor approving a published app — the same wall
+ * that keeps Gmail out (docs/OAUTH.md). What a person registers in their own
+ * Entra tenant needs no approval from anybody, which is the whole reason this
+ * flow is reachable at all.
+ *
+ * No timing lives here. The server runs the RFC 8628 poll loop with its
+ * back-off; this asks "has anything changed" on a fixed two seconds, which is
+ * a UI refresh rate and not a protocol constant. If those two ever have to
+ * agree, the wrong one is this one.
+ *
+ * Built once and handed to whichever form is showing it — the full mail form
+ * and the simple one both — so the device flow exists in one place. `user`
+ * is read when the button is pressed, not captured, because the mailbox being
+ * signed in to is whatever the form says at that moment. `onStart` receives
+ * the client id and tenant the person typed, which is what the account has to
+ * be saved with; `onConnected` fires when Microsoft has handed over a grant.
+ */
+function microsoftSignIn({ keyRef, user, clientId = '', tenantId = 'common', onStart = null, onConnected = null }) {
+  const clientIdInput = input({ value: clientId, placeholder: '00000000-0000-0000-0000-000000000000', autocomplete: 'off' });
+  const tenantInput = input({ value: tenantId || 'common', placeholder: 'common', autocomplete: 'off' });
+  const oauth = () => ({ clientId: clientIdInput.value.trim(), tenantId: tenantInput.value.trim() || 'common' });
+
+  const signInStatus = statusLine();
+  const codeBox = el('div', { class: 'device-code' });
+  let poll = null;
+  let flowId = null;
+
+  const stopPolling = () => { if (poll) { clearInterval(poll); poll = null; } };
+
+  /* The panel is rebuilt whenever the account form is, and an interval that
+     outlives its node keeps calling a server about a sign-in nobody is watching
+     — and keeps a finished flow's verdict from ever being read. */
+  const landed = (flow) => {
+    stopPolling();
+    flowId = null;
+    codeBox.replaceChildren();
+    if (flow.state === 'connected') {
+      signInStatus.good('Signed in. The token is in your keychain; Zelos will refresh it on its own.');
+      onConnected?.();
+    } else if (flow.state === 'cancelled') {
+      signInStatus.bad('Sign-in cancelled.');
+    } else {
+      signInStatus.bad(flow.error || flow.message || 'Microsoft refused the sign-in.');
+    }
+  };
+
+  const showCode = (flow) => {
+    codeBox.replaceChildren(
+      el('p', { class: 'quiet-note', text: 'Open the address below and type this code. Leave this panel open.' }),
+      el('p', { class: 'device-code-value', text: flow.userCode || '' }),
+      el('a', {
+        href: /^https:\/\//.test(flow.verificationUri || '') ? flow.verificationUri : '#',
+        target: '_blank',
+        rel: 'noopener noreferrer',
+        text: flow.verificationUri || '',
+      }),
+      button('Give up', {
+        class: 'btn quiet',
+        onClick: async () => {
+          const id = flowId;
+          stopPolling();
+          flowId = null;
+          codeBox.replaceChildren();
+          signInStatus.working('Sign-in cancelled.');
+          if (id) await api.cancelMailOAuth(id).catch(() => {});
+        },
+      }),
+    );
+  };
+
+  async function start() {
+    if (!user()) { signInStatus.bad('Fill in the username first — it is the mailbox being signed in to.'); return; }
+    if (!clientIdInput.value.trim()) { signInStatus.bad('The application (client) ID from your Entra app registration is required.'); return; }
+    const chosen = oauth();
+    onStart?.(chosen);
+    stopPolling();
+    signInStatus.working('Asking Microsoft for a code…');
+    try {
+      const flow = await api.beginMailOAuth({
+        keyRef,
+        clientId: chosen.clientId,
+        tenantId: chosen.tenantId,
+      });
+      flowId = flow.id;
+      if (flow.state !== 'pending') { landed(flow); return; }
+      signInStatus.working('Waiting for you to finish in the browser…');
+      showCode(flow);
+      poll = setInterval(async () => {
+        try {
+          const now = await api.mailOAuthStatus(flowId);
+          if (now.state === 'pending') { showCode(now); return; }
+          landed(now);
+        } catch (err) {
+          // A 404 means the server restarted or the flow expired; either way
+          // there is nothing left to wait for, and silently spinning forever is
+          // the one outcome worse than saying so.
+          stopPolling();
+          codeBox.replaceChildren();
+          signInStatus.bad(err.message || 'The sign-in is no longer waiting.');
+        }
+      }, 2000);
+    } catch (err) {
+      signInStatus.bad(err.message || 'Could not start the sign-in.');
+    }
+  }
+
+  const node = el('div', { class: 'stack' }, [
+    field('Application (client) ID', clientIdInput, {
+      hint: 'From your own app registration in Microsoft Entra — Zelos ships no client ID, because one belonging to Zelos would need Microsoft to verify a published app, and this whole flow exists to avoid asking a vendor for permission. Register an app, switch on “Allow public client flows”, and paste its Application (client) ID here.',
+    }),
+    field('Directory (tenant) ID', tenantInput, {
+      hint: 'Leave it as “common” for a personal Outlook, Hotmail, Live or MSN account. A work or school mailbox needs the tenant its administrator gives you.',
+    }),
+    el('div', { class: 'row-inline' }, [
+      button('Sign in with Microsoft', { class: 'btn solid', onClick: start }),
+    ]),
+    signInStatus.node,
+    codeBox,
+  ]);
+
+  return {
+    node,
+    oauth,
+    /** Stop asking the server about a sign-in nobody is looking at any more. */
+    stop() { stopPolling(); codeBox.replaceChildren(); },
+  };
+}
+
 function mailForm(account, { onSaved, onCancel }) {
   const draft = { ...account };
   const status = statusLine();
@@ -843,136 +989,23 @@ function mailForm(account, { onSaved, onCancel }) {
     passInput.value = '';
   }
 
-  // Said before the save, about the field it is about. Without this the
-  // account went in with no secret and said "Saved." — and every sweep after
-  // it reported "No password stored", which is true, after the fact, and the
-  // one moment nobody was looking at Settings. The operator's own mailbox
-  // shipped this way on the first evening.
-  const NEEDS_PASSWORD = 'This account needs a password — paste it above. Gmail and Yahoo want an app password, not the account one.';
+  // The rule (NEEDS_PASSWORD, above): password auth, nothing typed, nothing
+  // stored. Microsoft sign-in carries no password and is exempt.
   const passwordMissing = () => authMethod() === 'password' && !passInput.value && !passwordStored();
 
-  /* ---------------------------------------------------------------- *
-   * "Sign in with Microsoft"
-   * ---------------------------------------------------------------- *
-   * Microsoft stopped accepting passwords for personal Outlook, Hotmail, Live
-   * and MSN on 16 September 2024, and app passwords went with them — so the
-   * preset in IMAP_HINTS above was, until this existed, an instruction to do
-   * something impossible, offered during onboarding.
-   *
-   * The client ID and tenant are the USER'S. Zelos ships neither, and cannot:
-   * an application id belonging to Zelos would need Microsoft publisher
-   * verification, which is a vendor approving a published app — the same wall
-   * that keeps Gmail out (docs/OAUTH.md). What a person registers in their own
-   * Entra tenant needs no approval from anybody, which is the whole reason this
-   * flow is reachable at all.
-   *
-   * No timing lives here. The server runs the RFC 8628 poll loop with its
-   * back-off; this asks "has anything changed" on a fixed two seconds, which is
-   * a UI refresh rate and not a protocol constant. If those two ever have to
-   * agree, the wrong one is this one.
-   */
   const authSelect = select(MAIL_AUTH_CHOICES, { value: draft.auth === 'xoauth2' ? 'xoauth2' : 'password' });
   const authMethod = () => (authSelect.value === 'xoauth2' ? 'xoauth2' : 'password');
 
-  const clientIdInput = input({ value: draft.oauth?.clientId || '', placeholder: '00000000-0000-0000-0000-000000000000', autocomplete: 'off' });
-  const tenantInput = input({ value: draft.oauth?.tenantId || 'common', placeholder: 'common', autocomplete: 'off' });
-
-  const signInStatus = statusLine();
-  const codeBox = el('div', { class: 'device-code' });
-  let poll = null;
-  let flowId = null;
-
-  const stopPolling = () => { if (poll) { clearInterval(poll); poll = null; } };
-
-  /* The panel is rebuilt whenever the account form is, and an interval that
-     outlives its node keeps calling a server about a sign-in nobody is watching
-     — and keeps a finished flow's verdict from ever being read. */
-  const landed = (flow) => {
-    stopPolling();
-    flowId = null;
-    codeBox.replaceChildren();
-    if (flow.state === 'connected') {
-      signInStatus.good('Signed in. The token is in your keychain; Zelos will refresh it on its own.');
-      draft.auth = 'xoauth2';
-    } else if (flow.state === 'cancelled') {
-      signInStatus.bad('Sign-in cancelled.');
-    } else {
-      signInStatus.bad(flow.error || flow.message || 'Microsoft refused the sign-in.');
-    }
-  };
-
-  const showCode = (flow) => {
-    codeBox.replaceChildren(
-      el('p', { class: 'quiet-note', text: 'Open the address below and type this code. Leave this panel open.' }),
-      el('p', { class: 'device-code-value', text: flow.userCode || '' }),
-      el('a', {
-        href: /^https:\/\//.test(flow.verificationUri || '') ? flow.verificationUri : '#',
-        target: '_blank',
-        rel: 'noopener noreferrer',
-        text: flow.verificationUri || '',
-      }),
-      button('Give up', {
-        class: 'btn quiet',
-        onClick: async () => {
-          const id = flowId;
-          stopPolling();
-          flowId = null;
-          codeBox.replaceChildren();
-          signInStatus.working('Sign-in cancelled.');
-          if (id) await api.cancelMailOAuth(id).catch(() => {});
-        },
-      }),
-    );
-  };
-
-  async function startMicrosoftSignIn() {
-    if (!draft.user) { signInStatus.bad('Fill in the username first — it is the mailbox being signed in to.'); return; }
-    if (!clientIdInput.value.trim()) { signInStatus.bad('The application (client) ID from your Entra app registration is required.'); return; }
-    draft.oauth = { clientId: clientIdInput.value.trim(), tenantId: tenantInput.value.trim() || 'common' };
-    stopPolling();
-    signInStatus.working('Asking Microsoft for a code…');
-    try {
-      const flow = await api.beginMailOAuth({
-        keyRef: draft.keyRef,
-        clientId: draft.oauth.clientId,
-        tenantId: draft.oauth.tenantId,
-      });
-      flowId = flow.id;
-      if (flow.state !== 'pending') { landed(flow); return; }
-      signInStatus.working('Waiting for you to finish in the browser…');
-      showCode(flow);
-      poll = setInterval(async () => {
-        try {
-          const now = await api.mailOAuthStatus(flowId);
-          if (now.state === 'pending') { showCode(now); return; }
-          landed(now);
-        } catch (err) {
-          // A 404 means the server restarted or the flow expired; either way
-          // there is nothing left to wait for, and silently spinning forever is
-          // the one outcome worse than saying so.
-          stopPolling();
-          codeBox.replaceChildren();
-          signInStatus.bad(err.message || 'The sign-in is no longer waiting.');
-        }
-      }, 2000);
-    } catch (err) {
-      signInStatus.bad(err.message || 'Could not start the sign-in.');
-    }
-  }
-
-  const microsoftBlock = el('div', { class: 'stack' }, [
-    field('Application (client) ID', clientIdInput, {
-      hint: 'From your own app registration in Microsoft Entra — Zelos ships no client ID, because one belonging to Zelos would need Microsoft to verify a published app, and this whole flow exists to avoid asking a vendor for permission. Register an app, switch on “Allow public client flows”, and paste its Application (client) ID here.',
-    }),
-    field('Directory (tenant) ID', tenantInput, {
-      hint: 'Leave it as “common” for a personal Outlook, Hotmail, Live or MSN account. A work or school mailbox needs the tenant its administrator gives you.',
-    }),
-    el('div', { class: 'row-inline' }, [
-      button('Sign in with Microsoft', { class: 'btn solid', onClick: startMicrosoftSignIn }),
-    ]),
-    signInStatus.node,
-    codeBox,
-  ]);
+  // "Sign in with Microsoft" — the one device flow, shared with the simple
+  // form; see microsoftSignIn above. What it learns lands on the draft.
+  const microsoft = microsoftSignIn({
+    keyRef: draft.keyRef,
+    user: () => draft.user,
+    clientId: draft.oauth?.clientId || '',
+    tenantId: draft.oauth?.tenantId || 'common',
+    onStart: (oauth) => { draft.oauth = oauth; },
+    onConnected: () => { draft.auth = 'xoauth2'; },
+  });
 
   const passwordBlock = el('div', { class: 'stack' }, [
     field('Password', passInput, {
@@ -983,9 +1016,9 @@ function mailForm(account, { onSaved, onCancel }) {
   const credentialSlot = el('div', {});
   const paintCredential = () => {
     const xo = authMethod() === 'xoauth2';
-    credentialSlot.replaceChildren(xo ? microsoftBlock : passwordBlock);
+    credentialSlot.replaceChildren(xo ? microsoft.node : passwordBlock);
     tlsSelect.closest('.field')?.toggleAttribute('hidden', xo);
-    if (!xo) { stopPolling(); codeBox.replaceChildren(); }
+    if (!xo) microsoft.stop();
   };
   authSelect.addEventListener('change', () => {
     draft.auth = authMethod();
@@ -1102,6 +1135,304 @@ function mailForm(account, { onSaved, onCancel }) {
   ]);
 }
 
+/* ---------------------------------------------------------- simple setup */
+
+/**
+ * The Connect sequence, with nothing on screen in it.
+ *
+ * One address and one pasted app password have to become a working account.
+ * The full form asked for that in five steps — know the host, store the
+ * password, Test, Save, fix the sent folder — and the operator's own first
+ * mailbox managed four of them. This is those steps in their only sensible
+ * order, as one call: store the password under the account's own keyRef
+ * (secrets travel only through POST /api/secrets, so the test has to name a
+ * ref that already holds it), test under exactly the rules the sweep will
+ * use, take the sent folder from the server's SPECIAL-USE flag, save. The
+ * account that comes out is the full form's blank with the guess filled in,
+ * so it validates the same way and sweeps the same way.
+ *
+ * `requireTls` is what the full form's Test sends for a new account: its
+ * select opens on "decide from the address", and `requireTlsFor('auto')` is
+ * that choice's stored value — encryption required everywhere except a server
+ * on this machine. Proton Bridge, the one provider that needs anything else,
+ * never reaches this call; the simple form sends it to the full one.
+ *
+ * Kept free of DOM so it can be run end to end against a fake fetch, the way
+ * the store is tested, rather than pinned as text.
+ */
+export async function connectSimpleMail({ id, keyRef, email, password = '', guess, auth = 'password', oauth = null }) {
+  if (auth === 'password' && password) await api.setSecret(keyRef, password);
+  const requireTls = requireTlsFor('auto');
+  const secure = guess.secure !== false;
+  const result = await api.testMail({
+    host: guess.host,
+    port: guess.port,
+    secure,
+    user: email,
+    keyRef,
+    requireTls,
+    ...(auth === 'xoauth2' ? { auth, oauth } : {}),
+  });
+  if (!result.ok) return { ok: false, error: result.error || 'The server refused the connection.' };
+
+  const sentMailbox = sentMailboxFromTest(result.mailboxes, '');
+  const account = {
+    id,
+    enabled: true,
+    // The list shows `label || user`, so a provider nobody here knows is
+    // better named by the address than by a bare domain.
+    label: guess.known ? guess.label : '',
+    host: guess.host,
+    port: guess.port,
+    secure,
+    requireTls,
+    user: email,
+    auth,
+    oauth: auth === 'xoauth2' ? oauth : null,
+    keyRef,
+    mailboxes: ['INBOX'],
+    sentMailbox,
+    lookbackDays: 14,
+    maxMessages: 400,
+  };
+  const others = (state.config?.mail || []).filter((m) => m.id !== id);
+  const patch = { mail: [...others, account] };
+  // The same adoption rule as the full form's Save: the address is both
+  // known and confirmed by hand at this moment, so it becomes identity.email
+  // — only when nothing is set, and announced rather than silent.
+  const known = String(state.config?.identity?.email ?? '').trim();
+  const adopted = !known && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ? email : '';
+  if (adopted) patch.identity = { email: adopted };
+  await saveConfig(patch);
+  return { ok: true, account, mailboxes: (result.mailboxes || []).length, sentMailbox, adopted };
+}
+
+/**
+ * Connecting a mailbox as one field, one button, one paste and Connect.
+ *
+ * People expect "Sign in with Google". Zelos cannot offer it: reading Gmail
+ * is a Google restricted scope, which means a paid security audit every year
+ * or a Cloud project per user (docs/OAUTH.md) — either of which is worse than
+ * the app password this replaces. So the app-password path is made to feel
+ * like sign-in instead. The address is typed once; the server says which
+ * provider it is (POST /api/mail/guess, so the address never sits in a URL);
+ * one button opens the exact page where that provider creates an app
+ * password; the password is pasted; Connect tests, finds the sent folder and
+ * saves in one go.
+ *
+ * The full form is never far. "Advanced" opens it prefilled with whatever the
+ * guess found, and a failed Connect offers it on the spot — on the same
+ * account id and keyRef, so a password Connect already stored is the password
+ * the full form saves. Microsoft's personal domains get the same sign-in
+ * block the full form shows, since there is no password to paste; Proton gets
+ * its Bridge note and the full form, because Bridge's own host, port and
+ * password are the whole of that setup.
+ */
+export function simpleMailForm({ onSaved, onCancel, onAdvanced }) {
+  const id = randomId('m');
+  const keyRef = `mail.${id}`;
+  const status = statusLine();
+  let guess = null;        // the server's answer, for the address it was asked about
+  let microsoft = null;    // the sign-in block, once the guess says xoauth2
+  let signedIn = false;
+
+  const emailInput = input({
+    type: 'email',
+    placeholder: 'you@example.com',
+    autocomplete: 'off',
+    spellcheck: 'false',
+    autofocus: true,
+  });
+  const passInput = el('input', {
+    class: 'input',
+    type: 'password',
+    autocomplete: 'off',
+    placeholder: 'paste the app password',
+  });
+  const card = el('div', { class: 'chosen' });
+  card.hidden = true;
+  const fallback = el('div', { class: 'row-inline' });
+
+  const email = () => emailInput.value.trim();
+
+  // Same shape as mailForm: a password this form stored itself counts, since
+  // `state.secretRefs` is refreshed by a config save and not by POST
+  // /api/secrets — and the same rule, in the same words.
+  const storedHere = new Set();
+  const passwordMissing = () => !passInput.value && !storedHere.has(keyRef);
+
+  /** What the full form opens on: everything the guess found, and the typed address. */
+  const prefill = () => ({
+    id,
+    keyRef,
+    user: email(),
+    label: guess?.known ? guess.label : '',
+    host: guess?.host || '',
+    port: guess?.port || 993,
+    secure: guess ? guess.secure !== false : true,
+    ...(guess?.auth === 'xoauth2' ? { auth: 'xoauth2', oauth: microsoft?.oauth() ?? null } : {}),
+  });
+
+  async function openAdvanced() {
+    microsoft?.stop();
+    // A password Connect already stored has to count in the full form, whose
+    // passwordStored() reads state.secretRefs. One GET /api/config is what
+    // makes that true; its failure leaves the form to ask again, which is
+    // the worse of two honest outcomes and not a wrong one.
+    if (storedHere.size) await loadConfig().catch(() => {});
+    onAdvanced(prefill());
+  }
+
+  async function lookUp() {
+    const address = email();
+    if (!address || guess?.for === address) return;
+    status.working('Working out the provider…');
+    try {
+      const found = await api.guessMail(address);
+      guess = { ...found, for: address };
+      status.clear();
+      paintCard();
+    } catch (err) {
+      status.bad(err.message);
+    }
+  }
+
+  async function connect() {
+    if (!guess || guess.for !== email()) await lookUp();
+    if (!guess || !guess.host) return;
+    if (guess.auth === 'password' && passwordMissing()) {
+      status.bad(NEEDS_PASSWORD);
+      return;
+    }
+    if (guess.auth === 'xoauth2' && !signedIn) {
+      status.bad('Sign in with Microsoft above first — a personal Microsoft mailbox has no password to paste.');
+      return;
+    }
+    fallback.replaceChildren();
+    status.working(`Connecting to ${guess.host}…`);
+    try {
+      const password = passInput.value;
+      const outcome = await connectSimpleMail({
+        id,
+        keyRef,
+        email: email(),
+        password,
+        guess,
+        auth: guess.auth,
+        oauth: microsoft?.oauth() ?? null,
+      });
+      // Whatever the server said about the connection, the password it was
+      // said about is stored now; a retry with the field left empty must
+      // not be refused for a secret the server already holds.
+      if (password) {
+        storedHere.add(keyRef);
+        passInput.value = '';
+        passInput.placeholder = 'a password is stored — paste a new one to replace it';
+      }
+      if (!outcome.ok) {
+        status.bad(outcome.error);
+        fallback.replaceChildren(button('Show advanced', { class: 'btn quiet', onClick: openAdvanced }));
+        return;
+      }
+      const sent = outcome.sentMailbox ? `sent folder “${outcome.sentMailbox}”` : 'no sent folder flagged';
+      status.good(`Connected · ${plural(outcome.mailboxes, 'mailbox', 'mailboxes')} · ${sent}`
+        + (outcome.adopted ? ` · Zelos will also treat ${outcome.adopted} as your own address — change it under Settings → You.` : ''));
+      onSaved();
+    } catch (err) {
+      status.bad(err.message);
+      fallback.replaceChildren(button('Show advanced', { class: 'btn quiet', onClick: openAdvanced }));
+    }
+  }
+
+  function paintCard() {
+    microsoft?.stop();
+    microsoft = null;
+    signedIn = false;
+    fallback.replaceChildren();
+    card.hidden = !guess;
+    if (!guess) { card.replaceChildren(); return; }
+
+    const head = el('div', { class: 'chosen-head' }, [
+      el('span', { class: 'chosen-label', text: guess.known ? guess.label : (guess.host ? 'A provider Zelos does not know' : 'Not an address Zelos can read') }),
+      guess.host ? el('span', { class: 'mono account-host', text: `${guess.host}:${guess.port}` }) : null,
+    ]);
+    const note = el('p', { class: 'quiet-note', text: guess.known
+      ? guess.note
+      : `We guessed ${guess.host} — Connect will tell you if that is right. Many providers want an app-specific password rather than your normal one.` });
+
+    if (!guess.host) {
+      card.replaceChildren(head, el('p', { class: 'quiet-note', text: guess.note }));
+      return;
+    }
+
+    if (guess.auth === 'bridge') {
+      card.replaceChildren(head, note, el('div', { class: 'row-inline' }, [
+        button('Continue with Bridge settings', { class: 'btn solid', onClick: openAdvanced }),
+      ]));
+      return;
+    }
+
+    const advanced = button('Advanced', {
+      // Prominent where the guess is only a guess: the full form is where a
+      // wrong host gets corrected, and a user whose provider is unknown is
+      // the user most likely to need it.
+      class: guess.known ? 'btn quiet' : 'btn',
+      onClick: openAdvanced,
+    });
+
+    if (guess.auth === 'xoauth2') {
+      microsoft = microsoftSignIn({
+        keyRef,
+        user: email,
+        onConnected: () => { signedIn = true; },
+      });
+      card.replaceChildren(head, note, microsoft.node, el('div', { class: 'row-inline' }, [
+        button('Connect', { class: 'btn solid', onClick: connect }),
+        advanced,
+      ]));
+      return;
+    }
+
+    // The desktop shell hands a target=_blank https link to the system
+    // browser (desktop/guard.js), which is exactly where a sign-in page
+    // belongs: the board's window loads nothing but the board.
+    const page = /^https:\/\//.test(guess.appPasswordUrl || '')
+      ? el('a', { class: 'btn', href: guess.appPasswordUrl, target: '_blank', rel: 'noopener noreferrer', text: 'Get an app password' })
+      : null;
+    card.replaceChildren(
+      head,
+      note,
+      page ? el('div', { class: 'row-inline' }, [page]) : null,
+      field('App password', passInput, { hint: secretStoreNotes(state.health?.backend?.name).password }),
+      el('div', { class: 'row-inline' }, [
+        button('Connect', { class: 'btn solid', onClick: connect }),
+        advanced,
+      ]),
+    );
+  }
+
+  emailInput.addEventListener('change', lookUp);
+  emailInput.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') { event.preventDefault(); lookUp(); }
+  });
+  passInput.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') { event.preventDefault(); connect(); }
+  });
+
+  return el('div', { class: 'account-form' }, [
+    field('Your email address', emailInput, {
+      hint: 'Zelos works out the provider from it. The address goes to the Zelos server on this machine and nowhere else.',
+    }),
+    card,
+    status.node,
+    fallback,
+    el('div', { class: 'row-inline' }, [
+      button('Advanced', { class: 'link', onClick: openAdvanced }),
+      button('Cancel', { class: 'btn quiet', onClick: () => { microsoft?.stop(); onCancel(); } }),
+    ]),
+  ]);
+}
+
 export function mailPanel({ compact = false, onDone = null, rerender } = {}) {
   const accounts = state.config?.mail || [];
   const wrap = el('div', { class: 'panel panel-mail' });
@@ -1154,27 +1485,35 @@ export function mailPanel({ compact = false, onDone = null, rerender } = {}) {
   const addButton = button('Add a mailbox', {
     class: 'btn solid',
     onClick: () => {
-      const id = randomId('m');
-      editor.replaceChildren(mailForm({
-        id,
-        enabled: true,
-        label: '',
-        host: '',
-        port: 993,
-        secure: true,
-        // Null, not false: a new account has not excused anything yet, and the
-        // blank this form opens on has to be the same blank core/config.mjs
-        // would have written.
-        requireTls: null,
-        user: '',
-        keyRef: `mail.${id}`,
-        mailboxes: ['INBOX'],
-        sentMailbox: 'Sent',
-        lookbackDays: 14,
-        maxMessages: 400,
-      }, {
-        onSaved: () => { onDone?.(); rerender?.(); },
-        onCancel: () => editor.replaceChildren(),
+      const saved = () => { onDone?.(); rerender?.(); };
+      const cancel = () => editor.replaceChildren();
+      editor.replaceChildren(simpleMailForm({
+        onSaved: saved,
+        onCancel: cancel,
+        // The full form, on the id and keyRef the simple one minted, so a
+        // password Connect already stored is the password this form saves.
+        onAdvanced: (prefill) => editor.replaceChildren(mailForm({
+          id: prefill.id,
+          enabled: true,
+          label: '',
+          host: '',
+          port: 993,
+          secure: true,
+          // Null, not false: a new account has not excused anything yet, and the
+          // blank this form opens on has to be the same blank core/config.mjs
+          // would have written.
+          requireTls: null,
+          user: '',
+          keyRef: prefill.keyRef,
+          mailboxes: ['INBOX'],
+          sentMailbox: 'Sent',
+          lookbackDays: 14,
+          maxMessages: 400,
+          ...prefill,
+        }, {
+          onSaved: saved,
+          onCancel: cancel,
+        })),
       }));
     },
   });

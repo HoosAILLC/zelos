@@ -408,9 +408,8 @@ export function renderOnboarding(ctx) {
   if (step === 'mail') {
     return shell(rerender, navigate, {
       title: 'Point it at a mailbox.',
-      lede: 'This is the step people fall off, and it is worth knowing why before you start: Gmail, iCloud and Yahoo will all refuse your normal password here. '
-        + 'Two-factor accounts do not hand it to third-party programs at all — you generate a separate app password in your provider’s security settings and paste that instead. '
-        + 'The provider’s own note appears under the host once you pick one, and “Test the connection” proves it works before you move on.',
+      lede: 'Gmail, iCloud and Yahoo will all refuse your normal password here — you paste a separate app password instead, one your provider makes for you and that you can revoke on its own. '
+        + 'Type your address, and the button that appears opens your provider’s own page for making one; Connect then proves it works before you move on.',
       body: mailPanel({ compact: true, rerender, onDone: () => rerender() }),
       primary: button('Next', { class: 'btn solid', onClick: () => next(rerender) }),
     });

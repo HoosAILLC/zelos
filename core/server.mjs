@@ -76,6 +76,7 @@ import { safeUrl, screenContent, cap, wrapUntrusted, scrubForPrompt, SafetyError
 import {
   testConnection as testMailConnection,
   connectDeviceCode,
+  describeProvider,
   MS_LOGIN_ORIGIN,
 } from './sources/imap.mjs';
 import {
@@ -1272,6 +1273,23 @@ function mailAuthFrom(body, keyRef) {
   return { method, oauth: { clientId, tenantId, tokenRef: keyRef } };
 }
 
+/**
+ * Which provider an address belongs to, and what connecting it will take.
+ *
+ * A POST carrying the address in the body, not a GET with it in the query
+ * string: a query string ends up in the browser's history, in a Referer, in a
+ * screenshot of the address bar, and this is the one route whose whole input
+ * is somebody's email address. The handler writes nothing to the log for the
+ * same reason — the 400s name the field, never its value — and the answer is
+ * a property of the domain, so a session token is as much as it needs.
+ */
+async function handleMailGuess(ctx) {
+  const body = await readJSON(ctx.req);
+  const email = requireString(body, 'email', { max: 320 });
+  if (!email.trim()) throw new HttpError(400, 'email is required');
+  sendJSON(ctx.res, 200, describeProvider(email));
+}
+
 async function handleMailTest(ctx) {
   const body = await readJSON(ctx.req);
   const host = requireString(body, 'host', { max: 255 });
@@ -2392,6 +2410,7 @@ const ROUTES = [
   ['GET', /^\/api\/model\/presets$/, handlePresets],
   ['GET', /^\/api\/local\/probe$/, handleLocalProbe],
   ['GET', /^\/api\/connectors$/, handleConnectors],
+  ['POST', /^\/api\/mail\/guess$/, handleMailGuess],
   ['POST', /^\/api\/mail\/test$/, handleMailTest],
   ['POST', /^\/api\/mail\/oauth$/, handleMailOAuthBegin],
   ['GET', new RegExp(`^/api/mail/oauth/${ID}$`), handleMailOAuthStatus],

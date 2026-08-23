@@ -42,6 +42,7 @@ bundled SQLite is built without it before 22.16 and throughout the whole Node 23
 that lacks it, Zelos refuses to start and names the versions that work.
 
 It opens in your browser at `127.0.0.1` and stays there. Nothing to install, no account, no server.
+To connect a mailbox, type your email address: Zelos recognises the provider, one button opens the page where it makes an app password, and **Connect** does the rest.
 
 ```bash
 zelos              # run it — this is the one you want
