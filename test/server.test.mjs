@@ -14,6 +14,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import net from 'node:net';
@@ -30,7 +31,7 @@ process.env.ZELOS_LOG_LEVEL = 'silent';
 const { createServer, listen } = await import('../core/server.mjs');
 const db = await import('../core/db.mjs');
 const { loadConfig } = await import('../core/config.mjs');
-const { setSecret, deleteSecret } = await import('../core/secrets.mjs');
+const { getSecret, setSecret, deleteSecret } = await import('../core/secrets.mjs');
 const { todayKey, addDaysToKey, instant, localTimezone, offsetFor, wallClock } =
   await import('../core/time.mjs');
 
@@ -2267,4 +2268,541 @@ test.after(() => {
        defect that does not exist and hides the ones that do. */
     if (err?.code !== 'EPERM' && err?.code !== 'EBUSY' && err?.code !== 'ENOTEMPTY') throw err;
   }
+});
+
+/* ================================================================== *
+ * "Sign in with Google": POST /api/mail/oauth {provider: 'google'},
+ * GET /oauth/callback, and the status the panel polls
+ * ================================================================== */
+
+const GOOGLE_CLIENT = '4242-zelos-test.apps.googleusercontent.com';
+const GOOGLE_SECRET = 'GOCSPX-fixture-not-a-real-secret';
+
+/**
+ * A Google-shaped authorization server on 127.0.0.1. GET /auth records the
+ * request and 302s back to its `redirect_uri` with a code bound to the PKCE
+ * challenge and the state; POST /token checks the verifier against that
+ * challenge, the redirect it came back to, and — when told to expect one —
+ * the client secret, then answers with tokens. A refresh answers with a new
+ * access token and, as Google does, no refresh token.
+ */
+async function startMockGoogle(t, { requireSecret = '', expiresIn = 3600, refreshExpiresIn = 3600 } = {}) {
+  const seen = [];
+  const byCode = new Map();
+  let issued = 0;
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url, 'http://127.0.0.1');
+    const send = (status, payload) => {
+      const text = JSON.stringify(payload);
+      res.writeHead(status, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(text) });
+      res.end(text);
+    };
+    if (req.method === 'GET' && url.pathname === '/auth') {
+      const q = Object.fromEntries(url.searchParams.entries());
+      seen.push({ kind: 'auth', query: q });
+      const code = `4/code-${crypto.randomBytes(6).toString('hex')}`;
+      byCode.set(code, { challenge: q.code_challenge, method: q.code_challenge_method, redirectUri: q.redirect_uri, scope: q.scope });
+      const back = new URL(q.redirect_uri);
+      back.searchParams.set('code', code);
+      back.searchParams.set('state', q.state);
+      res.writeHead(302, { Location: back.toString(), 'Content-Length': 0 });
+      res.end();
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/token') {
+      let body = '';
+      req.on('data', (d) => { body += d; });
+      req.on('end', () => {
+        const form = Object.fromEntries(new URLSearchParams(body).entries());
+        seen.push({ kind: 'token', form });
+        if (form.client_id !== GOOGLE_CLIENT) { send(401, { error: 'invalid_client' }); return; }
+        if (requireSecret && form.client_secret !== requireSecret) {
+          send(401, { error: 'invalid_client', error_description: 'client_secret is missing' });
+          return;
+        }
+        if (form.grant_type === 'authorization_code') {
+          const record = byCode.get(form.code);
+          const derived = crypto.createHash('sha256').update(String(form.code_verifier), 'ascii').digest('base64url');
+          if (!record || record.method !== 'S256' || derived !== record.challenge || record.redirectUri !== form.redirect_uri) {
+            send(400, { error: 'invalid_grant' });
+            return;
+          }
+          byCode.delete(form.code);
+          issued += 1;
+          send(200, { access_token: `ya29.access-${issued}`, refresh_token: '1//refresh-fixture', token_type: 'Bearer', expires_in: expiresIn, scope: record.scope });
+          return;
+        }
+        if (form.grant_type === 'refresh_token') {
+          if (form.refresh_token !== '1//refresh-fixture') { send(400, { error: 'invalid_grant', error_description: 'Token has been expired or revoked.' }); return; }
+          issued += 1;
+          send(200, { access_token: `ya29.access-${issued}`, token_type: 'Bearer', expires_in: refreshExpiresIn, scope: 'https://mail.google.com/' });
+          return;
+        }
+        send(400, { error: 'unsupported_grant_type' });
+      });
+      return;
+    }
+    res.writeHead(404, { 'Content-Length': 0 });
+    res.end();
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+  t.after(() => new Promise((r) => server.close(() => r())));
+  return {
+    seen,
+    authorizeUrl: `http://127.0.0.1:${port}/auth`,
+    tokenUrl: `http://127.0.0.1:${port}/token`,
+    tokenRequests: () => seen.filter((s) => s.kind === 'token'),
+  };
+}
+
+/** A server whose Google is the mock: the two seams, and nothing else changed. */
+function googleServer(t, google, options = {}) {
+  return startServer(t, { browserAuth: { authorizeUrl: google.authorizeUrl, tokenUrl: google.tokenUrl, ...(options.browserAuth || {}) }, ...options });
+}
+
+/** Play the browser: open the auth URL, and come back to Zelos with what Google sent. */
+async function signInThrough(ctx, authUrl) {
+  const hop = await fetch(authUrl, { redirect: 'manual' });
+  assert.equal(hop.status, 302, 'the mock authorization server redirects');
+  const back = hop.headers.get('location');
+  assert.ok(back.startsWith(`${ctx.base}/oauth/callback?`), `the redirect lands on this server: ${back}`);
+  const landing = await fetch(back, { redirect: 'manual' });
+  return { back, landing, page: await landing.text() };
+}
+
+const nxdomain = async () => { throw Object.assign(new Error('queryMx ENOTFOUND'), { code: 'ENOTFOUND' }); };
+const noDns = { resolveMx: nxdomain, resolveSrv: nxdomain };
+
+test('POST /api/mail/guess says which sign-in a provider has, and whether this install can run it', async (t) => {
+  const bare = await startServer(t, { dns: noDns });
+  const guess = async (ctx, email) => (await call(ctx, 'POST', '/api/mail/guess', { body: { email } })).json;
+
+  const gmail = await guess(bare, 'nemo@gmail.com');
+  assert.equal(gmail.signIn, 'google');
+  assert.equal(gmail.clientReady, false, 'nothing shipped yet and nothing configured');
+  assert.equal(gmail.auth, 'password', 'a password is still a way in for Gmail');
+  const outlook = await guess(bare, 'nemo@hotmail.com');
+  assert.equal(outlook.signIn, 'microsoft');
+  assert.equal(outlook.clientReady, false);
+  for (const email of ['nemo@icloud.com', 'nemo@pm.me', 'marcus@deco-associates.example']) {
+    const got = await guess(bare, email);
+    assert.equal(got.signIn, null, email);
+    assert.equal(got.clientReady, false, email);
+  }
+
+  // The operator's own registration, from config, is enough for Google and says nothing about Microsoft.
+  const ready = await startServer(t, {
+    dns: {
+      resolveMx: async () => [{ priority: 10, exchange: 'aspmx.l.google.com.' }],
+      resolveSrv: async () => [],
+    },
+    config: baseConfig({ oauth: { clients: { google: { clientId: GOOGLE_CLIENT } } } }),
+  });
+  assert.equal((await guess(ready, 'nemo@gmail.com')).clientReady, true);
+  assert.equal((await guess(ready, 'nemo@hotmail.com')).clientReady, false);
+  const workspace = await guess(ready, 'nemo@workspace-shaped.example');
+  assert.equal(workspace.via, 'mx');
+  assert.equal(workspace.signIn, 'google');
+  assert.equal(workspace.clientReady, true);
+});
+
+test('POST /api/mail/oauth {provider: "google"} mints a PKCE request back to the port this server bound', async (t) => {
+  const google = await startMockGoogle(t);
+  const ctx = await googleServer(t, google);
+  const began = await call(ctx, 'POST', '/api/mail/oauth', {
+    body: { provider: 'google', keyRef: 'mail.m_g1', clientId: GOOGLE_CLIENT, email: 'nemo@gmail.com' },
+  });
+  assert.equal(began.status, 200, began.text);
+  assert.equal(began.json.provider, 'google');
+  assert.equal(began.json.status, 'pending');
+  assert.equal(began.json.state, 'pending');
+  assert.equal(began.json.keyRef, 'mail.m_g1');
+  assert.equal(began.json.clientId, GOOGLE_CLIENT);
+  assert.match(began.json.id, /^[0-9a-f]{16}$/);
+  const untilExpiry = Date.parse(began.json.expiresAt) - Date.now();
+  assert.ok(untilExpiry > 9 * 60_000 && untilExpiry <= 10 * 60_000, `ten minutes to come back, got ${untilExpiry}ms`);
+
+  const url = new URL(began.json.authUrl);
+  assert.equal(`${url.origin}${url.pathname}`, google.authorizeUrl);
+  const q = url.searchParams;
+  assert.equal(q.get('redirect_uri'), `http://127.0.0.1:${ctx.port}/oauth/callback`);
+  assert.equal(q.get('client_id'), GOOGLE_CLIENT);
+  assert.equal(q.get('response_type'), 'code');
+  assert.equal(q.get('scope'), 'https://mail.google.com/');
+  assert.equal(q.get('access_type'), 'offline');
+  assert.equal(q.get('prompt'), 'consent');
+  assert.equal(q.get('code_challenge_method'), 'S256');
+  assert.match(q.get('code_challenge'), /^[A-Za-z0-9_-]{43}$/);
+  assert.match(q.get('state'), /^[A-Za-z0-9_-]{43}$/, '32 random bytes, base64url');
+  assert.equal(q.get('client_secret'), null);
+  assert.equal(q.get('login_hint'), null, 'the address is not put in a URL');
+  assert.ok(!began.json.authUrl.includes('nemo'), 'not under any other name either');
+
+  // The status reads the same shape without the URL, and nothing that could
+  // complete the flow.
+  const status = await call(ctx, 'GET', `/api/mail/oauth/${began.json.id}`);
+  assert.equal(status.status, 200);
+  assert.equal(status.json.status, 'pending');
+  assert.equal(status.json.provider, 'google');
+  assert.equal(status.json.keyRef, 'mail.m_g1');
+  assert.equal(status.json.authUrl, undefined);
+  assert.ok(!status.text.includes(q.get('state')), 'the state is not readable after the fact');
+  assert.ok(!status.text.includes(q.get('code_challenge')));
+
+  // Every state and every challenge is its own; a second server names its own port.
+  const other = await googleServer(t, google);
+  const again = await call(other, 'POST', '/api/mail/oauth', { body: { provider: 'google', keyRef: 'mail.m_g1', clientId: GOOGLE_CLIENT } });
+  const q2 = new URL(again.json.authUrl).searchParams;
+  assert.notEqual(q2.get('state'), q.get('state'));
+  assert.notEqual(q2.get('code_challenge'), q.get('code_challenge'));
+  assert.equal(q2.get('redirect_uri'), `http://127.0.0.1:${other.port}/oauth/callback`);
+  assert.notEqual(other.port, ctx.port);
+
+  // Without the seam the URL is Google's own endpoint, over https.
+  const real = await startServer(t);
+  const live = await call(real, 'POST', '/api/mail/oauth', { body: { provider: 'google', keyRef: 'mail.m_g1', clientId: GOOGLE_CLIENT } });
+  const realUrl = new URL(live.json.authUrl);
+  assert.equal(`${realUrl.origin}${realUrl.pathname}`, 'https://accounts.google.com/o/oauth2/v2/auth');
+
+  // DELETE cancels, and the cancelled flow reads as cancelled afterwards.
+  const cancelled = await call(ctx, 'DELETE', `/api/mail/oauth/${began.json.id}`);
+  assert.equal(cancelled.status, 200);
+  assert.equal(cancelled.json.status, 'cancelled');
+  assert.equal(cancelled.json.provider, 'google');
+  assert.equal((await call(ctx, 'GET', `/api/mail/oauth/${began.json.id}`)).json.status, 'cancelled');
+  assert.equal((await call(ctx, 'DELETE', '/api/mail/oauth/0000000000000000')).status, 404);
+  assert.equal((await call(ctx, 'GET', '/api/mail/oauth/0000000000000000')).status, 404);
+  assert.equal(google.tokenRequests().length, 0, 'nothing was exchanged');
+});
+
+test('a Google sign-in without a client id waits for one to be configured, and then uses it', async (t) => {
+  const google = await startMockGoogle(t);
+  const bare = await googleServer(t, google);
+  const refused = await call(bare, 'POST', '/api/mail/oauth', { body: { provider: 'google', keyRef: 'mail.m_g2' } });
+  assert.equal(refused.status, 400);
+  assert.match(refused.json.error, /no Google client is configured/);
+
+  const ready = await googleServer(t, google, { config: baseConfig({ oauth: { clients: { google: { clientId: GOOGLE_CLIENT } } } }) });
+  const began = await call(ready, 'POST', '/api/mail/oauth', { body: { provider: 'google', keyRef: 'mail.m_g2' } });
+  assert.equal(began.status, 200, began.text);
+  assert.equal(began.json.clientId, GOOGLE_CLIENT, 'the page is told which client it ran against, so it can save it on the account');
+  assert.equal(new URL(began.json.authUrl).searchParams.get('client_id'), GOOGLE_CLIENT);
+  // A client id in the body wins over the configured one.
+  const own = await call(ready, 'POST', '/api/mail/oauth', { body: { provider: 'google', keyRef: 'mail.m_g2', clientId: 'other.apps.googleusercontent.com' } });
+  assert.equal(own.json.clientId, 'other.apps.googleusercontent.com');
+
+  // The same gate and the same field rules as the Microsoft flow.
+  assert.equal((await call(ready, 'POST', '/api/mail/oauth', { token: null, body: { provider: 'google', keyRef: 'mail.m_g2' } })).status, 401);
+  const wrongProvider = await call(ready, 'POST', '/api/mail/oauth', { body: { provider: 'yahoo', keyRef: 'mail.m_g2' } });
+  assert.equal(wrongProvider.status, 400);
+  assert.match(wrongProvider.json.error, /provider must be "google" or "microsoft"/);
+  const wrongRef = await call(ready, 'POST', '/api/mail/oauth', { body: { provider: 'google', keyRef: 'model.default' } });
+  assert.equal(wrongRef.status, 400);
+  assert.match(wrongRef.json.error, /keyRef must name a mail account/);
+  const badSecret = await call(ready, 'POST', '/api/mail/oauth', { body: { provider: 'google', keyRef: 'mail.m_g2', clientSecret: 42 } });
+  assert.equal(badSecret.status, 400);
+  assert.match(badSecret.json.error, /^clientSecret must be a string/);
+});
+
+test('the Google callback exchanges the code with the verifier, files the grant under keyRef, and shows a page with nothing in it', async (t) => {
+  const google = await startMockGoogle(t, { requireSecret: GOOGLE_SECRET });
+  const ctx = await googleServer(t, google);
+  const keyRef = 'mail.m_g3';
+  t.after(() => deleteSecret(keyRef).catch(() => {}));
+  t.after(() => deleteSecret('oauth.google.clientSecret').catch(() => {}));
+
+  const began = await call(ctx, 'POST', '/api/mail/oauth', {
+    body: { provider: 'google', keyRef, clientId: GOOGLE_CLIENT, clientSecret: GOOGLE_SECRET },
+  });
+  assert.equal(began.status, 200, began.text);
+  assert.ok(!began.text.includes(GOOGLE_SECRET), 'the secret is never echoed');
+  assert.equal(await getSecret('oauth.google.clientSecret'), GOOGLE_SECRET, 'the secret went to the store under its ref');
+
+  const { back, landing, page } = await signInThrough(ctx, began.json.authUrl);
+  assert.equal(landing.status, 200, page);
+  assert.match(page, /Signed in\./);
+  assert.match(page, /You can close this tab and go back to Zelos\./);
+  assert.ok(!/<script/i.test(page), 'no script');
+  const sent = new URL(back).searchParams;
+  for (const secret of [sent.get('state'), sent.get('code'), 'ya29', 'refresh-fixture', GOOGLE_SECRET, '@']) {
+    assert.ok(!page.includes(secret), `the page carries ${secret}`);
+  }
+  assert.match(landing.headers.get('content-security-policy'), /default-src 'none'/);
+  assert.equal(landing.headers.get('cache-control'), 'no-store');
+  assert.equal(landing.headers.get('x-frame-options'), 'DENY');
+
+  // The exchange carried the verifier, the redirect it came back to and the
+  // secret from the store — and the mock checked all three before answering.
+  const exchanges = google.tokenRequests();
+  assert.equal(exchanges.length, 1);
+  assert.equal(exchanges[0].form.grant_type, 'authorization_code');
+  assert.equal(exchanges[0].form.redirect_uri, `http://127.0.0.1:${ctx.port}/oauth/callback`);
+  assert.equal(exchanges[0].form.client_secret, GOOGLE_SECRET);
+  assert.match(exchanges[0].form.code_verifier, /^[A-Za-z0-9_-]{43}$/);
+
+  const status = await call(ctx, 'GET', `/api/mail/oauth/${began.json.id}`);
+  assert.equal(status.json.status, 'connected');
+  assert.equal(status.json.state, 'connected');
+  assert.equal(status.json.provider, 'google');
+  assert.equal(status.json.keyRef, keyRef);
+  assert.equal(status.json.scope, 'https://mail.google.com/');
+  assert.equal(status.json.error, null);
+  assert.ok(!status.text.includes('ya29') && !status.text.includes('refresh-fixture'), 'no token in a status');
+
+  // Filed under the account's own keyRef, in the shape the Microsoft flow
+  // files — so removing the account removes it, and doctor and the sweep read
+  // it the way they already do.
+  const stored = JSON.parse(await getSecret(keyRef));
+  assert.equal(stored.v, 1);
+  assert.equal(stored.kind, 'xoauth2');
+  assert.equal(stored.accessToken, 'ya29.access-1');
+  assert.equal(stored.refreshToken, '1//refresh-fixture');
+  assert.equal(stored.tokenType, 'Bearer');
+  assert.equal(stored.scope, 'https://mail.google.com/');
+  assert.ok(Date.parse(stored.expiresAt) > Date.now());
+  assert.ok(Date.parse(stored.obtainedAt) <= Date.now());
+
+  // A replay of the same callback is a stranger's: refused, nothing exchanged, nothing changed.
+  const replay = await fetch(back, { redirect: 'manual' });
+  assert.equal(replay.status, 400);
+  assert.equal(google.tokenRequests().length, 1);
+  assert.equal((await call(ctx, 'GET', `/api/mail/oauth/${began.json.id}`)).json.status, 'connected');
+  assert.equal(JSON.parse(await getSecret(keyRef)).accessToken, 'ya29.access-1');
+});
+
+test('the Google callback takes no session token, and takes nothing it did not issue', async (t) => {
+  const google = await startMockGoogle(t);
+  const ctx = await googleServer(t, google);
+  const began = await call(ctx, 'POST', '/api/mail/oauth', { body: { provider: 'google', keyRef: 'mail.m_g4', clientId: GOOGLE_CLIENT } });
+  const state = new URL(began.json.authUrl).searchParams.get('state');
+  const pending = async () => (await call(ctx, 'GET', `/api/mail/oauth/${began.json.id}`)).json.status;
+
+  // No state, a wrong state, a near miss: the same generic page, no hint
+  // about what was wrong, the flow untouched, and no request to Google.
+  for (const query of ['', '?code=4%2Fabc', '?state=&code=4%2Fabc', '?state=nope&code=4%2Fabc', `?state=${state.slice(0, -1)}x&code=4%2Fabc`, `?state=${state.toUpperCase()}&code=4%2Fabc`]) {
+    const res = await fetch(`${ctx.base}/oauth/callback${query}`, { redirect: 'manual' });
+    const page = await res.text();
+    assert.equal(res.status, 400, query);
+    assert.match(page, /Zelos refused that callback/, query);
+    assert.ok(!page.includes('state') || !page.includes(state), query);
+    assert.ok(!/<script/i.test(page));
+    assert.equal(await pending(), 'pending', query);
+  }
+  assert.equal(google.tokenRequests().length, 0);
+
+  // Only a navigation: the wrong verb, a foreign Host, a page's Origin.
+  const posted = await fetch(`${ctx.base}/oauth/callback?state=${state}&code=4%2Fabc`, { method: 'POST', redirect: 'manual' });
+  assert.equal(posted.status, 405);
+  assert.equal(posted.headers.get('allow'), 'GET');
+  const foreignHost = await rawRequest(ctx.port, `GET /oauth/callback?state=${state}&code=4%2Fabc HTTP/1.1`, ['Host: zelos.example']);
+  assert.match(foreignHost, /^HTTP\/1\.1 403/);
+  const scripted = await fetch(`${ctx.base}/oauth/callback?state=${state}&code=4%2Fabc`, { redirect: 'manual', headers: { Origin: 'http://evil.example' } });
+  assert.equal(scripted.status, 403);
+  assert.equal(await pending(), 'pending', 'none of that spent the state');
+  assert.equal(google.tokenRequests().length, 0);
+
+  // Google's own refusal: the flow fails with a generic reason, and the state is spent.
+  const declined = await fetch(`${ctx.base}/oauth/callback?state=${state}&error=access_denied&error_description=The%20user%20denied%20access`, { redirect: 'manual' });
+  assert.equal(declined.status, 400);
+  const failed = (await call(ctx, 'GET', `/api/mail/oauth/${began.json.id}`)).json;
+  assert.equal(failed.status, 'failed');
+  assert.match(failed.error, /did not complete the sign-in/);
+  assert.ok(!failed.error.includes('denied access'), 'Google\'s wording is not echoed');
+  const late = await fetch(`${ctx.base}/oauth/callback?state=${state}&code=4%2Fabc`, { redirect: 'manual' });
+  assert.equal(late.status, 400);
+  assert.equal(google.tokenRequests().length, 0);
+});
+
+test('a Google sign-in nobody comes back to expires, and an exchange Google refuses fails without leaking', async (t) => {
+  const google = await startMockGoogle(t, { requireSecret: GOOGLE_SECRET });
+  t.after(() => deleteSecret('oauth.google.clientSecret').catch(() => {}));
+  await deleteSecret('oauth.google.clientSecret').catch(() => {});
+
+  const short = await googleServer(t, google, { browserAuth: { ttlMs: 60 } });
+  const began = await call(short, 'POST', '/api/mail/oauth', { body: { provider: 'google', keyRef: 'mail.m_g5', clientId: GOOGLE_CLIENT } });
+  assert.equal(began.status, 200, began.text);
+  await delay(90);
+  const expired = (await call(short, 'GET', `/api/mail/oauth/${began.json.id}`)).json;
+  assert.equal(expired.status, 'expired');
+  assert.match(expired.error, /not finished in time/);
+  const state = new URL(began.json.authUrl).searchParams.get('state');
+  assert.equal((await fetch(`${short.base}/oauth/callback?state=${state}&code=4%2Fabc`, { redirect: 'manual' })).status, 400,
+    'an expired flow takes no callback');
+  assert.equal(google.tokenRequests().length, 0);
+
+  // No secret in the store and a client that needs one: Google says no at
+  // /token, the browser is told it was refused, and the panel gets the
+  // endpoint's words — which can only ever be its `error` and description.
+  const ctx = await googleServer(t, google);
+  const keyRef = 'mail.m_g6';
+  t.after(() => deleteSecret(keyRef).catch(() => {}));
+  const second = await call(ctx, 'POST', '/api/mail/oauth', { body: { provider: 'google', keyRef, clientId: GOOGLE_CLIENT } });
+  const { landing, page } = await signInThrough(ctx, second.json.authUrl);
+  assert.equal(landing.status, 400);
+  assert.match(page, /Zelos refused that callback/);
+  const failed = (await call(ctx, 'GET', `/api/mail/oauth/${second.json.id}`)).json;
+  assert.equal(failed.status, 'failed');
+  assert.match(failed.error, /invalid_client/);
+  assert.equal(failed.reconnect, true);
+  assert.equal(await getSecret(keyRef), null, 'no grant was filed');
+  assert.equal(google.tokenRequests().length, 1);
+  assert.equal(google.tokenRequests()[0].form.client_secret, undefined, 'nothing in the store, nothing sent');
+});
+
+test('Sign in with Microsoft answers as it did, now naming its provider and status, and can take its client from config', async (t) => {
+  const ENTRA_CLIENT = '11111111-2222-3333-4444-555555555555';
+  const seen = [];
+  const entra = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (d) => { body += d; });
+    req.on('end', () => {
+      const url = new URL(req.url, 'http://127.0.0.1');
+      seen.push({ path: url.pathname, form: Object.fromEntries(new URLSearchParams(body).entries()) });
+      const send = (status, payload) => {
+        const text = JSON.stringify(payload);
+        res.writeHead(status, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(text) });
+        res.end(text);
+      };
+      if (/\/oauth2\/v2\.0\/devicecode$/.test(url.pathname)) {
+        send(200, {
+          device_code: 'device-code-secret-never-shown', user_code: 'HXQR-2K9T',
+          verification_uri: 'https://microsoft.com/devicelogin', expires_in: 900, interval: 5,
+          message: 'To sign in, use a web browser to open the page https://microsoft.com/devicelogin and enter the code HXQR-2K9T to authenticate.',
+        });
+        return;
+      }
+      send(400, { error: 'authorization_pending' });
+    });
+  });
+  await new Promise((resolve) => entra.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((r) => entra.close(() => r())));
+  const endpoint = `http://127.0.0.1:${entra.address().port}`;
+  /* The poll sleeps BEFORE its first request, so a cancel sent straight after
+     begin lands inside that sleep and the loop reports `cancelled` at its top;
+     a shorter sleep would race the cancel against a request in flight, which
+     the pad reports as `failed` — over either way, but a different word. */
+  const deviceAuth = { endpoint, sleep: () => delay(400) };
+
+  const ctx = await startServer(t, { deviceAuth });
+  const began = await call(ctx, 'POST', '/api/mail/oauth', { body: { keyRef: 'mail.m_ms1', clientId: ENTRA_CLIENT, tenantId: 'common' } });
+  assert.equal(began.status, 200, began.text);
+  assert.equal(began.json.provider, 'microsoft');
+  assert.equal(began.json.status, 'pending');
+  assert.equal(began.json.state, 'pending', 'the field the first version shipped with is still there');
+  assert.equal(began.json.userCode, 'HXQR-2K9T');
+  assert.equal(began.json.verificationUri, 'https://microsoft.com/devicelogin');
+  assert.equal(began.json.keyRef, 'mail.m_ms1');
+  assert.ok(began.json.expiresAt);
+  assert.ok(!began.text.includes('device-code-secret'), 'the device code never crosses to the page');
+  const status = await call(ctx, 'GET', `/api/mail/oauth/${began.json.id}`);
+  assert.equal(status.json.provider, 'microsoft');
+  assert.equal(status.json.status, 'pending');
+  const cancelled = await call(ctx, 'DELETE', `/api/mail/oauth/${began.json.id}`);
+  assert.equal(cancelled.json.status, 'cancelled');
+  assert.equal(cancelled.json.provider, 'microsoft');
+  for (let i = 0; i < 50 && (await call(ctx, 'GET', `/api/mail/oauth/${began.json.id}`)).json.status === 'pending'; i += 1) await delay(20);
+  const ended = (await call(ctx, 'GET', `/api/mail/oauth/${began.json.id}`)).json;
+  assert.equal(ended.status, 'cancelled', JSON.stringify(ended));
+
+  // No client id in the body and none configured: the 400 it always was.
+  const refused = await call(ctx, 'POST', '/api/mail/oauth', { body: { keyRef: 'mail.m_ms1' } });
+  assert.equal(refused.status, 400);
+  assert.equal(refused.json.error, 'clientId is required');
+
+  // The operator's registration from config, tenant and all.
+  const ready = await startServer(t, {
+    deviceAuth,
+    config: baseConfig({ oauth: { clients: { microsoft: { clientId: ENTRA_CLIENT, tenantId: 'consumers' } } } }),
+  });
+  const fromConfig = await call(ready, 'POST', '/api/mail/oauth', { body: { provider: 'microsoft', keyRef: 'mail.m_ms2' } });
+  assert.equal(fromConfig.status, 200, fromConfig.text);
+  assert.equal(fromConfig.json.provider, 'microsoft');
+  assert.equal(seen.at(-1).path, '/consumers/oauth2/v2.0/devicecode');
+  assert.equal(seen.at(-1).form.client_id, ENTRA_CLIENT);
+  await call(ready, 'DELETE', `/api/mail/oauth/${fromConfig.json.id}`);
+});
+
+test('POST /api/mail/test on a Google account renews the grant at Google and signs in with the bearer token', async (t) => {
+  const google = await startMockGoogle(t);
+  const ctx = await googleServer(t, google);
+  const keyRef = 'mail.m_g7';
+  t.after(() => deleteSecret(keyRef).catch(() => {}));
+  const user = 'nemo@gmail.com';
+
+  // A mail server that speaks AUTH=XOAUTH2 and accepts the token the mock Google hands out.
+  const received = [];
+  const sasl = [];
+  const imap = net.createServer((socket) => {
+    socket.setNoDelay(true);
+    socket.on('error', () => {});
+    socket.write('* OK [CAPABILITY IMAP4rev1 AUTH=XOAUTH2] mock\r\n');
+    let buffer = '';
+    let saslTag = null;
+    socket.on('data', (chunk) => {
+      buffer += chunk.toString('latin1');
+      let idx;
+      while ((idx = buffer.indexOf('\r\n')) >= 0) {
+        const line = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+        received.push(line);
+        if (saslTag) {
+          const decoded = Buffer.from(line, 'base64').toString('utf8');
+          sasl.push(decoded);
+          socket.write(decoded === `user=${user}\x01auth=Bearer ya29.access-2\x01\x01`
+            ? `${saslTag} OK AUTHENTICATE completed\r\n`
+            : `${saslTag} NO AUTHENTICATE failed.\r\n`);
+          saslTag = null;
+          continue;
+        }
+        const [tag, verb = '', ...rest] = line.split(' ');
+        switch (verb.toUpperCase()) {
+          case 'CAPABILITY': socket.write(`* CAPABILITY IMAP4rev1 AUTH=XOAUTH2\r\n${tag} OK done\r\n`); break;
+          case 'AUTHENTICATE': saslTag = tag; socket.write('+ \r\n'); break;
+          case 'LOGIN': socket.write(`${tag} NO [AUTHENTICATIONFAILED] Invalid credentials (Failure)\r\n`); break;
+          case 'LIST': socket.write(`* LIST (\\HasNoChildren) "/" "INBOX"\r\n${tag} OK LIST completed\r\n`); break;
+          case 'LOGOUT': socket.write(`* BYE\r\n${tag} OK LOGOUT completed\r\n`); break;
+          default: socket.write(`${tag} BAD ${rest.join(' ')}\r\n`);
+        }
+      }
+    });
+  });
+  await new Promise((resolve) => imap.listen(0, '127.0.0.1', resolve));
+  t.after(() => { imap.close(); });
+  const imapPort = imap.address().port;
+
+  // Sign in, then spend the grant from the store: the access token Google
+  // minted is already expired by the time the test button is pressed.
+  const began = await call(ctx, 'POST', '/api/mail/oauth', { body: { provider: 'google', keyRef, clientId: GOOGLE_CLIENT } });
+  await signInThrough(ctx, began.json.authUrl);
+  const stored = JSON.parse(await getSecret(keyRef));
+  await setSecret(keyRef, JSON.stringify({ ...stored, expiresAt: new Date(Date.now() - 1000).toISOString() }));
+
+  const tested = await call(ctx, 'POST', '/api/mail/test', {
+    body: { host: '127.0.0.1', port: imapPort, secure: false, user, keyRef, auth: 'xoauth2', oauth: { provider: 'google', clientId: GOOGLE_CLIENT } },
+  });
+  assert.equal(tested.status, 200, tested.text);
+  assert.equal(tested.json.ok, true, tested.json.error);
+  assert.ok(tested.json.mailboxes.some((m) => (typeof m === 'string' ? m : m.name) === 'INBOX'));
+  assert.deepEqual(google.tokenRequests().map((r) => r.form.grant_type), ['authorization_code', 'refresh_token']);
+  assert.deepEqual(sasl, [`user=${user}\x01auth=Bearer ya29.access-2\x01\x01`], 'the renewed token, not the spent one');
+  assert.ok(!received.some((l) => /\bLOGIN\b/i.test(l)), 'no password was tried');
+  assert.equal(JSON.parse(await getSecret(keyRef)).accessToken, 'ya29.access-2', 'and the renewal was written back');
+
+  // The block may leave the client id out when config has it.
+  const ready = await googleServer(t, google, { config: baseConfig({ oauth: { clients: { google: { clientId: GOOGLE_CLIENT } } } }) });
+  const viaConfig = await call(ready, 'POST', '/api/mail/test', {
+    body: { host: '127.0.0.1', port: imapPort, secure: false, user, keyRef, auth: 'xoauth2', oauth: { provider: 'google' } },
+  });
+  assert.equal(viaConfig.json.ok, true, viaConfig.json.error);
+  const noClient = await call(ctx, 'POST', '/api/mail/test', {
+    body: { host: '127.0.0.1', port: imapPort, secure: false, user, keyRef, auth: 'xoauth2', oauth: { provider: 'google' } },
+  });
+  assert.equal(noClient.status, 400);
+  assert.match(noClient.json.error, /oauth\.clientId is required/);
+  const badProvider = await call(ctx, 'POST', '/api/mail/test', {
+    body: { host: '127.0.0.1', port: imapPort, secure: false, user, keyRef, auth: 'xoauth2', oauth: { provider: 'gmail', clientId: GOOGLE_CLIENT } },
+  });
+  assert.equal(badProvider.status, 400);
+  assert.match(badProvider.json.error, /oauth\.provider must be/);
 });

@@ -49,6 +49,7 @@ const {
   startLoopbackReceiver, exchangeCode, refreshTokens,
   saveTokens, loadTokens, forgetTokens, tokensExpired,
   beginAuthorization, finishAuthorization, authorize, accessTokenFor,
+  DEFAULT_OAUTH_CLIENTS, oauthClient, GOOGLE_CLIENT_SECRET_REF, MAIL_CALLBACK_PATH,
 } = oauth;
 
 const { getSecret } = await import('../core/secrets.mjs');
@@ -249,13 +250,14 @@ test('exactly two providers are wired, both calendar, both https', () => {
   }
 });
 
-test('Gmail is not wired and cannot be asked for', () => {
+test('the calendar path still cannot ask for the mailbox, and the mail path can ask for nothing else', () => {
+  // The Gmail API is not a provider and is not wired: mail goes over IMAP,
+  // and "Sign in with Google" only buys the bearer token IMAP wants.
   assert.equal(providerFor('gmail'), null);
-  assert.ok(NOT_WIRED.gmail.includes('restricted'));
   assert.ok(NOT_WIRED.gmail.includes('IMAP'));
 
-  // Not merely absent from the defaults — absent from the allowlist, so the
-  // scope check throws rather than quietly widening the consent screen.
+  // Absent from the calendar allowlist, so the scope check throws rather than
+  // quietly widening the consent screen.
   for (const scope of [
     'https://www.googleapis.com/auth/gmail.readonly',
     'https://www.googleapis.com/auth/gmail.modify',
@@ -266,22 +268,96 @@ test('Gmail is not wired and cannot be asked for', () => {
   for (const scope of ['Mail.Read', 'Mail.Send', 'mail.readwrite']) {
     assert.throws(() => assertScopes('microsoft', [scope]), (err) => err.code === 'bad_scope', scope);
   }
-
-  // No mail scope is spelled anywhere in the module — not in an allowlist, not
-  // in a default, not commented out ready to be uncommented.
   // "email" is an identity claim and stays; anything that reads as a mailbox
-  // scope — gmail.*, //mail.*, Mail.Read — must not appear on any allowlist.
+  // scope — gmail.*, //mail.*, Mail.Read — must not appear on a calendar allowlist.
   const mailish = /gmail|(^|[./])mail\b/i;
   for (const id of PROVIDER_IDS) {
     for (const scope of PROVIDERS[id].allowedScopes) {
-      assert.ok(!mailish.test(scope), `${id} allows a mail scope: ${scope}`);
+      assert.ok(!mailish.test(scope), `${id} allows a mail scope on the calendar path: ${scope}`);
     }
   }
+
+  // The mail path is its own closed list: exactly the one scope IMAP needs,
+  // Google only, and a caller has to ask for it by name.
+  assert.deepEqual([...PROVIDERS.google.mailScopes], ['https://mail.google.com/']);
+  assert.equal(PROVIDERS.microsoft.mailScopes, undefined, 'Microsoft mail is the device grant in imap.mjs, not this table');
+  assert.deepEqual(assertScopes('google', ['https://mail.google.com/'], { purpose: 'mail' }), ['https://mail.google.com/']);
+  for (const scope of ['https://www.googleapis.com/auth/calendar.readonly', 'https://www.googleapis.com/auth/gmail.readonly', 'email']) {
+    assert.throws(() => assertScopes('google', [scope], { purpose: 'mail' }), (err) => err.code === 'bad_scope', scope);
+  }
+  assert.throws(() => assertScopes('microsoft', ['offline_access'], { purpose: 'mail' }), (err) => err.code === 'bad_scope');
+  assert.throws(() => assertScopes('google', ['https://mail.google.com/'], { purpose: 'everything' }), (err) => err.code === 'bad_scope');
+
+  // And that row is the one place the module spells a mail scope.
   const src = fs.readFileSync(new URL('../core/sources/oauth.mjs', import.meta.url), 'utf8');
   const mailScope = /googleapis\.com\/auth\/gmail|mail\.google\.com|['"]Mail\.(Read|Send|ReadWrite)/i;
-  for (const line of src.split('\n')) {
-    assert.ok(!mailScope.test(line), `a mail scope leaked into the code: ${line.trim()}`);
-  }
+  const spelled = src.split('\n').filter((line) => mailScope.test(line)).map((line) => line.trim());
+  assert.deepEqual(spelled, ["mailScopes: Object.freeze(['https://mail.google.com/']),"]);
+});
+
+test('buildAuthUrl for mail asks for the mailbox, offline access and a fresh consent — and never the calendar', () => {
+  const state = createState();
+  const verifier = createVerifier();
+  const raw = buildAuthUrl({
+    provider: 'google',
+    clientId: 'cid.apps.example',
+    redirectUri: `http://127.0.0.1:7777${MAIL_CALLBACK_PATH}`,
+    state,
+    challenge: challengeFor(verifier),
+    purpose: 'mail',
+  });
+  const url = new URL(raw);
+  assert.equal(`${url.origin}${url.pathname}`, 'https://accounts.google.com/o/oauth2/v2/auth');
+  assert.equal(url.searchParams.get('scope'), 'https://mail.google.com/');
+  assert.equal(url.searchParams.get('access_type'), 'offline');
+  assert.equal(url.searchParams.get('prompt'), 'consent');
+  assert.equal(url.searchParams.get('code_challenge_method'), 'S256');
+  assert.equal(url.searchParams.get('code_challenge'), challengeFor(verifier));
+  assert.equal(url.searchParams.get('redirect_uri'), 'http://127.0.0.1:7777/oauth/callback');
+  assert.equal(url.searchParams.get('state'), state);
+  assert.equal(url.searchParams.get('client_secret'), null);
+  assert.equal(MAIL_CALLBACK_PATH, '/oauth/callback');
+
+  assert.throws(() => buildAuthUrl({
+    provider: 'google', clientId: 'cid.apps.example', redirectUri: 'http://127.0.0.1:7777/oauth/callback',
+    state, challenge: challengeFor(verifier), purpose: 'mail',
+    scopes: ['https://www.googleapis.com/auth/calendar.readonly'],
+  }), (err) => err.code === 'bad_scope');
+  // The default purpose is unchanged: the calendar scope, and no mailbox.
+  const calendar = new URL(buildAuthUrl({
+    provider: 'google', clientId: 'cid.apps.example', redirectUri: 'http://127.0.0.1:7777/oauth/google',
+    state, challenge: challengeFor(verifier),
+  }));
+  assert.equal(calendar.searchParams.get('scope'), 'https://www.googleapis.com/auth/calendar.readonly');
+});
+
+test('oauthClient reads the operator\'s registration over the shipped default, and says which it found', () => {
+  assert.deepEqual(DEFAULT_OAUTH_CLIENTS, { google: { clientId: '' }, microsoft: { clientId: '', tenantId: 'common' } });
+  assert.ok(Object.isFrozen(DEFAULT_OAUTH_CLIENTS) && Object.isFrozen(DEFAULT_OAUTH_CLIENTS.google));
+  assert.equal(GOOGLE_CLIENT_SECRET_REF, 'oauth.google.clientSecret');
+
+  // Nothing shipped yet and nothing configured: none, and that is an answer, not an error.
+  assert.deepEqual(oauthClient(null, 'google'), { clientId: '', source: 'none', clientSecretRef: GOOGLE_CLIENT_SECRET_REF });
+  assert.deepEqual(oauthClient({}, 'microsoft'), { clientId: '', source: 'none', tenantId: 'common' });
+  assert.equal(oauthClient({ oauth: { google: { clientId: 'calendar-not-mail' } } }, 'google').source, 'none',
+    'the calendar block under oauth.google is not a mail client');
+
+  const cfg = {
+    oauth: {
+      clients: {
+        google: { clientId: '  4242-zelos.apps.googleusercontent.com  ' },
+        microsoft: { clientId: '11111111-2222-3333-4444-555555555555', tenantId: 'consumers' },
+      },
+    },
+  };
+  assert.deepEqual(oauthClient(cfg, 'google'),
+    { clientId: '4242-zelos.apps.googleusercontent.com', source: 'config', clientSecretRef: GOOGLE_CLIENT_SECRET_REF });
+  assert.deepEqual(oauthClient(cfg, 'microsoft'),
+    { clientId: '11111111-2222-3333-4444-555555555555', source: 'config', tenantId: 'consumers' });
+  assert.equal(oauthClient({ oauth: { clients: { microsoft: { clientId: 'x' } } } }, 'microsoft').tenantId, 'common');
+  assert.equal(oauthClient({ oauth: { clients: { google: { clientId: 'x', clientSecretRef: 'oauth.google.mine' } } } }, 'google').clientSecretRef,
+    'oauth.google.mine');
+  assert.throws(() => oauthClient(cfg, 'gmail'), (err) => err.code === 'unknown_provider');
 });
 
 test('a calendar WRITE scope is refused too — this surface is read-only', () => {
@@ -845,6 +921,39 @@ test('if the browser cannot be opened the port is released rather than left boun
     );
     assert.ok(boundPort > 0);
     await assert.rejects(() => get(`http://127.0.0.1:${boundPort}/oauth/google`));
+  } finally {
+    await mock.close();
+  }
+});
+
+/* ================================================================== *
+ * The client secret a Google "Desktop app" client carries to /token
+ * ================================================================== */
+
+test('exchangeCode and refreshTokens send a client secret only when handed one, and then verbatim', async () => {
+  const mock = await startAuthServer();
+  try {
+    for (const clientSecret of ['', 'GOCSPX-fixture-not-a-real-secret']) {
+      const pending = await beginAuthorization({ providerId: 'google', clientId: 'cid.apps.example', authorizeUrl: mock.authorizeUrl });
+      const hop = await get(pending.url);
+      await get(hop.headers.get('location'));
+      const { code } = await pending.receiver.waitForCode();
+      const tokens = await exchangeCode({
+        provider: 'google', clientId: 'cid.apps.example', clientSecret, code,
+        verifier: pending.verifier, redirectUri: pending.redirectUri, tokenUrl: mock.tokenUrl,
+      });
+      assert.equal(tokens.accessToken, 'at_first');
+      const call = mock.seen.filter((s) => s.kind === 'token').at(-1);
+      assert.equal(call.form.client_secret, clientSecret || undefined, `secret ${JSON.stringify(clientSecret)}`);
+      assert.equal(call.form.code_verifier, pending.verifier, 'PKCE is sent either way');
+    }
+    const refreshed = await refreshTokens({
+      provider: 'google', clientId: 'cid.apps.example', clientSecret: 'GOCSPX-fixture-not-a-real-secret',
+      refreshToken: 'rt_first', tokenUrl: mock.tokenUrl,
+    });
+    assert.equal(refreshed.accessToken, 'at_second');
+    assert.equal(refreshed.refreshToken, 'rt_first', 'Google omits the refresh token on a refresh, so the one sent is kept');
+    assert.equal(mock.seen.at(-1).form.client_secret, 'GOCSPX-fixture-not-a-real-secret');
   } finally {
     await mock.close();
   }

@@ -444,6 +444,8 @@ requests to `127.0.0.1`. So:
   before the session gate (after the `Host` and `Origin` checks, which it needs unchanged) and
   takes an AI bearer token instead. Neither credential works on the other's routes: the session
   gate 401s an AI token, and the MCP gate ignores `X-Zelos-Token`. See SPEC-v2 §1.
+  `GET /oauth/callback` is likewise outside the gate — a browser redirect carries no token — and is
+  authenticated by the one-time `state` the flow minted instead; see its row below.
 - Reject any request whose `Origin` header is present and is not the server's own origin.
 - No CORS headers, ever. `Access-Control-Allow-Origin` must not appear anywhere.
 - Static file serving is path-traversal-proof (resolve, then assert the resolved path is inside
@@ -469,8 +471,12 @@ Routes (JSON in/out unless noted):
 | GET | `/api/model/list` | `?protocol&baseUrl&keyRef` | `[{id,label}]` |
 | GET | `/api/model/presets` | | `PRESETS` |
 | GET | `/api/local/probe` | | detected local runtimes |
-| POST | `/api/mail/guess` | `{email}` — POST so the address is never in a URL | `{label, host, port, secure, auth, appPasswordUrl, note, known}` |
-| POST | `/api/mail/test` | mail account | `{ok, mailboxes, error}` |
+| POST | `/api/mail/guess` | `{email}` — POST so the address is never in a URL | `{label, host, port, secure, auth, signIn, clientReady, appPasswordUrl, note, known}` — `signIn` is `google`, `microsoft` or null; `clientReady` is whether a client id exists to run it (`oauthClient()` in core/sources/oauth.mjs: `config.oauth.clients.<provider>`, else the shipped default, else none) |
+| POST | `/api/mail/test` | mail account — `auth: 'xoauth2'` carries `oauth: {provider, clientId, tenantId?}`; `provider` absent is Microsoft | `{ok, mailboxes, error, reconnect}` |
+| POST | `/api/mail/oauth` | `{provider?, keyRef, clientId?, tenantId?, clientSecret?, email?}` — `keyRef` must be `mail.<id>`; `provider` absent is `microsoft` (RFC 8628 device code); `google` is Authorization Code + PKCE back to `/oauth/callback`. `clientId` may be left out when `oauthClient()` has one; a Google `clientSecret` is written to the secret store under `oauth.google.clientSecret` and never echoed | Microsoft: `{id, provider, state, status, keyRef, userCode, verificationUri, message, expiresAt, scope, error, reconnect}`. Google: `{id, provider, state, status, keyRef, clientId, authUrl, expiresAt, scope, error, reconnect}` — `authUrl` is what the page opens in a browser |
+| GET | `/api/mail/oauth/:id` | | the same object without `authUrl`; `status` (and `state`, its older name) is `pending`, `connected`, `failed`, `expired` or `cancelled`; `error` when failed. The grant is stored under `keyRef` in the shape core/sources/imap.mjs §6 files (`kind: 'xoauth2'`), never returned |
+| DELETE | `/api/mail/oauth/:id` | | the same object with `status: 'cancelled'` |
+| GET | `/oauth/callback` | `?state&code` or `?state&error` — **no session token**: the Google redirect is a browser navigation. Loopback only (Host, Origin and the socket's peer); `state` must match a pending flow in constant time or the answer is a generic 400 page; the code is exchanged with the PKCE verifier and the refresh token stored under the flow's `keyRef` | a static HTML page — no script, no token, no address — 200 "Signed in" or 400 "refused" |
 | POST | `/api/calendar/test` | calendar | `{ok, calendars, error}` |
 | POST | `/api/ask` | `{question}` | **SSE** streamed answer grounded in FTS5 hits |
 | PUT | `/api/drafts/:id` | `{body,state}` | draft |

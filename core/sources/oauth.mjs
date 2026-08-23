@@ -1,25 +1,31 @@
 /**
  * core/sources/oauth.mjs — OAuth 2.0 Authorization Code + PKCE, loopback redirect.
  *
- * Built, tested, and deliberately inert.
+ * Built and tested. The calendar half is still inert; the mail half is live.
  *
  * Zelos is a desktop app, so it is a *public* client: whatever secret you shipped
  * with it would be sitting in every copy of the tarball. The flow that is correct
  * for a public client is RFC 8252 — Authorization Code with PKCE (RFC 7636) and a
- * redirect back to a loopback listener on an ephemeral port. No client secret is
- * involved anywhere in this file, and there is no parameter one could ride in on.
+ * redirect back to a loopback listener. The one place a `client_secret` is sent
+ * is the token endpoint, and only for Google's mail sign-in: Google issues its
+ * "Desktop app" clients a secret and requires it at `/token`, while documenting
+ * that it is not confidential for an installed app. It is an explicit argument,
+ * read from the secret store by the caller, never a parameter a request body
+ * could ride in on.
  *
  * Three properties this module holds, all of them tested:
  *
- *  1. **Inert without a registration.** `config.oauth.<provider>.clientId` is blank
- *     by default. Every entry point refuses with `not_configured` until a human has
- *     registered an app and pasted the id in. Nothing here dials out on its own.
- *  2. **Calendar, read-only, and nothing else.** Each provider carries an explicit
- *     allowlist of scopes; `buildAuthUrl` refuses anything outside it. Gmail is not
- *     wired and cannot be: `gmail.readonly` is not on Google's list, so asking for
- *     it throws rather than quietly widening the consent screen. (Gmail read is a
- *     *restricted* scope — CASA Tier 2, re-assessed annually. IMAP remains the
- *     supported mail path. See docs/SPEC-v2.md §3.)
+ *  1. **Nothing dials out without a client id.** `DEFAULT_OAUTH_CLIENTS` is blank
+ *     until Zelos's own registrations exist, `config.oauth.clients.<provider>`
+ *     overrides it, and every entry point refuses with `not_configured` when
+ *     `oauthClient()` finds neither.
+ *  2. **Calendar stays read-only.** Each provider's `allowedScopes` is a closed
+ *     calendar-only set and `assertScopes` refuses anything outside it. Mail is a
+ *     separate, equally closed list — `mailScopes`, Google only — that a caller
+ *     has to ask for by name (`purpose: 'mail'`), so the calendar path cannot
+ *     widen into the mailbox by accident and the mail path is the one row
+ *     core/server.mjs's "Sign in with Google" reads. Microsoft's mail sign-in is
+ *     the device grant in core/sources/imap.mjs §6 and does not pass through here.
  *  3. **Refresh tokens live in the secret store.** `core/secrets.mjs`, same as every
  *     other credential — never `config.json`, never a log line, never argv.
  *
@@ -89,6 +95,13 @@ export const PROVIDERS = Object.freeze({
       'email',
       'profile',
     ]),
+    /**
+     * The one scope that opens IMAP. Full mailbox access is what Google grants
+     * for `AUTHENTICATE XOAUTH2`; there is no narrower scope the IMAP server
+     * accepts. Kept apart from `allowedScopes` so the calendar path cannot
+     * reach it — see `assertScopes`.
+     */
+    mailScopes: Object.freeze(['https://mail.google.com/']),
     /** RFC 8252 loopback. Google matches the host exactly and ignores the port. */
     loopbackHost: '127.0.0.1',
     redirectPath: '/oauth/google',
@@ -229,6 +242,72 @@ export function tokenRef(providerId, accountId = 'default') {
 }
 
 /* ------------------------------------------------------------------ *
+ * The mail sign-in clients
+ * ------------------------------------------------------------------ */
+
+/**
+ * Where Google sends the browser back: a fixed path on the Zelos server itself,
+ * not a second listener. The server already owns a loopback port, and a
+ * "Desktop app" client at Google accepts `http://127.0.0.1:<any port>/<path>`,
+ * so the redirect is whatever port Zelos actually bound plus this.
+ */
+export const MAIL_CALLBACK_PATH = '/oauth/callback';
+
+/**
+ * Where a user-supplied Google client secret is filed. A ref, like every other
+ * credential: config.json carries at most this NAME, never the value —
+ * core/config.mjs's `stripSecrets` deletes a `clientSecret` key at any depth on
+ * every save, so there is no way to store it there even by accident.
+ */
+export const GOOGLE_CLIENT_SECRET_REF = 'oauth.google.clientSecret';
+
+/**
+ * The client ids Zelos ships for "Sign in with Google" and "Sign in with
+ * Microsoft". Blank until Zelos's own registrations exist — the Google Cloud
+ * project is in Testing and the Entra registration is unverified — at which
+ * point these two strings are the only edit: the flow is already built to be
+ * byte-identical on either side of that day. While they are blank,
+ * `config.oauth.clients.<provider>.clientId` is how the operator's own
+ * registration is used.
+ */
+export const DEFAULT_OAUTH_CLIENTS = Object.freeze({
+  google: Object.freeze({ clientId: '' }),
+  microsoft: Object.freeze({ clientId: '', tenantId: 'common' }),
+});
+
+/**
+ * Which client a mail sign-in runs against, and where it came from.
+ *
+ * `source` is the answer to "will this work without the user registering
+ * anything": `config` when the operator pasted one in, `default` when Zelos
+ * ships one, `none` when neither — which is what POST /api/mail/guess reports
+ * as `clientReady: false`. Google's `clientSecretRef` is the NAME of the ref the
+ * secret may live under; whether anything is stored there is the secret
+ * store's business, and a client without one is still a working client.
+ */
+export function oauthClient(config, providerId) {
+  const p = requireProvider(providerId);
+  const clients = (config && typeof config === 'object' && config.oauth && typeof config.oauth === 'object'
+    && config.oauth.clients && typeof config.oauth.clients === 'object')
+    ? config.oauth.clients[p.id]
+    : null;
+  const own = clients && typeof clients === 'object' ? clients : {};
+  const shipped = DEFAULT_OAUTH_CLIENTS[p.id];
+  const configured = typeof own.clientId === 'string' ? own.clientId.trim() : '';
+  const clientId = configured || shipped.clientId;
+  const out = { clientId, source: configured ? 'config' : (shipped.clientId ? 'default' : 'none') };
+  if (p.id === 'microsoft') {
+    const tenant = typeof own.tenantId === 'string' ? own.tenantId.trim() : '';
+    out.tenantId = tenant || shipped.tenantId;
+  }
+  if (p.id === 'google') {
+    const ref = typeof own.clientSecretRef === 'string' ? own.clientSecretRef.trim() : '';
+    out.clientSecretRef = ref || GOOGLE_CLIENT_SECRET_REF;
+  }
+  return out;
+}
+
+/* ------------------------------------------------------------------ *
  * PKCE
  * ------------------------------------------------------------------ */
 
@@ -275,13 +354,20 @@ export function statesMatch(a, b) {
  * ------------------------------------------------------------------ */
 
 /**
- * Refuse any scope outside the provider's allowlist. This is the mechanism that
- * makes "calendar, read-only" structural: there is no argument to `authorize()`
- * that widens it, and adding a mail scope means editing `PROVIDERS` in a diff
+ * Refuse any scope outside the provider's allowlist for the stated purpose.
+ *
+ * This is the mechanism that keeps "calendar, read-only" structural: there is
+ * no argument to `authorize()` that widens it. `purpose: 'mail'` switches to
+ * the provider's `mailScopes` — a different closed list, not a superset — so a
+ * mail sign-in cannot ask for the calendar and a calendar sign-in cannot ask
+ * for the mailbox. Adding a scope to either means editing `PROVIDERS` in a diff
  * somebody has to look at.
  */
-export function assertScopes(provider, scopes) {
+export function assertScopes(provider, scopes, { purpose = 'calendar' } = {}) {
   const p = typeof provider === 'string' ? requireProvider(provider) : provider;
+  if (purpose !== 'calendar' && purpose !== 'mail') {
+    throw new OAuthError(`oauth: unknown purpose ${JSON.stringify(purpose)}`, { code: 'bad_scope', provider: p.id });
+  }
   const wanted = (Array.isArray(scopes) ? scopes : [scopes])
     .flatMap((s) => String(s ?? '').split(/\s+/))
     .map((s) => s.trim())
@@ -289,11 +375,15 @@ export function assertScopes(provider, scopes) {
   if (!wanted.length) {
     throw new OAuthError('oauth: at least one scope is required', { code: 'bad_scope', provider: p.id });
   }
-  const allowed = new Map(p.allowedScopes.map((s) => [s.toLowerCase(), s]));
+  const list = purpose === 'mail' ? (p.mailScopes || []) : p.allowedScopes;
+  if (!list.length) {
+    throw new OAuthError(`oauth: ${p.label} has no ${purpose} scopes wired`, { code: 'bad_scope', provider: p.id });
+  }
+  const allowed = new Map(list.map((s) => [s.toLowerCase(), s]));
   const refused = wanted.filter((s) => !allowed.has(s.toLowerCase()));
   if (refused.length) {
     throw new OAuthError(
-      `oauth: ${p.label} is wired for calendar read only; refusing scope ${refused.join(', ')}`,
+      `oauth: ${p.label} is wired for ${purpose === 'mail' ? 'mail' : 'calendar read'} only; refusing scope ${refused.join(', ')}`,
       { code: 'bad_scope', provider: p.id },
     );
   }
@@ -316,6 +406,7 @@ export function buildAuthUrl({
   loginHint = '',
   authorizeUrl = null,
   extra = null,
+  purpose = 'calendar',
 } = {}) {
   const p = typeof provider === 'string' ? requireProvider(provider) : requireProvider(provider?.id);
   const id = String(clientId ?? '').trim();
@@ -334,7 +425,8 @@ export function buildAuthUrl({
   params.set('response_type', 'code');
   params.set('client_id', id);
   params.set('redirect_uri', redirectUri);
-  params.set('scope', assertScopes(p, scopes ?? p.defaultScopes).join(' '));
+  const defaults = purpose === 'mail' ? p.mailScopes : p.defaultScopes;
+  params.set('scope', assertScopes(p, scopes ?? defaults, { purpose }).join(' '));
   params.set('state', state);
   params.set('code_challenge', challenge);
   params.set('code_challenge_method', CODE_CHALLENGE_METHOD);
@@ -559,11 +651,14 @@ function signalFor(timeoutMs, signal) {
   return signal ? AbortSignal.any([signal, timeout]) : timeout;
 }
 
-async function postForm(url, form, { fetchImpl, timeoutMs, signal, provider }) {
+async function postForm(url, form, { fetchImpl, timeoutMs, signal, provider, clientSecret = '' }) {
   const doFetch = fetchImpl || globalThis.fetch;
   const body = new URLSearchParams(form);
-  // Structural, not decorative: a public client sends no secret, ever.
+  // Structural, not decorative: whatever was in `form`, the only secret that
+  // goes out is the one the caller named as such — read from the secret store,
+  // never from a request body or a config file.
   body.delete('client_secret');
+  if (typeof clientSecret === 'string' && clientSecret) body.set('client_secret', clientSecret);
 
   let res;
   try {
@@ -635,10 +730,15 @@ function normalizeTokens(payload, { now = Date.now(), previous = null } = {}) {
   };
 }
 
-/** Trade the authorization code for tokens. PKCE verifier instead of a secret. */
+/**
+ * Trade the authorization code for tokens. PKCE verifier instead of a secret —
+ * plus the secret, when the registration has one: Google's "Desktop app"
+ * clients are refused at `/token` without it, PKCE or not.
+ */
 export async function exchangeCode({
   provider,
   clientId,
+  clientSecret = '',
   code,
   verifier,
   redirectUri,
@@ -661,7 +761,7 @@ export async function exchangeCode({
     code: String(code),
     code_verifier: String(verifier),
     redirect_uri: String(redirectUri),
-  }, { fetchImpl, timeoutMs, signal, provider: p.id });
+  }, { fetchImpl, timeoutMs, signal, provider: p.id, clientSecret });
 
   log.info('oauth: exchanged an authorization code', { provider: p.id });
   return normalizeTokens(payload, { now });
@@ -671,6 +771,7 @@ export async function exchangeCode({
 export async function refreshTokens({
   provider,
   clientId,
+  clientSecret = '',
   refreshToken,
   scopes = null,
   tokenUrl = null,
@@ -698,7 +799,7 @@ export async function refreshTokens({
   if (scopes) form.scope = assertScopes(p, scopes).join(' ');
 
   const payload = await postForm(tokenUrl || p.tokenUrl, form, {
-    fetchImpl, timeoutMs, signal, provider: p.id,
+    fetchImpl, timeoutMs, signal, provider: p.id, clientSecret,
   });
 
   log.info('oauth: refreshed an access token', { provider: p.id });

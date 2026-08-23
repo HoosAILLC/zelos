@@ -42,9 +42,10 @@ export const SECRET_KEYS = new Set([
      and it does not expire for 90 days. The snake_case spellings are here
      because they are what Microsoft's token endpoint answers with, so a patch
      that assigned a raw response object would carry those and not the
-     camelCase ones. `clientSecret` is never used — a device sign-in is a public
-     client and has none — which is exactly why a config carrying one is a
-     mistake worth swallowing rather than storing. */
+     camelCase ones. `clientSecret` is a Google client's, and it lives in the
+     secret store under a ref (core/sources/oauth.mjs GOOGLE_CLIENT_SECRET_REF)
+     — a config carrying the value itself is a mistake worth swallowing rather
+     than storing. */
   'accesstoken', 'access_token', 'refreshtoken', 'refresh_token',
   'clientsecret', 'client_secret', 'devicecode', 'device_code',
 ]);
@@ -56,15 +57,23 @@ const CALENDAR_KINDS = ['ics', 'caldav', 'file'];
  * How a mail account signs in.
  *
  * `password` is a password or an app password over `LOGIN`/`AUTHENTICATE PLAIN`.
- * `xoauth2` is a bearer token over `AUTHENTICATE XOAUTH2`, minted by the device
- * authorization grant in core/sources/imap.mjs §6 against an app registration
- * the USER owns — Zelos ships no client id of its own and never will, so there
- * is no third value where Zelos signs in on anybody's behalf.
+ * `xoauth2` is a bearer token over `AUTHENTICATE XOAUTH2`, minted from a grant
+ * the user gave in their browser: Microsoft's device code (core/sources/imap.mjs
+ * §6) or Google's PKCE redirect (core/sources/oauth.mjs, received by
+ * core/server.mjs). Which one is `oauth.provider` on the account; the client it
+ * ran against is whatever `oauthClient()` found — Zelos's own once it ships
+ * one, the operator's from `oauth.clients` until then.
  *
  * An account written before this key existed has no `auth` at all, and that is
  * read as `password`: it is what those accounts have always done.
  */
 export const MAIL_AUTH_METHODS = Object.freeze(['password', 'xoauth2']);
+
+/**
+ * The two browser sign-ins `mail[i].oauth.provider` can name. Absent reads as
+ * `microsoft`, because every account connected before the field existed was.
+ */
+export const MAIL_OAUTH_PROVIDERS = Object.freeze(['google', 'microsoft']);
 /* One theme (black). The only appearance choice is the accent, and it is
    validated as a six-digit hex because it is written straight into a CSS
    custom property — anything else must never reach the stylesheet. */
@@ -560,6 +569,18 @@ export function isValidClientId(value) {
 }
 
 /**
+ * True for what core/sources/imap.mjs's `normalizeGoogleClientId` accepts: one
+ * token, no whitespace, not absurdly long. Google's ids end in
+ * `.apps.googleusercontent.com` today; that suffix is not pinned, for the
+ * reason given there.
+ */
+export function isValidGoogleClientId(value) {
+  if (typeof value !== 'string') return false;
+  const raw = value.trim();
+  return raw.length > 0 && raw.length <= 200 && !/[\s\x00-\x1f\x7f]/.test(raw);
+}
+
+/**
  * The `oauth` block on one mail account.
  *
  * PRESENCE is required only for an enabled account, the way `host` and `user`
@@ -588,6 +609,28 @@ function checkMailOAuth(errors, at, account, { method, enabled }) {
     }
     return;
   }
+  /* Absent is Microsoft, not an error: the field was added after the first
+     accounts were connected, and those accounts must keep working untouched. */
+  const provider = block.provider === undefined || block.provider === null ? 'microsoft' : block.provider;
+  if (!MAIL_OAUTH_PROVIDERS.includes(provider)) {
+    errors.push({
+      path: `${at}.oauth.provider`,
+      message: `must be one of ${MAIL_OAUTH_PROVIDERS.join(', ')}`,
+    });
+    return;
+  }
+  if (provider === 'google') {
+    if ((block.clientId !== undefined || enabled) && !isValidGoogleClientId(block.clientId)) {
+      errors.push({
+        path: `${at}.oauth.clientId`,
+        message: 'must be the client ID of the Google Cloud project this mailbox was signed in through',
+      });
+    }
+    if (block.tenantId !== undefined && block.tenantId !== null && !isStr(block.tenantId)) {
+      errors.push({ path: `${at}.oauth.tenantId`, message: 'must be a string' });
+    }
+    return;
+  }
   if (block.clientId !== undefined || enabled) {
     if (!isValidClientId(block.clientId)) {
       errors.push({
@@ -613,6 +656,61 @@ function checkRef(errors, at, value, { allowNull = false } = {}) {
   }
   if (!isValidRef(value)) {
     errors.push({ path: at, message: 'must be a short ref like "model.default" (letters, digits, . _ -)' });
+  }
+}
+
+/**
+ * `oauth.clients` — the operator's own sign-in registrations, overriding the
+ * ones Zelos ships (core/sources/oauth.mjs `DEFAULT_OAUTH_CLIENTS`).
+ *
+ * Only this one key under `oauth` is checked; the rest of the block belongs to
+ * the calendar module and is left alone, as the KNOWN_TOP_LEVEL note says. A
+ * Google client's SECRET is never here — `stripSecrets` removes a
+ * `clientSecret` at any depth on save — only the ref it is filed under, and
+ * only when the operator wants a name other than the default.
+ */
+function checkOAuthClients(errors, block) {
+  if (block === undefined || block === null) return;
+  if (!isPlainObject(block)) {
+    errors.push({ path: 'oauth', message: 'must be an object' });
+    return;
+  }
+  const clients = block.clients;
+  if (clients === undefined || clients === null) return;
+  if (!isPlainObject(clients)) {
+    errors.push({ path: 'oauth.clients', message: 'must be an object' });
+    return;
+  }
+  for (const [provider, entry] of Object.entries(clients)) {
+    const at = `oauth.clients.${provider}`;
+    if (!MAIL_OAUTH_PROVIDERS.includes(provider)) {
+      errors.push({ path: at, message: `must be one of ${MAIL_OAUTH_PROVIDERS.join(', ')}` });
+      continue;
+    }
+    if (!isPlainObject(entry)) {
+      errors.push({ path: at, message: 'must be an object' });
+      continue;
+    }
+    if (entry.clientId !== undefined && !isStr(entry.clientId)) {
+      errors.push({ path: `${at}.clientId`, message: 'must be a string' });
+    } else if (provider === 'microsoft' && isStr(entry.clientId) && entry.clientId.trim() && !isValidClientId(entry.clientId)) {
+      errors.push({ path: `${at}.clientId`, message: 'must be the application (client) ID from your app registration\'s Overview page, which is a GUID' });
+    } else if (provider === 'google' && isStr(entry.clientId) && entry.clientId.trim() && !isValidGoogleClientId(entry.clientId)) {
+      errors.push({ path: `${at}.clientId`, message: 'must be the client ID from your Google Cloud project\'s credentials page' });
+    }
+    if (provider === 'microsoft') {
+      if (entry.tenantId !== undefined && !isStr(entry.tenantId)) {
+        errors.push({ path: `${at}.tenantId`, message: 'must be a string' });
+      } else if (!isValidTenant(entry.tenantId)) {
+        errors.push({
+          path: `${at}.tenantId`,
+          message: `must be ${TENANT_ALIASES.join(', ')}, the directory (tenant) ID from the same page, or your organisation's domain`,
+        });
+      }
+    }
+    if (provider === 'google') {
+      checkRef(errors, `${at}.clientSecretRef`, entry.clientSecretRef, { allowNull: true });
+    }
   }
 }
 
@@ -707,6 +805,8 @@ export function validateConfig(cfg) {
       if (!isInt(a.maxMessages, 1, 5000)) errors.push({ path: `${at}.maxMessages`, message: 'must be an integer between 1 and 5000' });
     });
   }
+
+  checkOAuthClients(errors, cfg.oauth);
 
   if (!Array.isArray(cfg.calendars)) errors.push({ path: 'calendars', message: 'must be an array' });
   else {

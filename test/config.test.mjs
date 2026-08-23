@@ -540,3 +540,88 @@ test('requireTls accepts only true, false and null', () => {
     assert.ok(result.errors.some((e) => e.path === 'mail[0].requireTls'), JSON.stringify(junk));
   }
 });
+
+/* ------------------------------------------------------------------ *
+ * Sign in with Google: the account's `oauth.provider` and the operator's
+ * `oauth.clients`
+ * ------------------------------------------------------------------ */
+
+const GOOGLE_CLIENT_ID = '4242-zelos-test.apps.googleusercontent.com';
+const ENTRA_CLIENT_ID = '11111111-2222-3333-4444-555555555555';
+
+/** An enabled xoauth2 account with every required field, and the given oauth block. */
+function oauthAccount(oauth, patch = {}) {
+  return {
+    id: 'm_1', enabled: true, label: 'Mailbox', host: 'imap.gmail.com', user: 'nemo@gmail.com',
+    port: 993, secure: true, requireTls: null, auth: 'xoauth2', oauth, keyRef: 'mail.m_1',
+    mailboxes: ['INBOX'], sentMailbox: 'Sent', lookbackDays: 14, maxMessages: 400,
+    ...patch,
+  };
+}
+
+test('a mail account says which browser sign-in it holds, and one from before the field existed is Microsoft', () => {
+  freshHome('oauth-provider');
+  const base = loadConfig();
+  const check = (oauth, patch) => validateConfig({ ...base, mail: [oauthAccount(oauth, patch)] });
+  const pathsOf = (result) => result.errors.map((e) => e.path);
+
+  assert.equal(check({ provider: 'google', clientId: GOOGLE_CLIENT_ID }).ok, true);
+  assert.equal(check({ provider: 'microsoft', clientId: ENTRA_CLIENT_ID, tenantId: 'common' }).ok, true);
+  // No provider: the block is read the way it was written, as Microsoft's.
+  assert.equal(check({ clientId: ENTRA_CLIENT_ID, tenantId: 'consumers' }).ok, true);
+  assert.deepEqual(pathsOf(check({ clientId: GOOGLE_CLIENT_ID })), ['mail[0].oauth.clientId'],
+    'with no provider a Google-shaped id is still a paste that went wrong, because the block is Microsoft\'s');
+
+  // A Google block needs a Google client id — and not a GUID.
+  assert.deepEqual(pathsOf(check({ provider: 'google' })), ['mail[0].oauth.clientId']);
+  assert.deepEqual(pathsOf(check({ provider: 'google', clientId: '' })), ['mail[0].oauth.clientId']);
+  assert.deepEqual(pathsOf(check({ provider: 'google', clientId: 'has a space' })), ['mail[0].oauth.clientId']);
+  assert.equal(check({ provider: 'google', clientId: ENTRA_CLIENT_ID }).ok, true, 'the shape is not pinned to Google\'s suffix');
+  assert.deepEqual(pathsOf(check({ provider: 'google', clientId: GOOGLE_CLIENT_ID, tenantId: 42 })), ['mail[0].oauth.tenantId']);
+  assert.equal(check({ provider: 'google', clientId: GOOGLE_CLIENT_ID, tenantId: 'anything' }).ok, true, 'a tenant means nothing to Google and is not checked as one');
+
+  // A parked Google account keeps the save unblocked, like a parked Microsoft one.
+  assert.equal(check({ provider: 'google' }, { enabled: false }).ok, true);
+
+  // The provider is a closed set.
+  for (const bad of ['gmail', 'Google', 'yahoo', 42, {}]) {
+    assert.deepEqual(pathsOf(check({ provider: bad, clientId: GOOGLE_CLIENT_ID })), ['mail[0].oauth.provider'], JSON.stringify(bad));
+  }
+});
+
+test('oauth.clients is the operator\'s own registrations, checked by shape, and the secret itself never lands there', () => {
+  const home = freshHome('oauth-clients');
+  const base = loadConfig();
+  const withClients = (clients) => validateConfig({ ...base, oauth: { clients } });
+  const pathsOf = (result) => result.errors.map((e) => e.path);
+
+  assert.equal(withClients({ google: { clientId: GOOGLE_CLIENT_ID }, microsoft: { clientId: ENTRA_CLIENT_ID, tenantId: 'consumers' } }).ok, true);
+  assert.equal(withClients({}).ok, true);
+  assert.equal(withClients({ google: { clientId: '' } }).ok, true, 'blank means "the shipped default"');
+  assert.equal(withClients({ google: { clientId: GOOGLE_CLIENT_ID, clientSecretRef: 'oauth.google.mine' } }).ok, true);
+  assert.equal(validateConfig({ ...base, oauth: {} }).ok, true);
+  assert.equal(validateConfig({ ...base, oauth: { google: { clientId: '', enabled: false } } }).ok, true,
+    'the calendar module\'s own block under oauth is still nobody\'s business here');
+
+  assert.deepEqual(pathsOf(validateConfig({ ...base, oauth: 'nope' })), ['oauth']);
+  assert.deepEqual(pathsOf(validateConfig({ ...base, oauth: { clients: [] } })), ['oauth.clients']);
+  assert.deepEqual(pathsOf(withClients({ yahoo: { clientId: 'x' } })), ['oauth.clients.yahoo']);
+  assert.deepEqual(pathsOf(withClients({ google: 'x' })), ['oauth.clients.google']);
+  assert.deepEqual(pathsOf(withClients({ google: { clientId: 42 } })), ['oauth.clients.google.clientId']);
+  assert.deepEqual(pathsOf(withClients({ google: { clientId: 'has space' } })), ['oauth.clients.google.clientId']);
+  assert.deepEqual(pathsOf(withClients({ microsoft: { clientId: 'not-a-guid' } })), ['oauth.clients.microsoft.clientId']);
+  assert.deepEqual(pathsOf(withClients({ microsoft: { clientId: ENTRA_CLIENT_ID, tenantId: '..' } })), ['oauth.clients.microsoft.tenantId']);
+  assert.deepEqual(pathsOf(withClients({ google: { clientId: GOOGLE_CLIENT_ID, clientSecretRef: '../escape' } })), ['oauth.clients.google.clientSecretRef']);
+
+  // The value of a secret pasted into the block is dropped on save, at any
+  // depth, and nothing under the home carries it.
+  const saved = saveConfig({ oauth: { clients: { google: { clientId: GOOGLE_CLIENT_ID, clientSecret: 'GOCSPX-never-on-disk' } } } });
+  assert.equal(saved.oauth.clients.google.clientId, GOOGLE_CLIENT_ID);
+  assert.equal(saved.oauth.clients.google.clientSecret, undefined);
+  const onDisk = fs.readdirSync(home, { recursive: true })
+    .map((name) => path.join(home, String(name)))
+    .filter((file) => fs.statSync(file).isFile())
+    .map((file) => fs.readFileSync(file, 'latin1'));
+  assert.ok(onDisk.length > 0, 'the save wrote something');
+  assert.ok(onDisk.every((text) => !text.includes('GOCSPX-never-on-disk')), 'the secret reached the disk');
+});

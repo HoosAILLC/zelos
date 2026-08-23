@@ -40,8 +40,11 @@ const {
   ImapOAuthError,
   MS_IMAP_SCOPES,
   MS_LOGIN_ORIGIN,
+  GOOGLE_TOKEN_ORIGIN,
   accessTokenFor,
+  assertGoogleTokenEndpoint,
   assertTokenEndpoint,
+  normalizeGoogleClientId,
   beginDeviceAuthorization,
   connectDeviceCode,
   describeProvider,
@@ -2671,5 +2674,299 @@ test('the Outlook preset stops recommending a password that has not worked since
       !appPassword.test(guess.note.replace(/app passwords no longer work[^.]*\./i, '')),
       `${domain}: the note still recommends an app password: ${guess.note}`,
     );
+  }
+});
+
+/* ================================================================== *
+ * Sign in with Google: the same stored grant, renewed at Google
+ *
+ * The browser half lives in core/server.mjs and is tested there. What this
+ * file owns is what the two providers share after the browser is gone — the
+ * grant under `keyRef`, its renewal, and the bearer token on the wire — and
+ * the one thing that differs: where the refresh token is spent, and with what.
+ * ================================================================== */
+
+const GOOGLE_CLIENT_ID = '4242-zelos-test.apps.googleusercontent.com';
+
+/**
+ * A mock of Google's token endpoint on 127.0.0.1: one path, one grant type,
+ * no rotation. `secret` is what a "Desktop app" client is expected to carry;
+ * blank means the client has none and the mock does not ask.
+ */
+async function startMockGoogleToken({
+  clientId = GOOGLE_CLIENT_ID,
+  secret = '',
+  expiresIn = 3600,
+  refreshToken = '1//refresh-fixture',
+} = {}) {
+  const seen = [];
+  let issued = 0;
+  const server = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (d) => { body += d; });
+    req.on('end', () => {
+      const url = new URL(req.url, 'http://127.0.0.1');
+      const form = Object.fromEntries(new URLSearchParams(body).entries());
+      seen.push({ path: url.pathname, form });
+      const send = (status, payload) => {
+        const text = JSON.stringify(payload);
+        res.writeHead(status, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(text) });
+        res.end(text);
+      };
+      if (url.pathname !== '/token') { send(404, { error: 'not_found' }); return; }
+      if (form.client_id !== clientId) { send(401, { error: 'invalid_client' }); return; }
+      if (secret && form.client_secret !== secret) {
+        send(401, { error: 'invalid_client', error_description: 'client_secret is missing' });
+        return;
+      }
+      if (form.grant_type !== 'refresh_token' || form.refresh_token !== refreshToken) {
+        send(400, { error: 'invalid_grant', error_description: 'Token has been expired or revoked.' });
+        return;
+      }
+      issued += 1;
+      // As Google does: a new access token, the scope, and no refresh token.
+      send(200, { access_token: `ya29.access-${issued}`, token_type: 'Bearer', expires_in: expiresIn, scope: 'https://mail.google.com/' });
+    });
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  return {
+    tokenUrl: `http://127.0.0.1:${server.address().port}/token`,
+    seen,
+    async close() { await new Promise((done) => server.close(done)); },
+  };
+}
+
+const longAgo = () => new Date(Date.now() - 3_600_000).toISOString();
+
+test('describeProvider names the browser sign-in a provider has, beside the password it still takes', () => {
+  for (const address of ['nemo@gmail.com', 'Nemo@GoogleMail.com']) {
+    const got = describeProvider(address);
+    assert.equal(got.signIn, 'google', address);
+    assert.equal(got.auth, 'password', `${address}: a password stays a way in for Gmail`);
+    assert.match(got.note, /Sign in with Google/);
+  }
+  for (const domain of ['outlook.com', 'hotmail.com', 'live.com', 'msn.com']) {
+    const got = describeProvider(`nemo@${domain}`);
+    assert.equal(got.signIn, 'microsoft', domain);
+    assert.equal(got.auth, 'xoauth2', `${domain}: and no password at all`);
+  }
+  for (const address of [
+    'nemo@icloud.com', 'nemo@yahoo.com', 'nemo@fastmail.com', 'nemo@pm.me', 'nemo@aol.com', 'nemo@zoho.com',
+    'marcus@deco-associates.example', '', 'not-an-email', null,
+  ]) {
+    const got = describeProvider(address);
+    assert.equal(got.signIn, null, JSON.stringify(address));
+    assert.ok('signIn' in got, `${JSON.stringify(address)}: the field is always present, so the form never reads undefined`);
+  }
+});
+
+test('discoverProvider carries the sign-in through an MX answer: Workspace is Google, 365 is Microsoft, the rest have none', async () => {
+  const mx = (exchange) => ({ resolveMx: async () => [{ priority: 10, exchange }], resolveSrv: async () => [] });
+  const workspace = await discoverProvider('nemo@custom.example', mx('aspmx.l.google.com.'));
+  assert.equal(workspace.signIn, 'google');
+  assert.equal(workspace.label, 'Google Workspace');
+  const tenant = await discoverProvider('nemo@custom.example', mx('custom-example.mail.protection.outlook.com.'));
+  assert.equal(tenant.signIn, 'microsoft');
+  assert.equal(tenant.label, 'Microsoft 365');
+  assert.equal((await discoverProvider('nemo@custom.example', mx('in1-smtp.messagingengine.com.'))).signIn, null);
+
+  const srv = { resolveMx: async () => [], resolveSrv: async () => [{ priority: 0, name: 'imap.custom.example', port: 993 }] };
+  const own = await discoverProvider('nemo@custom.example', srv);
+  assert.equal(own.via, 'srv');
+  assert.equal(own.signIn, null);
+  const nothing = {
+    resolveMx: async () => { throw Object.assign(new Error('ENOTFOUND'), { code: 'ENOTFOUND' }); },
+    resolveSrv: async () => { throw Object.assign(new Error('ENOTFOUND'), { code: 'ENOTFOUND' }); },
+  };
+  const guessed = await discoverProvider('nemo@custom.example', nothing);
+  assert.equal(guessed.via, 'guess');
+  assert.equal(guessed.signIn, null);
+});
+
+test('accessTokenFor on a Google account renews at Google with the stored secret, keeps the refresh token, and honours the cache', async () => {
+  const google = await startMockGoogleToken({ secret: 'GOCSPX-fixture-not-a-real-secret' });
+  const ref = freshRef();
+  const secretRef = `oauth.google.t${refSeq}`;
+  try {
+    await setSecret(secretRef, 'GOCSPX-fixture-not-a-real-secret');
+    await saveOAuthTokens(ref, { accessToken: 'spent', refreshToken: '1//refresh-fixture', expiresAt: longAgo() });
+    const args = { provider: 'google', clientId: GOOGLE_CLIENT_ID, clientSecretRef: secretRef, tokenRef: ref, tokenUrl: google.tokenUrl };
+
+    const first = await accessTokenFor(args);
+    assert.equal(first.accessToken, 'ya29.access-1');
+    assert.equal(first.refreshed, true);
+    assert.equal(google.seen.length, 1);
+    const { form } = google.seen[0];
+    assert.equal(form.grant_type, 'refresh_token');
+    assert.equal(form.client_id, GOOGLE_CLIENT_ID);
+    assert.equal(form.client_secret, 'GOCSPX-fixture-not-a-real-secret', 'the secret came from the store, not from the caller');
+    assert.equal(form.refresh_token, '1//refresh-fixture');
+    assert.equal(form.scope, undefined, 'Google is not re-asked for a scope on a refresh');
+
+    // Written back in the one shape every reader of the ref understands.
+    const stored = await loadOAuthTokens(ref);
+    assert.equal(stored.kind, 'xoauth2');
+    assert.equal(stored.accessToken, 'ya29.access-1');
+    assert.equal(stored.refreshToken, '1//refresh-fixture', 'Google does not rotate, so the one that was sent is kept');
+    assert.equal(stored.scope, 'https://mail.google.com/');
+
+    // Fresh for an hour: no request.
+    const second = await accessTokenFor(args);
+    assert.equal(second.accessToken, 'ya29.access-1');
+    assert.equal(second.refreshed, false);
+    assert.equal(google.seen.length, 1);
+
+    // Spent a minute early, so a session never races its own expiry.
+    const third = await accessTokenFor({ ...args, now: Date.parse(stored.expiresAt) - 30_000 });
+    assert.equal(third.accessToken, 'ya29.access-2');
+    assert.equal(third.refreshed, true);
+    assert.equal(google.seen.length, 2);
+  } finally {
+    await google.close();
+  }
+});
+
+test('a Google client with no secret sends none, and the refresh token goes to Google or loopback and nowhere else', async () => {
+  const google = await startMockGoogleToken();
+  const ref = freshRef();
+  try {
+    await saveOAuthTokens(ref, { accessToken: 'spent', refreshToken: '1//refresh-fixture', expiresAt: longAgo() });
+    const got = await accessTokenFor({
+      provider: 'google', clientId: GOOGLE_CLIENT_ID, clientSecretRef: `oauth.google.nothing${refSeq}`, tokenRef: ref, tokenUrl: google.tokenUrl,
+    });
+    assert.equal(got.accessToken, 'ya29.access-1');
+    assert.equal(google.seen[0].form.client_secret, undefined, 'nothing under the ref, nothing on the wire');
+
+    assert.equal(GOOGLE_TOKEN_ORIGIN, 'https://oauth2.googleapis.com');
+    assert.equal(assertGoogleTokenEndpoint(null), 'https://oauth2.googleapis.com/token');
+    assert.equal(assertGoogleTokenEndpoint(''), 'https://oauth2.googleapis.com/token');
+    assert.equal(assertGoogleTokenEndpoint(google.tokenUrl), google.tokenUrl, 'loopback keeps its path');
+    for (const bad of [
+      'https://oauth2.googleapis.com.evil.example/token',
+      'https://login.microsoftonline.com/common/oauth2/v2.0/token',
+      'http://oauth2.googleapis.com/token',
+      'https://accounts.google.com/o/oauth2/token',
+      'not a url',
+    ]) {
+      assert.throws(() => assertGoogleTokenEndpoint(bad), (err) => err.code === 'bad_endpoint', bad);
+    }
+    await assert.rejects(
+      () => accessTokenFor({
+        provider: 'google', clientId: GOOGLE_CLIENT_ID, tokenRef: ref,
+        tokenUrl: 'https://oauth2.googleapis.com.evil.example/token', now: Date.now() + 7_200_000,
+      }),
+      (err) => err.code === 'bad_endpoint',
+    );
+    assert.equal(google.seen.length, 1, 'and the refusal came before any request');
+
+    // A GUID check would refuse every real Google client id.
+    assert.equal(normalizeGoogleClientId(`  ${GOOGLE_CLIENT_ID} `), GOOGLE_CLIENT_ID);
+    for (const bad of ['', '   ', null, 'has space.apps.googleusercontent.com', 'a'.repeat(201), 'tab\tid']) {
+      assert.throws(() => normalizeGoogleClientId(bad), (err) => err.code === 'not_configured', JSON.stringify(bad));
+    }
+  } finally {
+    await google.close();
+  }
+});
+
+test('a revoked Google grant is the reconnect case, and an account with no provider is still Microsoft', async () => {
+  const google = await startMockGoogleToken({ refreshToken: '1//the-live-one' });
+  const entra = await startMockEntra();
+  try {
+    const ref = freshRef();
+    await saveOAuthTokens(ref, { accessToken: 'spent', refreshToken: '1//revoked', expiresAt: longAgo() });
+    await assert.rejects(
+      () => accessTokenFor({ provider: 'google', clientId: GOOGLE_CLIENT_ID, tokenRef: ref, tokenUrl: google.tokenUrl }),
+      (err) => {
+        assert.ok(err instanceof ImapOAuthError);
+        assert.equal(err.code, 'invalid_grant');
+        assert.equal(err.reconnect, true, 'the flag every caller acts on: connect the account again');
+        return true;
+      },
+    );
+    await assert.rejects(
+      () => accessTokenFor({ provider: 'google', clientId: GOOGLE_CLIENT_ID, tokenRef: freshRef(), tokenUrl: google.tokenUrl }),
+      (err) => err.code === 'not_connected' && err.reconnect === true && /Google/.test(err.message),
+    );
+
+    // No provider: the block is read as it always was — a GUID, against Entra.
+    const msRef = freshRef();
+    await saveOAuthTokens(msRef, { accessToken: 'spent', refreshToken: 'refresh-0', expiresAt: longAgo() });
+    const ms = await accessTokenFor({ clientId: CLIENT_ID, tenantId: 'common', tokenRef: msRef, endpoint: entra.origin });
+    assert.equal(ms.accessToken, 'access-token-1');
+    assert.equal(entra.seen.at(-1).path, '/common/oauth2/v2.0/token');
+    await assert.rejects(
+      () => accessTokenFor({ clientId: GOOGLE_CLIENT_ID, tokenRef: msRef, endpoint: entra.origin }),
+      (err) => err.code === 'not_configured',
+      'with no provider, a Google-shaped id is a paste that went wrong',
+    );
+  } finally {
+    await entra.close();
+    await google.close();
+  }
+});
+
+test('fetchRecent signs in to a Google mailbox with the stored grant over XOAUTH2, and the session is otherwise the Microsoft one', async () => {
+  const google = await startMockGoogleToken();
+  const ref = freshRef();
+  const headers = [
+    'From: Marcus Reyes <marcus@riverstone.example>',
+    'Subject: Change order',
+    'Date: Tue, 11 Aug 2026 09:15:00 -0400',
+    'Message-ID: <g1@riverstone.example>',
+    '',
+    '',
+  ].join('\r\n');
+  const box = mailbox([{
+    uid: 701,
+    internalDate: '11-Aug-2026 09:15:00 -0400',
+    structure: PLAIN_TEXT_STRUCTURE,
+    headers,
+    parts: { 1: 'Numbers are firm.\r\n' },
+  }]);
+  const handler = xoauth2Session({ user: 'nemo@gmail.com', token: 'ya29.access-1', extra: box });
+  const progress = [];
+
+  try {
+    await saveOAuthTokens(ref, { accessToken: 'spent', refreshToken: '1//refresh-fixture', expiresAt: longAgo() });
+    await withServer({ greeting: '* OK Zelos mock ready', onCommand: handler }, async ({ port, received }) => {
+      const messages = await fetchRecent({
+        host: '127.0.0.1',
+        port,
+        secure: false,
+        user: 'nemo@gmail.com',
+        auth: 'xoauth2',
+        oauth: { provider: 'google', clientId: GOOGLE_CLIENT_ID, tokenRef: ref, tokenUrl: google.tokenUrl },
+        timeoutMs: 5000,
+        onProgress: (p) => progress.push(p.message),
+      });
+      assert.equal(messages.length, 1);
+      assert.equal(messages[0].subject, 'Change order');
+      assert.equal(handler.seen.decoded, `user=nemo@gmail.com${SOH}auth=Bearer ya29.access-1${SOH}${SOH}`);
+      const sent = commands(received);
+      assert.ok(sent.includes('AUTHENTICATE XOAUTH2'));
+      assert.ok(!sent.some((c) => /^LOGIN\b/i.test(c)), 'a Google account never tries a password');
+      assert.ok(sent.some((c) => c === 'EXAMINE "INBOX"'), 'and the rest of the session is unchanged');
+    });
+    assert.ok(progress.includes('Renewing the Google sign-in'), progress.join(' | '));
+    assert.equal(google.seen.length, 1);
+
+    // The test button takes the same path, and a dead grant comes back as
+    // "connect it again" rather than "check your password".
+    const dead = await startMockGoogleToken({ refreshToken: '1//some-other-grant' });
+    try {
+      const result = await testConnection({
+        host: '127.0.0.1', port: 1, secure: false, user: 'nemo@gmail.com', auth: 'xoauth2',
+        oauth: { provider: 'google', clientId: GOOGLE_CLIENT_ID, tokenRef: ref, tokenUrl: dead.tokenUrl, now: Date.now() + 7_200_000 },
+        timeoutMs: 1000,
+      });
+      assert.equal(result.ok, false);
+      assert.equal(result.reconnect, true);
+      assert.match(result.error, /invalid_grant/);
+    } finally {
+      await dead.close();
+    }
+  } finally {
+    await google.close();
   }
 });
