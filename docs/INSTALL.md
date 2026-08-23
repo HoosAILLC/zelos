@@ -4,6 +4,15 @@ There are three ways to run Zelos, and all three run **the same program**. The
 desktop app is not a different Zelos — it is the same core, in a window, with
 a tray icon.
 
+**Not a programmer?** You want the desktop app. Download it for your Mac or
+Windows PC from [zelos-app.netlify.app](https://zelos-app.netlify.app/#download).
+The first time you open it your computer shows a warning; that is because
+nobody has paid the yearly fee that makes the warning go away, not because
+anything is wrong, and
+[Installing on macOS](#installing-on-macos--and-what-you-will-actually-see) and
+[Installing on Windows](#installing-on-windows--and-what-you-will-actually-see)
+below say what to click. The rest of this page is for people who type commands.
+
 |  | `npx zelos-app` | Run from source | Desktop app |
 |---|---|---|---|
 | What you install | nothing permanent | Node.js | a `.dmg` or a `.exe` |
@@ -116,6 +125,10 @@ faulty.
 ## Path 2 — Run it from source
 
 ### What you need
+
+This path is for people who already type commands. If that is not you, the
+desktop app in [Path 3](#path-3--the-desktop-app) is the same program in a
+window — take that instead.
 
 **Node.js 22.16 or newer, or 24 or newer** — and the gap in the middle is real,
 not a typo. Zelos keeps everything in the SQLite built into Node, and its index
@@ -279,6 +292,14 @@ the top-level `package.json`, which has no `dependencies` field at all.
 
 ## Installing on macOS — and what you will actually see
 
+**In plain English first.** Your Mac shows a warning the first time you open
+Zelos because we have not paid Apple's yearly developer fee — not because
+anything is wrong. The program is free, runs only on your computer, and anyone
+can read its code. Here is what to click, once: press **Done** on the warning
+(not *Move to Trash*), then open **System Settings → Privacy & Security**,
+scroll to the bottom, and press **Open Anyway**. Everything below this paragraph
+is the technical explanation of why.
+
 **These builds are ad-hoc signed and not notarized**, and the difference between
 those two words is the whole of this section.
 
@@ -346,6 +367,12 @@ the signature.
 ---
 
 ## Installing on Windows — and what you will actually see
+
+**In plain English first.** Windows shows a blue box that says **Windows
+protected your PC** the first time you run the installer. Click **More info**,
+then **Run anyway**. It appears because we have not paid the yearly fee for the
+stamp that makes it go away — not because anything is wrong. Everything below
+this paragraph is the technical explanation of why.
 
 **These builds are not signed at all** — not even ad-hoc. There is no signing
 configuration in the `win` block of `desktop/package.json`, so nothing is
