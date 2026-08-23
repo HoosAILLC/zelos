@@ -104,7 +104,7 @@ Modified` **does not count against the 5,000**. On a quiet day, 46 of 48 daily
 polls are 304s. GitHub also states a floor between polls in an `X-Poll-Interval`
 header, in seconds, on every response including the 304s — Zelos carries that
 number in its cursor and honours it before a socket exists, which is what stops
-the **Sweep now** button from being a hammer.
+the **Check now** button from being a hammer.
 
 Zelos declares its own budget of 120 calls an hour against GitHub's 5,000. That
 is sixty times the expected spend and exists only to cap a runaway — a retry

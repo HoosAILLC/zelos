@@ -454,7 +454,7 @@ async function checkSecrets(deps, home) {
 }
 
 async function checkModelKey(config, deps) {
-  const label = 'Model key';
+  const label = 'AI key';
   const model = config?.model ?? {};
   const address = String(model.baseUrl ?? '').trim().replace(/\/+$/, '');
   // A model nobody has chosen yet means "not set up", not "broken". The
@@ -463,7 +463,7 @@ async function checkModelKey(config, deps) {
   const chosen = String(model.model ?? '').trim();
 
   if (!address) {
-    return { result: check('model.key', label, 'skip', 'No model endpoint is set, so there is no key to check.'), key: null };
+    return { result: check('model.key', label, 'skip', 'No AI service has been chosen yet, so there is no key to check.'), key: null };
   }
   if (isLocalAddress(address)) {
     return {
@@ -475,8 +475,8 @@ async function checkModelKey(config, deps) {
     return {
       result: check(
         'model.key', label, chosen ? 'fail' : 'warn',
-        `${address} is not on this machine, so it needs an API key, and no place to keep one is configured.`,
-        'Open Settings → Model, pick your provider again and save. That sets up where the key is stored.',
+        `This AI service is not on this computer, so it needs a key, and Zelos has nowhere set up to keep one. For experts: ${address} has no keyRef.`,
+        'Open Settings → AI, pick your AI service again and save. That sets up where the key is stored.',
       ),
       key: null,
     };
@@ -489,7 +489,7 @@ async function checkModelKey(config, deps) {
       result: check(
         'model.key', label, 'fail',
         `Zelos could not read the key it stored for ${model.keyRef}: ${errorText(err)}`,
-        'See the secret store line above — that is where this failed. Re-entering the key in Settings → Model usually settles it.',
+        'See the secret store line above — that is where this failed. Re-entering the key in Settings → AI usually settles it.',
       ),
       key: null,
     };
@@ -499,21 +499,21 @@ async function checkModelKey(config, deps) {
       result: check(
         'model.key', label, chosen ? 'fail' : 'warn',
         chosen
-          ? `No API key is stored for ${address}, so every sweep will fail before it starts.`
-          : `Zelos has not been pointed at a model yet, and no API key is stored for ${address}.`,
-        'Open Settings → Model and paste your provider key. Zelos puts it in your system secret store — it is never written into the settings file, and it never appears in a log. If you would rather nothing left this machine at all, run Ollama or LM Studio and pick that instead; local models need no key.',
+          ? `No key has been saved for this AI service, so every check will fail before it starts. For experts: the service is ${address}.`
+          : `No AI has been chosen yet, and no key has been saved for the AI service. For experts: the service is ${address}.`,
+        'Open Settings → AI and paste the key your AI service gave you. Zelos keeps it in this computer’s own password store — it is never written into the settings file, and it never appears in a log. If you would rather nothing left this computer at all, run Ollama or LM Studio and pick that instead; an AI on this computer needs no key.',
       ),
       key: null,
     };
   }
   return {
-    result: check('model.key', label, 'pass', `A key is stored for ${address} under ${model.keyRef}.`),
+    result: check('model.key', label, 'pass', `A key is saved for this AI service. For experts: ${address}, under ${model.keyRef}.`),
     key,
   };
 }
 
 async function checkModelEndpoint(config, deps, { key, keyChecked, timeoutMs, signal }) {
-  const label = 'Model';
+  const label = 'AI';
   const model = config?.model ?? {};
   const address = String(model.baseUrl ?? '').trim().replace(/\/+$/, '');
   const chosen = String(model.model ?? '').trim();
@@ -521,14 +521,14 @@ async function checkModelEndpoint(config, deps, { key, keyChecked, timeoutMs, si
   if (!address) {
     return check(
       'model', label, 'fail',
-      'No model endpoint is set, so Zelos cannot think about anything it reads.',
-      'Open Zelos, go to Settings → Model, and pick a provider. If you want nothing to leave this machine at all, run Ollama or LM Studio and choose that.',
+      'No AI service has been chosen yet, so Zelos cannot think about anything it reads.',
+      'Open Zelos, go to Settings → AI, and pick an AI service. If you want nothing to leave this computer at all, run Ollama or LM Studio and choose that.',
     );
   }
   if (!keyChecked) {
     return check(
       'model', label, 'skip',
-      `Not checked — ${address} needs a key first (see above).`,
+      `Not checked — this AI service needs a key first (see above). For experts: ${address}.`,
       'Store the key, then run zelos doctor again.',
     );
   }
@@ -549,8 +549,8 @@ async function checkModelEndpoint(config, deps, { key, keyChecked, timeoutMs, si
     if (status === 401 || status === 403) {
       return check(
         'model', label, 'fail',
-        `${address} refused the stored key (HTTP ${status}).`,
-        'The key is wrong, revoked, or belongs to a different provider. Generate a fresh one in your provider\'s console and paste it into Settings → Model.',
+        `The AI service refused the stored key. For experts: ${address} answered HTTP ${status}.`,
+        'The key is wrong, has been cancelled, or belongs to a different AI service. Make a fresh one on your AI service’s website and paste it into Settings → AI.',
       );
     }
     if (status === 404 || status === 405) {
@@ -558,20 +558,20 @@ async function checkModelEndpoint(config, deps, { key, keyChecked, timeoutMs, si
       // reachable endpoint, which is what this check is actually asking.
       return check(
         'model', label, 'pass',
-        `${address} answered (it does not offer a model list, which is normal for some servers).`,
+        `The AI service answered. For experts: ${address} offers no model list, which is normal for some servers.`,
       );
     }
     if (status === 429) {
       return check(
         'model', label, 'warn',
-        `${address} answered, but is rate-limiting right now (HTTP 429).`,
-        'Nothing is misconfigured. Wait a minute and sweep again; if it never clears, check your plan limits with the provider.',
+        `The AI service answered, but is asking Zelos to slow down right now. For experts: ${address} answered HTTP 429.`,
+        'Nothing is set up wrong. Wait a minute and check again; if it never clears, check your plan limits with the AI service.',
       );
     }
     if (status && status >= 500) {
       return check(
         'model', label, 'warn',
-        `${address} answered with a server error (HTTP ${status}).`,
+        `The AI service answered with an error at its own end. For experts: ${address} answered HTTP ${status}.`,
         'That is their end, not yours. Try again shortly.',
       );
     }
@@ -579,8 +579,8 @@ async function checkModelEndpoint(config, deps, { key, keyChecked, timeoutMs, si
       'model', label, 'fail',
       errorText(err),
       local
-        ? `Nothing is listening at ${address}. Start your local model first — for Ollama that is: ollama serve — then run zelos doctor again. Check the port too: Ollama is 11434, LM Studio 1234, llama.cpp 8080.`
-        : `Zelos could not reach ${address}. Check the base URL in Settings → Model against your provider's documentation, and check this machine's internet connection.`,
+        ? `The AI program on this computer is not running. Start it first — for Ollama that is: ollama serve — then run zelos doctor again. For experts: nothing is listening at ${address}; check the port too — Ollama is 11434, LM Studio 1234, llama.cpp 8080.`
+        : `Zelos could not reach the AI service. Check this computer’s internet connection. For experts: check the base URL in Settings → AI (${address}) against the AI service’s documentation.`,
     );
   }
 
@@ -588,18 +588,18 @@ async function checkModelEndpoint(config, deps, { key, keyChecked, timeoutMs, si
     const sample = models.slice(0, 4).map((m) => m.id).join(', ');
     return check(
       'model', label, 'warn',
-      `${address} is reachable, but no model has been chosen yet, so sweeps will not run.`,
+      `The AI service answers, but which of its AIs to use has not been chosen yet, so checks will not run. For experts: ${address}.`,
       sample
-        ? `Open Settings → Model and pick one. This endpoint offers: ${sample}${models.length > 4 ? ', and others' : ''}.`
-        : 'Open Settings → Model and pick one.',
+        ? `Open Settings → AI and pick one. This service offers: ${sample}${models.length > 4 ? ', and others' : ''}.`
+        : 'Open Settings → AI and pick one.',
     );
   }
   if (models.length && !models.some((m) => m.id === chosen)) {
     const sample = models.slice(0, 4).map((m) => m.id).join(', ');
     return check(
       'model', label, 'warn',
-      `${address} is reachable, but does not list "${chosen}".`,
-      `Either the name has a typo or the model has not been pulled. Available here: ${sample}${models.length > 4 ? ', and others' : ''}. ${local ? `To fetch it in Ollama: ollama pull ${chosen}` : 'Pick one of those in Settings → Model.'}`,
+      `The AI service answers, but does not list "${chosen}". For experts: ${address}.`,
+      `Either the name has a typo or that AI has not been downloaded yet. Available here: ${sample}${models.length > 4 ? ', and others' : ''}. ${local ? `To fetch it in Ollama: ollama pull ${chosen}` : 'Pick one of those in Settings → AI.'}`,
     );
   }
   return check(

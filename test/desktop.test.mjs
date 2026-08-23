@@ -335,12 +335,12 @@ describe('WindowState', () => {
 describe('menus', () => {
   const labels = (template) => template.map((item) => item.label ?? item.role ?? item.type);
 
-  it('gives the tray exactly Sweep now, Open Zelos and Quit', () => {
+  it('gives the tray exactly Check now, Open Zelos and Quit', () => {
     const fired = [];
     const template = buildTrayMenuTemplate({
       actions: { sweepNow: () => fired.push('sweep'), openBoard: () => fired.push('open'), quit: () => fired.push('quit') },
     });
-    assert.deepEqual(labels(template), ['Sweep now', 'Open Zelos', 'separator', 'Quit Zelos']);
+    assert.deepEqual(labels(template), ['Check now', 'Open Zelos', 'separator', 'Quit Zelos']);
     for (const item of template) item.click?.();
     assert.deepEqual(fired, ['sweep', 'open', 'quit']);
   });
@@ -915,14 +915,14 @@ describe('the shell, booted against a stub Electron', () => {
     assert.ok(fs.existsSync(tray.image.file), `tray icon missing: ${tray.image.file}`);
     assert.deepEqual(
       tray.menu.template.map((item) => item.label ?? item.type),
-      ['Sweep now', 'Open Zelos', 'separator', 'Quit Zelos'],
+      ['Check now', 'Open Zelos', 'separator', 'Quit Zelos'],
     );
     assert.match(tray.tooltip, /^Zelos — http:\/\/127\.0\.0\.1:/);
     assert.ok(recorded.applicationMenu, 'no application menu was installed');
   });
 
   it('runs a sweep from the tray, against the supervisor and not a socket', async () => {
-    const sweep = recorded.trays[0].menu.template.find((item) => item.label === 'Sweep now');
+    const sweep = recorded.trays[0].menu.template.find((item) => item.label === 'Check now');
     sweep.click();
     assert.equal(booted.zelos.sweepStatus().running, true, 'the tray did not reach the sweep supervisor');
 

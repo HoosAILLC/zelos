@@ -1773,10 +1773,8 @@ textarea.input:focus,
   color: var(--on-accent);
   background: var(--accent);
   border-radius: 999px;
-  font-size: 0.625rem;
+  font-size: 0.6875rem;
   font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.1em;
 }
 
 .scope-state { font-size: 0.8125rem; color: var(--ink-3); }

@@ -291,7 +291,7 @@ function toolbar(keys, rerender) {
       'aria-label': ariaLabel,
       ...(reachable ? {} : {
         disabled: true,
-        title: `Zelos is holding ${served.from} to ${served.to}. There is nothing loaded past that — a sweep moves the window.`,
+        title: `Zelos is holding ${served.from} to ${served.to}. There is nothing loaded past that — a check moves the window.`,
       }),
       onClick: () => {
         if (!reachable) return;
@@ -374,7 +374,7 @@ function chip({ event, start, end, col, cols }, { today, nowMinutes, compact }) 
  * one that gets believed.
  */
 const NOT_LOADED_TITLE =
-  'Zelos has not loaded this day. The board carries a window around today; sweep, or come back when it has moved.';
+  'Zelos has not loaded this day. The board carries a window around today; check your mail, or come back when it has moved.';
 
 function notLoadedMark({ block = false } = {}) {
   return el('span', {
@@ -723,7 +723,7 @@ export function renderCalendar(ctx) {
   if ((state.config?.calendars?.length || 0) === 0 && !state.board.events.length) {
     body.appendChild(emptyState({
       title: 'No calendar connected',
-      detail: 'Add an .ics subscription, a CalDAV account or a local file in Settings, and your week appears here. The grid is drawn from the times in your calendar, in your calendar’s own zone.',
+      detail: 'Add your calendar in Settings, and your week appears here. Times are kept exactly as your calendar has them, so an appointment at 2pm stays at 2pm.',
       action: button('Connect a calendar', { class: 'btn solid', onClick: () => ctx.navigate('#/settings/calendars') }),
     }));
     return body;

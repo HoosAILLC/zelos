@@ -873,7 +873,63 @@ describe('doctor', () => {
     const model = byId(report, 'model');
     assert.equal(model.status, 'fail');
     assert.match(model.detail, /refused the stored key/);
-    assert.match(model.action, /Settings → Model/);
+    assert.match(model.action, /Settings → AI/);
+    assert.ok(!/Settings → Model/.test(model.action), 'the tab is labelled "AI" now, and the doctor still sends people to "Model"');
+  });
+
+  test('the doctor talks about the AI service in plain words first, and keeps the address for the expert', async () => {
+    // The audit's reader ran `zelos doctor` and met "model endpoint", "base
+    // URL" and "provider" before any sentence told them what to do. Every
+    // sentence about the AI now opens plain and keeps the address, the HTTP
+    // status and the base URL behind "For experts:" — present, never first.
+    process.env.ZELOS_HOME = freshHome({
+      model: { protocol: 'anthropic', baseUrl: 'https://api.anthropic.com', model: 'claude-opus-5', keyRef: 'model.default' },
+    });
+    const report = await diagnose({
+      deps: {
+        ...SILENT_DEPS,
+        getSecret: async () => 'sk-stored-key',
+        listModels: async () => { throw Object.assign(new Error('getaddrinfo ENOTFOUND api.anthropic.com'), { status: null }); },
+      },
+    });
+    const model = byId(report, 'model');
+    assert.equal(model.status, 'fail');
+    assert.equal(model.label, 'AI', 'the report line is labelled the way the Settings tab is');
+    assert.equal(byId(report, 'model.key').label, 'AI key');
+    assert.match(model.action, /^Zelos could not reach the AI service\. Check this computer’s internet connection\. For experts: check the base URL in Settings → AI \(https:\/\/api\.anthropic\.com\)/);
+
+    // A fresh install: the defaults point at Claude with nothing chosen and
+    // no key, and these are the two lines it prints.
+    process.env.ZELOS_HOME = freshHome({});
+    const fresh = await diagnose({ deps: SILENT_DEPS });
+    assert.equal(byId(fresh, 'model.key').status, 'warn');
+    assert.equal(byId(fresh, 'model.key').detail, 'No AI has been chosen yet, and no key has been saved for the AI service. For experts: the service is https://api.anthropic.com.');
+    assert.match(byId(fresh, 'model.key').action, /^Open Settings → AI and paste the key your AI service gave you\./);
+    assert.equal(byId(fresh, 'model').status, 'skip');
+    assert.match(byId(fresh, 'model').detail, /^Not checked — this AI service needs a key first \(see above\)\. For experts: https:\/\/api\.anthropic\.com\.$/);
+
+    // A key, a service that answers, and still no choice of which AI.
+    process.env.ZELOS_HOME = freshHome({});
+    const unchosen = await diagnose({
+      deps: {
+        ...SILENT_DEPS,
+        getSecret: async () => 'sk-stored-key',
+        listModels: async () => [{ id: 'claude-opus-5', label: 'claude-opus-5' }],
+      },
+    });
+    assert.equal(byId(unchosen, 'model').status, 'warn');
+    assert.match(byId(unchosen, 'model').detail, /^The AI service answers, but which of its AIs to use has not been chosen yet/);
+    assert.equal(byId(unchosen, 'model').action, 'Open Settings → AI and pick one. This service offers: claude-opus-5.');
+
+    // The words a person was never meant to meet first, across every AI line.
+    for (const r of [report, fresh, unchosen]) {
+      for (const c of r.checks.filter((x) => x.id === 'model' || x.id === 'model.key')) {
+        for (const text of [c.detail, c.action || '']) {
+          const plain = text.split('For experts:')[0];
+          assert.doesNotMatch(plain, /endpoint|base URL|provider|model id|pulled|Settings → Model/i, `${c.id}: "${text}" leads with a word for the expert`);
+        }
+      }
+    }
   });
 
   test('a model the endpoint does not offer is a warning that lists what it does', async () => {
@@ -1086,7 +1142,7 @@ describe('doctor', () => {
     const report = await diagnose({ deps: SILENT_DEPS });
     const text = formatReport(report);
     // Only the line that opens an action carries the marker in that column;
-    // "Settings → Model" inside a sentence must not be counted.
+    // "Settings → AI" inside a sentence must not be counted.
     const arrows = (text.match(/^ {7}→ {2}/gm) ?? []).length;
     const actions = report.checks.filter((c) => c.action).length;
     assert.equal(arrows, actions, 'every action line should be marked, and nothing else should be');

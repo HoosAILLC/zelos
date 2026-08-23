@@ -141,13 +141,13 @@ async function ask(question) {
           write(String(data?.text ?? ''));
         } else if (event === 'error') {
           failed = true;
-          write(`\n\n${String(data?.error || 'the model stopped answering')}`);
+          write(`\n\n${String(data?.error || 'the AI stopped answering')}`);
           answer.classList.add('is-bad');
         }
       },
     });
     if (!started) {
-      answer.textContent = 'The model returned nothing.';
+      answer.textContent = 'The AI returned nothing.';
       answer.classList.remove('is-waiting');
     }
   } catch (err) {
@@ -156,7 +156,7 @@ async function ask(question) {
       answer.classList.remove('is-waiting');
       answer.classList.add('is-bad');
       answer.textContent = err instanceof ApiError && err.status === 409
-        ? 'No model is configured yet. Pick one in Settings and ask again.'
+        ? 'No AI has been chosen yet. Pick one under Settings → AI and ask again.'
         : err.message;
     }
   } finally {
@@ -168,7 +168,7 @@ async function ask(question) {
       if (gotAnswer) {
         noteSlot.appendChild(el('p', { class: 'exchange-note mono', text: 'Stopped — this is as far as it got.' }));
       } else {
-        answer.textContent = 'Stopped before the model said anything.';
+        answer.textContent = 'Stopped before the AI said anything.';
       }
     }
     answer.setAttribute('aria-busy', 'false');
@@ -233,7 +233,7 @@ function build() {
   transcript = el('div', { class: 'transcript' });
 
   root = el('div', { class: 'view view-ask' }, [
-    el('p', { class: 'ask-lede', text: 'Ask about your own mail, calendar and notes. The answer is grounded in what Zelos has indexed on this machine — and it lists what it read.' }),
+    el('p', { class: 'ask-lede', text: 'Ask about your own mail, calendar and notes. The answer comes from what Zelos has read on this computer — and it lists what it looked at.' }),
     form,
     meander(),
     transcript,
@@ -246,9 +246,9 @@ export function renderAsk(ctx) {
 
   if (!state.health?.model?.configured) {
     return el('div', { class: 'view view-ask' }, emptyState({
-      title: 'Ask needs a model',
-      detail: 'Questions are answered by the model you choose — an API you hold the key to, or a runtime on this machine. Nothing is asked of anything you have not configured.',
-      action: button('Choose a model', { class: 'btn solid', onClick: () => navigateTo('#/settings/model') }),
+      title: 'Ask needs an AI',
+      detail: 'Questions are answered by the AI you choose — one you hold the key to, or one running on this computer. Nothing is asked of anything you have not set up.',
+      action: button('Choose an AI', { class: 'btn solid', onClick: () => navigateTo('#/settings/model') }),
     }));
   }
   return root;

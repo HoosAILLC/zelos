@@ -213,7 +213,7 @@ function resultsRegion() {
   if (found.status === 'idle') {
     return emptyState({
       title: 'Nothing searched yet',
-      detail: 'A name, a subject line, an invoice number, a word you half remember. Everything the sweeps have read is in here — mail, calendar, the items the model raised and the notes you kept.',
+      detail: 'A name, a subject line, an invoice number, a word you half remember. Everything Zelos has read is in here — mail, calendar, the things it flagged and the notes you kept.',
     });
   }
   // The results of the query before this one stay on screen while the next one
@@ -226,7 +226,7 @@ function resultsRegion() {
   if (!found.results.length) {
     return emptyState({
       title: `Nothing matched “${found.query}”`,
-      detail: 'The index holds what the sweeps have read, and only that. A word from the subject line, or a name, usually finds more than a whole phrase does.',
+      detail: 'Zelos can only find what it has read. A word from the subject line, or a name, usually finds more than a whole phrase does.',
     });
   }
   const board = { items: state.board.items || [], events: state.board.events || [] };

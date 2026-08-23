@@ -40,7 +40,7 @@ import { api, isMissingRoute, request } from '../lib/api.js';
 // A cycle: settings.js imports this panel, this panel imports its form helpers.
 // Both sides are `export function` declarations, which are initialised before
 // either module body runs, so nothing here is touched before it exists.
-import { field, input, statusLine } from './settings.js';
+import { field, fold, input, statusLine } from './settings.js';
 import { formatDay, formatTime, humanDelta } from '../lib/time.js';
 import { plural } from '../lib/format.js';
 
@@ -199,16 +199,16 @@ function exposureLine(v) {
   const on = v.scopeInfo.filter((s) => v.effective[s.id]).map(nameOf);
   if (!v.enabled) {
     return on.length
-      ? `Nothing is exposed. The switch is off, so the ${plural(on.length, 'scope')} ticked below do nothing until you turn it on.`
-      : 'Nothing is exposed. The switch is off and no scope is ticked.';
+      ? `Nothing is shared. The switch is off, so the ${plural(on.length, 'box')} ticked below do nothing until you switch it on.`
+      : 'Nothing is shared. The switch is off and no box is ticked.';
   }
   if (!on.length) {
-    return 'The switch is on, but no scope is ticked, so every tool call comes back empty. That is a working configuration — just not a useful one.';
+    return 'The switch is on, but no box is ticked, so the other program gets nothing when it asks. That works — it is just not useful.';
   }
   if (!v.tokens.length) {
-    return `${capitalise(listWords(on))} would be readable over HTTP, but no token has been minted yet. A client spawning Zelos directly can already read them.`;
+    return `${capitalise(listWords(on))} could be read, but no key has been created yet. (For experts: a program that starts Zelos itself needs no key, and can already read them.)`;
   }
-  return `${capitalise(listWords(on))} can be read by ${plural(v.tokens.length, 'token')}, up to ${plural(v.maxRows, 'row')} at a time, until you turn this off.`;
+  return `${capitalise(listWords(on))} can be read with ${plural(v.tokens.length, 'key')}, up to ${plural(v.maxRows, 'row')} at a time, until you switch this off.`;
 }
 
 /* ---------------------------------------------------------- config blocks */
@@ -285,7 +285,7 @@ function scopeRow(scope, { ticked, effective, grantedBy, readOnly, armed, onTogg
   const head = el('span', { class: 'scope-head' }, [
     el('span', { class: 'scope-label', text: scope.label }),
     el('code', { class: 'mono scope-name', text: scope.id }),
-    scope.exposing ? el('span', { class: 'scope-mark', text: 'the most exposing choice' }) : null,
+    scope.exposing ? el('span', { class: 'scope-mark', text: 'The most exposing choice' }) : null,
   ]);
 
   const body = [
@@ -325,7 +325,7 @@ function scopeRow(scope, { ticked, effective, grantedBy, readOnly, armed, onTogg
   /* --- mail.bodies ------------------------------------------------------ */
   const stateChip = el('span', {
     class: `scope-state${ticked ? ' is-on' : ''}`,
-    text: ticked ? 'on — bodies are being handed over' : 'off — bodies are withheld',
+    text: ticked ? 'on — the full text of your mail is being shared' : 'off — the full text is kept back',
   });
 
   let action = null;
@@ -334,7 +334,7 @@ function scopeRow(scope, { ticked, effective, grantedBy, readOnly, armed, onTogg
   } else if (armed) {
     action = el('div', { class: 'scope-confirm', role: 'group', 'aria-label': 'Confirm full message text' }, [
       el('p', { class: 'scope-confirm-q', text: 'Hand over the full text of your mail?' }),
-      el('p', { class: 'scope-confirm-what', text: 'From the moment you confirm, anything Zelos has let in can read the whole of every message it has indexed, as often as it likes, until you turn this off. It grants mail headers with it.' }),
+      el('p', { class: 'scope-confirm-what', text: 'From the moment you confirm, any program you have let in can read the whole of every message Zelos has stored, as often as it likes, until you switch this off. It shares the mail headers too.' }),
       el('div', { class: 'row-inline' }, [
         button('Yes — hand over full message text', {
           class: 'btn solid',
@@ -362,10 +362,10 @@ function scopeRow(scope, { ticked, effective, grantedBy, readOnly, armed, onTogg
 /* ------------------------------------------------------------- token rows */
 
 function tokenRow(token, { armed, onArm, onCancel, onRevoke }) {
-  const label = typeof token.label === 'string' && token.label ? token.label : 'unnamed token';
+  const label = typeof token.label === 'string' && token.label ? token.label : 'unnamed key';
   const created = token.createdAt
-    ? `minted ${formatDay(token.createdAt)}${formatTime(token.createdAt) ? ` at ${formatTime(token.createdAt)}` : ''}`
-    : 'minted at an unrecorded time';
+    ? `created ${formatDay(token.createdAt)}${formatTime(token.createdAt) ? ` at ${formatTime(token.createdAt)}` : ''}`
+    : 'created at an unrecorded time';
   const used = token.lastUsedAt ? `last used ${humanDelta(token.lastUsedAt)}` : 'never used';
 
   return el('div', { class: 'ai-token' }, [
@@ -376,7 +376,7 @@ function tokenRow(token, { armed, onArm, onCancel, onRevoke }) {
     el('p', { class: 'ai-token-meta', text: `${created} · ${used}` }),
     armed
       ? el('div', { class: 'ai-token-confirm', role: 'group', 'aria-label': `Confirm revoking ${label}` }, [
-        el('p', { class: 'ai-token-confirm-q', text: `Revoke ${label}? Anything using it stops working the moment you do, and the value cannot be recovered.` }),
+        el('p', { class: 'ai-token-confirm-q', text: `Revoke ${label}? The program using it stops working the moment you do, and the key cannot be brought back.` }),
         el('div', { class: 'row-inline' }, [
           button('Revoke it', { class: 'btn solid', 'data-confirm': 'true', onClick: onRevoke }),
           button('Keep it', { class: 'btn quiet', onClick: onCancel }),
@@ -521,9 +521,9 @@ export function aiAccessPanel() {
     run(() => api.saveAi({ enabled: next }), {
       message: next
         ? (on.length
-          ? `AI access is on. ${capitalise(listWords(on))} can now be read.`
-          : 'AI access is on, but no scope is ticked, so there is nothing to read yet.')
-        : 'AI access is off. Nothing is exposed, and a client holding a token is refused.',
+          ? `Sharing is on. ${capitalise(listWords(on))} can now be read.`
+          : 'Sharing is on, but no box is ticked, so there is nothing to read yet.')
+        : 'Sharing is off. Nothing is shared, and a program holding a key is turned away.',
     });
   }
 
@@ -537,7 +537,7 @@ export function aiAccessPanel() {
     const v = view();
     pending = null;
     const noun = capitalise(nameOf(scope));
-    const tail = v.enabled ? '' : ' The switch is still off, so nothing is exposed yet.';
+    const tail = v.enabled ? '' : ' The switch is still off, so nothing is shared yet.';
     const extra = scope.exposing && next ? ' Mail headers come with it.' : '';
     run(() => api.saveAi({ scopes: { [scope.id]: next } }), {
       message: `${noun} ${next ? 'is now readable' : 'is no longer readable'}.${extra}${tail}`,
@@ -546,15 +546,15 @@ export function aiAccessPanel() {
 
   async function mint(label) {
     if (!label) {
-      mintStatus.bad('Give the token a name first — you will want to know which client to revoke, months from now.');
+      mintStatus.bad('Give the key a name first — months from now you will want to know which program it belongs to.');
       return;
     }
-    mintStatus.working('Minting…');
+    mintStatus.working('Creating…');
     await run(() => api.mintAiToken(label), {
       onDone: (res) => {
         const value = typeof res?.value === 'string' ? res.value : '';
         if (!value) {
-          mintStatus.bad('The server minted a token but did not return its value, so there is nothing to copy. Revoke it below and try again.');
+          mintStatus.bad('Zelos made a key but did not hand back its value, so there is nothing to copy. Revoke it below and try again.');
           return;
         }
         revealed = { label, value, id: res?.token?.id || '' };
@@ -564,7 +564,7 @@ export function aiAccessPanel() {
         // asked for a new token.
         tokenDraft = null;
         mintStatus.clear();
-        say('Token minted. Copy it now — this is the only time it is shown.');
+        say('Key created. Copy it now — this is the only time it is shown.');
       },
     });
   }
@@ -576,8 +576,8 @@ export function aiAccessPanel() {
       onDone: (res) => {
         if (revealed && revealed.id && revealed.id === token.id) revealed = null;
         say(res?.revoked === false
-          ? 'That token was already gone.'
-          : `${token.label || 'That token'} is revoked. Anything still using it is refused.`);
+          ? 'That key was already gone.'
+          : `${token.label || 'That key'} is revoked. Anything still using it is turned away.`);
       },
     });
   }
@@ -594,16 +594,16 @@ export function aiAccessPanel() {
    */
   async function testConnection(value) {
     if (!value) {
-      testStatus.bad('Paste a token first — this checks a specific one, not the feature in general.');
+      testStatus.bad('Paste a key first — this checks one particular key, not the feature in general.');
       return;
     }
-    testStatus.working('Asking as a client would…');
+    testStatus.working('Asking the way that program would…');
     try {
       probe = await request('/api/ai/test', { method: 'POST', body: { token: value } });
       testStatus.clear();
       say(probe?.ok
-        ? 'The handshake worked. What is listed below is everything that client can reach.'
-        : 'That token would not connect. The reason is below.');
+        ? 'It connected. What is listed below is everything that program can reach.'
+        : 'That key would not connect. The reason is below.');
     } catch (err) {
       probe = null;
       testStatus.bad(`The test itself could not run: ${err.message}`);
@@ -624,7 +624,7 @@ export function aiAccessPanel() {
       onclick: () => setEnabled(!v.enabled),
     }, [
       el('span', { class: 'switch-track', 'aria-hidden': 'true' }, el('span', { class: 'switch-knob' })),
-      el('span', { class: 'switch-text', text: v.enabled ? 'AI access is on' : 'AI access is off' }),
+      el('span', { class: 'switch-text', text: v.enabled ? 'Sharing is on' : 'Sharing is off' }),
     ]);
 
     return el('div', { class: `ai-master${v.enabled ? ' is-on' : ''}` }, [
@@ -632,7 +632,7 @@ export function aiAccessPanel() {
       el('p', {
         class: 'ai-master-note',
         id: noteId,
-        text: 'Turning this on lets an AI client read the scopes you tick below, whenever it likes, without asking you again. Turning it off cuts every client off at once, token or no token.',
+        text: 'Switching this on lets the other AI program read whatever you tick below, whenever it likes, without asking you again. Switching it off cuts every program off at once, key or no key.',
       }),
       el('p', { class: 'ai-summary', text: exposureLine(v) }),
       live,
@@ -673,20 +673,20 @@ export function aiAccessPanel() {
   function revealBlock(v) {
     if (!revealed) return null;
     const onCopied = (text, tone) => { mintStatus[tone === 'good' ? 'good' : 'bad'](text); };
-    return el('div', { class: 'ai-reveal', role: 'group', 'aria-label': 'Your new token' }, [
-      el('p', { class: 'ai-reveal-eyebrow', text: `Token for ${revealed.label}` }),
+    return el('div', { class: 'ai-reveal', role: 'group', 'aria-label': 'Your new key' }, [
+      el('p', { class: 'ai-reveal-eyebrow', text: `Key for ${revealed.label}` }),
       el('p', { class: 'mono ai-reveal-value', text: revealed.value }),
       el('p', {
         class: 'ai-reveal-warn',
-        text: 'This is the only time Zelos will show this value. It went into the same store as your mail password, and no route in this app reads a secret back — if you lose it, revoke the token and mint another.',
+        text: 'This is the only time Zelos will show this key. It is kept in the same place as your mail password, and nothing in Zelos can read it back out — if you lose it, revoke this key and create another.',
       }),
       el('div', { class: 'row-inline' }, [
-        button('Copy the token', {
+        button('Copy the key', {
           class: 'btn solid',
           onClick: async () => {
             const ok = await copyText(revealed.value);
             mintStatus[ok ? 'good' : 'bad'](ok
-              ? 'Copied. Paste it into your client before you hide this.'
+              ? 'Copied. Paste it into the other program before you hide this.'
               : 'Could not reach the clipboard — select the value above and copy it by hand.');
           },
         }),
@@ -695,18 +695,24 @@ export function aiAccessPanel() {
           onClick: () => { revealed = null; probe = null; mintStatus.clear(); paint(); },
         }),
       ]),
-      codeCard(
-        'Ready to paste — any MCP client, over HTTP',
-        httpBlock(v.client, revealed.value),
-        'This block already holds the token above. It is the whole of what that client needs, and it is only complete while this is on screen.',
-        onCopied,
-      ),
-      codeCard(
-        'Ready to paste — a client that spawns Zelos itself',
-        stdioBlock(v.client),
-        'No token appears in this one, and that is correct: a client that spawns Zelos runs it as you, so the switch and the scopes above are the whole of what holds it back.',
-        onCopied,
-      ),
+      // The blocks an expert pastes into the other program's own settings
+      // file, with this key already written in. Folded: the person who just
+      // pressed "Create a key" needs the key and the two buttons above it, and
+      // the JSON is for whoever set the program up.
+      fold('For experts: connecting it, with this key filled in', [
+        codeCard(
+          'Ready to paste — any MCP client, over HTTP',
+          httpBlock(v.client, revealed.value),
+          'This block already holds the key above. It is the whole of what that client needs, and it is only complete while this is on screen.',
+          onCopied,
+        ),
+        codeCard(
+          'Ready to paste — a client that spawns Zelos itself',
+          stdioBlock(v.client),
+          'No key appears in this one, and that is correct: a client that spawns Zelos runs it as you, so the switch and the scopes above are the whole of what holds it back.',
+          onCopied,
+        ),
+      ]),
     ]);
   }
 
@@ -718,11 +724,11 @@ export function aiAccessPanel() {
     });
 
     return el('div', { class: 'ai-tokens' }, [
-      el('p', { class: 'field-hint', text: 'A client connecting over HTTP proves it is allowed by presenting a token. Mint one per client, so revoking one leaves the others working.' }),
+      el('p', { class: 'field-hint', text: 'The other program proves it is allowed in by showing Zelos a key. Make one key for each program, so revoking one leaves the others working.' }),
       revealBlock(v),
       el('div', { class: 'ai-mint' }, [
-        field('Name this token', labelInput, { hint: 'Whatever tells you which client it is. You will be reading this list months from now.' }),
-        el('div', { class: 'row-inline' }, button('Mint a token', { class: 'btn solid', onClick: submit })),
+        field('Name this key', labelInput, { hint: 'Whatever tells you which program it is. You will be reading this list months from now.' }),
+        el('div', { class: 'row-inline' }, button('Create a key for that program', { class: 'btn solid', onClick: submit })),
         mintStatus.node,
       ]),
       v.tokens.length
@@ -732,7 +738,7 @@ export function aiAccessPanel() {
           onCancel: () => { pending = null; paint(); },
           onRevoke: () => revoke(token),
         })))
-        : el('p', { class: 'quiet-note', text: 'No token has been minted, so nothing can connect over HTTP.' }),
+        : el('p', { class: 'quiet-note', text: 'No key has been created yet, so no other program can connect from outside. (For experts: a program that starts Zelos itself needs no key.)' }),
     ]);
   }
 
@@ -749,7 +755,7 @@ export function aiAccessPanel() {
   function logBlock(v) {
     const wider = Math.min(v.accessMax, Math.max(v.access.length * 4, 200));
     return el('div', { class: 'ai-log-wrap' }, [
-      el('p', { class: 'field-hint', text: 'One line for every call Zelos answered: the tool that was called, the scope it was spent against, how many rows went back and which token asked. It is written on this machine and goes nowhere.' }),
+      el('p', { class: 'field-hint', text: 'One line for every time the other program asked Zelos for something: what it asked for, which box that came under, how many rows went back and which key asked. This list is kept on this computer and goes nowhere.' }),
       v.access.length
         ? el('div', { class: 'ai-log' }, v.access.map(logRow))
         : el('p', { class: 'quiet-note', text: 'Nothing has read anything yet.' }),
@@ -758,7 +764,7 @@ export function aiAccessPanel() {
           class: 'field-hint',
           text: v.accessMore
             ? `The ${plural(v.access.length, 'most recent call')}. There are older ones behind these.`
-            : `${capitalise(plural(v.access.length, 'call'))}, which is the whole log.`,
+            : `${capitalise(plural(v.access.length, 'call'))}, which is the whole list.`,
         })
         : null,
       el('div', { class: 'row-inline' }, [
@@ -784,7 +790,7 @@ export function aiAccessPanel() {
    */
   function testBlock(v) {
     const tokenInput = input({
-      placeholder: 'zlt_t_… — paste the token your client is using',
+      placeholder: 'zlt_t_… — paste the key the other program is using',
       maxlength: '400',
       autocomplete: 'off',
       spellcheck: 'false',
@@ -800,8 +806,8 @@ export function aiAccessPanel() {
     });
 
     return el('div', { class: 'ai-connect' }, [
-      el('p', { class: 'field-hint', text: 'Zelos will present this token to its own MCP endpoint, run the handshake and the tool listing, and show you exactly what your client would be shown. It reads nothing, changes nothing, and does not count as the token being used.' }),
-      field('The token to try', tokenInput, { hint: v.tokens.length ? 'Whatever you pasted into the client. Zelos cannot read a token back, so this has to come from you.' : 'There is no token yet — mint one above first.' }),
+      el('p', { class: 'field-hint', text: 'Zelos tries this key on itself, the way the other program would, and shows you exactly what that program would be shown. It reads nothing, changes nothing, and does not count as the key being used.' }),
+      field('The key to try', tokenInput, { hint: v.tokens.length ? 'Whatever you pasted into the other program. Zelos cannot read a key back, so this has to come from you.' : 'There is no key yet — create one above first.' }),
       el('div', { class: 'row-inline' }, button('Test connection', { class: 'btn', onClick: submit })),
       testStatus.node,
       probeBlock(),
@@ -833,7 +839,7 @@ export function aiAccessPanel() {
           el('span', { class: 'scope-tools-label', text: plural(tools.length, 'tool') }),
           ...tools.map((t) => el('code', { class: 'mono scope-tool', text: String(t.name || '') })),
         ])
-        : el('p', { class: 'quiet-note', text: 'No tool at all: every scope is off, so that client connects and can read nothing.' }),
+        : el('p', { class: 'quiet-note', text: 'Nothing at all: every box is off, so that program connects and can read nothing.' }),
       probe.instructions
         ? el('div', { class: 'ai-code' }, [
           el('div', { class: 'ai-code-head' }, el('span', { class: 'ai-code-title', text: 'What the AI is told Zelos is' })),
@@ -848,39 +854,46 @@ export function aiAccessPanel() {
     const known = Boolean(v.client.command);
 
     return el('div', { class: 'ai-connect' }, [
-      codeCard(
-        'Claude Desktop, and anything else that spawns a server',
-        stdioBlock(v.client),
-        known
-          ? 'Those are the real paths to this copy of Zelos. A client that spawns it this way runs it as you, so it presents no token — the switch above and the scopes below it are the whole of what holds.'
-          : 'Generic form: this build did not report where it is installed. Replace the command with the path to your own copy.',
-        onCopied,
-      ),
-      el('p', {
-        class: 'field-hint',
-        text: 'Claude Desktop keeps that file at ~/Library/Application Support/Claude/claude_desktop_config.json on macOS and %APPDATA%\\Claude\\claude_desktop_config.json on Windows. Merge this into what is already there — a file with two mcpServers keys keeps only the last.',
-      }),
-      codeCard(
-        'Any MCP client, over HTTP',
-        httpBlock(v.client),
-        'Paste a token you minted above in place of the placeholder. This address only answers on this machine, and only while Zelos is running.',
-        onCopied,
-      ),
+      el('p', { class: 'field-hint', text: 'The other program has to be told where Zelos is. The drawer below holds the settings to copy into it — whoever set that program up will know where they go.' }),
+      // Everything from here down is the expert's: two settings-file blocks,
+      // the path to Claude Desktop's own file, and the protocol by name. It
+      // is all still here, one press away, and the person who only wanted to
+      // know what the switch does never has to read it.
+      fold('For experts: connecting it', [
+        codeCard(
+          'Claude Desktop, and anything else that spawns a server',
+          stdioBlock(v.client),
+          known
+            ? 'Those are the real paths to this copy of Zelos. A client that spawns it this way runs it as you, so it presents no key — the switch above and the scopes below it are the whole of what holds.'
+            : 'Generic form: this build did not report where it is installed. Replace the command with the path to your own copy.',
+          onCopied,
+        ),
+        el('p', {
+          class: 'field-hint',
+          text: 'Claude Desktop keeps that file at ~/Library/Application Support/Claude/claude_desktop_config.json on macOS and %APPDATA%\\Claude\\claude_desktop_config.json on Windows. Merge this into what is already there — a file with two mcpServers keys keeps only the last.',
+        }),
+        codeCard(
+          'Any MCP client, over HTTP',
+          httpBlock(v.client),
+          'Paste a key you created above in place of the placeholder. This address only answers on this machine, and only while Zelos is running.',
+          onCopied,
+        ),
+      ]),
     ]);
   }
 
   function limitsBlock() {
     return el('ul', { class: 'plain-list' }, [
-      el('li', { text: 'Every tool here reads. There is no tool that sends a message, edits an item, deletes a row or changes a setting — not a disabled one, none at all.' }),
-      el('li', { text: 'A scope that is off is not merely hidden: its tool is absent from the list the client is given, and a call to it is refused.' }),
-      el('li', { text: 'The master switch is checked before the token is, so a credential minted and then switched off cannot be used to probe anything.' }),
-      el('li', { text: 'This is a door into the database in your Zelos home. It is not a door into your mail server — nothing here can reach back to your provider.' }),
+      el('li', { text: 'Everything here only reads. There is nothing that sends a message, edits an item, deletes anything or changes a setting — not a switched-off one, none at all.' }),
+      el('li', { text: 'A box that is unticked is not merely hidden: the other program is not even told that part exists, and a request for it is refused.' }),
+      el('li', { text: 'The main switch is checked before the key is, so a key that was made and then switched off cannot be used to look at anything.' }),
+      el('li', { text: 'This is a door into what Zelos has collected on this computer. It is not a door into your mailbox — nothing here can reach back to your email provider.' }),
     ]);
   }
 
   /* --------------------------------------------------------------- build */
 
-  const LEDE = 'Zelos can act as a knowledge source for an AI assistant you already use, over MCP — the protocol Claude Desktop and most current clients speak.';
+  const LEDE = 'If you already use another AI program, such as Claude, you can let it read what Zelos has collected. It is off unless you switch it on.';
 
   function unavailableBody() {
     const v = view();  // empty payload: the fallback scope list, nothing ticked
@@ -888,9 +901,9 @@ export function aiAccessPanel() {
       el('p', { class: 'panel-lede', text: LEDE }),
       el('div', { class: 'banner banner-warn', role: 'status' }, [
         el('h3', { class: 'banner-title', text: 'Not available in this build' }),
-        el('p', { class: 'banner-detail', text: 'This copy of Zelos does not answer on /api/ai, so there is nothing here to turn on and nothing is exposed. What follows is what the feature would offer and what each choice would hand over, so the decision is already made when a build that has it arrives.' }),
+        el('p', { class: 'banner-detail', text: 'This copy of Zelos does not have this feature, so there is nothing here to switch on and nothing is shared. What follows is what it would offer and what each choice would hand over, so the decision is already made when a copy that has it arrives. (For experts: /api/ai answered 404.)' }),
       ]),
-      section('What each scope would hand over', {}, scopeBlock(v, { readOnly: true })),
+      section('What each box would hand over', {}, scopeBlock(v, { readOnly: true })),
       section('What it would never do', {}, limitsBlock()),
     ];
   }
@@ -899,7 +912,7 @@ export function aiAccessPanel() {
     if (phase === 'boot') {
       return [
         el('p', { class: 'panel-lede', text: LEDE }),
-        el('p', { class: 'quiet-note', text: 'Asking this build what it exposes…' }),
+        el('p', { class: 'quiet-note', text: 'Asking this copy of Zelos what it can share…' }),
       ];
     }
     if (phase === 'missing') return unavailableBody();
@@ -908,7 +921,7 @@ export function aiAccessPanel() {
         el('p', { class: 'panel-lede', text: LEDE }),
         el('div', { class: 'banner banner-warn', role: 'status' }, [
           el('h3', { class: 'banner-title', text: 'This panel could not read its own settings' }),
-          el('p', { class: 'banner-detail', text: `${loadError} — until that is answered, treat AI access as unknown rather than off.` }),
+          el('p', { class: 'banner-detail', text: `${loadError} — until that is answered, treat sharing as unknown rather than off.` }),
           el('div', { class: 'banner-actions' }, button('Try again', { class: 'btn quiet', onClick: load })),
         ]),
       ];
@@ -916,17 +929,17 @@ export function aiAccessPanel() {
 
     const v = view();
     return [
-      el('p', { class: 'panel-lede', text: `${LEDE} It is off until you turn it on, and what it hands over is exactly what you tick below and nothing else.` }),
+      el('p', { class: 'panel-lede', text: `${LEDE} What it hands over is exactly what you tick below and nothing else.` }),
       masterBlock(v),
       section('What you are handing over', {
-        note: 'Each of these is its own decision. The sentence under a scope is the list of things that leave this machine when it is on — read it before you tick it.',
+        note: 'Each of these is its own decision. The sentence under each box is the list of things that leave this computer when it is on — read it before you tick it.',
       }, scopeBlock(v)),
-      section('Tokens', {}, tokenBlock(v)),
-      section('Check a token', {}, testBlock(v)),
+      section('Keys', {}, tokenBlock(v)),
+      section('Check a key', {}, testBlock(v)),
       section('What your AI has read', {}, logBlock(v)),
-      section('Connecting a client', {}, connectBlock(v)),
+      section('Connecting the other program', {}, connectBlock(v)),
       section('What it cannot do', {}, [
-        el('p', { class: 'field-hint', text: `Any single answer is capped at ${plural(v.maxRows, 'row')}. That is a ceiling on one call, not on the day — a client that wants more asks again, and each ask is a line in the log above.` }),
+        el('p', { class: 'field-hint', text: `Any single answer is capped at ${plural(v.maxRows, 'row')}. That is a ceiling on one ask, not on the day — a program that wants more asks again, and each ask is a line in the list above.` }),
         limitsBlock(),
       ]),
     ];

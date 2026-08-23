@@ -1545,6 +1545,20 @@ test('guessImapHost covers the other common providers and degrades sensibly', ()
   assert.equal(proton.secure, false);
   assert.match(proton.note, /Bridge/);
 
+  // These notes reach the expert form and the doctor, so the facts stay —
+  // the Microsoft shut-off date above all — but each one opens in the words
+  // a person uses. The Outlook note used to open on the date and send the
+  // reader to "register a free app".
+  const outlook = guessImapHost('a@hotmail.com');
+  assert.match(outlook.note, /^Hotmail and Outlook\.com need a one-time setup at Microsoft’s website first \(about ten minutes\) — the app shows you every step\./);
+  assert.match(outlook.note, /16 September 2024/, 'the shut-off date is a fact the expert form still needs');
+  assert.ok(!/register a free app/.test(outlook.note), 'the note still says "register a free app"');
+  for (const address of ['a@gmail.com', 'a@icloud.com', 'a@yahoo.com', 'a@hotmail.com', 'a@fastmail.com', 'a@proton.me', 'a@aol.com', 'a@zoho.com']) {
+    const { note } = guessImapHost(address);
+    const opening = note.split(/ — |[.:]\s/)[0];
+    assert.doesNotMatch(opening, /\bIMAP\b/, `${address}: the note opens on the protocol: "${opening}"`);
+  }
+
   const guessed = guessImapHost('marcus@deco-associates.example');
   assert.equal(guessed.host, 'imap.deco-associates.example');
   assert.equal(guessed.port, 993);

@@ -199,7 +199,7 @@ Press `Ctrl-C` in the terminal to stop it.
 ### What the shell adds
 
 - A real application window and a Dock/taskbar icon.
-- A tray icon with **Sweep now**, **Open Zelos** and **Quit**.
+- A tray icon with **Check now**, **Open Zelos** and **Quit**.
 - A menu bar, so ⌘C and ⌘V work in the draft editors, and ⌘1…⌘6 jump between
   views.
 - It keeps running when you close the window, so scheduled sweeps keep
@@ -571,7 +571,7 @@ logged. Mail is written by strangers; a link in it does not get to reach into
 this machine.
 
 **Where did the app go when I closed the window?**
-It is in the tray (macOS: the menu bar, top right). That is where **Sweep now**,
+It is in the tray (macOS: the menu bar, top right). That is where **Check now**,
 **Open Zelos** and **Quit** live. On Windows this only happens when automatic
 sweeps are switched on; with them off, closing the window quits. On Linux,
 closing the window quits even with sweeps on, unless you have set

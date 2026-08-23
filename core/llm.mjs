@@ -494,7 +494,7 @@ function requireKey(apiKey, address) {
   if (typeof apiKey === 'string' && apiKey.trim()) return apiKey.trim();
   if (isLocalAddress(address)) return null; // keyless local models are the point
   throw new LLMError(
-    `No API key configured for ${address || '(no address)'} — remote endpoints need one, local ones do not`,
+    'No key has been saved for this AI service — open Settings → AI and paste one. (An AI program on this computer needs no key.)',
     { address: address || null },
   );
 }

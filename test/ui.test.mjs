@@ -3082,7 +3082,7 @@ const GUIDES = {
 
 const GUESSES = {
   'frank@gmail.com': { label: 'Gmail', host: 'imap.gmail.com', port: 993, secure: true, auth: 'password', signIn: 'google', clientReady: false, appPasswordUrl: 'https://myaccount.google.com/apppasswords', note: '"Sign in with Google" connects this mailbox in one step. Gmail requires 2-Step Verification plus a 16-character App Password. This provider does not accept your normal password over IMAP.', known: true },
-  'frank@hotmail.com': { label: 'Outlook / Microsoft', host: 'outlook.office365.com', port: 993, secure: true, auth: 'xoauth2', signIn: 'microsoft', clientReady: false, appPasswordUrl: null, note: 'Microsoft switched password sign-in off for personal Outlook, Hotmail, Live and MSN accounts on 16 September 2024. Zelos asks you to register a free app in your own Microsoft account.', known: true },
+  'frank@hotmail.com': { label: 'Outlook / Microsoft', host: 'outlook.office365.com', port: 993, secure: true, auth: 'xoauth2', signIn: 'microsoft', clientReady: false, appPasswordUrl: null, note: 'Hotmail and Outlook.com need a one-time setup at Microsoft’s website first (about ten minutes) — the app shows you every step. There is no password to paste: Microsoft switched password sign-in off for personal Outlook, Hotmail, Live and MSN accounts on 16 September 2024.', known: true },
   'frank@icloud.com': { label: 'iCloud Mail', host: 'imap.mail.me.com', port: 993, secure: true, auth: 'password', signIn: null, clientReady: false, appPasswordUrl: 'https://account.apple.com/account/manage', note: 'iCloud Mail requires an app-specific password. This provider does not accept your normal password over IMAP.', known: true },
 };
 
@@ -3169,12 +3169,12 @@ test('no screen in onboarding, and no mail card, shows a first-timer a protocol 
     // The server's own note — host, port and all — appears with the expert
     // form, which opens BENEATH the card and closes back to it. The card and
     // the address survive the round trip; the old Advanced replaced both.
-    assert.doesNotMatch(anywhere(view), /over IMAP|register a free app/, `${address}: the server's note is on screen before anyone asked`);
+    assert.doesNotMatch(anywhere(view), /over IMAP|16 September 2024/, `${address}: the server's note is on screen before anyone asked`);
     const expert = findButtons(view, /^Server settings \(for experts\)$/).find((b) => !plainHidden(b));
     assert.ok(expert, `${address}: no expert button on the card`);
     expert.fire('click');
     await settle();
-    assert.match(anywhere(view), /over IMAP|register a free app/, `${address}: the server's own note is gone rather than folded`);
+    assert.match(anywhere(view), /over IMAP|16 September 2024/, `${address}: the server's own note is gone rather than folded`);
     assert.match(onScreen(view), new RegExp(GUESSES[address].host.replace(/\./g, '\\.')), `${address}: the expert form does not show the host`);
     expert.fire('click');
     await settle();
@@ -3541,4 +3541,137 @@ test('no user-facing failure names an address the person did not type, and the b
     assert.ok(!storeSrc.includes(word), `ui/lib/store.js still says ${word}`);
   }
   assert.match(storeSrc, /message: 'Checking your mail…'/);
+});
+
+/**
+ * The stragglers. The pass that put "AI" on the tab and "Check now" on the
+ * button left four corners of the board still speaking the engine's language:
+ * Ask said "model" three ways, Search said "the sweeps have read", the Calendar
+ * said "sweep, or come back" in a hover title and "CalDAV" in its empty state,
+ * and the sharing panel said "token" and "MCP" in its first sentence. This
+ * renders each of those screens against the small DOM and reads what is NOT
+ * folded away — including hover titles and placeholders, which a source grep
+ * does not see as text. The expert's words are still there: the sharing panel
+ * keeps both settings-file blocks under "For experts: connecting it".
+ */
+test('Ask, Search, the Calendar and the sharing panel meet a first-timer without a word from the engine', async (t) => {
+  withPlainDom(t);
+  const STRAGGLERS = /IMAP|CalDAV|endpoint|keychain|config\.json|MCP|token|model\b|sweep/i;
+  const base = plainFetch({ presets: await llmPresets(), manifests: await connectorManifests() });
+  // The sharing panel, switched on, with one key, one line in its log and a
+  // real install path — every row type it can draw, drawn.
+  const aiPayload = {
+    enabled: true,
+    scopes: { board: true, 'mail.bodies': true },
+    effectiveScopes: { board: true, 'mail.metadata': true, 'mail.bodies': true },
+    maxRows: 50,
+    tokens: [{ id: 't_9f3a1c', label: 'Claude Desktop', createdAt: '2026-08-20T09:00:00Z', lastUsedAt: '2026-08-22T09:00:00Z' }],
+    access: [{ at: '2026-08-22T09:00:00Z', tool: 'zelos_board', scope: 'board', rows: 4, ok: true, label: 'Claude Desktop' }],
+    accessMore: false,
+    accessMax: 500,
+    client: { command: '/usr/local/bin/node', args: ['/opt/zelos/bin/zelos', 'mcp'], home: '/tmp/zelos-home', httpUrl: 'http://127.0.0.1:7777/api/mcp' },
+    scopeInfo: [
+      { id: 'board', label: 'Board', summary: 'Items.', tools: ['zelos_board', 'zelos_item'] },
+      { id: 'calendar', label: 'Calendar', summary: 'Events.', tools: ['zelos_calendar'] },
+      { id: 'mail.metadata', label: 'Mail, without the mail', summary: 'Headers.', tools: ['zelos_search', 'zelos_thread'] },
+      { id: 'mail.bodies', label: 'Mail, in full', summary: 'Bodies.', tools: [], implies: ['mail.metadata'], sensitive: true },
+      { id: 'drafts', label: 'Drafts', summary: 'Drafts.', tools: ['zelos_drafts'] },
+      { id: 'people', label: 'People', summary: 'People.', tools: ['zelos_people'] },
+    ],
+  };
+  globalThis.fetch = async (reqPath, init = {}) => {
+    if (reqPath === '/api/ai' || reqPath.startsWith('/api/ai?')) {
+      return { ok: true, status: 200, text: async () => JSON.stringify(aiPayload) };
+    }
+    return base(reqPath, init);
+  };
+  t.after(() => { delete globalThis.fetch; });
+
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  store.state.config = { identity: {}, model: {}, mail: [], calendars: [], sources: [] };
+  store.state.health = { model: { configured: false }, backend: { name: 'encrypted-file' } };
+  store.state.secretRefs = [];
+  // A served window of one day, so both calendar arrows are at the edge and
+  // wear the hover title that used to say "a sweep moves the window".
+  const today = new Date().toISOString().slice(0, 10);
+  store.state.board = { ...store.state.board, items: [], events: [], notes: [], counts: {}, runs: {}, eventWindow: { from: today, to: today } };
+  const ctx = { navigate() {}, rerender() {}, sub: null, tz: 'UTC' };
+  const explain = (name, seen) => `${name}: "${seen.match(STRAGGLERS)?.[0]}" is on screen — in: ${seen.slice(Math.max(0, seen.search(STRAGGLERS) - 60), seen.search(STRAGGLERS) + 60)}`;
+
+  // Ask, with no AI chosen: the empty state that sends people to Settings.
+  const ask = await import(fileUrl(UI, 'views/ask.js'));
+  let seen = onScreen(ask.renderAsk(ctx));
+  assert.match(seen, /Ask needs an AI/);
+  assert.match(seen, /Questions are answered by the AI you choose/);
+  assert.ok(findButton(ask.renderAsk(ctx), 'Choose an AI'), 'the empty state does not offer "Choose an AI"');
+  assert.doesNotMatch(seen, STRAGGLERS, explain('Ask, empty', seen));
+  // And with one: the page itself, lede and form.
+  store.state.health = { model: { configured: true }, backend: { name: 'encrypted-file' } };
+  seen = onScreen(ask.renderAsk(ctx));
+  assert.match(seen, /Ask about your own mail, calendar and notes/);
+  assert.doesNotMatch(seen, STRAGGLERS, explain('Ask', seen));
+  // The one sentence the page says when the server answers 409 is not
+  // reachable without a server, so it is read off the source.
+  const askSrc = fs.readFileSync(path.join(UI, 'views/ask.js'), 'utf8');
+  assert.match(askSrc, /'No AI has been chosen yet\. Pick one under Settings → AI and ask again\.'/);
+  for (const word of ["'Ask needs a model'", "'Choose a model'", 'the model stopped answering', 'The model returned nothing', 'before the model said anything']) {
+    assert.ok(!askSrc.includes(word), `ui/views/ask.js still says ${word}`);
+  }
+
+  // Search, before anyone has typed.
+  const search = await import(fileUrl(UI, 'views/search.js'));
+  seen = onScreen(search.renderSearch(ctx));
+  assert.match(seen, /Nothing searched yet/);
+  assert.match(seen, /Everything Zelos has read is in here/);
+  assert.doesNotMatch(seen, STRAGGLERS, explain('Search', seen));
+  const searchSrc = fs.readFileSync(path.join(UI, 'views/search.js'), 'utf8');
+  assert.match(searchSrc, /detail: 'Zelos can only find what it has read\. /, 'the no-match state still blames "the index" and "the sweeps"');
+  assert.ok(!searchSrc.includes('the sweeps have read'), 'ui/views/search.js still says "the sweeps have read"');
+
+  // The Calendar, with nothing connected: the empty state, plus the toolbar
+  // whose arrows carry a hover title at the served edge.
+  const calendar = await import(fileUrl(UI, 'views/calendar.js'));
+  const calView = calendar.renderCalendar(ctx);
+  seen = onScreen(calView);
+  assert.match(seen, /No calendar connected/);
+  assert.match(seen, /a check moves the window/, 'the arrows at the edge of the window carry no title');
+  assert.doesNotMatch(seen, STRAGGLERS, explain('Calendar', seen));
+  const calSrc = fs.readFileSync(path.join(UI, 'views/calendar.js'), 'utf8');
+  assert.match(calSrc, /const NOT_LOADED_TITLE =\n\s+'Zelos has not loaded this day\. The board carries a window around today; check your mail, or come back when it has moved\.'/);
+  assert.ok(!calSrc.includes('sweep, or come back'), 'ui/views/calendar.js still says "sweep, or come back"');
+
+  // The sharing panel, as Settings shows it: the one-line warning first, then
+  // the panel once it has read its own state.
+  const settings = await import(fileUrl(UI, 'views/settings.js'));
+  const access = await import(fileUrl(UI, 'views/ai-access.js'));
+  const panel = access.aiAccessPanel();
+  await settle();
+  seen = onScreen(panel);
+  assert.match(seen, /If you already use another AI program, such as Claude, you can let it read what Zelos has collected\. It is off unless you switch it on\./);
+  assert.match(seen, /Sharing is on/);
+  assert.ok(findButton(panel, 'Create a key for that program'), 'no "Create a key for that program" button');
+  assert.ok(!findButton(panel, 'Mint a token'), '"Mint a token" is still the button');
+  assert.match(seen, /The most exposing choice/, 'the marker on full message text is gone');
+  assert.doesNotMatch(seen, /THE MOST EXPOSING CHOICE/, 'the marker shouts');
+  assert.doesNotMatch(seen, STRAGGLERS, explain('Sharing', seen));
+  // The expert's blocks are folded, not deleted: one press and the settings
+  // file is there, protocol and all.
+  const expert = findButtons(panel, /For experts: connecting it$/).find((b) => !plainHidden(b));
+  assert.ok(expert, 'no "For experts: connecting it" drawer');
+  assert.match(anywhere(panel), /"mcpServers"/, 'the settings-file block is gone rather than folded');
+  assert.match(anywhere(panel), /Any MCP client, over HTTP/, 'the HTTP block is gone rather than folded');
+  assert.doesNotMatch(seen, /"mcpServers"|claude_desktop_config\.json/, 'the settings-file block is on screen before anyone asked');
+  expert.fire('click');
+  assert.match(onScreen(panel), /"mcpServers"/, 'the drawer does not open');
+  assert.match(onScreen(panel), /claude_desktop_config\.json/, 'the drawer does not show the path');
+  // Settings still puts its own warning above the panel, in the same words.
+  const settingsSrc = fs.readFileSync(path.join(UI, 'views/settings.js'), 'utf8');
+  assert.match(settingsSrc, /This is NOT where you choose the AI that reads your mail — that is under AI\./);
+  assert.equal(typeof settings.fold, 'function');
+  // The uppercase was the stylesheet's: the marker is sentence case in the
+  // markup and the rule that shouted it is gone.
+  const css = fs.readFileSync(path.join(UI, 'app.css'), 'utf8');
+  const mark = /^\.scope-mark \{([^}]*)\}/m.exec(css);
+  assert.ok(mark, '.scope-mark rule is missing');
+  assert.ok(!/text-transform: uppercase/.test(mark[1]), '.scope-mark still shouts');
 });

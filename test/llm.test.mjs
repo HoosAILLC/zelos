@@ -515,9 +515,12 @@ test('a missing key is an error for a remote address, before any socket is opene
       }),
     (err) => {
       assert.ok(err instanceof LLMError);
-      assert.match(err.message, /No API key/i);
-      assert.match(err.message, /api\.example\.invalid/, 'the error must name the address');
-      assert.equal(err.address, FAKE_ORIGIN);
+      // The sentence is the one a person reads on the board, so it says
+      // where to go and not which host would have been asked; the address
+      // rides on the error for the log.
+      assert.equal(err.message, 'No key has been saved for this AI service — open Settings → AI and paste one. (An AI program on this computer needs no key.)');
+      assert.ok(!/api\.example\.invalid/.test(err.message), 'the message names the address the reader never typed');
+      assert.equal(err.address, FAKE_ORIGIN, 'the address must still ride on the error');
       return true;
     },
   );
@@ -1545,8 +1548,8 @@ test('listModels refuses a remote address with no key, and reports server errors
   await assert.rejects(
     () => listModels({ protocol: 'openai', baseUrl: FAKE_ORIGIN }),
     (err) => {
-      assert.match(err.message, /No API key/);
-      assert.match(err.message, /api\.example\.invalid/);
+      assert.match(err.message, /^No key has been saved for this AI service — open Settings → AI and paste one\./);
+      assert.equal(err.address, FAKE_ORIGIN);
       return true;
     },
   );
