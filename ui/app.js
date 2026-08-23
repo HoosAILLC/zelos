@@ -23,7 +23,7 @@ import {
   needsOnboarding, applyAccent, currentAccent, notify, nowMark,
 } from './lib/store.js';
 import { api, hasToken } from './lib/api.js';
-import { BUCKET_LABEL, sweepSummary, tokenLine } from './lib/format.js';
+import { BUCKET_LABEL, sweepSummary, sweepDetail, tokenLine } from './lib/format.js';
 import { humanDelta, formatDay } from './lib/time.js';
 
 import { renderNow } from './views/now.js';
@@ -41,7 +41,9 @@ import { renderOnboarding } from './views/onboarding.js';
 const VIEWS = [
   { id: 'now', label: 'Now', render: renderNow, countKey: 'now' },
   { id: 'today', label: 'Today', render: renderToday, countKey: 'today' },
-  { id: 'owed', label: 'Owed', render: renderOwed, countKey: 'drafts' },
+  // "Promises", not "Owed": owed what, by whom? was the audit's question. The
+  // view holds what you promised and what was promised to you.
+  { id: 'owed', label: 'Promises', render: renderOwed, countKey: 'drafts' },
   { id: 'calendar', label: 'Calendar', render: renderCalendar, countKey: 'events' },
   { id: 'search', label: 'Search', render: renderSearch, countKey: null },
   { id: 'ask', label: 'Ask', render: renderAsk, countKey: null },
@@ -112,61 +114,74 @@ function announce(node, text) {
 
 /**
  * The sweep line: one node, built once, repainted in place. Its text is the
- * live region above, so this line is where "Sweeping…", "Sweep finished" and a
- * sweep's failure are spoken as well as shown.
+ * live region above, so this line is where "Checking your mail…", "Finished
+ * checking" and a check's failure are spoken as well as shown.
+ *
+ * What it says is "Last checked 20 minutes ago · 214 emails · 28
+ * appointments". The run's duration and the day's token spend — "41.8s",
+ * "9.8k tokens in · 135 out" — were the most prominent numbers on the screen
+ * and the least explicable ones (bus tokens? is this costing me money?), so
+ * they moved behind the line's hover title, and the spend is stated in full
+ * under Settings → About as "AI usage this session".
  */
 function buildSweepLine() {
   const textNode = el('p', { class: 'sweepline-text mono', 'aria-live': 'polite' });
-  // The day's token spend sits OUTSIDE the live region: it is a fact to glance
-  // at, not an announcement, and reading it aloud on every sweep tick would
-  // bury the progress it sits beside.
-  const tokenNode = el('p', { class: 'sweepline-tokens mono' });
   const fillNode = el('div', { class: 'sweepbar-fill', style: { width: '0%' } });
   const barNode = el('div', { class: 'sweepbar' }, fillNode);
   return {
-    node: el('div', { class: 'sweepline' }, [textNode, tokenNode, barNode]),
+    node: el('div', { class: 'sweepline' }, [textNode, barNode]),
     textNode,
-    tokenNode,
     barNode,
     fillNode,
   };
 }
 
+/** "Last checked 20 minutes ago · 3 emails", or the state of the check under way. */
+export function sweepLineText(s, last) {
+  if (s.running) return s.message || 'Checking your mail…';
+  if (s.error) return s.error;
+  if (!last) return 'Not checked yet';
+  const summary = sweepSummary(last);
+  return `Last checked ${humanDelta(last.ended_at || last.started_at)}${summary ? ` · ${summary}` : ''}`;
+}
+
+/** The hover title: duration and spend, the two numbers that left the line. */
+export function sweepLineTitle(last, tokens, todayKeyStr) {
+  return [sweepDetail(last), tokenLine(tokens, todayKeyStr)].filter(Boolean).join(' · ');
+}
+
 function paintSweepLine(parts) {
   const s = state.sweep;
   const last = state.board.runs?.last;
-
-  const text = s.running
-    ? (s.message || 'Sweeping…')
-    : s.error
-      ? s.error
-      : last
-        ? `Swept ${humanDelta(last.ended_at || last.started_at)}${sweepSummary(last) ? ` · ${sweepSummary(last)}` : ''}`
-        : 'Never swept';
+  const text = sweepLineText(s, last);
 
   const pct = s.running && s.total > 0 ? Math.min(100, Math.round((s.done / s.total) * 100)) : null;
 
   parts.node.className = `sweepline${s.running ? ' is-running' : ''}${s.error ? ' is-bad' : ''}`;
   parts.textNode.setAttribute('aria-busy', s.running ? 'true' : 'false');
   announce(parts.textNode, text);
-  parts.tokenNode.textContent = tokenLine(state.board.tokens, nowMark().key);
+  // The title is set on the node the pointer rests on, outside the live
+  // region's text: a tooltip is a fact to glance at, not an announcement.
+  const title = sweepLineTitle(last, state.board.tokens, nowMark().key);
+  if (title) parts.node.setAttribute('title', title);
+  else parts.node.removeAttribute('title');
   parts.barNode.className = `sweepbar${pct === null && s.running ? ' is-indeterminate' : ''}`;
   parts.fillNode.style.width = s.running ? `${pct ?? 100}%` : '0%';
 }
 
-/** Quick capture. It is a note to yourself; the next sweep reads it. */
+/** Quick capture. It is a reminder to yourself; the next check reads it. */
 function capturePanel() {
   const box = el('textarea', {
     class: 'capture-field',
     rows: '2',
-    'aria-label': 'A note for the next sweep',
+    'aria-label': 'A reminder for yourself',
     placeholder: 'Remind me to chase the survey invoice…',
   });
   const status = el('span', { class: 'status', role: 'status' });
   const panel = el('form', { class: 'capture', hidden: true }, [
     box,
     el('div', { class: 'row-inline' }, [
-      el('button', { type: 'submit', class: 'btn solid', text: 'Keep it' }),
+      el('button', { type: 'submit', class: 'btn solid', text: 'Save' }),
       status,
     ]),
   ]);
@@ -178,13 +193,14 @@ function capturePanel() {
     try {
       await api.capture(text);
       box.value = '';
-      status.textContent = 'Kept. The next sweep will read it.';
+      status.textContent = 'Saved. Zelos reads it the next time it checks.';
     } catch (err) {
       status.textContent = err.message;
     }
   });
 
-  const toggle = button('Note', {
+  // "Add a reminder", because "Note" did not say what the box was for.
+  const toggle = button('Add a reminder', {
     class: 'btn quiet',
     'aria-expanded': 'false',
     onClick: (e) => {
@@ -214,7 +230,7 @@ let chrome = null;
 function buildChrome() {
   const capture = capturePanel();
   const dateNode = el('p', { class: 'topbar-date mono' });
-  const sweepBtn = button('Sweep now', {
+  const sweepBtn = button('Check now', {
     class: 'btn solid',
     onClick: () => startSweep('auto'),
   });
@@ -223,7 +239,8 @@ function buildChrome() {
     el('div', { class: 'topbar-row' }, [
       el('a', { class: 'wordmark', href: '#/now' }, [
         el('span', { class: 'wordmark-name', text: 'Zelos' }),
-        el('span', { class: 'wordmark-greek', 'aria-hidden': 'true', text: 'ΖΗΛΟΣ' }),
+        // The tooltip answers "is that a logo glitch?" — it is the name, in Greek.
+        el('span', { class: 'wordmark-greek', 'aria-hidden': 'true', title: 'Zelos, in Greek', text: 'ΖΗΛΟΣ' }),
       ]),
       dateNode,
       el('div', { class: 'topbar-actions' }, [capture.toggle, sweepBtn]),
@@ -276,8 +293,8 @@ function rail(current) {
     // only `configured` is. Naming a model the app cannot call would be a lie
     // told in the calmest possible typeface.
     el('p', { class: 'rail-foot mono', text: state.health?.model?.configured
-      ? `${state.health.model.label}${state.health.model.local ? ' · local' : ''}`
-      : 'no model yet' }),
+      ? `${state.health.model.label}${state.health.model.local ? ' · on this computer' : ''}`
+      : 'no AI chosen yet' }),
   ]);
 }
 
@@ -537,7 +554,7 @@ function paintChrome() {
   // header must say the day the reader is living in.
   const nm = nowMark();
   chrome.dateNode.textContent = nm.key ? formatDay(nm.key) : '';
-  chrome.sweepBtn.textContent = state.sweep.running ? 'Sweeping…' : 'Sweep now';
+  chrome.sweepBtn.textContent = state.sweep.running ? 'Checking…' : 'Check now';
   chrome.sweepBtn.disabled = state.sweep.running;
 
   paintSweepLine(chrome.sweep);

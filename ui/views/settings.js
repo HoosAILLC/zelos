@@ -7,9 +7,19 @@
  * key is *stored* and never what it is. That is deliberate in core/server.mjs
  * and it is why the key fields below always start empty.
  *
- * The model panel offers local runtimes first. A model on your own machine is
- * the configuration where Zelos's central claim — nothing leaves the machine —
- * is unconditionally true, so it goes at the top, not in an "advanced" drawer.
+ * The model panel offers a local runtime first when one is running. A model on
+ * your own machine is the configuration where Zelos's central claim — nothing
+ * leaves the machine — is unconditionally true, so it goes at the top, not in
+ * an "advanced" drawer.
+ *
+ * Two registers of English live in this file, and the rule for which is which
+ * is simple: anything a person sees before they have asked for more is written
+ * for someone who has never heard the word "protocol". Hosts, ports, model ids,
+ * file names and the reasons behind them are all still here — every one of
+ * them sits under a control that literally says "Advanced" or "for experts",
+ * built by `fold()` below, and nothing was deleted to make the first screen
+ * plain. A 70-year-old read the previous version and stopped at "IMAP host";
+ * the expert who needs that field now opens one drawer to find it.
  */
 
 import { el, button, meander, section, copyText, replace } from '../lib/dom.js';
@@ -18,24 +28,77 @@ import { el, button, meander, section, copyText, replace } from '../lib/dom.js';
    place to look for a call that has exactly one call site. */
 import { api, request } from '../lib/api.js';
 import { state, saveConfig, loadConfig, setAccent, applyAccent, currentAccent, DEFAULT_ACCENT, markOnboarded } from '../lib/store.js';
-import { plural } from '../lib/format.js';
+import { plural, tokenLine } from '../lib/format.js';
 import { aiAccessPanel } from './ai-access.js';
 
+/**
+ * The tab strip, in the order a person looks for things. The ids are routes
+ * (`#/settings/model` has been a deep link since the first release and still
+ * is); only the labels are words. "AI" is the model, "Email" is the mailbox,
+ * and the two tabs nobody new should open say so in their own names.
+ */
 const PANELS = [
   { id: 'you', label: 'You' },
-  { id: 'model', label: 'Model' },
-  { id: 'mail', label: 'Mail' },
+  { id: 'model', label: 'AI' },
+  { id: 'mail', label: 'Email' },
   { id: 'calendars', label: 'Calendars' },
-  { id: 'sources', label: 'Sources' },
-  { id: 'sweep', label: 'Sweeps' },
+  { id: 'sweep', label: 'Schedule' },
   { id: 'privacy', label: 'Privacy' },
-  { id: 'ai', label: 'AI access' },
-  { id: 'data', label: 'Data' },
+  { id: 'sources', label: 'Other things it can read (optional)' },
+  { id: 'ai', label: 'Share with another AI (advanced)' },
+  { id: 'data', label: 'Your data' },
   { id: 'about', label: 'About' },
+  { id: 'appearance', label: 'Colour' },
 ];
+
+/** Where Settings opens with no sub-route: the thing people come here to change. */
+export const DEFAULT_PANEL = 'mail';
 
 let uid = 0;
 const nextId = (prefix) => `${prefix}-${(uid += 1)}`;
+
+/**
+ * A drawer. Collapsed by default, opened by a button that says what is inside
+ * it — "Advanced", "Server settings (for experts)", "More choices" — and hidden
+ * with `[hidden]`, which is what every disclosure in ui/ uses and what the one
+ * load-bearing CSS rule makes stick.
+ *
+ * This is the only mechanism by which expert text is kept out of a
+ * first-timer's way. Nothing is removed: the field, the note, the command are
+ * all still built, and all still reachable by one press. A guard in
+ * test/ui.test.mjs walks the rendered tree and reads only what is NOT inside
+ * one of these, so the register of the open text is tested, not trusted.
+ */
+export function fold(label, children, { open = false } = {}) {
+  const body = el('div', { class: 'unfold-body' }, children);
+  body.hidden = !open;
+  const toggle = el('button', {
+    type: 'button',
+    class: 'unfold-toggle',
+    'aria-expanded': open ? 'true' : 'false',
+    onclick() {
+      const was = this.getAttribute('aria-expanded') === 'true';
+      this.setAttribute('aria-expanded', was ? 'false' : 'true');
+      body.hidden = was;
+    },
+  }, [
+    el('span', { class: 'unfold-caret', 'aria-hidden': 'true', text: '▸' }),
+    el('span', { text: label }),
+  ]);
+  return el('div', { class: 'unfold' }, [toggle, body]);
+}
+
+/** The way to the one-time Microsoft setup, as a button — or its name alone when the server sent no page. */
+function setupLink(href) {
+  if (!/^https:\/\/\S+$/i.test(String(href || ''))) return el('span', { class: 'quiet-note', text: 'The setup page is described in docs/OAUTH.md, under Microsoft.' });
+  return el('a', { class: 'btn', href, target: '_blank', rel: 'noopener noreferrer', text: 'Show me how ↗' });
+}
+
+/** An outbound link, https only, opened in a new tab — what desktop/guard.js hands to the system browser. */
+function outLink(href, text) {
+  if (!/^https:\/\/\S+$/i.test(String(href || ''))) return el('span', { text });
+  return el('a', { class: 'link', href, target: '_blank', rel: 'noopener noreferrer', text: `${text} ↗` });
+}
 
 /**
  * Common IMAP hosts, as a typing aid only. core/sources/imap.mjs has the real
@@ -346,6 +409,30 @@ export function secretStoreNotes(backendName) {
 }
 
 /**
+ * The same three facts, for the screens a first-timer sees. secretStoreNotes
+ * above is the expert version — file names, modes, the service name — and it
+ * now lives under the "for experts" drawers. These are the sentences beside a
+ * password box and on the Your data tab: true on both stores, and free of any
+ * word that needs decoding. The file store's data line says the one thing a
+ * person backing the folder up has to know.
+ */
+export function plainSecretNotes(backendName) {
+  const field = 'Saved on this computer only, scrambled so nobody else can read it.';
+  if (backendName === 'encrypted-file') {
+    return {
+      field,
+      data: 'Your saved passwords are in this folder too, encrypted. If you back the folder up, keep the backup somewhere private.',
+      about: 'Your passwords are locked in an encrypted file on this computer.',
+    };
+  }
+  return {
+    field,
+    data: 'Your saved passwords are not in this folder — they are in this computer’s own password store.',
+    about: 'Your passwords are kept in this computer’s own password store.',
+  };
+}
+
+/**
  * The one credential a source may have, asked for in the connector's own words.
  *
  * `credential: null` and `{required: false}` are different facts and the whole
@@ -435,17 +522,17 @@ function youPanel() {
   const tzInput = input({ value: identity.timezone || '', readonly: true });
 
   return el('div', { class: 'panel panel-you' }, [
-    el('p', { class: 'panel-lede', text: 'Two facts about you, used in two places and nowhere else. Neither leaves this machine except inside the request to the model endpoint you chose.' }),
+    el('p', { class: 'panel-lede', text: 'Two facts about you. Neither leaves this computer except inside what Zelos sends to the AI you chose.' }),
     field('Your name', nameInput, {
-      hint: 'Signs the drafts. Left blank, every prompt reads “name: (not set — do not invent one)” and drafts come back unsigned, with nothing on screen to say why.',
+      hint: 'Signs the replies Zelos writes. If you leave this blank, the replies Zelos writes for you will not be signed.',
     }),
     field('Your email address', emailInput, {
       hint: !stored && guess
-        ? `Zelos has not been told this yet, so the address of your first mailbox is filled in above. Press Save to use it. It is how a message written straight to you is ranked ahead of one you were only copied on — until it is set, that ranking does nothing at all.`
-        : 'How a message written straight to you is ranked ahead of one you were only copied on, and how Zelos tells your own replies from everyone else’s.',
+        ? 'The address Zelos treats as yours (usually the same as your mailbox). Your first mailbox is filled in above — press Save to use it. It lets Zelos put a message written straight to you ahead of one you were only copied on.'
+        : 'The address Zelos treats as yours (usually the same as your mailbox). It lets Zelos put a message written straight to you ahead of one you were only copied on, and tell your own replies from everyone else’s.',
     }),
     field('Timezone', tzInput, {
-      hint: 'Read from this machine every time Zelos starts, so it follows you rather than sticking where you were. Not editable here on purpose.',
+      hint: 'Read from this computer every time Zelos starts, so it follows you when you travel. Not editable here on purpose.',
     }),
     el('div', { class: 'row-inline' }, [
       button('Save', {
@@ -462,7 +549,7 @@ function youPanel() {
           status.working('Saving…');
           try {
             await saveConfig({ identity: { name: nameInput.value.trim(), email } });
-            status.good('Saved. The next sweep uses it.');
+            status.good('Saved. Zelos uses it the next time it checks.');
           } catch (err) {
             status.bad(err.message);
           }
@@ -476,8 +563,84 @@ function youPanel() {
 /* --------------------------------------------------------------- the model */
 
 /**
+ * The two providers a first-timer is offered by name, and what the guided
+ * card says for each. Everything else the server's preset list carries is
+ * one drawer down under "More choices", with a plain sentence apiece.
+ *
+ * `friendly` is the name the person has heard of — "Claude", "OpenAI" — and is
+ * what the card says once the key works. `createStep` is the button on the
+ * provider's own key page, spelled the way that page spells it, because "press
+ * the thing that makes a key" is exactly the instruction that loses people.
+ */
+const GUIDED_PROVIDERS = {
+  anthropic: {
+    title: 'Claude, by Anthropic',
+    badge: 'Recommended',
+    blurb: 'Easiest to set up. Made by the company that makes Claude.',
+    friendly: 'Claude',
+    keyPage: 'Anthropic’s key page',
+    createStep: 'Press Create Key and copy it.',
+    preferModel: 'claude-sonnet-5',
+  },
+  openai: {
+    title: 'OpenAI, who make ChatGPT',
+    badge: null,
+    blurb: 'The company behind ChatGPT.',
+    friendly: 'OpenAI',
+    keyPage: 'OpenAI’s key page',
+    createStep: 'Press Create new secret key and copy it.',
+    preferModel: null,
+  },
+};
+
+/** One plain sentence per provider under "More choices". Anything unlisted keeps the server's own note. */
+const PLAIN_PROVIDER_NOTES = {
+  gemini: 'Google’s AI. The key comes from Google AI Studio.',
+  groq: 'Very fast. Runs freely available models.',
+  mistral: 'A French company; your mail summaries stay in Europe.',
+  deepseek: 'Inexpensive.',
+  xai: 'Grok, from xAI.',
+  together: 'A wide choice of freely available models.',
+  openrouter: 'One key that reaches most of the others.',
+  fireworks: 'Fast hosted models.',
+  cerebras: 'Very fast.',
+};
+
+/** Never a number. Zelos does not know what anyone pays, and a made-up figure here would be the most damaging sentence on the screen. */
+export const COST_LINE = 'Pay-as-you-go. You can set a monthly spending cap on their site.';
+
+/**
+ * The model the guided card picks on the person's behalf.
+ *
+ * Nothing is invented: the id has to be one the preset already names in
+ * `suggestedModels`, which core/llm.mjs maintains against the providers'
+ * own lists. Anthropic's list leads with the largest model and the guided
+ * default is the middle one — the one that reads a day of mail without
+ * costing like the flagship — so the preference is stated here, and falls
+ * back to the list's first entry when the preferred id is not on it.
+ */
+export function pickDefaultModel(preset, preferred = GUIDED_PROVIDERS[preset?.id]?.preferModel) {
+  const list = Array.isArray(preset?.suggestedModels) ? preset.suggestedModels.filter(Boolean) : [];
+  if (preferred && list.includes(preferred)) return preferred;
+  return list[0] || '';
+}
+
+/**
  * The model panel, shared with onboarding. `onDone` fires after a save that
  * leaves the model usable, which is what lets the onboarding flow advance.
+ *
+ * Three layers, top to bottom, and the person reads only as far as they need:
+ *
+ *   1. A runtime already running on this computer (when the probe found one,
+ *      and only then — nobody is shown a sentence about four ports), then the
+ *      two providers most people have heard of, as cards.
+ *   2. The guided card for whichever was chosen: open the key page, create a
+ *      key, paste it, press "Check it works". That one button stores the key,
+ *      tests the connection, picks the model and saves — the same four calls
+ *      the expert form makes from four buttons, in the only sensible order.
+ *   3. "More choices" and "Advanced", both collapsed. The expert form with
+ *      base URL, model id and "List available models" is the Advanced drawer,
+ *      unchanged in what it does.
  */
 export function modelPanel({ compact = false, onDone = null } = {}) {
   const cfg = state.config?.model || {};
@@ -487,12 +650,20 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
     baseUrl: cfg.baseUrl || '',
     model: cfg.model || '',
     keyRef: cfg.keyRef || 'model.default',
+    // The guided card to show, or null for the expert form alone. Set by
+    // choose(); restored from the saved config once the presets arrive.
+    guide: null,
+    suggested: [],
   };
 
   const status = statusLine();
-  const localWrap = el('div', { class: 'runtime-list' }, el('p', { class: 'quiet-note', text: 'Looking for a model running on this machine…' }));
-  const presetWrap = el('div', { class: 'preset-grid' });
+  const localWrap = el('div', { class: 'runtime-list' });
+  const choiceWrap = el('div', { class: 'preset-grid' }, el('p', { class: 'quiet-note', text: 'Loading the list of AI services…' }));
+  const moreWrap = el('div', { class: 'preset-grid' });
+  const guidedWrap = el('div', { class: 'chosen' });
+  guidedWrap.hidden = true;
   const formWrap = el('div', { class: 'chosen' });
+  const probeNote = el('p', { class: 'quiet-note' });
 
   // Refs this panel has stored itself since it was drawn. `state.secretRefs`
   // is refreshed by a config save, not by POST /api/secrets, so a key stored
@@ -501,6 +672,7 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
   const storedHere = new Set();
   const keyStored = () => state.secretRefs.includes(draft.keyRef) || storedHere.has(draft.keyRef);
   const isLocal = () => /^https?:\/\/(127\.0\.0\.1|localhost|\[?::1\]?)(:|\/|$)/i.test(draft.baseUrl || '');
+  const friendly = () => draft.guide?.friendly || draft.label || 'this service';
 
   function drawForm() {
     const modelInput = input({ value: draft.model, placeholder: 'model id, e.g. llama3.1:8b', list: 'zelos-models' });
@@ -509,12 +681,14 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
     const baseInput = input({ value: draft.baseUrl, placeholder: 'https://…' });
     baseInput.addEventListener('input', () => { draft.baseUrl = baseInput.value.trim(); });
 
+    // One key box. It sits in the guided card when there is one and in the
+    // Advanced form otherwise; the helpers below read it wherever it is.
     const keyInput = el('input', {
       class: 'input',
       type: 'password',
       autocomplete: 'off',
       spellcheck: 'false',
-      placeholder: keyStored() ? 'a key is stored — type a new one to replace it' : 'paste your API key',
+      placeholder: keyStored() ? 'a key is saved — paste a new one to replace it' : 'paste the key here',
     });
 
     const datalist = el('datalist', { id: 'zelos-models' });
@@ -537,9 +711,10 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
       keyInput.value = '';
     }
 
-    // A hosted endpoint will not answer without a key, and the server says so
-    // only after the call; said here, before it, about the field it is about.
-    const NEEDS_KEY = 'Paste an API key first — a hosted endpoint will not answer without one.';
+    // A hosted service will not answer without a key, and the server says so
+    // only after the call; said here, before it, about the field it is about
+    // — and in the name of the service, not of the address behind it.
+    const needsKey = () => `Paste the key first — ${friendly()} will not answer without one.`;
 
     async function loadModels() {
       try {
@@ -549,7 +724,7 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
         return;
       }
       if (!isLocal() && !keyStored()) {
-        suggestions.replaceChildren(el('span', { class: 'quiet-note', text: NEEDS_KEY }));
+        suggestions.replaceChildren(el('span', { class: 'quiet-note', text: needsKey() }));
         return;
       }
       suggestions.replaceChildren(el('span', { class: 'quiet-note', text: 'Asking the endpoint what it has…' }));
@@ -574,14 +749,14 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
 
     async function save() {
       if (!draft.baseUrl || !draft.model) {
-        status.bad('A base URL and a model id are both required.');
+        status.bad('An address and a model id are both required — both are under Advanced.');
         return false;
       }
       // Refused rather than saved: a hosted model with no key is a model every
       // sweep fails on, and this save used to go through silently — and, in
       // onboarding, advance to the next step on the strength of it.
       if (!isLocal() && !keyStored() && !keyInput.value.trim()) {
-        status.bad('A hosted endpoint needs an API key. Paste one above, or pick a runtime on this machine.');
+        status.bad(`${friendly()} needs a key. Paste one above, or pick an AI program on this computer.`);
         return false;
       }
       status.working('Saving…');
@@ -612,10 +787,10 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
         return false;
       }
       if (!isLocal() && !keyStored()) {
-        status.bad(NEEDS_KEY);
+        status.bad(needsKey());
         return false;
       }
-      status.working(`Calling ${draft.baseUrl}…`);
+      status.working(`Checking that ${friendly()} answers…`);
       try {
         const result = await api.testModel({
           protocol: draft.protocol,
@@ -624,7 +799,7 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
           keyRef: draft.keyRef,
         });
         if (result.ok) status.good(`Answered in ${result.ms}ms: “${result.sample}”`);
-        else status.bad(result.error || 'The endpoint refused the call.');
+        else status.bad(result.error || `${friendly()} refused the call.`);
         return result.ok;
       } catch (err) {
         status.bad(err.message);
@@ -632,7 +807,76 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
       }
     }
 
-    formWrap.replaceChildren(
+    /**
+     * The guided card's one button. Store, test, save — test() and save()
+     * above, in that order, so the model-panel rules (a key is stored before
+     * the call that needs it; a hosted service with no key is refused before
+     * anything is written) hold on this path exactly as they do on the expert
+     * one. The model was picked when the card was chosen, so there is nothing
+     * for the person to type but the key.
+     */
+    async function checkItWorks() {
+      if (!draft.model) {
+        status.bad('Zelos could not pick a model for this service — choose one under Advanced.');
+        return false;
+      }
+      const answered = await test();
+      if (!answered) return false;
+      const saved = await save();
+      if (!saved) return false;
+      status.good(`Working. Zelos will use ${friendly()}.`);
+      onDone?.();
+      return true;
+    }
+
+    const keyHint = keyStored()
+      ? 'A key is saved. For safety it is never shown again.'
+      : plainSecretNotes(state.health?.backend?.name).field;
+    const keyField = field(draft.guide ? 'Your key' : 'API key', keyInput, {
+      hint: draft.guide ? keyHint : (keyStored()
+        ? 'A key is already stored for this slot. Zelos cannot show it back to you — there is no route that reads a secret.'
+        : secretStoreNotes(state.health?.backend?.name).field),
+    });
+
+    // The guided card: the steps, the key box, one button.
+    const guide = draft.guide;
+    guidedWrap.hidden = !guide;
+    if (guide) {
+      const steps = guide.local
+        ? [
+          el('p', { text: `Zelos found ${guide.friendly} running on this computer. Nothing you read will leave this computer.` }),
+          el('p', { text: draft.model
+            ? `It will use ${draft.model}.`
+            : `${guide.friendly} is running but has nothing loaded yet. Load something in ${guide.friendly}, then press the button.` }),
+        ]
+        : [
+          el('p', {}, [
+            '1. Open ',
+            outLink(guide.keyUrl, guide.keyPage),
+            ' — they may ask you to sign in or make an account.',
+          ]),
+          el('p', { text: `2. ${guide.createStep}` }),
+          el('p', { text: '3. Paste it here.' }),
+        ];
+      replace(guidedWrap, [
+        el('div', { class: 'chosen-head' }, [
+          el('span', { class: 'chosen-label', text: guide.title }),
+          guide.local ? el('span', { class: 'badge-local', text: 'on this computer' }) : null,
+        ]),
+        el('div', { class: 'stack' }, steps),
+        guide.local ? null : keyField,
+        el('div', { class: 'row-inline' }, [
+          button('Check it works', { class: 'btn solid', onClick: checkItWorks }),
+        ]),
+        status.node,
+        guide.local ? null : el('p', { class: 'quiet-note', text: COST_LINE }),
+      ]);
+    }
+
+    // Through dom.js's replace(), which skips a null child: the status line
+    // and the key field each have one home, and a native replaceChildren
+    // handed a null throws in every browser.
+    replace(formWrap, [
       el('div', { class: 'chosen-head' }, [
         el('span', { class: 'chosen-label', text: draft.label || 'Custom endpoint' }),
         el('span', { class: 'mono chosen-proto', text: draft.protocol }),
@@ -647,13 +891,11 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
         button('List available models', { class: 'btn quiet', onClick: loadModels }),
         suggestions,
       ]),
-      isLocal() && !keyStored()
-        ? el('p', { class: 'field-hint', text: 'Local runtimes usually need no key, and Zelos will not invent one.' })
-        : field('API key', keyInput, {
-          hint: keyStored()
-            ? 'A key is already stored for this slot. Zelos cannot show it back to you — there is no route that reads a secret.'
-            : 'Stored in your OS keychain where one is available, never in config.json, never in a log.',
-        }),
+      guide
+        ? el('p', { class: 'field-hint', text: 'The key box is in the card above.' })
+        : isLocal() && !keyStored()
+          ? el('p', { class: 'field-hint', text: 'Local runtimes usually need no key, and Zelos will not invent one.' })
+          : keyField,
       el('div', { class: 'row-inline' }, [
         button('Save', {
           class: 'btn solid',
@@ -680,66 +922,118 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
           })
           : null,
       ]),
-      status.node,
-    );
+      // The status line has one home. It sits in the guided card when there
+      // is one, so the expert form borrows it only when it is the whole panel.
+      guide ? null : status.node,
+    ]);
   }
 
-  function choose(next) {
+  function choose(next, { scroll = true } = {}) {
     Object.assign(draft, next);
     drawForm();
-    formWrap.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    if (scroll) (draft.guide ? guidedWrap : formWrap).scrollIntoView({ block: 'nearest', behavior: 'smooth' });
   }
+
+  /** The guided card for a hosted preset, or for a runtime the probe found. */
+  const guideFor = (preset) => ({
+    ...GUIDED_PROVIDERS[preset.id],
+    keyUrl: preset.keyUrl || '',
+    local: false,
+  });
+  const guideForRuntime = (rt) => ({
+    title: `${rt.label}, on this computer`,
+    friendly: rt.label,
+    local: true,
+  });
 
   api.probeLocal().then((found) => {
     if (!found?.length) {
-      localWrap.replaceChildren(el('p', { class: 'quiet-note', text: 'No local runtime answered on the usual ports (Ollama 11434, LM Studio 1234, llama.cpp 8080, vLLM 8000). Start one and reopen this panel, or pick a hosted provider below.' }));
+      // Said under Advanced, and only there. A first-timer is not told about
+      // four ports that did not answer; an expert who started a runtime and
+      // wonders why it is not listed finds the list of what was tried.
+      probeNote.textContent = 'No AI program answered on this computer. Zelos checks the usual four — Ollama on 11434, LM Studio on 1234, llama.cpp on 8080, vLLM on 8000 — and looks nowhere else; it will not go hunting on the network. Start one and reopen this panel.';
       return;
     }
-    localWrap.replaceChildren(...found.map((rt) => el('div', { class: 'runtime' }, [
-      el('div', { class: 'runtime-body' }, [
-        el('span', { class: 'runtime-label', text: rt.label }),
-        el('span', { class: 'mono runtime-url', text: rt.baseUrl }),
-        el('span', { class: 'quiet-note', text: `${plural(rt.models?.length || 0, 'model')} loaded` }),
-      ]),
-      button('Use this', {
-        class: 'btn solid',
-        onClick: () => choose({
-          protocol: 'openai',
-          label: rt.label,
-          baseUrl: rt.baseUrl,
-          model: rt.models?.[0]?.id || '',
-        }),
+    localWrap.replaceChildren(...found.map((rt) => el('button', {
+      type: 'button',
+      class: 'preset',
+      onclick: () => choose({
+        protocol: 'openai',
+        label: rt.label,
+        baseUrl: rt.baseUrl,
+        model: rt.models?.[0]?.id || '',
+        guide: guideForRuntime(rt),
       }),
+    }, [
+      el('span', { class: 'preset-label', text: `An AI program on this computer — ${rt.label}` }),
+      el('span', { class: 'preset-note', text: 'Most private. Nothing leaves this computer.' }),
     ])));
   }).catch((err) => {
-    localWrap.replaceChildren(el('p', { class: 'quiet-note', text: `Could not probe for local runtimes: ${err.message}` }));
+    probeNote.textContent = `Could not look for an AI program on this computer: ${err.message}`;
   });
 
   api.presets().then((presets) => {
-    presetWrap.replaceChildren(...(presets || []).filter((p) => !p.local).map((p) => el('button', {
+    const hosted = (presets || []).filter((p) => !p.local);
+    const guided = hosted.filter((p) => GUIDED_PROVIDERS[p.id]);
+    const rest = hosted.filter((p) => !GUIDED_PROVIDERS[p.id]);
+
+    choiceWrap.replaceChildren(...guided.map((p) => {
+      const g = GUIDED_PROVIDERS[p.id];
+      return el('button', {
+        type: 'button',
+        class: 'preset',
+        onclick: () => choose({
+          protocol: p.protocol,
+          label: p.label,
+          baseUrl: p.baseUrl,
+          model: pickDefaultModel(p),
+          guide: guideFor(p),
+        }),
+      }, [
+        el('span', { class: 'preset-label', text: g.badge ? `${g.title} — ${g.badge}` : g.title }),
+        el('span', { class: 'preset-note', text: g.blurb }),
+      ]);
+    }));
+
+    moreWrap.replaceChildren(...rest.map((p) => el('button', {
       type: 'button',
       class: 'preset',
       onclick: () => choose({
         protocol: p.protocol,
         label: p.label,
         baseUrl: p.baseUrl,
-        model: p.suggestedModels?.[0] || '',
+        model: pickDefaultModel(p),
+        guide: null,
       }),
     }, [
       el('span', { class: 'preset-label', text: p.label }),
-      el('span', { class: 'preset-note', text: p.note || '' }),
+      el('span', { class: 'preset-note', text: PLAIN_PROVIDER_NOTES[p.id] || p.note || '' }),
     ])));
+
+    // A saved provider that has a guided card gets it back on open, model and
+    // all, so Settings › AI says "Claude" to someone who chose Claude rather
+    // than opening on a blank expert form. A fresh home is this case too:
+    // core/config.mjs's DEFAULTS pre-select the Anthropic preset with an
+    // empty model id, and a card restored with that blank told the first
+    // person to press "Check it works" that it could not pick a model — found
+    // by driving the app, not by the tests, which always clicked the card.
+    const current = guided.find((p) => p.baseUrl && p.baseUrl === draft.baseUrl);
+    if (current) choose({ guide: guideFor(current), model: draft.model || pickDefaultModel(current) }, { scroll: false });
   }).catch(() => {
-    presetWrap.replaceChildren(el('p', { class: 'quiet-note', text: 'Could not load the provider list.' }));
+    choiceWrap.replaceChildren(el('p', { class: 'quiet-note', text: 'Could not load the list of AI services.' }));
   });
 
   drawForm();
 
   return el('div', { class: 'panel panel-model' }, [
-    !compact ? el('p', { class: 'panel-lede', text: 'Zelos talks to exactly one model endpoint, and you choose it. A runtime on this machine keeps everything local; a hosted key means your mail summaries go to that provider and nowhere else.' }) : null,
-    section('On this machine', {}, localWrap),
-    section('Hosted providers', {}, presetWrap),
-    section('Endpoint', {}, formWrap),
+    el('p', { class: 'panel-lede', text: compact
+      ? 'Zelos sends your mail summaries to the AI you pick here, and to nothing else.'
+      : 'Pick the AI that reads your mail. Zelos talks to it and to nothing else; your mail summaries go there and nowhere else.' }),
+    localWrap,
+    choiceWrap,
+    guidedWrap,
+    fold('More choices', moreWrap),
+    fold('Advanced', [probeNote, formWrap]),
   ]);
 }
 
@@ -787,6 +1081,81 @@ export function sentMailboxFromTest(mailboxes, current = '') {
 const NEEDS_PASSWORD = 'This account needs a password — paste it above. Gmail and Yahoo want an app password, not the account one.';
 
 /**
+ * The simple card's version of the same refusal, said about the box it has
+ * just opened rather than one "above" that may have been hidden. Google's
+ * sentence names the thing Google actually hands out — sixteen letters — and
+ * every provider's names the button that makes one.
+ */
+export function needsPassword(guess) {
+  const google = guess?.signIn === 'google';
+  return google
+    ? 'Paste the 16-letter app password from Google here. Don’t have one yet? Press Get an app password.'
+    : 'Paste the app password here. Don’t have one yet? Press Get an app password.';
+}
+
+/**
+ * What the card says about a provider, in plain words.
+ *
+ * The server's `guess.note` is written for the doctor and the expert form: it
+ * says "over IMAP", names `myaccount.google.com → Security → App passwords`,
+ * and for Microsoft says "register a free app". Every one of those sentences
+ * is still shown — under "Server settings (for experts)" — and these are what
+ * a person reads first. Keyed by the label the server gives the provider,
+ * which is the one string the two sides already share.
+ */
+export function plainProviderNote(guess) {
+  if (!guess?.host) return guess?.note || '';
+  if (guess.auth === 'bridge') {
+    return 'Proton Mail works through Proton Bridge, a program from Proton that runs on this computer. Open Bridge, copy the settings it shows you, and enter them under Server settings.';
+  }
+  if (guess.auth === 'xoauth2') {
+    return guess.clientReady
+      ? 'Press Sign in with Microsoft. Zelos shows you a short code; type it at microsoft.com/devicelogin and sign in there as usual.'
+      : 'Hotmail and Outlook.com need a one-time setup at Microsoft’s website first — about ten minutes, and no new account.';
+  }
+  if (guess.signIn === 'google') {
+    return guess.clientReady
+      ? 'Press Sign in with Google and finish in the tab that opens. Or use an app password instead — the link below explains.'
+      : 'Google does not let other programs use your normal password. Instead it makes a special 16-letter password just for Zelos. You need Google’s text-message sign-in (2-Step Verification) switched on first — the page below walks you through both.';
+  }
+  if (!guess.known) {
+    return `We guessed ${guess.host} — Connect will tell you if that is right. Many providers want a special app password rather than your normal one.`;
+  }
+  const name = String(guess.label || 'This provider').replace(/ Mail$/, '');
+  return `${name} needs a special password made just for Zelos (it calls it an app password). The button below opens the page where you make one.`;
+}
+
+/** Under the "Get an app password" button: what the person will see there, and that they have to come back. */
+export function appPasswordSteps(guess) {
+  if (guess?.signIn === 'google') {
+    return 'Google opens in a new tab and may ask you to sign in. Type a name like ‘Zelos’, press Create, copy the 16 letters, then come back here and paste them.';
+  }
+  const name = String(guess?.label || 'Your provider').replace(/ Mail$/, '');
+  return `${name} opens in a new tab and may ask you to sign in. Make a new app password, name it something like ‘Zelos’, copy it, then come back here and paste it.`;
+}
+
+/**
+ * The pages the guided cards send a person to — Google Calendar's settings,
+ * Apple's app-specific passwords and iCloud's CalDAV host, Outlook's
+ * calendar, the Microsoft one-time setup — as GET /api/guides hands them
+ * over. ui/ names no remote host itself (three suites assert it, so the page
+ * works offline and shows only addresses this server gave it), which is why
+ * these, like the presets' key pages and the mail guess's app-password pages,
+ * arrive as data. Fetched once per page load; a build without the route
+ * answers 404, and the cards then say the page's name without linking it.
+ */
+let guidesPromise = null;
+
+export function guideLinks() {
+  if (!guidesPromise) {
+    guidesPromise = request('/api/guides')
+      .then((payload) => (payload && typeof payload === 'object' ? payload : {}))
+      .catch(() => ({}));
+  }
+  return guidesPromise;
+}
+
+/**
  * Where a sign-in flow stands, read off whatever the server called it.
  *
  * The Microsoft device flow has always answered `state`; the route that grew
@@ -826,7 +1195,7 @@ const flowStatus = (flow) => flow?.status ?? flow?.state;
  * the client id and tenant the person typed, which is what the account has to
  * be saved with; `onConnected` fires when Microsoft has handed over a grant.
  */
-function microsoftSignIn({ keyRef, user, clientId = '', tenantId = 'common', clientReady = false, onStart = null, onConnected = null }) {
+function microsoftSignIn({ keyRef, user, clientId = '', tenantId = 'common', clientReady = false, setupUrl = '', linkShownAbove = false, onStart = null, onConnected = null }) {
   const clientIdInput = input({ value: clientId, placeholder: '00000000-0000-0000-0000-000000000000', autocomplete: 'off' });
   const tenantInput = input({ value: tenantId || 'common', placeholder: 'common', autocomplete: 'off' });
   // `provider` travels with the account from here on, so a sweep can tell a
@@ -849,7 +1218,7 @@ function microsoftSignIn({ keyRef, user, clientId = '', tenantId = 'common', cli
     flowId = null;
     codeBox.replaceChildren();
     if (flowStatus(flow) === 'connected') {
-      signInStatus.good('Signed in. The token is in your keychain; Zelos will refresh it on its own.');
+      signInStatus.good('Signed in. Zelos stays signed in on its own from here.');
       onConnected?.();
     } else if (flowStatus(flow) === 'cancelled') {
       signInStatus.bad('Sign-in cancelled.');
@@ -885,8 +1254,17 @@ function microsoftSignIn({ keyRef, user, clientId = '', tenantId = 'common', cli
   async function start() {
     if (!user()) { signInStatus.bad('Fill in the username first — it is the mailbox being signed in to.'); return; }
     // With a shipped client the id is optional: an empty one tells the server
-    // to use its own. Without one it is the whole flow, and it is required.
-    if (!clientReady && !clientIdInput.value.trim()) { signInStatus.bad('The application (client) ID from your Entra app registration is required.'); return; }
+    // to use its own. Without one there is no flow to start — and the answer
+    // to a person who pressed the big button is the page that walks them
+    // through the one-time setup, never a sentence about an ID they have
+    // never heard of. The fields for that ID are one drawer down.
+    if (!clientReady && !clientIdInput.value.trim()) {
+      signInStatus.bad('One more step first: Zelos needs a one-time setup at Microsoft’s website (about ten minutes). The page below shows every click; the ID it gives you goes under “For work accounts (advanced)”.');
+      // The simple card already shows the link above the button; the full
+      // form does not, so the block carries it there.
+      if (!linkShownAbove) codeBox.replaceChildren(el('div', { class: 'row-inline' }, [setupLink(setupUrl)]));
+      return;
+    }
     const chosen = oauth();
     onStart?.(chosen);
     stopPolling();
@@ -927,21 +1305,25 @@ function microsoftSignIn({ keyRef, user, clientId = '', tenantId = 'common', cli
   // stick covers this one too.
   const registration = el('div', { class: 'stack' }, [
     field('Application (client) ID', clientIdInput, {
-      hint: 'From your own app registration in Microsoft Entra. Register an app, switch on “Allow public client flows”, and paste its Application (client) ID here.',
+      hint: 'Only for a work or school account whose IT department gave you an ID, or after the one-time setup at Microsoft’s website (“Show me how” above). Register an app there, switch on “Allow public client flows”, and paste its Application (client) ID here.',
     }),
     field('Directory (tenant) ID', tenantInput, {
-      hint: 'Leave it as “common” for a personal Outlook, Hotmail, Live or MSN account. A work or school mailbox needs the tenant its administrator gives you.',
+      hint: 'Leave it as “common” for a personal Outlook, Hotmail, Live or MSN account. A work or school mailbox needs the ID its administrator gives you.',
     }),
   ]);
-  registration.hidden = clientReady;
+  // Folded, not merely hidden: a field a person is told to leave alone should
+  // not be on the screen, and a work account's administrator knows to open
+  // the drawer that names them.
+  const workAccounts = fold('For work accounts (advanced)', registration);
+  workAccounts.hidden = clientReady;
 
   const node = el('div', { class: 'stack' }, [
-    registration,
     el('div', { class: 'row-inline' }, [
       button('Sign in with Microsoft', { class: 'btn solid', onClick: start }),
     ]),
     signInStatus.node,
     codeBox,
+    workAccounts,
   ]);
 
   return {
@@ -1002,8 +1384,8 @@ function googleSignIn({ keyRef, email, clientReady = false, clientId = '', signe
     const status = flowStatus(flow);
     if (status === 'connected') {
       signInStatus.good(flow.user
-        ? `Signed in as ${flow.user}. The token is in your keychain; Zelos will refresh it on its own.`
-        : 'Signed in. The token is in your keychain; Zelos will refresh it on its own.');
+        ? `Signed in as ${flow.user}. Zelos stays signed in on its own from here.`
+        : 'Signed in. Zelos stays signed in on its own from here.');
       onConnected?.({ keyRef, provider: 'google', clientId: oauth().clientId, user: flow.user || '' });
     } else if (status === 'cancelled') {
       signInStatus.bad('Sign-in cancelled.');
@@ -1471,24 +1853,31 @@ export async function connectSimpleMail({ id, keyRef, email, password = '', gues
  * Connecting a mailbox as one field, one button, one paste and Connect.
  *
  * People expect "Sign in with Google", and for Gmail and Google Workspace it
- * is what they get — first, above the app-password path, which stays one
- * link away because it is the floor: a provider that offers nothing else
- * (iCloud, Yahoo, Fastmail, a server of one's own) still connects with one.
+ * is what they get when Zelos has a Google client to sign in with — first,
+ * above the app-password path, which stays one link away because it is the
+ * floor: a provider that offers nothing else (iCloud, Yahoo, Fastmail, a
+ * server of one's own) still connects with one. Until the client ships, the
+ * app password IS the path and the sign-in lives under "For developers".
  * The address is typed once; the server says which provider it is and
  * whether it signs in (POST /api/mail/guess, so the address never sits in a
  * URL); one button opens the provider's own sign-in page, or the exact page
  * where it creates an app password; Connect tests, finds the sent folder and
  * saves in one go.
  *
- * The full form is never far. "Advanced" opens it prefilled with whatever the
- * guess found, and stays where it is when Connect fails — one button, on the
- * same account id and keyRef, so a password Connect already stored is the
- * password the full form saves. Microsoft's personal domains get the same sign-in
- * block the full form shows, since there is no password to paste; Proton gets
- * its Bridge note and the full form, because Bridge's own host, port and
- * password are the whole of that setup.
+ * What the card says is written for someone who has never heard of IMAP.
+ * The server's own note for the provider, its host and port, and the full
+ * form all still exist — under "Server settings (for experts)", which opens
+ * BENEATH the card and leaves the address and the card exactly where they
+ * were when it closes. The old Advanced replaced the whole card and offered
+ * Cancel as the only way back, which threw away the address a person had
+ * just typed. There is exactly one route to the full form at a time: the
+ * link under the address before a card is up, the card's own button after.
+ * Microsoft's personal domains get the same sign-in block the full form
+ * shows, since there is no password to paste; Proton gets its Bridge note
+ * and the full form, because Bridge's own host, port and password are the
+ * whole of that setup.
  */
-export function simpleMailForm({ onSaved, onCancel, onAdvanced }) {
+export function simpleMailForm({ onSaved, onCancel }) {
   const id = randomId('m');
   const keyRef = `mail.${id}`;
   const status = statusLine();
@@ -1496,6 +1885,9 @@ export function simpleMailForm({ onSaved, onCancel, onAdvanced }) {
   let microsoft = null;    // the sign-in block, once the guess says xoauth2
   let google = null;       // the sign-in block, once the guess says signIn: 'google'
   let signedIn = false;
+  // The server's own words about the provider — host, port, how it knows,
+  // the sentence about IMAP — shown with the expert form and nowhere else.
+  let expertNote = null;
   // Whichever sign-in block the card is showing; at most one is built.
   const signInBlock = () => google || microsoft;
   // A Google sign-in that finished is the account's auth, whatever the guess
@@ -1517,14 +1909,20 @@ export function simpleMailForm({ onSaved, onCancel, onAdvanced }) {
   });
   const card = el('div', { class: 'chosen' });
   card.hidden = true;
+  // The full form opens here, under the card, and closes back to nothing.
+  const expertSlot = el('div', { class: 'editor' });
 
   const email = () => emailInput.value.trim();
 
   // Same shape as mailForm: a password this form stored itself counts, since
   // `state.secretRefs` is refreshed by a config save and not by POST
-  // /api/secrets — and the same rule, in the same words.
+  // /api/secrets — and the same rule, in plainer words.
   const storedHere = new Set();
   const passwordMissing = () => !passInput.value && !storedHere.has(keyRef);
+  // The password box, when the card has folded it away: Connect opens it
+  // before it asks for anything, so "paste it here" is never about a box the
+  // person cannot see.
+  let revealPassword = () => {};
 
   /** What the full form opens on: everything the guess found, and the typed address. */
   const prefill = () => ({
@@ -1538,24 +1936,48 @@ export function simpleMailForm({ onSaved, onCancel, onAdvanced }) {
     ...(guess?.auth === 'xoauth2' || viaGoogle() ? { auth: 'xoauth2', oauth: signInBlock()?.oauth() ?? null } : {}),
   });
 
+  /**
+   * The full form, beneath the card. A password Connect already stored has
+   * to count in the full form, whose passwordStored() reads
+   * state.secretRefs. One GET /api/config is what makes that true; its
+   * failure leaves the form to ask again, which is the worse of two honest
+   * outcomes and not a wrong one. Pressing the button again closes it.
+   */
   async function openAdvanced() {
+    if (expertSlot.children.length) { expertSlot.replaceChildren(); return; }
     microsoft?.stop();
     google?.stop();
-    // A password Connect already stored has to count in the full form, whose
-    // passwordStored() reads state.secretRefs. One GET /api/config is what
-    // makes that true; its failure leaves the form to ask again, which is
-    // the worse of two honest outcomes and not a wrong one.
     if (storedHere.size) await loadConfig().catch(() => {});
-    onAdvanced(prefill());
+    expertSlot.replaceChildren(mailForm({
+      enabled: true,
+      label: '',
+      host: '',
+      port: 993,
+      secure: true,
+      // Null, not false: a new account has not excused anything yet, and the
+      // blank this form opens on has to be the same blank core/config.mjs
+      // would have written.
+      requireTls: null,
+      user: '',
+      mailboxes: ['INBOX'],
+      sentMailbox: 'Sent',
+      lookbackDays: 14,
+      maxMessages: 400,
+      ...prefill(),
+    }, {
+      onSaved,
+      onCancel: () => expertSlot.replaceChildren(),
+    }));
+    if (expertNote) expertSlot.appendChild(expertNote);
   }
 
   async function lookUp() {
     const address = email();
     if (!address || guess?.for === address) return;
-    status.working('Working out the provider…');
+    status.working('Working out who provides your email…');
     try {
-      const found = await api.guessMail(address);
-      guess = { ...found, for: address };
+      const [found, links] = await Promise.all([api.guessMail(address), guideLinks()]);
+      guess = { ...found, for: address, setupUrl: links.microsoftSetup || '' };
       status.clear();
       paintCard();
     } catch (err) {
@@ -1568,14 +1990,15 @@ export function simpleMailForm({ onSaved, onCancel, onAdvanced }) {
     if (!guess || !guess.host) return;
     const auth = viaGoogle() ? 'xoauth2' : guess.auth;
     if (auth === 'password' && passwordMissing()) {
-      status.bad(NEEDS_PASSWORD);
+      revealPassword();
+      status.bad(needsPassword(guess));
       return;
     }
     if (guess.auth === 'xoauth2' && !signedIn) {
-      status.bad('Sign in with Microsoft above first — a personal Microsoft mailbox has no password to paste.');
+      status.bad('Press Sign in with Microsoft first — a personal Microsoft mailbox has no password to paste.');
       return;
     }
-    status.working(`Connecting to ${guess.host}…`);
+    status.working(`Connecting to ${guess.known ? guess.label : guess.host}…`);
     try {
       // A signed-in mailbox carries no password, whatever was pasted before
       // the sign-in finished.
@@ -1595,16 +2018,16 @@ export function simpleMailForm({ onSaved, onCancel, onAdvanced }) {
       if (password) {
         storedHere.add(keyRef);
         passInput.value = '';
-        passInput.placeholder = 'a password is stored — paste a new one to replace it';
+        passInput.placeholder = 'a password is saved — paste a new one to replace it';
       }
-      // The card's own Advanced is still on screen, and it is the one way to
-      // the full form: a second button under the error would be the two
-      // "Advanced"s paintCard avoids, one line apart.
+      // The card's own expert button is still on screen, and it is the one
+      // way to the full form: a second button under the error would be two
+      // routes, one line apart.
       if (!outcome.ok) {
         status.bad(outcome.error);
         return;
       }
-      const sent = outcome.sentMailbox ? `sent folder “${outcome.sentMailbox}”` : 'no sent folder flagged';
+      const sent = outcome.sentMailbox ? `sent folder “${outcome.sentMailbox}”` : 'no sent folder found';
       status.good(`Connected · ${plural(outcome.mailboxes, 'mailbox', 'mailboxes')} · ${sent}`
         + (outcome.adopted ? ` · Zelos will also treat ${outcome.adopted} as your own address — change it under Settings → You.` : ''));
       onSaved();
@@ -1613,7 +2036,7 @@ export function simpleMailForm({ onSaved, onCancel, onAdvanced }) {
     }
   }
 
-  const formAdvanced = button('Advanced', { class: 'link', onClick: openAdvanced });
+  const formAdvanced = button('Server settings (for experts)', { class: 'link', onClick: openAdvanced });
 
   function paintCard() {
     microsoft?.stop();
@@ -1621,25 +2044,33 @@ export function simpleMailForm({ onSaved, onCancel, onAdvanced }) {
     google?.stop();
     google = null;
     signedIn = false;
+    revealPassword = () => {};
+    expertNote = null;
+    expertSlot.replaceChildren();
     card.hidden = !guess;
     // One route to the full form at a time: before a guess it is the link under
-    // the address; once a card is up, the card carries its own. Two "Advanced"
+    // the address; once a card is up, the card carries its own. Two expert
     // buttons on one screen read as two different things.
     formAdvanced.hidden = Boolean(guess);
     if (!guess) { card.replaceChildren(); return; }
 
     // How the server knows: a custom domain on Workspace or 365 is named
     // from its mail records, and a domain with an IMAP SRV record from that.
+    // The line is mono and technical, so a recognised provider does not show
+    // it at all; a guessed host is the one fact a person can check.
     const via = guess.via === 'mx' ? ' · found through your domain\'s mail records'
       : guess.via === 'srv' ? ' · advertised by your domain'
         : '';
     const head = el('div', { class: 'chosen-head' }, [
       el('span', { class: 'chosen-label', text: guess.known ? guess.label : (guess.host ? 'A provider Zelos does not know' : 'Not an address Zelos can read') }),
-      guess.host ? el('span', { class: 'mono account-host', text: `${guess.host}:${guess.port}${via}` }) : null,
+      guess.host && !guess.known ? el('span', { class: 'mono account-host', text: `${guess.host}:${guess.port}${via}` }) : null,
     ]);
-    const note = el('p', { class: 'quiet-note', text: guess.known || guess.via === 'srv'
-      ? guess.note
-      : `We guessed ${guess.host} — Connect will tell you if that is right. Many providers want an app-specific password rather than your normal one.` });
+    const note = el('p', { class: 'quiet-note', text: plainProviderNote(guess) });
+    // The server's own words about this provider — host, port, how it knows,
+    // the sentence about IMAP — kept for the expert, under the expert form.
+    expertNote = guess.note
+      ? el('p', { class: 'quiet-note', text: `${guess.host}:${guess.port}${via}. ${guess.note}` })
+      : null;
 
     if (!guess.host) {
       card.replaceChildren(head, el('p', { class: 'quiet-note', text: guess.note }));
@@ -1647,19 +2078,20 @@ export function simpleMailForm({ onSaved, onCancel, onAdvanced }) {
     }
 
     if (guess.auth === 'bridge') {
-      card.replaceChildren(head, note, el('div', { class: 'row-inline' }, [
+      replace(card, [head, note, el('div', { class: 'row-inline' }, [
         button('Continue with Bridge settings', { class: 'btn solid', onClick: openAdvanced }),
-      ]));
+      ])]);
       return;
     }
 
-    const advanced = button('Advanced', {
+    const advanced = button('Server settings (for experts)', {
       // Prominent where the guess is only a guess: the full form is where a
       // wrong host gets corrected, and a user whose provider is unknown is
       // the user most likely to need it.
       class: guess.known ? 'btn quiet' : 'btn',
       onClick: openAdvanced,
     });
+    const experts = el('div', { class: 'row-inline' }, [advanced]);
 
     if (guess.auth === 'xoauth2') {
       microsoft = microsoftSignIn({
@@ -1668,12 +2100,20 @@ export function simpleMailForm({ onSaved, onCancel, onAdvanced }) {
         // The shipped client, when the server has one: the registration form
         // is hidden and the button is the whole block.
         clientReady: guess.clientReady === true,
+        setupUrl: guess.setupUrl,
+        linkShownAbove: guess.clientReady !== true,
         onConnected: () => { signedIn = true; },
       });
-      card.replaceChildren(head, note, microsoft.node, el('div', { class: 'row-inline' }, [
-        button('Connect', { class: 'btn solid', onClick: connect }),
-        advanced,
-      ]));
+      replace(card, [
+        head,
+        note,
+        guess.clientReady ? null : el('div', { class: 'row-inline' }, [setupLink(guess.setupUrl)]),
+        microsoft.node,
+        el('div', { class: 'row-inline' }, [
+          button('Connect', { class: 'btn solid', onClick: connect }),
+        ]),
+        experts,
+      ]);
       return;
     }
 
@@ -1683,39 +2123,56 @@ export function simpleMailForm({ onSaved, onCancel, onAdvanced }) {
     const page = /^https:\/\//.test(guess.appPasswordUrl || '')
       ? el('a', { class: 'btn', href: guess.appPasswordUrl, target: '_blank', rel: 'noopener noreferrer', text: 'Get an app password' })
       : null;
+    const passwordPath = el('div', { class: 'stack' }, [
+      page ? el('div', { class: 'row-inline' }, [page]) : null,
+      page ? el('p', { class: 'quiet-note', text: appPasswordSteps(guess) }) : null,
+      field('App password', passInput, { hint: plainSecretNotes(state.health?.backend?.name).field }),
+    ]);
 
-    // Gmail and Workspace: sign in first, and the app password one link
-    // beneath. The password path is the same nodes the branch below paints,
-    // hidden until asked for — and hidden again once a sign-in has landed,
-    // because Connect will use the grant and a password field under a
-    // "Signed in" line reads as a second thing to do.
+    // Gmail and Workspace: sign in first when Zelos can, and the app password
+    // one link beneath. The password path is the same nodes the branch below
+    // paints, hidden until asked for — and hidden again once a sign-in has
+    // landed, because Connect will use the grant and a password field under
+    // a "Signed in" line reads as a second thing to do. Without a Google
+    // client the order flips: the password path is the card, and the
+    // sign-in — with its "paste your own client" fields — is the drawer.
     if (guess.signIn === 'google') {
-      const passwordPath = el('div', { class: 'stack' }, [
-        page ? el('div', { class: 'row-inline' }, [page]) : null,
-        field('App password', passInput, { hint: secretStoreNotes(state.health?.backend?.name).password }),
-      ]);
-      passwordPath.hidden = true;
+      const ready = guess.clientReady === true;
+      passwordPath.hidden = ready;
       const usePassword = button('Use an app password instead', {
         class: 'link',
         onClick: () => { passwordPath.hidden = false; usePassword.hidden = true; },
       });
+      usePassword.hidden = !ready;
+      revealPassword = () => { passwordPath.hidden = false; usePassword.hidden = true; };
       google = googleSignIn({
         keyRef,
         email,
-        clientReady: guess.clientReady === true,
+        clientReady: ready,
         onConnected: () => { signedIn = true; passwordPath.hidden = true; usePassword.hidden = true; },
       });
-      replace(card, [
-        head,
-        note,
-        google.node,
-        usePassword,
-        passwordPath,
-        el('div', { class: 'row-inline' }, [
-          button('Connect', { class: 'btn solid', onClick: connect }),
-          advanced,
-        ]),
-      ]);
+      replace(card, ready
+        ? [
+          head,
+          note,
+          google.node,
+          usePassword,
+          passwordPath,
+          el('div', { class: 'row-inline' }, [
+            button('Connect', { class: 'btn solid', onClick: connect }),
+          ]),
+          experts,
+        ]
+        : [
+          head,
+          note,
+          passwordPath,
+          el('div', { class: 'row-inline' }, [
+            button('Connect', { class: 'btn solid', onClick: connect }),
+          ]),
+          fold('For developers', google.node),
+          experts,
+        ]);
       return;
     }
     // Through dom.js's replace(), not the DOM's own replaceChildren: a null
@@ -1724,12 +2181,11 @@ export function simpleMailForm({ onSaved, onCancel, onAdvanced }) {
     replace(card, [
       head,
       note,
-      page ? el('div', { class: 'row-inline' }, [page]) : null,
-      field('App password', passInput, { hint: secretStoreNotes(state.health?.backend?.name).password }),
+      passwordPath,
       el('div', { class: 'row-inline' }, [
         button('Connect', { class: 'btn solid', onClick: connect }),
-        advanced,
       ]),
+      experts,
     ]);
   }
 
@@ -1743,9 +2199,10 @@ export function simpleMailForm({ onSaved, onCancel, onAdvanced }) {
 
   return el('div', { class: 'account-form' }, [
     field('Your email address', emailInput, {
-      hint: 'Zelos works out the provider from it. The address goes to the Zelos server on this machine and nowhere else. For a domain Zelos does not recognise, it asks your DNS resolver who handles mail for the domain — the domain only, never the address.',
+      hint: 'Your address stays on this computer.',
     }),
     card,
+    expertSlot,
     status.node,
     el('div', { class: 'row-inline' }, [
       formAdvanced,
@@ -1759,17 +2216,16 @@ export function mailPanel({ compact = false, onDone = null, rerender } = {}) {
   const wrap = el('div', { class: 'panel panel-mail' });
 
   if (!compact) {
-    wrap.appendChild(el('p', { class: 'panel-lede', text: 'Zelos reads mail over IMAP, directly from your server. Messages are stored in the database in your Zelos home and nowhere else. BODY.PEEK is used throughout, so reading your mail does not mark it read.' }));
+    wrap.appendChild(el('p', { class: 'panel-lede', text: 'The email account Zelos reads. It only looks: nothing it reads gets marked read, moved or deleted, and what it reads is kept on this computer and nowhere else.' }));
   }
 
   const list = el('div', { class: 'stack' }, accounts.length
     ? accounts.map((account) => el('div', { class: 'account' }, [
       el('div', { class: 'account-head' }, [
         el('span', { class: 'account-label', text: account.label || account.user }),
-        el('span', { class: 'mono account-host', text: `${account.host}:${account.port}` }),
         account.enabled === false ? el('span', { class: 'chip', text: 'off' }) : null,
       ]),
-      el('p', { class: 'quiet-note', text: `${account.user} · ${(account.mailboxes || []).join(', ')} · last ${account.lookbackDays} days` }),
+      el('p', { class: 'quiet-note', text: `${account.user} · the last ${account.lookbackDays} days` }),
       el('div', { class: 'row-inline' }, [
         button(account.enabled === false ? 'Enable' : 'Disable', {
           class: 'btn quiet',
@@ -1799,42 +2255,19 @@ export function mailPanel({ compact = false, onDone = null, rerender } = {}) {
         }),
       ]),
     ]))
-    : el('p', { class: 'quiet-note', text: 'No mailbox connected yet.' }));
+    : el('p', { class: 'quiet-note', text: 'No email account connected yet.' }));
 
   const editor = el('div', { class: 'editor' });
 
-  const addButton = button('Add a mailbox', {
+  // The simple form, which carries the full one beneath its own card — on the
+  // id and keyRef it minted, so a password Connect already stored is the
+  // password the full form saves.
+  const addButton = button('Add an email account', {
     class: 'btn solid',
     onClick: () => {
-      const saved = () => { onDone?.(); rerender?.(); };
-      const cancel = () => editor.replaceChildren();
       editor.replaceChildren(simpleMailForm({
-        onSaved: saved,
-        onCancel: cancel,
-        // The full form, on the id and keyRef the simple one minted, so a
-        // password Connect already stored is the password this form saves.
-        onAdvanced: (prefill) => editor.replaceChildren(mailForm({
-          id: prefill.id,
-          enabled: true,
-          label: '',
-          host: '',
-          port: 993,
-          secure: true,
-          // Null, not false: a new account has not excused anything yet, and the
-          // blank this form opens on has to be the same blank core/config.mjs
-          // would have written.
-          requireTls: null,
-          user: '',
-          keyRef: prefill.keyRef,
-          mailboxes: ['INBOX'],
-          sentMailbox: 'Sent',
-          lookbackDays: 14,
-          maxMessages: 400,
-          ...prefill,
-        }, {
-          onSaved: saved,
-          onCancel: cancel,
-        })),
+        onSaved: () => { onDone?.(); rerender?.(); },
+        onCancel: () => editor.replaceChildren(),
       }));
     },
   });
@@ -1846,6 +2279,73 @@ export function mailPanel({ compact = false, onDone = null, rerender } = {}) {
 }
 
 /* ------------------------------------------------------------- calendars */
+
+/**
+ * The four ways in, by the name a person knows their calendar by.
+ *
+ * Each guide fixes the connector kind and, where there is only one right
+ * answer, the address; the rest of the form is the same form, so a guided
+ * path tests and saves through exactly the code the expert one does. "Something
+ * else" is the expert form unchanged, under that label. The iCloud address is
+ * the host Apple publishes for CalDAV; core/sources/caldav.mjs discovers the
+ * account's calendars from it, across the partition hop Apple answers with.
+ */
+export const CALENDAR_GUIDES = [
+  {
+    id: 'google',
+    kind: 'ics',
+    title: 'Google Calendar',
+    blurb: 'The calendar that goes with a Gmail address.',
+    label: 'Google Calendar',
+    steps: [
+      ['1. Open ', { link: ['google', 'settings'], text: 'Google Calendar on the web' }, '.'],
+      '2. On the left, click your calendar.',
+      '3. Scroll to ‘Secret address in iCal format’ and copy it.',
+      '4. Paste it here.',
+    ],
+    urlLabel: 'The secret address',
+    urlPlaceholder: 'https://…/calendar/ical/…',
+  },
+  {
+    id: 'icloud',
+    kind: 'caldav',
+    title: 'iPhone or Mac (iCloud)',
+    blurb: 'The calendar on your iPhone, iPad or Mac.',
+    label: 'iCloud',
+    url: ['icloud', 'caldav'],
+    steps: [
+      'Zelos needs two things: your Apple ID email, and an app-specific password.',
+      ['To make the password: go to ', { link: ['icloud', 'appPasswords'], text: 'appleid.apple.com' }, ' → Sign-In and Security → App-Specific Passwords → name it Zelos. Copy it and paste it below.'],
+    ],
+    userLabel: 'Your Apple ID email',
+    passLabel: 'The app-specific password',
+  },
+  {
+    id: 'outlook',
+    kind: 'ics',
+    title: 'Outlook',
+    blurb: 'Outlook.com, Hotmail, or a work calendar in Outlook.',
+    label: 'Outlook',
+    steps: [
+      ['1. Open ', { link: ['outlook', 'calendar'], text: 'Outlook.com' }, ' → Settings → Calendar → Shared calendars.'],
+      '2. Under ‘Publish a calendar’, pick your calendar and press Publish.',
+      '3. Copy the ICS link and paste it here.',
+    ],
+    urlLabel: 'The ICS link',
+    urlPlaceholder: 'https://…/owa/calendar/…',
+  },
+  {
+    id: 'other',
+    kind: null,
+    title: 'Something else',
+    blurb: 'A calendar link, an account, or a file on this computer.',
+    label: '',
+    steps: [],
+  },
+];
+
+/** What the list calls a kind, instead of the connector's id. */
+const KIND_WORDS = { ics: 'a calendar link', caldav: 'a calendar account', file: 'a file on this computer' };
 
 /**
  * The calendar editor.
@@ -1863,21 +2363,33 @@ export function mailPanel({ compact = false, onDone = null, rerender } = {}) {
  * about it — and that is the part that was wrong before: `file` has
  * `credential: null`, and this form asked for a username and password to read a
  * path on the user's own disk.
+ *
+ * A `guide` (one of CALENDAR_GUIDES) turns the form into the steps for one
+ * named calendar: the kind is fixed, the address is prefilled where there is
+ * one, and the one button runs the same Test and then the same Save.
  */
-export function calendarForm(calendar, { manifests = [], onSaved, onCancel }) {
+export function calendarForm(calendar, { manifests = [], guide = null, links = {}, onSaved, onCancel }) {
   const draft = { ...calendar };
   const status = statusLine();
   const options = kindOptions(manifests, 'calendars');
+  const guided = guide && guide.kind ? guide : null;
+  // A guide names its links by key; the addresses are the server's.
+  const linkFor = (key) => String(links?.calendars?.[key[0]]?.[key[1]] || '');
+  if (guided) {
+    draft.kind = guided.kind;
+    if (guided.url && !draft.url) draft.url = linkFor(guided.url);
+    if (guided.label && !draft.label) draft.label = guided.label;
+  }
 
   const labelInput = input({ value: draft.label, placeholder: 'Personal' });
   labelInput.addEventListener('input', () => { draft.label = labelInput.value; });
 
   const kindSelect = select(options, { value: draft.kind || options[0]?.value || '' });
 
-  const urlInput = input({ value: draft.url, placeholder: 'https://…  or  /Users/you/calendar.ics' });
+  const urlInput = input({ value: draft.url, placeholder: guided?.urlPlaceholder || 'https://…  or  /Users/you/calendar.ics' });
   urlInput.addEventListener('input', () => { draft.url = urlInput.value.trim(); });
 
-  const userInput = input({ value: draft.user || '', placeholder: 'only for a protected address', autocomplete: 'off' });
+  const userInput = input({ value: draft.user || '', placeholder: guided?.userLabel ? 'you@icloud.com' : 'only for a protected address', autocomplete: 'off' });
   userInput.addEventListener('input', () => { draft.user = userInput.value.trim(); });
 
   /* The sign-in half of the form, redrawn whenever the kind changes. Both
@@ -1892,9 +2404,18 @@ export function calendarForm(calendar, { manifests = [], onSaved, onCancel }) {
       keyRef: draft.keyRef || `calendar.${draft.id}`,
       stored: state.secretRefs.includes(draft.keyRef),
     });
+    if (credential && guided?.passLabel) {
+      // The same input and keyRef the connector asked for, labelled in the
+      // guide's words rather than the manifest's and the store's.
+      credential.node = field(guided.passLabel, credential.input, {
+        hint: plainSecretNotes(state.health?.backend?.name).field,
+      });
+    }
     signIn.replaceChildren(...(credential
-      ? [field('Username', userInput), credential.node]
-      : [el('p', { class: 'quiet-note', text: `${manifest?.option || 'This kind of calendar'} needs no username and no password.` })]));
+      ? [field(guided?.userLabel || 'Username', userInput), credential.node]
+      : guided
+        ? []
+        : [el('p', { class: 'quiet-note', text: `${manifest?.option || 'This kind of calendar'} needs no username and no password.` })]));
   }
   kindSelect.addEventListener('change', drawCredential);
   drawCredential();
@@ -1915,57 +2436,94 @@ export function calendarForm(calendar, { manifests = [], onSaved, onCancel }) {
     credential.input.value = '';
   }
 
+  async function runSave() {
+    if (!draft.url) {
+      status.bad(guided ? 'Paste the address first.' : 'An address is required.');
+      return false;
+    }
+    status.working('Saving…');
+    try {
+      await persistPassword();
+      const others = (state.config.calendars || []).filter((c) => c.id !== draft.id);
+      await saveConfig({ calendars: [...others, { ...draft, kind: kindNow() }] });
+      status.good('Saved.');
+      onSaved();
+      return true;
+    } catch (err) {
+      status.bad(err.message);
+      return false;
+    }
+  }
+
+  async function runTest() {
+    if (!draft.url) {
+      status.bad(guided ? 'Paste the address first.' : 'An address is required.');
+      return false;
+    }
+    status.working('Fetching…');
+    try {
+      await persistPassword();
+      // The kind goes with it, from the same control the save reads, or
+      // this is a test of a different calendar from the one about to be
+      // stored — the mail form makes the same point about requireTls.
+      const result = await api.testCalendar({
+        kind: kindNow(),
+        url: draft.url,
+        user: draft.user,
+        keyRef: draft.keyRef,
+      });
+      if (result.ok) {
+        const name = result.calendars?.[0]?.name || 'calendar';
+        status.good(`${name}: ${plural(result.events ?? 0, 'appointment')} found.`);
+        return true;
+      }
+      status.bad(result.error || 'Nothing came back.');
+      return false;
+    } catch (err) {
+      status.bad(err.message);
+      return false;
+    }
+  }
+
+  const stepNodes = (guided?.steps || []).map((step) => el('p', {}, Array.isArray(step)
+    ? step.map((part) => (typeof part === 'string' ? part : outLink(linkFor(part.link), part.text)))
+    : step));
+
+  if (guided) {
+    return el('div', { class: 'account-form' }, [
+      el('div', { class: 'chosen-head' }, [el('span', { class: 'chosen-label', text: guided.title })]),
+      el('div', { class: 'stack' }, stepNodes),
+      guided.urlLabel ? field(guided.urlLabel, urlInput) : null,
+      // A secret address needs no password, so the optional one a published
+      // calendar MAY take is under Advanced; iCloud's is the card.
+      guided.passLabel ? signIn : null,
+      el('div', { class: 'row-inline' }, [
+        // Test, then Save — the two buttons below, pressed in the only
+        // sensible order, as one.
+        button('Check it works and save', {
+          class: 'btn solid',
+          onClick: async () => { if (await runTest()) await runSave(); },
+        }),
+        button('Cancel', { class: 'btn quiet', onClick: onCancel }),
+      ]),
+      status.node,
+      fold('Advanced', [
+        field('Name it', labelInput),
+        field('Kind', kindSelect),
+        guided.urlLabel ? null : field('Address', urlInput, { hint: 'webcal:// links work; Zelos rewrites them to https.' }),
+        guided.passLabel ? null : signIn,
+      ]),
+    ]);
+  }
+
   return el('div', { class: 'account-form' }, [
     field('Name it', labelInput),
     field('Kind', kindSelect),
     field('Address', urlInput, { hint: 'webcal:// links work; Zelos rewrites them to https.' }),
     signIn,
     el('div', { class: 'row-inline' }, [
-      button('Save calendar', {
-        class: 'btn solid',
-        onClick: async () => {
-          if (!draft.url) {
-            status.bad('An address is required.');
-            return;
-          }
-          status.working('Saving…');
-          try {
-            await persistPassword();
-            const others = (state.config.calendars || []).filter((c) => c.id !== draft.id);
-            await saveConfig({ calendars: [...others, { ...draft, kind: kindNow() }] });
-            status.good('Saved.');
-            onSaved();
-          } catch (err) {
-            status.bad(err.message);
-          }
-        },
-      }),
-      button('Test it', {
-        class: 'btn quiet',
-        onClick: async () => {
-          status.working('Fetching…');
-          try {
-            await persistPassword();
-            // The kind goes with it, from the same control the save reads, or
-            // this is a test of a different calendar from the one about to be
-            // stored — the mail form makes the same point about requireTls.
-            const result = await api.testCalendar({
-              kind: kindNow(),
-              url: draft.url,
-              user: draft.user,
-              keyRef: draft.keyRef,
-            });
-            if (result.ok) {
-              const name = result.calendars?.[0]?.name || 'calendar';
-              status.good(`${name}: ${plural(result.events ?? 0, 'event')} found.`);
-            } else {
-              status.bad(result.error || 'Nothing came back.');
-            }
-          } catch (err) {
-            status.bad(err.message);
-          }
-        },
-      }),
+      button('Save calendar', { class: 'btn solid', onClick: runSave }),
+      button('Test it', { class: 'btn quiet', onClick: runTest }),
       button('Cancel', { class: 'btn quiet', onClick: onCancel }),
     ]),
     status.node,
@@ -1984,11 +2542,11 @@ export function calendarForm(calendar, { manifests = [], onSaved, onCancel }) {
 async function openEditor(editor, status, build) {
   status.working('Reading what this build can connect to…');
   try {
-    const manifests = await connectorManifests();
+    const [manifests, links] = await Promise.all([connectorManifests(), guideLinks()]);
     status.clear();
-    editor.replaceChildren(build(manifests));
+    editor.replaceChildren(build(manifests, links));
   } catch (err) {
-    status.bad(`Zelos could not say what kinds of source it has: ${err.message}`);
+    status.bad(`Zelos could not say what kinds of calendar it can read: ${err.message}`);
   }
 }
 
@@ -1999,14 +2557,14 @@ export function calendarPanel({ compact = false, onDone = null, rerender } = {})
   const status = statusLine();
 
   if (!compact) {
-    wrap.appendChild(el('p', { class: 'panel-lede', text: 'Times are kept exactly as your calendar publishes them — with their own UTC offset — so an event at 2pm in New York stays at 2pm whatever zone this machine thinks it is in.' }));
+    wrap.appendChild(el('p', { class: 'panel-lede', text: 'Add your calendar, and Zelos knows what is coming. Times are kept exactly as your calendar has them, so an appointment at 2pm stays at 2pm wherever this computer thinks it is.' }));
   }
 
   wrap.appendChild(el('div', { class: 'stack' }, calendars.length
     ? calendars.map((calendar) => el('div', { class: 'account' }, [
       el('div', { class: 'account-head' }, [
         el('span', { class: 'account-label', text: calendar.label || calendar.url }),
-        el('span', { class: 'mono account-host', text: calendar.kind }),
+        el('span', { class: 'quiet-note', text: KIND_WORDS[calendar.kind] || calendar.kind }),
       ]),
       el('p', { class: 'quiet-note', text: calendar.url }),
       el('div', { class: 'row-inline' }, [
@@ -2029,29 +2587,38 @@ export function calendarPanel({ compact = false, onDone = null, rerender } = {})
     ]))
     : el('p', { class: 'quiet-note', text: 'No calendar connected yet.' })));
 
-  wrap.appendChild(el('div', { class: 'row-inline' }, button('Add a calendar', {
-    class: 'btn solid',
-    onClick: () => {
+  // The four named ways in. Each opens the editor on its guide; "Something
+  // else" opens it on the first connector the registry lists, as "Add a
+  // calendar" always did.
+  wrap.appendChild(el('div', { class: 'preset-grid' }, CALENDAR_GUIDES.map((guide) => el('button', {
+    type: 'button',
+    class: 'preset',
+    onclick: () => {
       const id = randomId('c');
-      /* The blank a new calendar opens on comes from the registry, not from the
-         string 'ics': the first `calendars` connector is what the picker will be
-         showing, and a literal here is a default that can disagree with the
-         control under it. */
-      openEditor(editor, status, (manifests) => calendarForm({
+      openEditor(editor, status, (manifests, links) => calendarForm({
         id,
         enabled: true,
         label: '',
-        kind: kindOptions(manifests, 'calendars')[0]?.value || '',
+        /* The blank a new calendar opens on comes from the registry, not from
+           the string 'ics': the first `calendars` connector is what the picker
+           will be showing, and a literal here is a default that can disagree
+           with the control under it. A guide names its kind on purpose. */
+        kind: guide.kind || kindOptions(manifests, 'calendars')[0]?.value || '',
         url: '',
         user: '',
         keyRef: null,
       }, {
         manifests,
+        guide,
+        links,
         onSaved: () => { onDone?.(); rerender?.(); },
         onCancel: () => editor.replaceChildren(),
       }));
     },
-  })));
+  }, [
+    el('span', { class: 'preset-label', text: guide.title }),
+    el('span', { class: 'preset-note', text: guide.blurb }),
+  ]))));
   wrap.appendChild(editor);
   wrap.appendChild(status.node);
   return wrap;
@@ -2145,7 +2712,7 @@ export function sourceForm(source, { manifests = [], onSaved, onCancel }) {
                 settings: controls.read(),
               }],
             });
-            status.good('Saved. The next sweep reads it.');
+            status.good('Saved. Zelos reads it the next time it checks.');
             onSaved();
           } catch (err) {
             status.bad(err.message);
@@ -2164,7 +2731,7 @@ export function sourcesPanel({ rerender } = {}) {
   const editor = el('div', { class: 'editor' });
   const status = statusLine();
 
-  wrap.appendChild(el('p', { class: 'panel-lede', text: 'Everything that is neither mail nor a calendar. Zelos only ever reads: a source here is fetched on the sweep, stored in your Zelos home, and nothing is ever written back to it.' }));
+  wrap.appendChild(el('p', { class: 'panel-lede', text: 'Most people need nothing here. If you use any of these work tools, add them. Zelos only ever reads them — nothing is ever written back.' }));
 
   wrap.appendChild(el('div', { class: 'stack' }, sources.length
     ? sources.map((src) => el('div', { class: 'account' }, [
@@ -2227,21 +2794,43 @@ export function sourcesPanel({ rerender } = {}) {
 
 /* ----------------------------------------------------------------- sweeps */
 
+/**
+ * "6 am" for 6, "11 pm" for 23: what the two hour pickers say. Config stores
+ * the 24-hour number (core/config.mjs validates 0–23, start before end), and
+ * the 24-hour clock is exactly the thing the audit's reader did not know —
+ * "23" was a number to them, not a time.
+ */
+export function hourLabel(h) {
+  const n = Number(h);
+  if (!Number.isInteger(n) || n < 0 || n > 23) return '';
+  const twelve = n % 12 === 0 ? 12 : n % 12;
+  return `${twelve} ${n < 12 ? 'am' : 'pm'}`;
+}
+
+/**
+ * The choices each picker offers. The start can be any hour; the end stops at
+ * 11 pm because config wants a number 0–23 and a start strictly before it — the
+ * old number box accepted 24 and `|| 24`'d a blank, which validateConfig then
+ * refused about a field the person had never seen.
+ */
+export const HOUR_CHOICES = Array.from({ length: 24 }, (_, h) => ({ value: String(h), label: hourLabel(h) }));
+export const END_HOUR_CHOICES = HOUR_CHOICES.slice(1);
+
 function sweepPanel() {
   const cfg = state.config?.sweep || { intervalMinutes: 30, activeHours: [6, 23], auto: true };
   const status = statusLine();
 
   const intervalInput = input({ type: 'number', value: String(cfg.intervalMinutes), min: '5', max: '1440' });
-  const fromInput = input({ type: 'number', value: String(cfg.activeHours?.[0] ?? 6), min: '0', max: '23' });
-  const toInput = input({ type: 'number', value: String(cfg.activeHours?.[1] ?? 23), min: '1', max: '24' });
+  const fromSelect = select(HOUR_CHOICES, { value: String(cfg.activeHours?.[0] ?? 6) });
+  const toSelect = select(END_HOUR_CHOICES, { value: String(cfg.activeHours?.[1] ?? 23) });
   let auto = cfg.auto !== false;
 
   return el('div', { class: 'panel' }, [
-    el('p', { class: 'panel-lede', text: 'A sweep fetches your sources and, when there is something new, asks your model to re-read the board. Between model calls it still re-derives staleness and ordering, which costs nothing.' }),
-    checkbox('Sweep on a schedule', { checked: auto, onChange: (v) => { auto = v; } }),
+    el('p', { class: 'panel-lede', text: 'When Zelos looks at your mail and calendar on its own. You can always press Check now as well.' }),
+    checkbox('Check my mail automatically', { checked: auto, onChange: (v) => { auto = v; } }),
     el('div', { class: 'grid-2' }, [
-      field('Every (minutes)', intervalInput),
-      field('Between these hours', el('div', { class: 'row-inline' }, [fromInput, el('span', { class: 'mono', text: 'and' }), toInput])),
+      field('Check my mail every (minutes)', intervalInput),
+      field('Between', el('div', { class: 'row-inline' }, [fromSelect, el('span', { text: 'and' }), toSelect])),
     ]),
     el('div', { class: 'row-inline' }, [
       button('Save', {
@@ -2252,11 +2841,11 @@ function sweepPanel() {
             await saveConfig({
               sweep: {
                 intervalMinutes: Number(intervalInput.value) || 30,
-                activeHours: [Number(fromInput.value) || 0, Number(toInput.value) || 24],
+                activeHours: [Number(fromSelect.value) || 0, Number(toSelect.value) || 23],
                 auto,
               },
             });
-            status.good('Saved. The schedule picks it up on the next tick.');
+            status.good('Saved. The new times apply from the next check.');
           } catch (err) {
             status.bad(err.message);
           }
@@ -2264,6 +2853,9 @@ function sweepPanel() {
       }),
     ]),
     status.node,
+    fold('Advanced', [
+      el('p', { class: 'quiet-note', text: 'A check fetches your email account, your calendars and anything under “Other things it can read”, and, only when something new arrived, asks the AI to re-read the board. Between those calls it still re-derives what is stale and what comes first, which costs nothing and contacts nobody.' }),
+    ]),
   ]);
 }
 
@@ -2277,15 +2869,18 @@ function privacyPanel() {
   const maxInput = input({ type: 'number', value: String(cfg.maxItemsPerSweep), min: '10', max: '1000' });
 
   return el('div', { class: 'panel' }, [
-    el('p', { class: 'panel-lede', text: 'What leaves this machine is exactly one thing: the request Zelos makes to the model endpoint you configured. There is no telemetry, no analytics, no update check and no remote font.' }),
-    checkbox('Send message bodies to the model', {
+    el('p', { class: 'panel-lede', text: 'Zelos only talks to the AI service you chose. It sends nothing to us and nothing to anyone else.' }),
+    checkbox('Let the AI read the full text of your emails (recommended — it does a better job)', {
       checked: sendBodies,
       onChange: (v) => { sendBodies = v; },
-      hint: 'Off means the model sees only headers and the first couple of lines. It will be worse at judging what matters, and it will say less about why. This setting genuinely changes what is sent — it is not a label.',
+      hint: 'Switched off, the AI sees only who wrote, the subject, and the first couple of lines. It will be worse at judging what matters, and it will say less about why.',
     }),
-    el('div', { class: 'grid-2' }, [
-      field('Characters of each body', charsInput),
-      field('Most items per sweep', maxInput),
+    fold('Advanced', [
+      el('p', { class: 'quiet-note', text: 'There is no telemetry, no analytics, no update check and no remote font; the one outbound request is the one to the AI. These two numbers cap what each request carries.' }),
+      el('div', { class: 'grid-2' }, [
+        field('Characters of each email sent to the AI', charsInput),
+        field('Most items per check', maxInput),
+      ]),
     ]),
     el('div', { class: 'row-inline' }, [
       button('Save', {
@@ -2313,9 +2908,29 @@ function privacyPanel() {
 
 /* ------------------------------------------------------------------- data */
 
+/**
+ * How to get to the folder once its path is on the clipboard, per platform.
+ * The desktop shell has a button that opens it; a browser tab has only the
+ * clipboard, so this is the one sentence that turns a path into a window.
+ */
+export function folderHint(platform = '') {
+  const p = String(platform || '').toLowerCase();
+  if (p.startsWith('win')) return 'In File Explorer, click the address bar, paste, and press Enter.';
+  if (p.startsWith('linux')) return 'In your file manager, press Ctrl+L, paste, and press Enter.';
+  return 'In Finder press ⌘⇧G, paste, and press Return.';
+}
+
+/**
+ * Whether the page is inside the desktop shell with the one bridge that
+ * reveals the folder (desktop/preload.js). The board has to keep working
+ * when opened from `zelos` on the command line, where no preload runs.
+ */
+const canShowFolder = () => typeof window !== 'undefined' && typeof window.zelos?.showHome === 'function';
+
 function dataPanel() {
   const status = statusLine();
   const home = state.health?.home || '(unknown)';
+  const platform = typeof window !== 'undefined' ? (window.zelos?.platform || window.navigator?.platform || '') : '';
 
   async function exportAll() {
     status.working('Gathering…');
@@ -2334,31 +2949,42 @@ function dataPanel() {
       a.click();
       a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 10_000);
-      status.good('Exported. It contains no secrets — those live in the keychain, not the database.');
+      status.good('Saved. The file holds no passwords.');
     } catch (err) {
       status.bad(err.message);
     }
   }
 
+  const copyPath = async () => {
+    const ok = await copyText(home);
+    if (ok) status.good(`Copied. ${folderHint(platform)}`);
+    else status.bad('Could not reach the clipboard.');
+  };
+
   return el('div', { class: 'panel' }, [
-    el('p', { class: 'panel-lede', text: 'Everything Zelos knows is in one directory. Back it up by copying it; delete it and Zelos forgets.' }),
-    field('Zelos home', input({ value: home, readonly: true })),
+    el('p', { class: 'panel-lede', text: 'Everything Zelos knows is in one folder on this computer. Back it up by copying the folder; delete it and Zelos forgets everything.' }),
+    field('The Zelos folder', input({ value: home, readonly: true })),
     el('div', { class: 'row-inline' }, [
-      button('Export a JSON snapshot', { class: 'btn solid', onClick: exportAll }),
-      button('Copy the path', {
-        class: 'btn quiet',
-        onClick: async () => {
-          const ok = await copyText(home);
-          if (ok) status.good('Path copied.');
-          else status.bad('Could not reach the clipboard.');
-        },
-      }),
+      canShowFolder()
+        ? button('Show the Zelos folder', {
+          class: 'btn solid',
+          onClick: async () => {
+            const shown = await window.zelos.showHome().catch(() => false);
+            if (!shown) { status.bad('Could not open the folder. Copy the path instead:'); await copyPath(); }
+          },
+        })
+        : button('Copy the folder path', { class: 'btn solid', onClick: copyPath }),
+      button('Save a copy as a file', { class: 'btn quiet', onClick: exportAll }),
     ]),
-    section('Deleting everything', {
-      note: 'Zelos deliberately has no route that wipes your data — a local server that can destroy the database on request is a local server a stray web page can point at. Do it yourself, with the app closed:',
-    }, [
-      el('pre', { class: 'code' }, el('code', { text: `rm -rf "${home}"` })),
-      el('p', { class: 'quiet-note', text: secretStoreNotes(state.health?.backend?.name).data }),
+    canShowFolder() ? null : el('p', { class: 'quiet-note', text: folderHint(platform) }),
+    section('Erasing everything', {}, [
+      el('p', { class: 'quiet-note', text: 'To erase everything: quit Zelos, then drag this folder to the Trash and empty the Trash.' }),
+      el('p', { class: 'quiet-note', text: plainSecretNotes(state.health?.backend?.name).data }),
+      fold('For experts', [
+        el('p', { class: 'quiet-note', text: 'Zelos deliberately has no route that wipes your data — a local server that can destroy the database on request is a local server a stray web page can point at. Done by hand, with the app closed, it is one command:' }),
+        el('pre', { class: 'code' }, el('code', { text: `rm -rf "${home}"` })),
+        el('p', { class: 'quiet-note', text: secretStoreNotes(state.health?.backend?.name).data }),
+      ]),
     ]),
     status.node,
   ]);
@@ -2368,28 +2994,41 @@ function dataPanel() {
 
 function aboutPanel() {
   const backend = state.health?.backend || { name: 'unknown', writable: false, note: '' };
+  // The day's AI usage, moved here from the header. A count of what went to
+  // the AI, never a price: Zelos has no idea what anyone is paying per token.
+  const usage = tokenLine(state.board?.tokens, null);
   return el('div', { class: 'panel panel-about' }, [
     el('dl', { class: 'facts' }, [
       el('dt', { text: 'Version' }), el('dd', { class: 'mono', text: state.health?.version || '—' }),
-      el('dt', { text: 'Home' }), el('dd', { class: 'mono', text: state.health?.home || '—' }),
-      el('dt', { text: 'Secret store' }), el('dd', { class: 'mono', text: backend.name }),
-      el('dt', { text: 'Model' }),
+      el('dt', { text: 'Folder' }), el('dd', { class: 'mono', text: state.health?.home || '—' }),
+      el('dt', { text: 'AI' }),
       el('dd', {
-        class: 'mono',
         // `label` carries a default, so it is not evidence that anything works.
         text: state.health?.model?.configured
-          ? `${state.health.model.label} · ${state.config?.model?.baseUrl || ''}`
-          : 'not configured',
+          ? `${state.health.model.label}${state.health.model.local ? ' · on this computer' : ''}`
+          : 'none chosen yet',
       }),
+      el('dt', { text: 'AI usage this session' }),
+      el('dd', { text: usage ? `${usage}. What that costs depends on your AI service’s prices; Zelos does not see them.` : 'Nothing sent to the AI yet.' }),
     ]),
-    backend.note ? section('What the secret store protects', {}, el('p', { class: 'panel-lede', text: backend.note })) : null,
-    section('Where Zelos stands', {}, [
-      el('ul', { class: 'plain-list' }, [
-        el('li', { text: 'The server binds 127.0.0.1 and nothing else. Every API call carries a session token minted at launch; no CORS header is ever sent, so a page in another tab cannot read one. The one exception is /api/mcp, the read-only channel an AI client uses: it is off until you switch it on in AI access, and it carries the separate AI token you mint there rather than the session token — that one is meant to outlive a restart, and it lasts until you turn AI access off or revoke it.' }),
-        el('li', { text: 'The only outbound connections are the ones you configured: your IMAP host, your calendar address, your model endpoint.' }),
-        el('li', { text: 'Mail is attacker-controlled input, and so is anything the model writes after reading it. Zelos never executes, shells out to, or navigates to anything derived from either. It renders them, and you click.' }),
-        el('li', { text: 'Drafts are drafts. Zelos has no send path at all — not a disabled button, no code.' }),
-        el('li', { text: 'Prompt-injection defences here are mitigation, not proof. The guarantee is the one above: nothing acts on model output but you.' }),
+    el('p', { class: 'panel-lede', text: plainSecretNotes(backend.name).about }),
+    fold('Security details', [
+      el('dl', { class: 'facts' }, [
+        el('dt', { text: 'Secret store' }), el('dd', { class: 'mono', text: backend.name }),
+        el('dt', { text: 'Model endpoint' }), el('dd', { class: 'mono', text: state.config?.model?.baseUrl || '—' }),
+      ]),
+      // The store's own note, with its shouting taken out: "does NOT protect"
+      // in capitals reads as "you are not protected" to the person it was
+      // meant to reassure, and the sentence is just as true in lower case.
+      backend.note ? section('What the secret store protects', {}, el('p', { class: 'panel-lede', text: String(backend.note).replace(/\bNOT\b/g, 'not') })) : null,
+      section('Where Zelos stands', {}, [
+        el('ul', { class: 'plain-list' }, [
+          el('li', { text: 'The server binds 127.0.0.1 and nothing else. Every API call carries a session token minted at launch; no CORS header is ever sent, so a page in another tab cannot read one. The one exception is /api/mcp, the read-only channel an AI client uses: it is off until you switch it on under Share with another AI, and it carries the separate AI token you mint there rather than the session token — that one is meant to outlive a restart, and it lasts until you turn sharing off or revoke it.' }),
+          el('li', { text: 'The only outbound connections are the ones you configured: your IMAP host, your calendar address, your model endpoint.' }),
+          el('li', { text: 'Mail is untrusted input, and so is anything the model writes after reading it. Zelos never executes, shells out to, or navigates to anything derived from either. It renders them, and you click.' }),
+          el('li', { text: 'Drafts are drafts. Zelos has no send path at all — not a disabled button, no code.' }),
+          el('li', { text: 'Prompt-injection defences here are mitigation, not proof. The guarantee is the one above: nothing acts on model output but you.' }),
+        ]),
       ]),
     ]),
     section('Start over', {}, [
@@ -2462,8 +3101,8 @@ function appearancePanel() {
     custom.value = currentAccent();
   }
 
-  return el('div', { class: 'accent-choice' }, [
-    el('p', { class: 'field-note', text:
+  return el('div', { class: 'panel accent-choice' }, [
+    el('p', { class: 'panel-lede', text:
       'Zelos is black. The accent is the one colour on screen — it marks the thing that needs you, and nothing else.' }),
     swatches,
     el('div', { class: 'accent-custom-row' }, [
@@ -2508,7 +3147,7 @@ const tabId = (id) => `settings-tab-${id}`;
 const panelId = (id) => `settings-panel-${id}`;
 
 export function renderSettings(ctx) {
-  const panel = ctx.sub || 'model';
+  const panel = ctx.sub || DEFAULT_PANEL;
   const rerender = ctx.rerender;
 
   // Arrow keys move between tabs, the way a tablist is expected to. Activation
@@ -2552,9 +3191,17 @@ export function renderSettings(ctx) {
   else if (panel === 'sources') body = sourcesPanel({ rerender });
   else if (panel === 'sweep') body = sweepPanel();
   else if (panel === 'privacy') body = privacyPanel();
-  else if (panel === 'ai') body = aiAccessPanel();
-  else if (panel === 'data') body = dataPanel();
+  else if (panel === 'ai') {
+    // The audit's reader opened this tab looking for the place to switch the
+    // AI on, because the board kept saying "no model yet". One sentence,
+    // first, before the panel explains what it hands over.
+    body = el('div', { class: 'panel' }, [
+      el('p', { class: 'panel-lede', text: 'This is NOT where you choose the AI that reads your mail — that is under AI. Leave this off unless you know what it is.' }),
+      aiAccessPanel(),
+    ]);
+  } else if (panel === 'data') body = dataPanel();
   else if (panel === 'about') body = aboutPanel();
+  else if (panel === 'appearance') body = appearancePanel();
   else body = modelPanel({});
 
   // The other half of the relationship the tabs now name. `tabindex="-1"` is
@@ -2568,10 +3215,11 @@ export function renderSettings(ctx) {
 
   const errors = state.configErrors || [];
 
+  // The colour picker is a tab now — the last one — rather than the first
+  // thing Settings shows. People open Settings to find their email.
   return el('div', { class: 'view view-settings' }, [
     el('div', { class: 'settings-head' }, [
       el('h1', { class: 'view-title', text: 'Settings' }),
-      appearancePanel(),
     ]),
     meander(),
     tabs,

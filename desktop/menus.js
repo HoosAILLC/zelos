@@ -3,7 +3,7 @@
  *
  * These are plain arrays: `Menu.buildFromTemplate` is called by main.js, not
  * here. That keeps the shape of every menu — and the fact that the tray really
- * does carry Sweep now / Open Zelos / Quit — checkable without Electron.
+ * does carry Check now / Open Zelos / Quit — checkable without Electron.
  *
  * The macOS menu is not decoration. Without a real Edit menu, ⌘C and ⌘V do
  * nothing in a text field, and the Owed view is mostly text fields.
@@ -58,7 +58,7 @@ export function buildAppMenuTemplate({ platform = process.platform, appName = 'Z
   template.push({
     label: 'Board',
     submenu: [
-      { label: 'Sweep now', accelerator: 'CmdOrCtrl+Shift+S', click: () => actions.sweepNow?.() },
+      { label: 'Check now', accelerator: 'CmdOrCtrl+Shift+S', click: () => actions.sweepNow?.() },
       { type: 'separator' },
       // Deliberately not `role: 'reload'`. The board strips its session token
       // out of the address bar the moment it has read it, so a plain reload
@@ -151,7 +151,7 @@ export function buildAppMenuTemplate({ platform = process.platform, appName = 'Z
 /** The tray menu — the three things the spec asks for, and nothing else. */
 export function buildTrayMenuTemplate({ actions = {} } = {}) {
   return [
-    { label: 'Sweep now', click: () => actions.sweepNow?.() },
+    { label: 'Check now', click: () => actions.sweepNow?.() },
     { label: 'Open Zelos', click: () => actions.openBoard?.() },
     { type: 'separator' },
     { label: 'Quit Zelos', click: () => actions.quit?.() },

@@ -1777,6 +1777,36 @@ test('/api/model/presets covers the providers a user might pick', async (t) => {
   assert.ok(res.json.every((p) => p.protocol === 'openai' || p.protocol === 'anthropic'));
 });
 
+/**
+ * The guided setup cards send a person to four pages — Google Calendar's
+ * settings, Apple's app-specific passwords and iCloud's CalDAV host, Outlook's
+ * calendar, and the Microsoft section of docs/OAUTH.md. They are served from
+ * here because ui/ names no remote host at all (test/ui.test.mjs,
+ * test/repo.test.mjs and test/security.test.mjs each assert it): the page
+ * works offline, and the only addresses it ever links are ones this server
+ * handed it — as PRESETS' key pages and the mail guess's app-password pages
+ * already were.
+ */
+test('/api/guides hands the guided cards their pages, every one https, and nothing else', async (t) => {
+  const ctx = await startServer(t);
+  const res = await call(ctx, 'GET', '/api/guides');
+  assert.equal(res.status, 200);
+  const g = res.json;
+  assert.match(g.microsoftSetup, /^https:\/\/github\.com\/HoosAILLC\/zelos\/blob\/main\/docs\/OAUTH\.md#microsoft/);
+  assert.match(g.calendars.google.settings, /^https:\/\/calendar\.google\.com\//);
+  assert.match(g.calendars.icloud.caldav, /^https:\/\/caldav\.icloud\.com\//);
+  assert.match(g.calendars.icloud.appPasswords, /^https:\/\/account\.apple\.com\//);
+  assert.match(g.calendars.outlook.calendar, /^https:\/\/outlook\.live\.com\//);
+  const every = (value) => (typeof value === 'string' ? [value] : Object.values(value).flatMap(every));
+  for (const url of every(g)) assert.match(url, /^https:\/\/\S+$/, `${url} is not an https page`);
+  assert.deepEqual(Object.keys(g).sort(), ['calendars', 'microsoftSetup'], 'the route carries more than the four pages');
+  // The anchor is GitHub's slug for the heading docs/OAUTH.md actually has.
+  const doc = fs.readFileSync(new URL('../docs/OAUTH.md', import.meta.url), 'utf8');
+  const heading = /^## Microsoft — register Zelos's multi-tenant public client$/m.test(doc);
+  assert.ok(heading, 'docs/OAUTH.md no longer has the Microsoft heading the link points at');
+  assert.match(g.microsoftSetup, /#microsoft--register-zeloss-multi-tenant-public-client$/);
+});
+
 test('/api/mail/test needs the password to have been stored first', async (t) => {
   const ctx = await startServer(t);
   const res = await call(ctx, 'POST', '/api/mail/test', {

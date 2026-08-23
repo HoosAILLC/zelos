@@ -1,50 +1,54 @@
 /**
  * ui/views/onboarding.js — first run.
  *
- * The shortest honest path, in that order of words.
+ * Five named steps — Welcome, AI, Email, Calendar, Done — with the names on
+ * screen from the first one, and a "Step 2 of 5" line so the person knows how
+ * long this is. The first screen is two buttons: set Zelos up, or look around
+ * with made-up data first. Nothing on it probes anything; the sentence about
+ * four ports that did not answer used to be the first thing a person read,
+ * and it read as an error.
  *
- * *Shortest*: the first screen is one decision, and every version of it ends in a
- * usable app. If a model is already running on this machine, there is a single
- * button that adopts it and opens the board. If there is not, the biggest button
- * on the screen is "Skip and look around" — because the board is legible with
- * nothing connected, and a first screen that demands a hostname and a password
- * before it shows you anything is where people close the tab.
+ * *Honest*: nothing here claims a thing is set up when it is not. The sample
+ * data says out loud that it is invented and can be removed in one click; the
+ * last step says plainly when it has nothing to read, and which earlier step
+ * would give it something.
  *
- * *Honest*: nothing here claims a thing is set up when it is not. The local probe
- * says which ports it tried and stops; the sample data says out loud that it is
- * invented and can be removed in one click; the sweep step says plainly when it
- * has nothing to sweep.
+ * The later steps are not a funnel, they are a menu. Each mounts the same
+ * panel Settings uses, so there is exactly one implementation of "connect an
+ * email account", and every one of them can be walked past.
  *
- * The later steps are not a funnel, they are a menu. Each mounts the same panel
- * Settings uses, so there is exactly one implementation of "configure a mailbox",
- * and every one of them can be walked past.
+ * The words are for someone who has never heard of a protocol. "The AI that
+ * reads your mail" is the model; "your email account" is the IMAP source;
+ * "check" is the sweep. The code keeps the engine's names — `step === 'model'`,
+ * `startSweep` — because those are the routes and the calls; the screen does
+ * not. test/ui.test.mjs renders these screens and reads what is on them, and
+ * fails on any word from the first list.
  */
 
 import { el, button, meander } from '../lib/dom.js';
 import { modelPanel, mailPanel, calendarPanel } from './settings.js';
 import {
-  state, subscribe, startSweep, markOnboarded, refresh, saveConfig, notify,
+  state, subscribe, startSweep, markOnboarded, refresh, notify,
 } from '../lib/store.js';
-import { api, request, ApiError } from '../lib/api.js';
+import { request, ApiError } from '../lib/api.js';
 import { sweepSummary } from '../lib/format.js';
 
 const STEPS = ['start', 'model', 'mail', 'calendar', 'sweep'];
 const STEP_LABELS = {
-  start: 'Start',
-  model: 'Model',
-  mail: 'Mail',
+  start: 'Welcome',
+  model: 'AI',
+  mail: 'Email',
   calendar: 'Calendar',
-  sweep: 'First sweep',
+  sweep: 'Done',
 };
 
 let step = 'start';
 
 /**
- * The probes are per-session facts, not per-render ones. Caching them here keeps
- * a rerender from re-scanning four ports and re-asking the server whether it
- * knows about sample data every time somebody clicks.
+ * A per-session fact, not a per-render one. Caching it here keeps a rerender
+ * from re-asking the server whether it knows about sample data every time
+ * somebody clicks.
  */
-let localProbe = null;      // null = not asked yet | {found:[]} | {error:''}
 let sampleState = null;     // null = not asked yet | {supported:false} | {supported:true, ...status}
 
 function go(stepId, rerender) {
@@ -79,16 +83,23 @@ function progressRail(rerender) {
   }));
 }
 
+/** "Step 2 of 5 · AI" — said in words, because the rail's labels hide on a narrow screen. */
+export function stepLine(current = step) {
+  const i = Math.max(0, STEPS.indexOf(current));
+  return `Step ${i + 1} of ${STEPS.length} · ${STEP_LABELS[STEPS[i]]}`;
+}
+
 /**
- * `actions` overrides the default row wholesale — the start screen swaps its own
- * in once the probes land, because which button is the *biggest* one depends on
- * what came back.
+ * `actions` overrides the default row wholesale — the welcome screen swaps its
+ * own in once the sample-data probe lands, because whether the second button
+ * loads the made-up week or clears it depends on what came back.
  */
 function shell(rerender, navigate, { title, lede, body, primary = null, skip = 'Do this later', actions = null }) {
   return el('div', { class: 'view view-onboarding' }, [
     el('header', { class: 'ob-head' }, [
-      el('p', { class: 'ob-mark', text: 'ΖΗΛΟΣ' }),
+      el('p', { class: 'ob-mark', title: 'Zelos, in Greek', text: 'ΖΗΛΟΣ' }),
       progressRail(rerender),
+      el('p', { class: 'quiet-note ob-count', text: stepLine() }),
     ]),
     meander({ class: 'ob-rule' }),
     el('h1', { class: 'ob-title', text: title }),
@@ -99,17 +110,17 @@ function shell(rerender, navigate, { title, lede, body, primary = null, skip = '
       step === 'sweep'
         ? button('Go to the board', { class: 'btn quiet', onClick: () => finish(navigate) })
         : skip && button(skip, { class: 'btn quiet', onClick: () => next(rerender) }),
-      button('Skip setup entirely', { class: 'link', onClick: () => finish(navigate) }),
+      button('Skip the rest', { class: 'link', onClick: () => finish(navigate) }),
     ]),
   ]);
 }
 
-/** When something is wrong, the answer is a command, not a shrug. */
+/** When something is wrong, the answer is a command, not a shrug — said once, and plainly. */
 function doctorNote(reason) {
   return el('p', { class: 'quiet-note' }, [
-    `${reason} For a plain-English check of Node, this folder's permissions, the model and your sources, run `,
+    `${reason} If you started Zelos from a terminal, `,
     el('span', { class: 'code mono', text: 'zelos doctor' }),
-    ' in the terminal that started Zelos.',
+    ' there checks everything and says what is wrong in plain English.',
   ]);
 }
 
@@ -147,10 +158,10 @@ async function loadSample(rerender, navigate) {
     await sampleApi.load();
     sampleState = null;
     await refresh({ silent: true });
-    notify('Sample data loaded. Every row is marked, and one click removes it.', { tone: 'info' });
+    notify('The made-up week is loaded. Every row is marked, and one click removes it.', { tone: 'info' });
     finish(navigate);
   } catch (err) {
-    notify(`Could not load the sample data: ${err.message}`, { tone: 'warn' });
+    notify(`Could not load the made-up data: ${err.message}`, { tone: 'warn' });
     rerender();
   }
 }
@@ -160,186 +171,89 @@ async function clearSample(rerender) {
     await sampleApi.clear();
     sampleState = null;
     await refresh({ silent: true });
-    notify('Sample data removed. Nothing else was touched.', { tone: 'info' });
+    notify('The made-up data is gone. Nothing else was touched.', { tone: 'info' });
   } catch (err) {
-    notify(`Could not clear the sample data: ${err.message}`, { tone: 'warn' });
+    notify(`Could not clear the made-up data: ${err.message}`, { tone: 'warn' });
   }
   rerender();
 }
 
-/* -------------------------------------------------------------- local model */
-
-/** One click: adopt the runtime that is already running and open the board. */
-async function adoptRuntime(runtime, rerender, navigate, status) {
-  const model = runtime.models?.[0]?.id || '';
-  status.textContent = `Pointing Zelos at ${runtime.label}…`;
-  status.className = 'ob-outcome status is-working';
-  try {
-    await saveConfig({
-      model: {
-        protocol: 'openai',
-        label: runtime.label,
-        baseUrl: runtime.baseUrl,
-        model,
-      },
-    });
-    await refresh({ silent: true });
-  } catch (err) {
-    status.textContent = err.message;
-    status.className = 'ob-outcome status is-bad';
-    return;
-  }
-  if (!model) {
-    // Honest rather than convenient: the runtime is up, but it has nothing
-    // loaded, and pretending otherwise means a sweep that fails later.
-    status.textContent = `${runtime.label} is running but has not pulled a model yet. Pull one, then pick it under Model.`;
-    status.className = 'ob-outcome status is-bad';
-    rerender();
-    return;
-  }
-  finish(navigate);
-}
-
-/** The body of the start screen: what is on this machine, and nothing else. */
-function runtimeBlock(rerender, navigate) {
-  // `.ob-outcome` collapses when empty, so an unused slot costs no vertical gap.
-  const status = el('p', { class: 'ob-outcome status', 'aria-live': 'polite' });
-  const list = el('div', { class: 'runtime-list' },
-    el('p', { class: 'quiet-note', text: 'Looking for a model already running on this machine…' }));
-
-  const paint = () => {
-    if (!localProbe) return;
-    if (localProbe.error) {
-      list.replaceChildren(doctorNote(`Zelos could not check for a local model: ${localProbe.error}.`));
-      return;
-    }
-    if (!localProbe.found.length) {
-      list.replaceChildren(el('p', { class: 'quiet-note', text: 'Nothing answered on the four ports Zelos checks — Ollama on 11434, LM Studio on 1234, llama.cpp on 8080, vLLM on 8000. It does not look anywhere else, and it will not go hunting on the network. You can point it at a hosted provider under Model whenever you like.' }));
-      return;
-    }
-    list.replaceChildren(...localProbe.found.map((rt) => el('div', { class: 'runtime' }, [
-      el('div', { class: 'runtime-body' }, [
-        el('span', { class: 'runtime-label', text: rt.label }),
-        el('span', { class: 'mono runtime-url', text: rt.baseUrl }),
-        el('span', {
-          class: 'quiet-note',
-          text: rt.models?.length
-            ? `${rt.models.length} model${rt.models.length === 1 ? '' : 's'} loaded — Zelos will use ${rt.models[0].id}`
-            : 'no model pulled yet',
-        }),
-      ]),
-      // The pill sits in `.runtime`, not in `.runtime-body`: the body is a grid,
-      // and a grid child stretches, which turns a pill into a full-width bar.
-      el('span', { class: 'badge-local', text: 'on this machine' }),
-      button(`Use ${rt.label}`, {
-        class: 'btn solid',
-        onClick: () => adoptRuntime(rt, rerender, navigate, status),
-      }),
-    ])));
-  };
-
-  paint();
-  return { node: el('div', { class: 'stack' }, [list, status]), paint, status };
-}
-
-/* ------------------------------------------------------------- start screen */
+/* ------------------------------------------------------------ welcome screen */
 
 function startScreen(rerender, navigate) {
-  const runtimes = runtimeBlock(rerender, navigate);
   const sampleNote = el('div', { class: 'ob-outcome' });
   const actions = el('div', { class: 'ob-actions' },
-    button('Skip and look around', { class: 'btn solid', onClick: () => finish(navigate) }));
+    button('Set up Zelos', { class: 'btn solid', onClick: () => go('model', rerender) }));
 
   /**
-   * The action row, painted from whatever the probes have answered so far.
+   * The action row, painted from whatever the sample probe has answered so far.
    *
    * This ran behind `if (!actions.isConnected) return;`, which was never true
-   * when it mattered. The synchronous call below happens twelve lines before
-   * `shell()` puts `actions` in a tree, so the first pass always bailed, and
-   * the two `.finally` callbacks that made up for it are gated on the
-   * module-level probe caches — so on the SECOND build of this screen, with
-   * both probes already answered, neither ran and the row kept its
-   * placeholder. What was lost: "Use Ollama and open the board", "Try it with
-   * sample data", "Choose a model", "Connect mail and a calendar", and the
-   * demo-week note. Sample data has no other way in anywhere in the app, and
-   * `watchBoard` rebuilds this screen every three minutes and on every
-   * tab-visibility change, so the row emptied itself while nobody touched it.
+   * when it mattered. The synchronous call below happens before `shell()`
+   * puts `actions` in a tree, so the first pass always bailed, and the
+   * `.finally` that made up for it is gated on the module-level cache — so on
+   * the SECOND build of this screen, with the probe already answered, it did
+   * not run and the row kept its placeholder. Sample data has no other way in
+   * anywhere in the app, and `watchBoard` rebuilds this screen every three
+   * minutes and on every tab-visibility change, so the row emptied itself
+   * while nobody touched it.
    *
    * There is nothing here that needs a live node — `replaceChildren` on a
-   * detached element is perfectly ordinary — so the guard is simply gone.
+   * detached element is perfectly ordinary — so there is no guard.
    */
   const paintActions = () => {
-    const found = localProbe?.found?.length ? localProbe.found[0] : null;
-    const usable = found && found.models?.length;
     const sample = sampleState?.supported ? sampleState : null;
 
-    const row = [];
-    if (usable) {
-      // A model is already here. One click is the whole of setup.
-      row.push(button(`Use ${found.label} and open the board`, {
-        class: 'btn solid',
-        onClick: () => adoptRuntime(found, rerender, navigate, runtimes.status),
-      }));
-      row.push(button('Skip and look around', { class: 'btn quiet', onClick: () => finish(navigate) }));
-    } else {
-      // Nothing running. The most prominent thing on the screen stays the exit.
-      row.push(button('Skip and look around', { class: 'btn solid', onClick: () => finish(navigate) }));
-    }
-
+    // Two buttons. The first is setup; the second is the way to see the
+    // board before connecting anything — with the made-up week when this
+    // build ships one, and bare when it does not.
+    const row = [button('Set up Zelos', { class: 'btn solid', onClick: () => go('model', rerender) })];
     if (sample && !sample.installed) {
-      row.push(button('Try it with sample data', { class: 'btn quiet', onClick: () => loadSample(rerender, navigate) }));
+      row.push(button('Look around with made-up data first', { class: 'btn quiet', onClick: () => loadSample(rerender, navigate) }));
     } else if (sample && sample.installed) {
-      row.push(button('Clear the sample data', { class: 'btn quiet', onClick: () => clearSample(rerender) }));
+      row.push(button('Look around', { class: 'btn quiet', onClick: () => finish(navigate) }));
+      row.push(button('Clear the made-up data', { class: 'link', onClick: () => clearSample(rerender) }));
+    } else {
+      row.push(button('Look around first', { class: 'btn quiet', onClick: () => finish(navigate) }));
     }
-
-    if (!usable) row.push(button('Choose a model', { class: 'btn quiet', onClick: () => go('model', rerender) }));
-    row.push(button('Connect mail and a calendar', { class: 'link', onClick: () => go('mail', rerender) }));
     actions.replaceChildren(...row);
 
     if (sample) {
       sampleNote.replaceChildren(el('p', {
         class: 'quiet-note',
         text: sample.installed
-          ? `The demo week is loaded. ${sample.summary || ''} Every row of it starts with “Sample ·”, and clearing removes exactly those rows and nothing of yours.`.trim()
-          : `${sample.summary || 'A made-up week at a small studio, so the board has something on it before you connect anything.'} It loads into this same home, every row of it marked, and one click takes it back out.`,
+          ? 'The made-up week is loaded. Every row of it starts with “Sample ·”, and clearing it removes exactly those rows and nothing of yours.'
+          : 'The made-up data is a week at a small studio, so the board has something on it before you connect anything. Every row is marked, and one click takes it back out.',
       }));
     } else if (sampleState && sampleState.error) {
-      sampleNote.replaceChildren(el('p', { class: 'quiet-note', text: `Sample data is not available: ${sampleState.error}` }));
+      sampleNote.replaceChildren(el('p', { class: 'quiet-note', text: `The made-up data is not available: ${sampleState.error}` }));
     }
   };
 
   paintActions();
 
-  if (!localProbe) {
-    api.probeLocal()
-      .then((found) => { localProbe = { found: Array.isArray(found) ? found : [] }; })
-      .catch((err) => { localProbe = { found: [], error: err.message }; })
-      .finally(() => { runtimes.paint(); paintActions(); });
-  }
   if (!sampleState) {
     readSampleState().finally(paintActions);
   }
 
   return shell(rerender, navigate, {
-    title: 'Zelos reads what arrived, and tells you what needs you.',
-    lede: 'Mail and calendar in, one page out: what needs you now, what you owe, what owes you, what is coming. '
-      + 'It runs on this machine and stores everything in one directory you control. You can look at it before you connect anything.',
+    title: 'Zelos reads your email and calendar, and tells you what needs you.',
+    lede: 'It never sends, moves or deletes anything. Everything stays on this computer.',
     body: el('div', { class: 'stack' }, [
-      runtimes.node,
       sampleNote,
       el('ul', { class: 'ob-points' }, [
-        el('li', { text: 'Mail is fetched over IMAP straight from your server, read-only in practice — Zelos uses BODY.PEEK, so nothing it reads gets marked read.' }),
-        el('li', { text: 'The thinking is done by a model you choose. Choose one running here and nothing leaves the machine at all.' }),
-        el('li', { text: 'Zelos never sends mail. It writes drafts; you press send, somewhere else.' }),
+        el('li', { text: 'Zelos only looks at your mail. It never marks anything read, never moves anything, never deletes anything.' }),
+        el('li', { text: 'The thinking is done by an AI you choose. Choose one running on this computer and nothing leaves it at all.' }),
+        el('li', { text: 'Zelos never sends mail. It writes replies for you; you press send, in your own email program.' }),
       ]),
     ]),
     actions,
   });
 }
 
-/* -------------------------------------------------------------- sweep step */
+/* -------------------------------------------------------------- done step */
 
-/** The sweep step's live progress. Subscribes itself; detaches when removed. */
+/** The last step's live progress. Subscribes itself; detaches when removed. */
 function sweepProgress() {
   const line = el('p', { class: 'ob-progress-line', 'aria-live': 'polite' });
   const bar = el('div', { class: 'ob-bar' }, el('div', { class: 'ob-bar-fill' }));
@@ -357,12 +271,12 @@ function sweepProgress() {
       return;
     }
     if (s.error) {
-      line.textContent = 'The sweep stopped.';
+      line.textContent = 'The check stopped.';
       bar.classList.remove('is-indeterminate');
       fill.style.width = '0%';
       outcome.replaceChildren(
         el('p', { class: 'status is-bad', text: s.error }),
-        doctorNote('That is usually a source or a model that cannot be reached.'),
+        doctorNote('That is usually an email account or an AI that cannot be reached.'),
       );
       return;
     }
@@ -389,6 +303,17 @@ function sweepProgress() {
   return el('div', { class: 'ob-progress' }, [line, bar, outcome]);
 }
 
+/**
+ * What the last step still needs, said by step number so the person knows
+ * where to go back to. Exported so the sentence is tested rather than read.
+ */
+export function notReadyLine({ model = false, sources = false } = {}) {
+  if (model && sources) return 'Zelos can’t read anything yet — it still needs an AI (step 2) and an email account (step 3).';
+  if (model) return 'Zelos can’t read anything yet — it still needs an AI (step 2).';
+  if (sources) return 'Zelos can’t read anything yet — it still needs an email account (step 3).';
+  return '';
+}
+
 /* ------------------------------------------------------------------ render */
 
 export function renderOnboarding(ctx) {
@@ -398,8 +323,8 @@ export function renderOnboarding(ctx) {
 
   if (step === 'model') {
     return shell(rerender, navigate, {
-      title: 'Choose who does the thinking.',
-      lede: 'Local runtimes are listed first because they are the only configuration where “nothing leaves this machine” is unconditional. A hosted key works exactly as well, and your mail summaries go to that provider and nowhere else.',
+      title: 'Pick the AI that reads your mail.',
+      lede: null,
       body: modelPanel({ compact: true, onDone: () => next(rerender) }),
       primary: button('Next', { class: 'btn solid', onClick: () => next(rerender) }),
     });
@@ -407,9 +332,8 @@ export function renderOnboarding(ctx) {
 
   if (step === 'mail') {
     return shell(rerender, navigate, {
-      title: 'Point it at a mailbox.',
-      lede: 'Gmail and Outlook sign you in with the provider itself; iCloud, Yahoo and everyone else take a separate app password — one your provider makes for you and that you can revoke on its own. '
-        + 'Type your address, and the button that appears opens your provider’s own sign-in page, or its page for making an app password; Connect then proves it works before you move on.',
+      title: 'Connect your email.',
+      lede: 'Type your email address and Zelos will show you the next step.',
       body: mailPanel({ compact: true, rerender, onDone: () => rerender() }),
       primary: button('Next', { class: 'btn solid', onClick: () => next(rerender) }),
     });
@@ -417,31 +341,30 @@ export function renderOnboarding(ctx) {
 
   if (step === 'calendar') {
     return shell(rerender, navigate, {
-      title: 'And a calendar.',
-      lede: 'A subscription URL, a CalDAV account, or a file on disk. Times keep the offset your calendar published them with, so nothing slides when you travel.',
+      title: 'Add your calendar.',
+      lede: 'Pick the one you use. Google Calendar goes with a Gmail address; iCloud is the calendar on an iPhone or Mac.',
       body: calendarPanel({ compact: true, rerender, onDone: () => rerender() }),
       primary: button('Next', { class: 'btn solid', onClick: () => next(rerender) }),
     });
   }
 
-  const ready = Boolean(state.health?.model?.configured)
-    && ((state.config?.mail?.length || 0) + (state.config?.calendars?.length || 0)) > 0;
+  const missingModel = !state.health?.model?.configured;
+  const missingSources = ((state.config?.mail?.length || 0) + (state.config?.calendars?.length || 0)) === 0;
+  const ready = !missingModel && !missingSources;
 
   return shell(rerender, navigate, {
-    title: 'Run the first sweep.',
+    title: 'Read my mail for the first time.',
     lede: ready
-      ? 'This fetches your recent mail and calendar, then asks your model to read the pile once. It takes as long as it takes; the progress below is real.'
-      : 'A sweep needs a model and at least one source. Go back and add one, or head to the board — everything still works, there is just nothing to read yet.',
+      ? 'Zelos fetches your recent mail and calendar, then asks the AI to read through it once. It takes as long as it takes; the progress below is real.'
+      : notReadyLine({ model: missingModel, sources: missingSources }),
     body: el('div', { class: 'stack' }, [
       sweepProgress(),
-      !ready ? el('p', { class: 'quiet-note', text: 'Missing: '
-        + [!state.health?.model?.configured ? 'a model' : null,
-          !((state.config?.mail?.length || 0) + (state.config?.calendars?.length || 0)) ? 'a source' : null]
-          .filter(Boolean).join(' and ') + '.' }) : null,
+      !ready ? el('p', { class: 'quiet-note', text: 'You can go back to either step, or go to the board — everything still works, there is just nothing to read yet.' }) : null,
     ]),
-    primary: button(state.sweep.running ? 'Sweeping…' : 'Sweep now', {
+    primary: button(state.sweep.running ? 'Reading…' : 'Read my mail now', {
       class: 'btn solid',
       disabled: !ready || state.sweep.running,
+      title: ready ? null : notReadyLine({ model: missingModel, sources: missingSources }),
       onClick: async () => {
         await startSweep('full');
         await refresh({ silent: true });

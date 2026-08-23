@@ -323,7 +323,10 @@ test('the Sources panel is reachable, not merely defined', () => {
   store.state.configErrors = [];
   const view = settings.renderSettings({ sub: 'sources', navigate() {}, rerender() {} });
   const tabs = walk(view).filter((n) => n.attributes.role === 'tab').map((n) => n.textContent);
-  assert.ok(tabs.includes('Sources'), `the tab strip offers ${tabs.join(', ')}`);
+  // The tab is labelled in words now — "Other things it can read (optional)" —
+  // and its route is still `sources`; the label may be reworded again, the
+  // panel id below is what the route has to keep.
+  assert.ok(tabs.some((t) => /other things it can read/i.test(t)), `the tab strip offers ${tabs.join(', ')}`);
 
   const panel = walk(view).find((n) => n.attributes.role === 'tabpanel');
   assert.ok(panel, 'the selected tab controls nothing');

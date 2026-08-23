@@ -1242,7 +1242,11 @@ function recomputeDerived(db, { now = nowISO() } = {}) {
  */
 async function modelNotReadyReason(config, getSecret) {
   const model = config?.model;
-  if (!model?.baseUrl || !model?.model) return 'No model is configured — open Settings → Model';
+  // Both sentences name the Settings tab by the label it wears ("AI") and
+  // neither names the base URL: this reason reaches the board's banner, and
+  // an address the person never typed reads there as the program having gone
+  // somewhere on its own. Same words as core/llm.mjs's empty-model error.
+  if (!model?.baseUrl || !model?.model) return 'No AI has been chosen yet — open Settings → AI and pick one';
   if (isLocalAddress(model.baseUrl)) return null;
   let key = null;
   try {
@@ -1251,7 +1255,7 @@ async function modelNotReadyReason(config, getSecret) {
     slog.debug('no API key available', { error: errorText(err) });
   }
   if (typeof key === 'string' && key.trim()) return null;
-  return `No API key is stored for ${model.baseUrl} — open Settings → Model`;
+  return 'No key has been saved for the AI you chose — open Settings → AI and paste one';
 }
 
 /**

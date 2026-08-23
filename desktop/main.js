@@ -15,7 +15,9 @@
  *     outright. Mail is attacker-controlled, and a link in it must never be
  *     able to load inside a window that holds the session token.
  *   - The renderer has no privileges: context isolation on, node integration
- *     off, sandbox on, `<webview>` off, and a preload that exposes four strings.
+ *     off, sandbox on, `<webview>` off, and a preload that exposes four strings
+ *     and one function — "show the Zelos folder", answered only for the
+ *     board's own window and carrying nothing the page chose.
  *   - The session cancels every outbound request that is not the board itself —
  *     on every scheme Chromium will put on the network, WebSockets included,
  *     and not only the http(s) a scheme wildcard would have shown it — and
@@ -38,7 +40,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
-  app, BrowserWindow, Menu, Tray, dialog, nativeImage, nativeTheme, screen, session, shell,
+  app, BrowserWindow, Menu, Tray, dialog, ipcMain, nativeImage, nativeTheme, screen, session, shell,
 } from 'electron';
 
 import { classifyTarget, guardWebContents } from './guard.js';
@@ -511,6 +513,39 @@ function openLocalPath(target) {
   });
 }
 
+/**
+ * The one request the page can make of the shell: show the Zelos folder.
+ *
+ * Settings → Your data tells a person to erase everything by dragging the
+ * folder to the Trash, and a sentence that says "this folder" has to be able
+ * to put it on screen — `rm -rf` in a code block was the previous answer,
+ * and the audit's reader would not type it. The channel takes no argument
+ * and reveals only the shell's own data home; the page cannot name a path.
+ * Answered only for the board's own window, because the preload is attached
+ * to that window alone and any other sender is by definition not the board.
+ * `showItemInFolder` selects the folder in its parent rather than opening it,
+ * which is the view a person drags from.
+ */
+export const SHOW_HOME_CHANNEL = 'zelos:show-home';
+
+export function showHomeHandler({ getHome, isBoard, reveal }) {
+  return (event) => {
+    if (!isBoard(event?.sender)) return false;
+    const home = getHome();
+    if (!home) return false;
+    reveal(home);
+    return true;
+  };
+}
+
+function installShowHome() {
+  ipcMain.handle(SHOW_HOME_CHANNEL, showHomeHandler({
+    getHome: () => zelos?.paths.home ?? '',
+    isBoard: (sender) => Boolean(sender) && Boolean(mainWindow) && !mainWindow.isDestroyed() && sender === mainWindow.webContents,
+    reveal: (home) => shell.showItemInFolder(home),
+  }));
+}
+
 function installAppMenu() {
   if (!actions) return;
   Menu.setApplicationMenu(Menu.buildFromTemplate(buildAppMenuTemplate({ appName: APP_NAME, actions })));
@@ -758,6 +793,7 @@ async function bootstrap() {
   installAppMenu();
   createTray(actions);
   createWindow();
+  installShowHome();
 
   // The badge is the only thing a swept-in-the-background Zelos says while its
   // window is shut. It is set when a sweep ends — from the clock or by hand,

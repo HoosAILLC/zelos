@@ -48,21 +48,21 @@ export function renderToday(ctx) {
 
   if (!today.length && !soon.length && !money.length) {
     // Three different reasons for an empty list, three different next steps.
-    // "Sweep now" when there is no model to sweep with is a button that fails.
+    // "Check now" when there is no AI to check with is a button that fails.
     const configured = Boolean(state.health?.model?.configured);
     const swept = Boolean(state.board.runs?.last);
     body.appendChild(emptyState({
       title: configured ? 'Today is clear' : 'Nothing has been read yet',
       detail: !configured
-        ? 'Zelos sorts what arrives into today, soon and later — once you have chosen a model for it to think with.'
+        ? 'Zelos sorts what arrives into today, soon and later — once you have chosen an AI for it to think with.'
         : swept
           ? 'Nothing landed in today. Now has the things that cannot wait.'
-          : 'Run a sweep and Zelos will sort what arrived into today, soon and later.',
+          : 'Press Check now and Zelos will sort what arrived into today, soon and later.',
       action: !configured
-        ? button('Choose a model', { class: 'btn solid', onClick: () => navigate('#/settings/model') })
+        ? button('Choose an AI', { class: 'btn solid', onClick: () => navigate('#/settings/model') })
         : swept
           ? button('Open Now', { class: 'btn quiet', onClick: () => navigate('#/now') })
-          : button('Sweep now', { class: 'btn solid', onClick: () => startSweep('full') }),
+          : button('Check now', { class: 'btn solid', onClick: () => startSweep('full') }),
     }));
     return body;
   }
@@ -76,7 +76,9 @@ export function renderToday(ctx) {
   }
 
   if (money.length) {
-    body.appendChild(section('Money', { count: money.length, note: 'Invoices, payments and anything with a number attached.' },
+    // "Money" alarmed the audit's reader — does it know about my bank? — so
+    // the note says where these come from: the mail, and nowhere else.
+    body.appendChild(section('Money', { count: money.length, note: 'Bills and invoices found in your mail.' },
       foldedList(money, (item) => itemRow(item, { tz, showBucket: false }), { visible: 5 })));
   }
 

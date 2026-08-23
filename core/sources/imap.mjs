@@ -2614,7 +2614,7 @@ export async function testConnection({
 }
 
 const APP_PASSWORD_NOTE =
-  'This provider does not accept your normal password over IMAP. Create an app-specific password in your account security settings and paste that instead.';
+  'This provider will not take your normal password from a program like Zelos. Make a special app password in your account’s security settings and paste that instead. (For experts: ordinary passwords are refused over IMAP.)';
 
 /*
  * `appPasswordUrl` is the page where the user CREATES an app password — not a
@@ -2677,7 +2677,7 @@ const PROVIDERS = [
        personal Outlook, Hotmail, Live and MSN ended on 16 September 2024 and
        app passwords went with it: there is no password of any kind that opens
        an IMAP session on these accounts now. */
-    note: 'Microsoft switched password sign-in off for personal Outlook, Hotmail, Live and MSN accounts on 16 September 2024, and app passwords no longer work either. Connect this account with "Sign in with Microsoft" instead — Zelos asks you to register a free app in your own Microsoft account and then hands you a code to type into microsoft.com/devicelogin. A work or school account may still allow a password if your administrator has left IMAP on.',
+    note: 'Hotmail and Outlook.com need a one-time setup at Microsoft’s website first (about ten minutes) — the app shows you every step. After that, press "Sign in with Microsoft" and type the short code Zelos gives you at microsoft.com/devicelogin. There is no password to paste: Microsoft switched password sign-in off for personal Outlook, Hotmail, Live and MSN accounts on 16 September 2024, and app passwords no longer work either. A work or school account may still allow a password if your administrator has left IMAP on.',
   },
   {
     domains: ['fastmail.com', 'fastmail.fm', 'messagingengine.com'],
@@ -2686,7 +2686,7 @@ const PROVIDERS = [
     port: 993,
     secure: true,
     appPasswordUrl: 'https://app.fastmail.com/settings/security/devicekeys',
-    note: 'Fastmail requires an app password with the "Mail (IMAP)" scope (Settings → Privacy & Security → App passwords).',
+    note: 'Fastmail needs a special app password made just for Zelos — when you make it, choose the "Mail (IMAP)" kind (Settings → Privacy & Security → App passwords).',
   },
   {
     domains: ['proton.me', 'protonmail.com', 'protonmail.ch', 'pm.me'],
@@ -2696,7 +2696,7 @@ const PROVIDERS = [
     secure: false,
     bridge: true,
     appPasswordUrl: null,
-    note: 'Proton encrypts mail on their servers, so IMAP only works through Proton Bridge running on this machine. Use the host, port and password shown in Bridge — not your Proton account password.',
+    note: 'Proton Mail works through Proton Bridge, a program from Proton that runs on this computer. Use the host, port and password Bridge shows you — not your Proton account password. (Proton encrypts mail on its servers, so Bridge is the only way in over IMAP.)',
   },
   {
     domains: ['aol.com'],
@@ -2714,7 +2714,7 @@ const PROVIDERS = [
     port: 993,
     secure: true,
     appPasswordUrl: 'https://accounts.zoho.com/home#security/app_password',
-    note: 'Zoho requires IMAP to be enabled in Mail Settings, and an app-specific password if two-factor authentication is on.',
+    note: 'Zoho needs a switch turned on first: in Zoho Mail’s settings, enable IMAP access. If two-factor sign-in is on, it also needs a special app password made just for Zelos.',
   },
 ];
 
@@ -2838,7 +2838,7 @@ const MX_HOSTS = [
     suffixes: ['.mail.protection.outlook.com'],
     host: 'outlook.office365.com',
     label: 'Microsoft 365',
-    note: () => 'Your domain\'s mail is hosted by Microsoft 365. Work and school accounts connect with "Sign in with Microsoft" — Zelos asks you to register a free app in your own Microsoft account and then hands you a code to type into microsoft.com/devicelogin. Some tenants still allow a password, if your administrator has left IMAP on; Advanced is where that goes.',
+    note: () => 'Your domain\'s mail is hosted by Microsoft 365. Work and school accounts connect with "Sign in with Microsoft" — a one-time setup at Microsoft’s website first (about ten minutes; the app shows you every step), then a short code to type at microsoft.com/devicelogin. Some tenants still allow a password, if your administrator has left IMAP on; Advanced is where that goes.',
   },
   { suffixes: ['.messagingengine.com'], host: 'imap.fastmail.com' },
   { suffixes: ['.zoho.com', '.zoho.eu'], host: 'imap.zoho.com' },

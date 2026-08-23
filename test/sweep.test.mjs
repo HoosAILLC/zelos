@@ -1648,7 +1648,8 @@ test('REGRESSION: a scheduler on a home with no model runs nothing, writes no ru
   assert.equal(after.busy, false);
   assert.equal(after.nextRunAt, '2026-08-08T11:00:00+00:00', 'the timer keeps its grid');
   assert.equal(after.lastResult?.skipped, true, 'status() must say the slot was skipped, not failed');
-  assert.match(after.lastResult?.reason ?? '', /Settings → Model/, 'and say where to go');
+  assert.match(after.lastResult?.reason ?? '', /Settings → AI/, 'and say where to go, by the label the tab wears');
+  assert.doesNotMatch(after.lastResult?.reason ?? '', /https?:/, 'and never name an address the person did not type');
 
   // The next slot is the same story: still no row, still on the grid.
   t.mock.timers.tick(30 * 60_000);
@@ -1706,9 +1707,13 @@ test('a remote model with no stored key is skipped until the key is pasted, then
   t.mock.timers.tick(31 * 60_000);
   await flush();
   assert.equal(runs, 0, 'a model name alone is not enough for a remote endpoint');
-  assert.match(scheduler.status().lastResult?.reason ?? '', /No API key is stored for https:\/\/api\.anthropic\.com/);
+  // The reason names the missing key and the tab, never the base URL: it is
+  // painted on the board, where an address the person did not type reads as
+  // the program having gone somewhere on its own.
+  assert.match(scheduler.status().lastResult?.reason ?? '', /No key has been saved[^]*Settings → AI/);
+  assert.doesNotMatch(scheduler.status().lastResult?.reason ?? '', /api\.anthropic\.com/);
 
-  // The key is pasted under Settings → Model. No reconfigure is needed: the
+  // The key is pasted under Settings → AI. No reconfigure is needed: the
   // config did not change, the secret store did.
   stored = 'sk-ant-test';
   t.mock.timers.tick(30 * 60_000);
@@ -1731,7 +1736,7 @@ test('a hand-started sweep on the same home still fails loudly, with the real er
   const result = await scheduler.runNow('auto');
   assert.equal(result.ok, false);
   assert.equal(result.skipped, undefined, 'a person who asked is told what went wrong, not that nothing happened');
-  assert.match(result.error, /API key|model/i);
+  assert.match(result.error, /API key|model|No AI has been chosen/i);
   assert.equal(relayed.length, 1, 'the board hears about a sweep the user started');
 
   assert.equal(countRuns(db), 1);

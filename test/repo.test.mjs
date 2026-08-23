@@ -1310,3 +1310,86 @@ test('docs/VERIFICATION.md is the Google submission kit, and the pages that need
       `docs/SECURITY.md's table of what each route does with a secret has no row for ${route}`);
   }
 });
+
+/* ================================================================== *
+ * The install prose reads for the person who is not a programmer
+ * ================================================================== */
+
+/**
+ * A persona audit — a 70-year-old who has never opened a terminal — read the
+ * install page and stopped at the first-open warning. The three clicks were
+ * there, but under a paragraph about ad-hoc signatures and notarisation that
+ * read, to them, as the warning being right. So each warning section now opens
+ * with what to click, in words with none of these in them; the expert
+ * explanation is still the rest of the section, and only the lead is pinned.
+ */
+const EXPERT_WORDS = /\b(IMAP|CalDAV|endpoints?|keychain|config\.json|secrets\.enc|\.seed|DNS|ports?|tokens?|ad[- ]hoc|notari[sz]\w*|Authenticode|SmartScreen|certificates?|signatures?|Electron|Node(?:\.js)?|terminal|codesign)\b/i;
+
+/** The first paragraph after a markdown heading, with its line breaks folded. */
+function firstParagraphUnder(text, heading) {
+  const at = text.indexOf(heading);
+  assert.ok(at !== -1, `heading not found: ${heading}`);
+  const body = text.slice(at + heading.length);
+  const first = body.split(/\n[ \t]*\n/).map((p) => p.trim()).find(Boolean) ?? '';
+  return first.replace(/\s+/g, ' ');
+}
+
+test('docs/INSTALL.md leads each first-open warning with what to click, in plain words', () => {
+  const install = fs.readFileSync(path.join(ROOT, 'docs', 'INSTALL.md'), 'utf8');
+
+  const mac = firstParagraphUnder(install, '## Installing on macOS — and what you will actually see');
+  for (const click of ['Done', 'System Settings', 'Privacy & Security', 'Open Anyway']) {
+    assert.ok(mac.includes(click), `the macOS lead never says to click ${click}:\n${mac}`);
+  }
+  assert.equal(EXPERT_WORDS.exec(mac)?.[0], undefined, `the macOS lead is written for an expert:\n${mac}`);
+
+  const win = firstParagraphUnder(install, '## Installing on Windows — and what you will actually see');
+  for (const click of ['Windows protected your PC', 'More info', 'Run anyway']) {
+    assert.ok(win.includes(click), `the Windows lead never says to click ${click}:\n${win}`);
+  }
+  assert.equal(EXPERT_WORDS.exec(win)?.[0], undefined, `the Windows lead is written for an expert:\n${win}`);
+
+  // And the page opens by sending that reader to the app, before it tabulates
+  // three install paths they will not be taking.
+  const top = install.slice(0, install.indexOf('## Path 1'));
+  assert.match(top, /Not a programmer\?/, 'docs/INSTALL.md does not open with a paragraph for the non-programmer');
+  assert.match(top, /zelos-app\.netlify\.app/, 'the non-programmer paragraph does not say where the app is');
+});
+
+test('README.md sends the person who is not a programmer to the app before it names a command', () => {
+  const readme = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8');
+  const start = readme.indexOf('\n## Run it\n');
+  assert.ok(start !== -1, 'README.md has no "Run it" section');
+  const next = readme.indexOf('\n## ', start + 1);
+  const section = readme.slice(start, next === -1 ? undefined : next);
+  const fence = section.indexOf('```');
+  assert.ok(fence !== -1, 'the Run it section has no command in it');
+  const lead = section.slice('\n## Run it\n'.length, fence).replace(/\s+/g, ' ');
+  assert.match(lead, /Not a programmer\?/, `nothing before the first command speaks to the non-programmer:\n${lead}`);
+  assert.match(lead, /zelos-app\.netlify\.app/, 'the lead does not say where the app is');
+  assert.equal(EXPERT_WORDS.exec(lead)?.[0], undefined, `the lead is written for an expert:\n${lead}`);
+});
+
+/**
+ * "Both run against a client Zelos ships, so there is nothing to register"
+ * stood in the README while DEFAULT_OAUTH_CLIENTS shipped two empty strings
+ * and the app, asked to sign in, demanded an Entra application id. The page
+ * said one thing and the program another, and the persona trusted the page.
+ * So the sentence is read against the constant: while no client ships, the
+ * README has to say a registration of the reader's own is what a sign-in
+ * needs; the day the ids are filled in, that is the sentence that goes stale.
+ */
+test('README.md says what a sign-in needs from the reader, and the code agrees', async () => {
+  const { DEFAULT_OAUTH_CLIENTS } = await import('../core/sources/oauth.mjs');
+  const shipped = Object.entries(DEFAULT_OAUTH_CLIENTS).filter(([, c]) => c.clientId).map(([id]) => id);
+  const readme = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8');
+  if (shipped.length === 0) {
+    assert.doesNotMatch(readme, /nothing to register/i,
+      'README.md promises a sign-in that registers nothing, and DEFAULT_OAUTH_CLIENTS ships no client id — the app asks the reader for one');
+    assert.match(readme, /registration of your own/,
+      'README.md should say a registration of the reader\'s own is what a sign-in needs today');
+  } else {
+    assert.doesNotMatch(readme, /not shipped yet/,
+      `DEFAULT_OAUTH_CLIENTS ships ${shipped.join(' and ')} now — README.md still says the clients are not shipped`);
+  }
+});

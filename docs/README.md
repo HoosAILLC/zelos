@@ -207,7 +207,7 @@ messages, not your whole mailbox.
 
 That is not the only thing that spends money, and the other one is you: **every
 question on the Ask page is its own model call**, streamed, with the matching
-mail and events as context. So is each press of **Test** in Settings → Model.
+mail and events as context. So is each press of **Test** in Settings → AI.
 Neither is on a schedule — they happen when you ask — but a long session on the
 Ask page can outspend a day of sweeps.
 
@@ -626,7 +626,7 @@ With Zelos running, in another terminal:
   Get-NetTCPConnection -State Established | Where-Object OwningProcess -in (Get-Process node).Id
   ```
 
-Press **Sweep now** in Zelos and run it again. You should see three kinds of
+Press **Check now** in Zelos and run it again. You should see three kinds of
 connection by default and no others: **your mail server**, **your calendar
 host**, and **the model address you chose** — plus one host for each source you
 have added in Settings → Sources, which is also an address you chose:
