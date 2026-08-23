@@ -15,6 +15,9 @@
 
 import { el, button, meander, section } from '../lib/dom.js';
 import { itemHero, itemRow, emptyState } from '../lib/items.js';
+// The one control this view borrows from Settings: the "Stuck? Ask Claude"
+// line under the empty state of a home with no AI, about the AI step.
+import { askClaude } from './settings.js';
 import { byUrgency, sweepSummary, plural } from '../lib/format.js';
 import { state, startSweep, itemsInBucket, snoozedItems, boardNotes } from '../lib/store.js';
 import { humanDelta, instant } from '../lib/time.js';
@@ -53,7 +56,12 @@ function emptyForContext(navigate) {
     return emptyState({
       title: 'No AI chosen yet',
       detail: `${NO_AI_YET} Zelos reads your mail and calendar and thinks about them with an AI you choose — including one running on this computer.`,
-      action: button('Choose an AI', { class: 'btn solid', onClick: () => navigate('#/settings/model') }),
+      // A plain wrapper, not a .stack: that one is a column flex and would
+      // stretch the button across the card, where it has always sat inline.
+      action: el('div', {}, [
+        button('Choose an AI', { class: 'btn solid', onClick: () => navigate('#/settings/model') }),
+        askClaude({ step: 'ai' }),
+      ]),
     });
   }
   if (missing === 'sources') {

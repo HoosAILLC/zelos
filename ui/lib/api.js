@@ -155,6 +155,12 @@ export const api = {
   // browser's history and sent as a Referer, and this call's whole input is
   // somebody's email address.
   guessMail: (email) => request('/api/mail/guess', { method: 'POST', body: { email } }),
+  /* "Ask Claude to walk me through this": the message for one setup screen
+     and the two links that open a chat with it typed in. POST for the same
+     reason as guessMail — what rides along is what the app calls the
+     provider, and the server answers with only what core/help.mjs allows in
+     a message: the step, the provider's name, this computer's kind. */
+  helpLinks: (args) => request('/api/help', { method: 'POST', body: args }),
   testMail: (account) => request('/api/mail/test', { method: 'POST', body: account }),
   testCalendar: (calendar) => request('/api/calendar/test', { method: 'POST', body: calendar }),
 

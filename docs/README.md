@@ -227,6 +227,15 @@ IMAP command that fetches a message without marking it as read, so nothing in
 your inbox changes because Zelos looked at it. It never deletes, never moves,
 never sends.
 
+**If you get stuck, every setup step has an Ask Claude link.**
+[zelos-app.netlify.app/help](https://zelos-app.netlify.app/help) carries one
+message per step — opening the app the first time, choosing the AI, each mail
+provider below, each calendar — written so that Claude (or ChatGPT) knows which
+screen you are on, what that screen needs and the provider's real steps, and is
+told to go one step at a time, in plain words, and to ask you what you see. A
+message names the step and the provider and nothing else: never your address, a
+password or a key, and it tells Claude never to ask for one.
+
 **The short way.** Under **Settings → Mail → Add a mailbox**, type your email
 address. Zelos recognises the provider — Gmail, iCloud, Yahoo, AOL, Fastmail,
 Zoho, Outlook, and a custom domain hosted on Google Workspace or Microsoft 365,

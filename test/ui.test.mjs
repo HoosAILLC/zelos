@@ -3051,6 +3051,7 @@ function plainFetch({ probe = [], guesses = {}, presets, manifests, guides = GUI
     if (reqPath === '/api/local/probe') return ok(probe);
     if (reqPath === '/api/model/presets') return ok(presets);
     if (reqPath === '/api/guides') return ok(guides);
+    if (reqPath === '/api/help') return ok(helpAnswer(body));
     if (reqPath === '/api/sample-data') return ok({ installed: false, summary: 'A made-up week.' });
     if (reqPath === '/api/connectors') return ok({ connectors: manifests });
     if (reqPath === '/api/mail/guess') {
@@ -3067,6 +3068,25 @@ function plainFetch({ probe = [], guesses = {}, presets, manifests, guides = GUI
     if (reqPath === '/api/state') return ok({ items: [], events: [], notes: [], counts: {}, runs: {} });
     if (reqPath.startsWith('/api/ai')) return ok({ error: 'not found' }, 404);
     throw new Error(`unexpected ${init.method || 'GET'} ${reqPath}`);
+  };
+}
+
+/**
+ * What POST /api/help answers — the shape core/server.mjs serves, with
+ * reserved hosts. The message is a stand-in: what the page is entitled to is
+ * two https links and a message to copy, and the message's own content is
+ * test/help.test.mjs's business.
+ */
+function helpAnswer(body) {
+  const prompt = `A message for the ${body?.step} step${body?.provider ? ` about ${body.provider}` : ''}.`;
+  const q = encodeURIComponent(prompt);
+  return {
+    step: body?.step,
+    platform: 'mac',
+    title: `Help with ${body?.step}`,
+    prompt,
+    claude: `https://claude.example/new?q=${q}`,
+    chatgpt: `https://chatgpt.example/?q=${q}`,
   };
 }
 
@@ -3288,7 +3308,10 @@ test('the guided AI card stores the key, tests, picks the model itself, saves an
   await settle();
   await settle();
 
-  const wire = calls.filter((c) => c.method !== 'GET').map((c) => `${c.method} ${c.path}`);
+  // Every write, in order. The "Stuck? Ask Claude" line under the panel asks
+  // POST /api/help for its message on each paint; that is a read with a body,
+  // not a write, and it is the other test's business.
+  const wire = calls.filter((c) => c.method !== 'GET' && c.path !== '/api/help').map((c) => `${c.method} ${c.path}`);
   assert.deepEqual(wire, ['POST /api/secrets', 'POST /api/model/test', 'PUT /api/config'], `the wire was ${wire.join(', ')}`);
   assert.deepEqual(calls.find((c) => c.path === '/api/secrets').body, { ref: 'model.default', value: 'sk-ant-not-a-real-key' });
   const tested = calls.find((c) => c.path === '/api/model/test').body;
@@ -3674,4 +3697,184 @@ test('Ask, Search, the Calendar and the sharing panel meet a first-timer without
   const mark = /^\.scope-mark \{([^}]*)\}/m.exec(css);
   assert.ok(mark, '.scope-mark rule is missing');
   assert.ok(!/text-transform: uppercase/.test(mark[1]), '.scope-mark still shouts');
+});
+
+/* ------------------------------------------------ 8. "Stuck? Ask Claude" */
+
+/**
+ * One quiet line under every setup screen: "Stuck? Ask Claude to walk me
+ * through this · or ChatGPT · Copy this message". The two links open a chat
+ * with a message the server wrote about that exact screen; this test drives
+ * every screen the line is meant to be on and reads the line back — which
+ * step it asked the server about, that the links are https in a new tab
+ * (what desktop/guard.js hands to the system browser), that Copy exists and
+ * falls back to a visible box when the clipboard is refused — and, the one
+ * that matters, that nothing the page sends to /api/help carries the address
+ * the person typed. The provider goes by its NAME; the address stays in the
+ * box it was typed into.
+ */
+test('"Stuck? Ask Claude" sits under every setup screen, names the step, links https in a new tab, and never sends the address', async (t) => {
+  withPlainDom(t);
+  const calls = [];
+  globalThis.fetch = plainFetch({ presets: await llmPresets(), manifests: await connectorManifests(), guesses: GUESSES, calls });
+  t.after(() => { delete globalThis.fetch; });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const onboarding = await import(fileUrl(UI, 'views/onboarding.js'));
+  const settings = await import(fileUrl(UI, 'views/settings.js'));
+  const now = await import(fileUrl(UI, 'views/now.js'));
+  store.state.config = { identity: {}, model: {}, mail: [], calendars: [], sources: [], sweep: { intervalMinutes: 30, activeHours: [6, 23], auto: true }, privacy: { sendBodies: true, bodyChars: 4000, maxItemsPerSweep: 150 } };
+  store.state.health = { model: { configured: false }, home: '/tmp/zelos-home', backend: { name: 'encrypted-file' } };
+  store.state.secretRefs = [];
+  store.state.configErrors = [];
+  store.state.board = { items: [], events: [], notes: [], counts: {}, runs: {}, first: null, tokens: null };
+
+  const helpCalls = () => calls.filter((c) => c.path === '/api/help');
+  const helpOn = (root) => plainWalk(root).filter((n) => n.dataset?.helpStep && !plainHidden(n));
+  /** The one visible line on a screen, checked for its step, its links and its button. */
+  const expectHelp = async (root, step, where, { provider = undefined } = {}) => {
+    await settle();
+    const shown = helpOn(root);
+    assert.equal(shown.length, 1, `${where}: ${shown.length} help lines on screen (${shown.map((n) => n.dataset.helpStep).join(', ')})`);
+    const line = shown[0];
+    assert.equal(line.dataset.helpStep, step, `${where}: the line is about the wrong step`);
+    assert.match(textOf(line), /Stuck\? Ask Claude to walk me through this · or ChatGPT · Copy this message/, `${where}: the line does not read as one line`);
+    const links = plainWalk(line).filter((n) => n.tag === 'a');
+    assert.equal(links.length, 2, `${where}: two links expected`);
+    assert.equal(textOf(links[0]), 'Ask Claude to walk me through this');
+    assert.equal(textOf(links[1]), 'ChatGPT');
+    for (const a of links) {
+      assert.match(a.attributes.href || '', /^https:\/\//, `${where}: ${textOf(a)} is not an https link — ${a.attributes.href}`);
+      assert.equal(a.attributes.target, '_blank', `${where}: ${textOf(a)} opens in this window`);
+      assert.equal(a.attributes.rel, 'noopener noreferrer', `${where}: ${textOf(a)} leaks an opener`);
+    }
+    assert.ok(findButton(line, 'Copy this message'), `${where}: no Copy button`);
+    assert.doesNotMatch(onScreen(line), JARGON, `${where}: ${onScreen(line).match(JARGON)?.[0]}`);
+    // What the page asked the server: the step, and the provider by name when one is known.
+    const asked = helpCalls().find((c) => c.body.step === step && (provider === undefined || c.body.provider === provider));
+    assert.ok(asked, `${where}: the page never asked /api/help about ${step}${provider === undefined ? '' : ` for ${provider}`} — asked: ${JSON.stringify(helpCalls().map((c) => c.body))}`);
+    assert.equal(asked.method, 'POST', `${where}: the ask is not a POST`);
+    return line;
+  };
+
+  // Onboarding, step by step.
+  let view = null;
+  const ctx = { navigate() {}, rerender() { view = onboarding.renderOnboarding(ctx); } };
+  ctx.rerender();
+  const stepButton = (n) => plainWalk(view).filter((b) => b.tag === 'button' && (b.attributes.class || '').includes('ob-step-btn'))[n - 1];
+  const goTo = (n) => { stepButton(n).fire('click'); };
+
+  await expectHelp(view, 'general', 'Welcome');
+
+  goTo(2);
+  await expectHelp(view, 'ai', 'AI step', { provider: null });
+  findButtons(view, /^Claude, by Anthropic/)[0].fire('click');
+  await expectHelp(view, 'ai', 'AI step, Claude chosen', { provider: 'Claude' });
+
+  goTo(3);
+  await expectHelp(view, 'email', 'Email step', { provider: null });
+  findButton(view, 'Add an email account').fire('click');
+  await expectHelp(view, 'email', 'Email step, form open', { provider: null });
+  const emailInput = findInput(view, (n) => n.attributes.type === 'email');
+  for (const [address, name] of [['frank@gmail.com', 'Gmail'], ['frank@hotmail.com', 'Outlook / Microsoft'], ['frank@icloud.com', 'iCloud Mail']]) {
+    emailInput.value = address;
+    emailInput.fire('change');
+    await settle();
+    await expectHelp(view, 'email', `Email step, ${address}`, { provider: name });
+  }
+  // The Hotmail ask carries what the guess said about the sign-in, and no more.
+  const hotmail = helpCalls().find((c) => c.body.provider === 'Outlook / Microsoft');
+  assert.deepEqual(hotmail.body, { step: 'email', provider: 'Outlook / Microsoft', signIn: 'microsoft', clientReady: false });
+
+  goTo(4);
+  await expectHelp(view, 'calendar', 'Calendar step', { provider: null });
+  findButtons(view, /^iPhone or Mac/)[0].fire('click');
+  await expectHelp(view, 'calendar', 'Calendar step, iCloud chosen', { provider: 'icloud' });
+  findButtons(view, /^Something else/)[0].fire('click');
+  await expectHelp(view, 'calendar', 'Calendar step, Something else', { provider: null });
+
+  goTo(5);
+  await expectHelp(view, 'first-check', 'Done step');
+  goTo(1);
+
+  // Settings: the three panels carry the same line.
+  await expectHelp(settings.renderSettings({ sub: 'model', navigate() {}, rerender() {} }), 'ai', 'Settings › AI');
+  await expectHelp(settings.renderSettings({ sub: 'mail', navigate() {}, rerender() {} }), 'email', 'Settings › Email');
+  await expectHelp(settings.renderSettings({ sub: 'calendars', navigate() {}, rerender() {} }), 'calendar', 'Settings › Calendars');
+  // And not the ones that are not setup screens.
+  for (const sub of ['you', 'sweep', 'privacy', 'data', 'about', 'appearance']) {
+    const panel = settings.renderSettings({ sub, navigate() {}, rerender() {} });
+    await settle();
+    assert.equal(helpOn(panel).length, 0, `Settings › ${sub} carries a help line it has no screen for`);
+  }
+
+  // The board with no AI: the empty state offers the AI step.
+  const board = now.renderNow({ navigate() {}, rerender() {}, tz: 'UTC' });
+  assert.ok(findButton(board, 'Choose an AI'), 'the empty state lost its button');
+  await expectHelp(board, 'ai', 'Now, no AI yet');
+
+  // PRIVACY: nothing the page sent to /api/help carries an address, a path, or a password.
+  assert.ok(helpCalls().length >= 8, `only ${helpCalls().length} asks — the sweep is broken`);
+  for (const c of helpCalls()) {
+    const wire = JSON.stringify(c.body);
+    assert.doesNotMatch(wire, /@/, `an address went to /api/help: ${wire}`);
+    assert.doesNotMatch(wire, /frank|hotmail\.com|gmail\.com|icloud\.com/, `the typed address's parts went to /api/help: ${wire}`);
+    assert.deepEqual(Object.keys(c.body).sort(), ['clientReady', 'provider', 'signIn', 'step'], `the ask carries more than the four fields: ${wire}`);
+  }
+  // And ui/ names neither chat host: the links are the server's, like every outbound address on these screens.
+  for (const file of ['views/settings.js', 'views/onboarding.js', 'views/now.js', 'lib/api.js']) {
+    const src = fs.readFileSync(path.join(UI, file), 'utf8');
+    for (const [i, line] of src.split('\n').entries()) {
+      if (/^\s*(\*|\/\/)/.test(line)) continue;
+      assert.doesNotMatch(line, /claude\.ai|chatgpt\.com/, `${file}:${i + 1} names a chat host`);
+    }
+  }
+});
+
+test('"Copy this message" copies the server\'s message, says so, and shows the message in a box when the clipboard is refused', async (t) => {
+  withPlainDom(t);
+  const calls = [];
+  globalThis.fetch = plainFetch({ calls });
+  t.after(() => { delete globalThis.fetch; });
+  const settings = await import(fileUrl(UI, 'views/settings.js'));
+  const expected = helpAnswer({ step: 'first-check' }).prompt;
+
+  // A browser whose clipboard takes the text.
+  const realNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  let copied = null;
+  Object.defineProperty(globalThis, 'navigator', { value: { clipboard: { writeText: async (text) => { copied = text; } } }, configurable: true, writable: true });
+  t.after(() => { if (realNavigator) Object.defineProperty(globalThis, 'navigator', realNavigator); else delete globalThis.navigator; });
+
+  const line = settings.askClaude({ step: 'first-check' });
+  await settle();
+  const box = findInput(line, (n) => n.tag === 'textarea');
+  assert.ok(box, 'no box for the message');
+  assert.ok(plainHidden(box), 'the box is on screen before the clipboard has been refused');
+  findButton(line, 'Copy this message').fire('click');
+  await settle();
+  assert.equal(copied, expected, 'the clipboard did not get the server\'s message');
+  assert.match(onScreen(line), /Copied\. Paste it into the chat\./);
+  assert.ok(plainHidden(box), 'the box opened although the clipboard took the text');
+  assert.doesNotMatch(onScreen(line), JARGON, onScreen(line).match(JARGON)?.[0]);
+
+  // A browser whose clipboard refuses: the message in a box the person can select.
+  Object.defineProperty(globalThis, 'navigator', { value: { clipboard: { writeText: async () => { throw new Error('NotAllowedError'); } } }, configurable: true, writable: true });
+  const refused = settings.askClaude({ step: 'first-check' });
+  await settle();
+  findButton(refused, 'Copy this message').fire('click');
+  await settle();
+  const shown = findInput(refused, (n) => n.tag === 'textarea');
+  assert.ok(!plainHidden(shown), 'the clipboard was refused and no box appeared');
+  assert.equal(shown.value, expected, 'the box does not hold the message');
+  assert.equal(shown.attributes.readonly, '', 'the box is editable');
+  assert.match(onScreen(refused), /Select the text below and copy it\./);
+  assert.doesNotMatch(onScreen(refused), /Copied/, 'the page claims a copy that did not happen');
+
+  // A server without the route: the line removes itself rather than offering a dead link.
+  globalThis.fetch = async (reqPath, init = {}) => {
+    if (reqPath === '/api/help') return { ok: false, status: 404, text: async () => JSON.stringify({ error: 'not found' }) };
+    return plainFetch({ calls })(reqPath, init);
+  };
+  const gone = settings.askClaude({ step: 'general' });
+  await settle();
+  assert.equal(gone.hidden, true, 'a 404 left a line with no links on screen');
 });

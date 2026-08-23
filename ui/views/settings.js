@@ -100,6 +100,91 @@ function outLink(href, text) {
   return el('a', { class: 'link', href, target: '_blank', rel: 'noopener noreferrer', text: `${text} ↗` });
 }
 
+/* ------------------------------------------------------------ ask Claude */
+
+/**
+ * "Stuck? Ask Claude to walk me through this · or ChatGPT · Copy this message"
+ *
+ * One quiet line under a setup screen. The two links open a chat in the
+ * person's browser with a message already typed — which screen they are on,
+ * what it shows, their provider's real steps, and how to help someone who
+ * has never heard of a protocol. The server writes the message
+ * (core/help.mjs) and this line only carries it: ui/ names no remote host,
+ * so the addresses arrive from POST /api/help like every other outbound link
+ * on these screens, and the desktop shell's guard hands a target=_blank
+ * https link to the system browser exactly as it does the app-password one.
+ *
+ * `provider` is what the app calls it — the mail guess's label, a calendar
+ * guide's id, the AI card's name — and never the address. The server reduces
+ * it to a closed list before a word of it reaches the message; the address
+ * is not sent at all, and test/help.test.mjs hunts every message for one.
+ *
+ * "Copy this message" is for the page that does not prefill: the clipboard
+ * first, and when the clipboard is refused (an old browser, a page without
+ * focus), the message in a box the person can select themselves — a copy
+ * button that does nothing visible is the failure mode this avoids.
+ *
+ * A build without the route answers 404, and the line removes itself: an
+ * offer that cannot be honoured is worse than no offer.
+ */
+export function askClaude({ step, provider = null, signIn = null, clientReady = false } = {}) {
+  const claude = el('a', { class: 'link', target: '_blank', rel: 'noopener noreferrer', text: 'Ask Claude to walk me through this' });
+  const chatgpt = el('a', { class: 'link', target: '_blank', rel: 'noopener noreferrer', text: 'ChatGPT' });
+  const note = el('span', { class: 'quiet-note', 'aria-live': 'polite' });
+  const fallback = el('textarea', {
+    class: 'input',
+    readonly: true,
+    rows: '6',
+    'aria-label': 'The message to paste into Claude or ChatGPT',
+  });
+  fallback.hidden = true;
+  let answer = null;
+
+  const copy = button('Copy this message', {
+    class: 'link',
+    onClick: async () => {
+      if (!answer) return;
+      let ok = false;
+      try {
+        ok = await copyText(answer.prompt);
+      } catch {
+        ok = false;
+      }
+      if (ok) {
+        note.textContent = 'Copied. Paste it into the chat.';
+        return;
+      }
+      fallback.value = answer.prompt;
+      fallback.hidden = false;
+      if (typeof fallback.select === 'function') fallback.select();
+      note.textContent = 'Select the text below and copy it.';
+    },
+  });
+
+  const line = el('p', { class: 'quiet-note ask-claude' }, [
+    'Stuck? ', claude, ' · or ', chatgpt, ' · ', copy, ' ', note,
+  ]);
+  const wrap = el('div', { class: 'ask-claude-wrap', dataset: { helpStep: step } }, [line, fallback]);
+
+  // Asked on every paint rather than cached: the answer is a few hundred
+  // bytes from this machine, and a cache would be one more thing that could
+  // hold a stale link after the provider changed.
+  api.helpLinks({ step, provider, signIn, clientReady }).then((got) => {
+    if (!/^https:\/\//.test(String(got?.claude || '')) || !/^https:\/\//.test(String(got?.chatgpt || ''))) {
+      wrap.hidden = true;
+      return;
+    }
+    answer = got;
+    claude.setAttribute('href', got.claude);
+    claude.setAttribute('title', got.title || '');
+    chatgpt.setAttribute('href', got.chatgpt);
+  }).catch(() => {
+    wrap.hidden = true;
+  });
+
+  return wrap;
+}
+
 /**
  * Common IMAP hosts, as a typing aid only. core/sources/imap.mjs has the real
  * `guessImapHost`, but no route exposes it — rather than duplicate its logic
@@ -664,6 +749,9 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
   guidedWrap.hidden = true;
   const formWrap = el('div', { class: 'chosen' });
   const probeNote = el('p', { class: 'quiet-note' });
+  // The "Stuck?" line, redrawn with the card's name once one is chosen so the
+  // message Claude gets is about Anthropic's key page and not both.
+  const helpSlot = el('div');
 
   // Refs this panel has stored itself since it was drawn. `state.secretRefs`
   // is refreshed by a config save, not by POST /api/secrets, so a key stored
@@ -926,6 +1014,11 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
       // is one, so the expert form borrows it only when it is the whole panel.
       guide ? null : status.node,
     ]);
+
+    replace(helpSlot, [askClaude({
+      step: 'ai',
+      provider: guide ? (guide.local ? 'local' : guide.friendly) : null,
+    })]);
   }
 
   function choose(next, { scroll = true } = {}) {
@@ -1034,6 +1127,7 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
     guidedWrap,
     fold('More choices', moreWrap),
     fold('Advanced', [probeNote, formWrap]),
+    helpSlot,
   ]);
 }
 
@@ -1911,6 +2005,9 @@ export function simpleMailForm({ onSaved, onCancel }) {
   card.hidden = true;
   // The full form opens here, under the card, and closes back to nothing.
   const expertSlot = el('div', { class: 'editor' });
+  // The "Stuck?" line: about email in general until the guess lands, then
+  // about the provider it named — its label, never the address.
+  const helpSlot = el('div', {}, [askClaude({ step: 'email' })]);
 
   const email = () => emailInput.value.trim();
 
@@ -2053,6 +2150,12 @@ export function simpleMailForm({ onSaved, onCancel }) {
     // buttons on one screen read as two different things.
     formAdvanced.hidden = Boolean(guess);
     if (!guess) { card.replaceChildren(); return; }
+    replace(helpSlot, [askClaude({
+      step: 'email',
+      provider: guess.known ? guess.label : 'unknown',
+      signIn: guess.signIn || null,
+      clientReady: guess.clientReady === true,
+    })]);
 
     // How the server knows: a custom domain on Workspace or 365 is named
     // from its mail records, and a domain with an IMAP SRV record from that.
@@ -2208,6 +2311,7 @@ export function simpleMailForm({ onSaved, onCancel }) {
       formAdvanced,
       button('Cancel', { class: 'btn quiet', onClick: () => { microsoft?.stop(); google?.stop(); onCancel(); } }),
     ]),
+    helpSlot,
   ]);
 }
 
@@ -2258,6 +2362,10 @@ export function mailPanel({ compact = false, onDone = null, rerender } = {}) {
     : el('p', { class: 'quiet-note', text: 'No email account connected yet.' }));
 
   const editor = el('div', { class: 'editor' });
+  // The panel's own "Stuck?" line. The simple form carries one of its own,
+  // about the provider once it is known, so this one steps aside while the
+  // form is open: two on one screen read as two different things.
+  const help = askClaude({ step: 'email' });
 
   // The simple form, which carries the full one beneath its own card — on the
   // id and keyRef it minted, so a password Connect already stored is the
@@ -2265,9 +2373,10 @@ export function mailPanel({ compact = false, onDone = null, rerender } = {}) {
   const addButton = button('Add an email account', {
     class: 'btn solid',
     onClick: () => {
+      help.hidden = true;
       editor.replaceChildren(simpleMailForm({
         onSaved: () => { onDone?.(); rerender?.(); },
-        onCancel: () => editor.replaceChildren(),
+        onCancel: () => { editor.replaceChildren(); help.hidden = false; },
       }));
     },
   });
@@ -2275,6 +2384,7 @@ export function mailPanel({ compact = false, onDone = null, rerender } = {}) {
   wrap.appendChild(list);
   wrap.appendChild(el('div', { class: 'row-inline' }, addButton));
   wrap.appendChild(editor);
+  wrap.appendChild(help);
   return wrap;
 }
 
@@ -2555,6 +2665,8 @@ export function calendarPanel({ compact = false, onDone = null, rerender } = {})
   const wrap = el('div', { class: 'panel panel-calendars' });
   const editor = el('div', { class: 'editor' });
   const status = statusLine();
+  // The "Stuck?" line, redrawn for the calendar a card names once one is pressed.
+  const helpSlot = el('div', {}, [askClaude({ step: 'calendar' })]);
 
   if (!compact) {
     wrap.appendChild(el('p', { class: 'panel-lede', text: 'Add your calendar, and Zelos knows what is coming. Times are kept exactly as your calendar has them, so an appointment at 2pm stays at 2pm wherever this computer thinks it is.' }));
@@ -2595,6 +2707,7 @@ export function calendarPanel({ compact = false, onDone = null, rerender } = {})
     class: 'preset',
     onclick: () => {
       const id = randomId('c');
+      replace(helpSlot, [askClaude({ step: 'calendar', provider: guide.kind ? guide.id : null })]);
       openEditor(editor, status, (manifests, links) => calendarForm({
         id,
         enabled: true,
@@ -2621,6 +2734,7 @@ export function calendarPanel({ compact = false, onDone = null, rerender } = {})
   ]))));
   wrap.appendChild(editor);
   wrap.appendChild(status.node);
+  wrap.appendChild(helpSlot);
   return wrap;
 }
 

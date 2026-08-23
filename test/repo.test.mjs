@@ -1371,6 +1371,38 @@ test('README.md sends the person who is not a programmer to the app before it na
 });
 
 /**
+ * The site's /help page hands any setup step to Claude with a message Zelos
+ * wrote: the step, the provider, the real page names, and four rules for the
+ * AI. The two places a stuck person reads before they find a website — the
+ * README's non-programmer paragraph and the mail section of docs/README.md —
+ * have to say it exists, and say the one thing that makes it safe to press:
+ * the message never carries their address, a password or a key. A doc that
+ * promised the link without that sentence would be teaching people to paste
+ * secrets into a chat.
+ */
+test('both READMEs send the stuck person to /help, and say what the message never contains', () => {
+  const readme = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8');
+  const docs = fs.readFileSync(path.join(ROOT, 'docs', 'README.md'), 'utf8');
+  const HELP = 'https://zelos-app.netlify.app/help';
+
+  // README.md: in the non-programmer lead of "Run it", before the first command.
+  const start = readme.indexOf('\n## Run it\n');
+  const section = readme.slice(start, readme.indexOf('\n## ', start + 1));
+  const lead = section.slice(0, section.indexOf('```')).replace(/\s+/g, ' ');
+  assert.ok(lead.includes(HELP), 'README.md\'s non-programmer lead does not link the help page');
+  assert.match(lead, /Claude/, 'README.md does not say who the help page hands the step to');
+
+  // docs/README.md: under "Connecting your mail", ahead of the provider steps.
+  // Line breaks folded, like the README lead: markdown wraps at 80 columns.
+  const mail = docs.slice(docs.indexOf('\n## Connecting your mail\n'), docs.indexOf('\n### Gmail\n')).replace(/\s+/g, ' ');
+  assert.ok(mail.includes(HELP), 'docs/README.md § Connecting your mail does not link the help page');
+  assert.match(mail, /Ask Claude/, 'docs/README.md does not name the link the way the site does');
+  assert.match(mail, /one step at a time/i, 'the paragraph does not say how Claude is told to go');
+  assert.match(mail, /never your address, a password or a key/,
+    'the paragraph does not say what the message never contains — the one sentence that makes the link safe');
+});
+
+/**
  * "Both run against a client Zelos ships, so there is nothing to register"
  * stood in the README while DEFAULT_OAUTH_CLIENTS shipped two empty strings
  * and the app, asked to sign in, demanded an Entra application id. The page

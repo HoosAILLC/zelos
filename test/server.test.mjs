@@ -1807,6 +1807,82 @@ test('/api/guides hands the guided cards their pages, every one https, and nothi
   assert.match(g.microsoftSetup, /#microsoft--register-zeloss-multi-tenant-public-client$/);
 });
 
+/**
+ * "Ask Claude to walk me through this." POST /api/help hands the page the
+ * message core/help.mjs writes for one setup screen, and the two links that
+ * open a chat with it typed in. Three things are the route's own to get
+ * right, and are tested here rather than in test/help.test.mjs: the shape on
+ * the wire, the platform — this process's, never the body's — and that
+ * nothing the body carries beyond a step and a provider's name comes back.
+ */
+test('POST /api/help answers the message and links for a step, with the platform this server runs on', async (t) => {
+  const { platformName, HELP_RULES } = await import('../core/help.mjs');
+  const ctx = await startServer(t);
+  const res = await call(ctx, 'POST', '/api/help', { body: { step: 'ai' } });
+  assert.equal(res.status, 200);
+  assert.deepEqual(Object.keys(res.json).sort(), ['chatgpt', 'claude', 'platform', 'prompt', 'step', 'title']);
+  assert.equal(res.json.step, 'ai');
+  assert.equal(res.json.platform, platformName(process.platform), 'the platform is not the one the server is running on');
+  assert.match(res.json.claude, /^https:\/\/claude\.ai\/new\?q=/);
+  assert.match(res.json.chatgpt, /^https:\/\/chatgpt\.com\/\?q=/);
+  assert.equal(new URL(res.json.claude).searchParams.get('q'), res.json.prompt);
+  assert.match(res.json.prompt, /Pick the AI that reads your mail/);
+  for (const rule of HELP_RULES) assert.ok(res.json.prompt.includes(rule), `the message is missing “${rule}”`);
+  assert.ok(res.json.prompt.length < 3500);
+  // The step is the only required field, and it has to be a real one.
+  const bad = await call(ctx, 'POST', '/api/help', { body: { step: 'reboot' } });
+  assert.equal(bad.status, 400);
+  assert.match(bad.json.error, /step must be one of/);
+  assert.equal((await call(ctx, 'POST', '/api/help', { body: {} })).status, 400);
+  // Behind the session token, like every /api route.
+  assert.equal((await call(ctx, 'POST', '/api/help', { token: null, body: { step: 'ai' } })).status, 401);
+  assert.equal((await call(ctx, 'GET', '/api/help')).status, 405);
+});
+
+test('PRIVACY: POST /api/help ignores the body\'s platform and address, and neither comes back', async (t) => {
+  const { platformName } = await import('../core/help.mjs');
+  const ctx = await startServer(t);
+  const address = 'nemo.underwood@marchetti.example';
+  const foreign = platformName(process.platform) === 'windows' ? 'mac' : 'windows';
+  const res = await call(ctx, 'POST', '/api/help', {
+    body: {
+      step: 'email',
+      provider: 'Gmail',
+      signIn: 'google',
+      clientReady: false,
+      // What a confused or hostile caller might add. None of it is the route's business.
+      platform: foreign,
+      email: address,
+      user: address,
+      password: 'hunter2-app-password',
+      keyRef: 'mail.m_1',
+      home: '/Users/nemo/.zelos',
+    },
+  });
+  assert.equal(res.status, 200);
+  assert.equal(res.json.platform, platformName(process.platform), 'the body chose the platform');
+  assert.ok(!res.json.prompt.includes(`They are on a ${foreign === 'mac' ? 'Mac' : 'Windows PC'}.`), 'the message says it is the body’s platform');
+  assert.ok(!res.text.includes(address), 'the address came back');
+  assert.ok(!res.text.includes('marchetti'), 'the domain came back');
+  assert.ok(!res.text.includes('hunter2'), 'the password came back');
+  assert.ok(!res.text.includes('mail.m_1'), 'the secret ref came back');
+  assert.ok(!res.text.includes('/Users/'), 'the home path came back');
+  assert.ok(!decodeURIComponent(res.json.claude).includes('marchetti'), 'the address is in the link');
+  // What it IS allowed to say: the provider's name.
+  assert.match(res.json.prompt, /their email is with Gmail/);
+  // And an address sent AS the provider is reduced to "unknown", never echoed.
+  const asProvider = await call(ctx, 'POST', '/api/help', { body: { step: 'email', provider: address } });
+  assert.equal(asProvider.status, 200);
+  assert.ok(!asProvider.text.includes('marchetti'));
+  assert.match(asProvider.json.prompt, /A provider Zelos does not know/);
+  // The calendar pages in the message are the ones /api/guides serves, not a second copy.
+  const guides = (await call(ctx, 'GET', '/api/guides')).json;
+  const calendar = await call(ctx, 'POST', '/api/help', { body: { step: 'calendar', provider: 'google' } });
+  assert.ok(calendar.json.prompt.includes(guides.calendars.google.settings), 'the calendar message does not name the page /api/guides serves');
+  const outlook = await call(ctx, 'POST', '/api/help', { body: { step: 'email', provider: 'Outlook / Microsoft', clientReady: false } });
+  assert.ok(outlook.json.prompt.includes(guides.microsoftSetup), 'the Outlook message does not name the setup page /api/guides serves');
+});
+
 test('/api/mail/test needs the password to have been stored first', async (t) => {
   const ctx = await startServer(t);
   const res = await call(ctx, 'POST', '/api/mail/test', {
