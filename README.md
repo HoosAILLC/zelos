@@ -42,7 +42,13 @@ bundled SQLite is built without it before 22.16 and throughout the whole Node 23
 that lacks it, Zelos refuses to start and names the versions that work.
 
 It opens in your browser at `127.0.0.1` and stays there. Nothing to install, no account, no server.
-To connect a mailbox, type your email address: Zelos recognises the provider, one button opens the page where it makes an app password, and **Connect** does the rest.
+To connect a mailbox, type your email address. Gmail and Google Workspace get **Sign in with
+Google**; Outlook, Hotmail, Live, MSN and Microsoft 365 get **Sign in with Microsoft** — both run
+against a client Zelos ships, so there is nothing to register, and the Google one comes back to
+Zelos on `127.0.0.1`. Everything else — iCloud, Yahoo, Fastmail, a server of your own — gets one
+button to the page where your provider makes an app password, and **Connect** does the rest. Gmail
+takes either. [docs/OAUTH.md](docs/OAUTH.md) has what the sign-ins send where and what Google's
+review of them costs.
 
 ```bash
 zelos              # run it — this is the one you want
@@ -66,7 +72,10 @@ has the exact extent of it.
 Three things by default, and you chose all three: your mail provider, your calendar address, and
 your model endpoint — plus one host for each source you add in Settings → Sources, which is also
 an address you chose. Each connector names its host (`origins` in `core/connectors/*.mjs`) and the
-one transport they all share (`core/connectors/http.mjs`) refuses any other. Of all of those, only
+one transport they all share (`core/connectors/http.mjs`) refuses any other. Signing in with Google
+or Microsoft adds that provider's sign-in service — `accounts.google.com` and
+`oauth2.googleapis.com`, or `login.microsoftonline.com` — for the length of the sign-in and of each
+token refresh, and still no Zelos server. Of all of those, only
 the model request carries what Zelos read; point it at a local model and nothing it read leaves at
 all. No telemetry, no analytics, no update pings, no crash reports.
 
@@ -87,7 +96,11 @@ that table:** `POST /api/mcp`, the channel an AI client uses. It is lifted out o
 *before* the session gate because it takes the separate AI token you mint in Settings, and the two
 credentials work in neither direction — the session gate returns 401 for an AI token, and the MCP
 gate ignores `X-Zelos-Token` entirely. The loopback bind, the `Host` check and the `Origin` check
-apply to it unchanged, so a web page cannot reach it even holding a stolen bearer token.
+apply to it unchanged, so a web page cannot reach it even holding a stolen bearer token. A second
+one, `GET /oauth/callback`, is where Google's sign-in redirect lands; a browser redirect cannot
+carry a token, so that route takes none and is held instead to `127.0.0.1`, to a `state` that
+matches a sign-in still in progress, and to a reply page with nothing in it —
+[docs/SECURITY.md § 6](docs/SECURITY.md) has the exact extent.
 
 **One thing said plainly:** your mail is written by other people, so a message can contain text
 aimed at the model. Zelos never acts on what the model says — it renders, and you click. That is a
@@ -116,7 +129,8 @@ rebinding, FTS injection, token forgery and MCP scope escapes.
 | [docs/INSTALL.md](docs/INSTALL.md) | installing, including the unsigned-app dance |
 | [docs/SECURITY.md](docs/SECURITY.md) | the threat model, stated honestly |
 | [docs/SPEC.md](docs/SPEC.md) · [docs/SPEC-v2.md](docs/SPEC-v2.md) | what it is meant to do |
-| [docs/OAUTH.md](docs/OAUTH.md) | why there is no "Sign in with Google" button yet |
+| [docs/OAUTH.md](docs/OAUTH.md) | how Sign in with Google and Sign in with Microsoft work, and what registering them takes |
+| [docs/VERIFICATION.md](docs/VERIFICATION.md) | the Google review kit: scope justification, demo shot list, CASA checklist |
 
 ## Licence
 
