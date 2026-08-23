@@ -647,8 +647,8 @@ function oauthTrouble(account, grant, name) {
     return {
       detail: `${name} is set to sign in with ${who}, but no client ID is stored, so there is no registration to sign in against.`,
       action: google
-        ? 'Open Settings → Mail, edit this account and press "Sign in with Google" again — the client Zelos signed in through is saved on the account when the sign-in finishes.'
-        : 'Open Settings → Mail, edit this account and follow the steps under "Sign in with Microsoft" — '
+        ? 'Open Settings → Email, edit this account and press "Sign in with Google" again — the client Zelos signed in through is saved on the account when the sign-in finishes.'
+        : 'Open Settings → Email, edit this account and follow the steps under "Sign in with Microsoft" — '
           + 'they end with an application (client) ID and a directory (tenant) ID to paste in.',
     };
   }
@@ -656,8 +656,8 @@ function oauthTrouble(account, grant, name) {
     return {
       detail: `${name} has a registration but has never been signed in on this machine, so there is no token to open the mailbox with.`,
       action: google
-        ? 'Open Settings → Mail, edit this account and press "Sign in with Google". A browser tab opens, you approve access, and the panel finishes on its own.'
-        : 'Open Settings → Mail, edit this account and press "Sign in with Microsoft". '
+        ? 'Open Settings → Email, edit this account and press "Sign in with Google". A browser tab opens, you approve access, and the panel finishes on its own.'
+        : 'Open Settings → Email, edit this account and press "Sign in with Microsoft". '
           + 'Zelos shows a code, you type it at microsoft.com/devicelogin, and the panel finishes on its own.',
     };
   }
@@ -665,8 +665,8 @@ function oauthTrouble(account, grant, name) {
     return {
       detail: `${name} is signed in to ${who}, but the stored grant has no refresh token, so it will stop working within the hour.`,
       action: google
-        ? 'Sign in again from Settings → Mail and approve access when Google asks — a consent screen that was skipped is what leaves the refresh token out.'
-        : 'The app registration has to request the offline_access scope. Add it under API permissions, then sign in again from Settings → Mail.',
+        ? 'Sign in again from Settings → Email and approve access when Google asks — a consent screen that was skipped is what leaves the refresh token out.'
+        : 'The app registration has to request the offline_access scope. Add it under API permissions, then sign in again from Settings → Email.',
     };
   }
   return null;
@@ -681,7 +681,7 @@ async function checkMailAccount(account, deps, { timeoutMs }) {
 
   if (!account.host) {
     return check(id, label, 'fail', 'No IMAP server is set for this account.',
-      `Open Settings → Mail and fill in the server.${guess.host ? ` For ${account.user || 'that address'} it is usually ${guess.host}, port ${guess.port}.` : ''}`);
+      `Open Settings → Email and fill in the server.${guess.host ? ` For ${account.user || 'that address'} it is usually ${guess.host}, port ${guess.port}.` : ''}`);
   }
 
   let stored = null;
@@ -689,7 +689,7 @@ async function checkMailAccount(account, deps, { timeoutMs }) {
     stored = account.keyRef ? await deps.getSecret(account.keyRef) : null;
   } catch (err) {
     return check(id, label, 'fail', `Zelos could not read the stored ${oauth ? 'Microsoft sign-in' : 'password'}: ${errorText(err)}`,
-      `See the secret store line above. ${oauth ? 'Signing in again' : 'Re-entering the password'} in Settings → Mail usually settles it.`);
+      `See the secret store line above. ${oauth ? 'Signing in again' : 'Re-entering the password'} in Settings → Email usually settles it.`);
   }
 
   const grant = storedGrant(stored);
@@ -700,7 +700,7 @@ async function checkMailAccount(account, deps, { timeoutMs }) {
     return check(
       id, label, 'fail',
       `No password is stored for ${name}, so Zelos cannot sign in.`,
-      `Open Settings → Mail and enter it. ${guess.note}`,
+      `Open Settings → Email and enter it. ${guess.note}`,
     );
   } else if (grant) {
     /* A grant under an account that is set to send a password. It happens one
@@ -711,7 +711,7 @@ async function checkMailAccount(account, deps, { timeoutMs }) {
     return check(
       id, label, 'fail',
       `${name} holds a Microsoft sign-in but is set to send a password, so Zelos would offer the stored token as one.`,
-      'Open Settings → Mail and set "How Zelos signs in" to "Sign in with Microsoft", or enter a password to replace the stored sign-in.',
+      'Open Settings → Email and set "How Zelos signs in" to "Sign in with Microsoft", or enter a password to replace the stored sign-in.',
     );
   }
 
@@ -753,7 +753,7 @@ async function checkMailAccount(account, deps, { timeoutMs }) {
       return check(
         id, label, 'fail',
         `${account.host}: ${reason}`,
-        `Zelos stopped before your password left this machine. Use the TLS port in Settings → Mail — ${guess.host ? `${guess.host}:${guess.port}` : 'usually 993'} — and if this host really is a local bridge that cannot do TLS, turn requireTls off for this account.`,
+        `Zelos stopped before your password left this machine. Use the TLS port in Settings → Email — ${guess.host ? `${guess.host}:${guess.port}` : 'usually 993'} — and if this host really is a local bridge that cannot do TLS, turn requireTls off for this account.`,
       );
     }
     const authish = /auth|login|credential|password|invalid|denied|token|oauth/i.test(reason);
@@ -771,7 +771,7 @@ async function checkMailAccount(account, deps, { timeoutMs }) {
         `${account.host}: ${reason}`,
         result?.reconnect
           ? 'The Microsoft sign-in for this mailbox is no longer good — a changed password, a revoked consent, a new conditional access policy or 90 days of inactivity all do this. '
-            + 'Open Settings → Mail, edit this account and press "Sign in with Microsoft" again.'
+            + 'Open Settings → Email, edit this account and press "Sign in with Microsoft" again.'
           : `If this says the server does not offer AUTH=XOAUTH2, the host is wrong — Microsoft's is ${guess.host || 'outlook.office365.com'}:993. `
             + 'If it names a scope, the app registration is missing IMAP.AccessAsUser.All under API permissions. '
             + 'Everything else is worth trying again: an unreachable sign-in endpoint is not a broken account.',
@@ -782,7 +782,7 @@ async function checkMailAccount(account, deps, { timeoutMs }) {
       `${account.host}: ${reason}`,
       authish
         ? `Most sign-in failures here are not a wrong password — they are a provider that refuses ordinary passwords over IMAP. ${guess.note}`
-        : `Check the server and port in Settings → Mail (${account.host}:${account.port ?? 993}${account.secure === false ? ', STARTTLS' : ', TLS'}). If they are right, the server may be blocking IMAP for this account — that is a setting in your provider's web mail.`,
+        : `Check the server and port in Settings → Email (${account.host}:${account.port ?? 993}${account.secure === false ? ', STARTTLS' : ', TLS'}). If they are right, the server may be blocking IMAP for this account — that is a setting in your provider's web mail.`,
     );
   }
 
@@ -813,7 +813,7 @@ async function checkMailAccount(account, deps, { timeoutMs }) {
       id, label, 'warn',
       `Signed in to ${account.host}, but ${missing.join(', ')} ${missing.length === 1 ? 'is' : 'are'} not on the server.`,
       sentIsMissing && flagged
-        ? `This server calls its sent folder "${flagged}" — put that in Settings → Mail → Sent folder. Until then Zelos never reads what you wrote, so "you promised" and half of "waiting on" cannot be built.${missing.length > 1 ? ` The rest: pick from ${[...names].slice(0, 8).join(', ')}${names.size > 8 ? ', …' : ''}` : ''}`
+        ? `This server calls its sent folder "${flagged}" — put that in Settings → Email → Sent folder. Until then Zelos never reads what you wrote, so "you promised" and half of "waiting on" cannot be built.${missing.length > 1 ? ` The rest: pick from ${[...names].slice(0, 8).join(', ')}${names.size > 8 ? ', …' : ''}` : ''}`
         : `Zelos will read nothing from ${missing.length === 1 ? 'that folder' : 'those folders'}. Pick from what the server actually has: ${[...names].slice(0, 8).join(', ')}${names.size > 8 ? ', …' : ''}`,
     );
   }
@@ -1041,7 +1041,7 @@ async function checkSource(source, deps, { timeoutMs, signal, timezone }) {
     return check(
       id, label, 'fail',
       `${name} has no ${missing.map((f) => f.label.toLowerCase()).join(', ')} yet, so there is nothing for Zelos to read.`,
-      `Open Settings → Sources, edit ${name}, and fill in ${names}.`,
+      `Open Settings → Other things it can read, edit ${name}, and fill in ${names}.`,
     );
   }
 
@@ -1051,7 +1051,7 @@ async function checkSource(source, deps, { timeoutMs, signal, timezone }) {
       secret = await deps.getSecret(source.keyRef);
     } catch (err) {
       return check(id, label, 'fail', `Zelos could not read the stored credential for ${name}: ${errorText(err)}`,
-        'See the secret store line above — that is where this failed. Re-entering it in Settings → Sources usually settles it.');
+        'See the secret store line above — that is where this failed. Re-entering it in Settings → Other things it can read usually settles it.');
     }
   }
   /* `credential: null` and `{required: false}` are different facts and this is
@@ -1064,7 +1064,7 @@ async function checkSource(source, deps, { timeoutMs, signal, timezone }) {
     return check(
       id, label, 'fail',
       `No ${what.toLowerCase()} is stored for ${name}, so Zelos cannot read it.`,
-      `Open Settings → Sources and paste it. ${connector.credential.help || ''}${mint}`.trim(),
+      `Open Settings → Other things it can read and paste it. ${connector.credential.help || ''}${mint}`.trim(),
     );
   }
 
@@ -1081,7 +1081,7 @@ async function checkSource(source, deps, { timeoutMs, signal, timezone }) {
     return check(id, label, verdict?.status ?? 'fail', verdict?.detail ?? '', verdict?.action ?? null);
   } catch (err) {
     return check(id, label, 'fail', `${name}: ${errorText(err)}`,
-      'That is a failure inside Zelos rather than in your settings. Check this source in Settings → Sources, and report it if it keeps happening.');
+      'That is a failure inside Zelos rather than in your settings. Check this source in Settings → Other things it can read, and report it if it keeps happening.');
   }
 }
 
@@ -1174,7 +1174,7 @@ export async function diagnose({ config = null, timeoutMs = 10_000, signal, deps
       checks.push(check(
         'mail', 'Mail', 'warn',
         'No mail account is switched on.',
-        'Open Settings → Mail to add one. Zelos reads over IMAP with BODY.PEEK, so nothing is marked as read, and it never sends.',
+        'Open Settings → Email to add one. Zelos reads over IMAP with BODY.PEEK, so nothing is marked as read, and it never sends.',
       ));
     } else {
       // One at a time: several TLS logins to the same provider at once is how a

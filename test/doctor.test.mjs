@@ -295,7 +295,7 @@ describe('the mail check and the sent folder', () => {
     // The server's own \Sent flag, which listMailboxes has computed since the
     // client was written and which nothing outside a test had ever read.
     assert.match(check.action, /Sent Items/, 'the answer was in the response the whole time');
-    assert.match(check.action, /Settings → Mail → Sent folder/);
+    assert.match(check.action, /Settings → Email → Sent folder/);
   });
 
   test('the pass line names every folder the sweep will actually read', async () => {
