@@ -1785,6 +1785,56 @@ test('/api/mail/test needs the password to have been stored first', async (t) =>
   assert.match(res.json.error, /POST \/api\/secrets/);
 });
 
+/**
+ * The simple mail form's one question, and the one route whose entire input
+ * is somebody's email address. POST so the address is never in a URL — a
+ * query string is kept in history and sent as a Referer — and a handler that
+ * writes nothing down, checked against the log itself rather than by reading
+ * the handler: the logger is the test's, and it is proved to be the one the
+ * server writes to before the absence of the address in it means anything.
+ */
+test('POST /api/mail/guess names the provider, wants the token, and never writes the address down', async (t) => {
+  const lines = [];
+  const record = (lvl) => (msg, meta) => { lines.push(`${lvl} ${msg} ${meta === undefined ? '' : JSON.stringify(meta)}`); };
+  const logger = { debug: record('debug'), info: record('info'), warn: record('warn'), error: record('error'), child() { return this; } };
+  const ctx = await startServer(t, { logger });
+  const address = 'marcus.aurelius.stoic@gmail.com';
+
+  const gmail = await call(ctx, 'POST', '/api/mail/guess', { body: { email: address } });
+  assert.equal(gmail.status, 200);
+  assert.equal(gmail.json.label, 'Gmail');
+  assert.equal(gmail.json.host, 'imap.gmail.com');
+  assert.equal(gmail.json.auth, 'password');
+  assert.equal(gmail.json.known, true);
+  assert.match(gmail.json.appPasswordUrl, /^https:\/\//);
+
+  const guessed = await call(ctx, 'POST', '/api/mail/guess', { body: { email: 'marcus@deco-associates.example' } });
+  assert.equal(guessed.status, 200);
+  assert.equal(guessed.json.known, false);
+  assert.equal(guessed.json.host, 'imap.deco-associates.example');
+
+  // The same gate as every other route, and only the one verb.
+  assert.equal((await call(ctx, 'POST', '/api/mail/guess', { token: null, body: { email: address } })).status, 401);
+  const wrongVerb = await call(ctx, 'GET', '/api/mail/guess');
+  assert.equal(wrongVerb.status, 405);
+  assert.deepEqual(wrongVerb.json.allowed, ['POST']);
+
+  // Blank, absent or not a string: a 400 that names the field and never its value.
+  for (const body of [{}, { email: '' }, { email: '   ' }, { email: 42 }, { email: null }, { email: ['a@b.example'] }, { email: `${address}`.padEnd(400, 'x') }]) {
+    const res = await call(ctx, 'POST', '/api/mail/guess', { body });
+    assert.equal(res.status, 400, JSON.stringify(body));
+    assert.match(res.json.error, /^email /, JSON.stringify(body));
+    assert.ok(!res.text.includes(address), 'a 400 echoed the address');
+  }
+
+  // The capture is real: a line the server is known to write lands in it.
+  await call(ctx, 'GET', '/api/health', { headers: { Origin: 'http://evil.example' } });
+  assert.ok(lines.some((l) => l.includes('refused a request from a foreign origin')), 'the test logger is not the one the server writes to');
+  // And the address is on none of them, at any level.
+  const leaked = lines.filter((l) => l.includes(address) || l.includes('deco-associates'));
+  assert.deepEqual(leaked, [], 'the address was written to the log');
+});
+
 test('/api/calendar/test reads an ics feed and refuses a dangerous url', async (t) => {
   const upstream = await startMockUpstream(t);
   const ctx = await startServer(t);

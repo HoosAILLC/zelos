@@ -731,6 +731,7 @@ connection means using the credential:
 | Route | What it does with a stored secret |
 | --- | --- |
 | `POST /api/model/test`, `GET /api/model/list` | sends the model key to the `baseUrl` **in the request** |
+| `POST /api/mail/guess` | nothing — it names a provider from the address’s domain and reads no secret |
 | `POST /api/mail/test` | sends the mail password to the `host`/`port` **in the request** |
 | `POST /api/calendar/test` | sends the calendar password to the `url` **in the request** |
 

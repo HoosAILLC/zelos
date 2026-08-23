@@ -2464,33 +2464,53 @@ export async function testConnection({
 const APP_PASSWORD_NOTE =
   'This provider does not accept your normal password over IMAP. Create an app-specific password in your account security settings and paste that instead.';
 
+/*
+ * `appPasswordUrl` is the page where the user CREATES an app password — not a
+ * help article about them. Every one was fetched and answered 200 (through
+ * the provider's sign-in redirect, where there is one) on 2026-08-22; the
+ * simple mail form puts it behind its one button, so a dead link here is the
+ * first thing a new user meets. `label` is what that form calls the provider.
+ * Two providers carry no page: Microsoft's personal domains have no password
+ * of any kind (`auth: 'xoauth2'`) and Proton goes through Bridge
+ * (`bridge: true`).
+ */
 const PROVIDERS = [
   {
     domains: ['gmail.com', 'googlemail.com'],
+    label: 'Gmail',
     host: 'imap.gmail.com',
     port: 993,
     secure: true,
+    appPasswordUrl: 'https://myaccount.google.com/apppasswords',
     note: `Gmail requires 2-Step Verification plus a 16-character App Password (myaccount.google.com → Security → App passwords). ${APP_PASSWORD_NOTE}`,
   },
   {
     domains: ['icloud.com', 'me.com', 'mac.com'],
+    label: 'iCloud Mail',
     host: 'imap.mail.me.com',
     port: 993,
     secure: true,
+    // App-Specific Passwords live under Sign-In and Security on this page.
+    appPasswordUrl: 'https://account.apple.com/account/manage',
     note: `iCloud Mail requires an app-specific password (appleid.apple.com → Sign-In and Security). ${APP_PASSWORD_NOTE}`,
   },
   {
     domains: ['yahoo.com', 'yahoo.co.uk', 'yahoo.co.jp', 'ymail.com', 'rocketmail.com'],
+    label: 'Yahoo Mail',
     host: 'imap.mail.yahoo.com',
     port: 993,
     secure: true,
+    appPasswordUrl: 'https://login.yahoo.com/myaccount/security/app-password',
     note: `Yahoo requires an app password (Account Security → Generate app password). ${APP_PASSWORD_NOTE}`,
   },
   {
     domains: ['outlook.com', 'hotmail.com', 'live.com', 'msn.com', 'passport.com'],
+    label: 'Outlook / Microsoft',
     host: 'outlook.office365.com',
     port: 993,
     secure: true,
+    auth: 'xoauth2',
+    appPasswordUrl: null,
     /* Written in the past tense on purpose. The previous version of this note
        said Microsoft "is retiring" password IMAP and suggested an app password
        if two-step verification was on — a sentence that had been false for
@@ -2503,30 +2523,39 @@ const PROVIDERS = [
   },
   {
     domains: ['fastmail.com', 'fastmail.fm', 'messagingengine.com'],
+    label: 'Fastmail',
     host: 'imap.fastmail.com',
     port: 993,
     secure: true,
+    appPasswordUrl: 'https://app.fastmail.com/settings/security/devicekeys',
     note: 'Fastmail requires an app password with the "Mail (IMAP)" scope (Settings → Privacy & Security → App passwords).',
   },
   {
     domains: ['proton.me', 'protonmail.com', 'protonmail.ch', 'pm.me'],
+    label: 'Proton Mail',
     host: '127.0.0.1',
     port: 1143,
     secure: false,
+    bridge: true,
+    appPasswordUrl: null,
     note: 'Proton encrypts mail on their servers, so IMAP only works through Proton Bridge running on this machine. Use the host, port and password shown in Bridge — not your Proton account password.',
   },
   {
     domains: ['aol.com'],
+    label: 'AOL Mail',
     host: 'imap.aol.com',
     port: 993,
     secure: true,
+    appPasswordUrl: 'https://login.aol.com/myaccount/security/app-password',
     note: `AOL requires an app password. ${APP_PASSWORD_NOTE}`,
   },
   {
     domains: ['zoho.com', 'zohomail.com'],
+    label: 'Zoho Mail',
     host: 'imap.zoho.com',
     port: 993,
     secure: true,
+    appPasswordUrl: 'https://accounts.zoho.com/home#security/app_password',
     note: 'Zoho requires IMAP to be enabled in Mail Settings, and an app-specific password if two-factor authentication is on.',
   },
 ];
@@ -2561,5 +2590,48 @@ export function guessImapHost(email) {
     port: 993,
     secure: true,
     note: `Guessed from your address. If imap.${domain} is wrong, your provider's help pages list the correct IMAP server. Many providers also require an app-specific password rather than your normal one.`,
+  };
+}
+
+/**
+ * Everything the simple mail form needs to know about an address, in one
+ * answer: what to call the provider, where to connect, how it signs in, and
+ * the page where its app password is made.
+ *
+ * `guessImapHost` answers "which server"; this answers "what happens next".
+ * `auth` is the branch the form takes — `password` pastes an app password,
+ * `xoauth2` is Microsoft's device sign-in, `bridge` means Proton Bridge on
+ * this machine and the full form. An address nobody here recognises gets the
+ * same guess `guessImapHost` makes, marked `known: false` so the form can say
+ * it is guessing and put the full form within reach; its label is the domain,
+ * because that is the only name there is.
+ */
+export function describeProvider(email) {
+  const address = String(email ?? '').trim().toLowerCase();
+  const domain = address.includes('@') ? address.slice(address.lastIndexOf('@') + 1) : '';
+  const provider = domain ? PROVIDERS.find((p) => p.domains.includes(domain)) : null;
+  if (provider) {
+    return {
+      label: provider.label,
+      host: provider.host,
+      port: provider.port,
+      secure: provider.secure,
+      auth: provider.bridge ? 'bridge' : (provider.auth || 'password'),
+      appPasswordUrl: provider.appPasswordUrl || null,
+      note: provider.note,
+      known: true,
+    };
+  }
+  const guess = guessImapHost(email);
+  return {
+    // No host means no usable domain — there is nothing to name.
+    label: guess.host ? domain : '',
+    host: guess.host,
+    port: guess.port,
+    secure: guess.secure,
+    auth: 'password',
+    appPasswordUrl: null,
+    note: guess.note,
+    known: false,
   };
 }

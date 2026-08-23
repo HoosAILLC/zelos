@@ -44,6 +44,7 @@ const {
   assertTokenEndpoint,
   beginDeviceAuthorization,
   connectDeviceCode,
+  describeProvider,
   describeXOAuth2Challenge,
   fetchRecent,
   guessImapHost,
@@ -1550,6 +1551,75 @@ test('guessImapHost covers the other common providers and degrades sensibly', ()
     assert.equal(result.host, '');
     assert.equal(result.port, 993);
     assert.ok(result.note.length > 0, 'the user is always told what to do next');
+  }
+});
+
+/**
+ * The simple mail form asks one question — "what does connecting this address
+ * take?" — and this is the answer. Gmail, iCloud, Yahoo, AOL, Fastmail and
+ * Zoho each get the page where an app password is CREATED, every one fetched
+ * live (200, through the provider's sign-in redirect where there is one)
+ * before it shipped; Microsoft's personal domains get no page because no
+ * password of any kind opens them any more; Proton gets Bridge. Anything else
+ * is a guess, and says so.
+ */
+test('describeProvider says what each known provider is called, how it signs in, and where its app password is made', () => {
+  const expected = {
+    'nemo@gmail.com': ['Gmail', 'password', 'https://myaccount.google.com/apppasswords'],
+    'Nemo@ICLOUD.com': ['iCloud Mail', 'password', 'https://account.apple.com/account/manage'],
+    'nemo@ymail.com': ['Yahoo Mail', 'password', 'https://login.yahoo.com/myaccount/security/app-password'],
+    'nemo@aol.com': ['AOL Mail', 'password', 'https://login.aol.com/myaccount/security/app-password'],
+    'nemo@fastmail.fm': ['Fastmail', 'password', 'https://app.fastmail.com/settings/security/devicekeys'],
+    'nemo@zohomail.com': ['Zoho Mail', 'password', 'https://accounts.zoho.com/home#security/app_password'],
+    'nemo@hotmail.com': ['Outlook / Microsoft', 'xoauth2', null],
+    'nemo@pm.me': ['Proton Mail', 'bridge', null],
+  };
+  for (const [address, [label, auth, url]] of Object.entries(expected)) {
+    const got = describeProvider(address);
+    assert.equal(got.known, true, address);
+    assert.equal(got.label, label, address);
+    assert.equal(got.auth, auth, address);
+    assert.equal(got.appPasswordUrl, url, address);
+    // Where to connect is the answer guessImapHost already gives: one table.
+    assert.deepEqual({ host: got.host, port: got.port, secure: got.secure, note: got.note }, guessImapHost(address), address);
+    assert.ok(got.note.length > 0, address);
+    if (auth === 'password') {
+      assert.ok(url, `${address}: a password provider with no page to make one on`);
+      assert.equal(new URL(url).protocol, 'https:', `${address}: an app-password page has to be https`);
+    } else {
+      assert.equal(url, null, `${address}: no password, so no page for one`);
+    }
+  }
+  // Proton is the one that connects to this machine, not to Proton.
+  const proton = describeProvider('nemo@pm.me');
+  assert.equal(proton.host, '127.0.0.1');
+  assert.equal(proton.port, 1143);
+  assert.equal(proton.secure, false);
+});
+
+test('describeProvider guesses for a domain it does not know, and says that it is guessing', () => {
+  const guessed = describeProvider('marcus@deco-associates.example');
+  assert.equal(guessed.known, false);
+  assert.equal(guessed.label, 'deco-associates.example', 'the domain is the only name there is');
+  assert.equal(guessed.host, 'imap.deco-associates.example');
+  assert.equal(guessed.port, 993);
+  assert.equal(guessed.secure, true);
+  assert.equal(guessed.auth, 'password');
+  assert.equal(guessed.appPasswordUrl, null);
+  assert.deepEqual(
+    { host: guessed.host, port: guessed.port, secure: guessed.secure, note: guessed.note },
+    guessImapHost('marcus@deco-associates.example'),
+    'the fallback is guessImapHost\'s fallback, not a second one',
+  );
+
+  for (const bad of ['', null, undefined, 42, 'not-an-email', 'a@localhost', '@', 'a@', { email: 'a@gmail.com' }]) {
+    const got = describeProvider(bad);
+    assert.equal(got.known, false, JSON.stringify(bad));
+    assert.equal(got.host, '', JSON.stringify(bad));
+    assert.equal(got.label, '', `${JSON.stringify(bad)}: nothing to name`);
+    assert.equal(got.auth, 'password', JSON.stringify(bad));
+    assert.equal(got.appPasswordUrl, null, JSON.stringify(bad));
+    assert.ok(got.note.length > 0, 'the user is always told what to do next');
   }
 });
 

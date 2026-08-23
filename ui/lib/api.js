@@ -151,6 +151,10 @@ export const api = {
   },
   presets: () => request('/api/model/presets'),
   probeLocal: () => request('/api/local/probe'),
+  // POST, so the address rides in the body: a query string is kept by the
+  // browser's history and sent as a Referer, and this call's whole input is
+  // somebody's email address.
+  guessMail: (email) => request('/api/mail/guess', { method: 'POST', body: { email } }),
   testMail: (account) => request('/api/mail/test', { method: 'POST', body: account }),
   testCalendar: (calendar) => request('/api/calendar/test', { method: 'POST', body: calendar }),
 
