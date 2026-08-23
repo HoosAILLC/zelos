@@ -2498,3 +2498,286 @@ test('Connect with a passing test saves an account whose sent folder is the one 
   // And the address is not adopted twice: it was set by the first save.
   assert.equal(calls.find((c) => c.path === '/api/config').body.identity, undefined);
 });
+
+/* ----------------------------------------------- 6. "Sign in with Google" */
+
+/**
+ * The product decision: app passwords are the floor, and Google and Microsoft
+ * sign in on top of it. The Google block is built against the route contract
+ * before the route exists, so what these pin is the page's half of it — the
+ * calls it makes, the shape it returns, what it shows first, and the two things
+ * that must never be on screen for longer than they are needed.
+ */
+
+const googleBlock = (src) => {
+  const m = /\nfunction googleSignIn\(\{ keyRef, email, clientReady[^)]*\)[\s\S]*?\n\}/m.exec(src);
+  assert.ok(m, 'googleSignIn is missing, or no longer takes { keyRef, email, clientReady, … }');
+  return m[0];
+};
+
+test('Sign in with Google has the shape of Sign in with Microsoft, and opens Google in a new tab', () => {
+  const src = fs.readFileSync(path.join(UI, 'views/settings.js'), 'utf8');
+  const flow = googleBlock(src);
+
+  // The same three calls as the Microsoft block, the same provider on the wire,
+  // and the same return shape, so either form can show either block.
+  for (const call of ['beginMailOAuth', 'mailOAuthStatus', 'cancelMailOAuth']) {
+    assert.match(flow, new RegExp(`api\\.${call}\\(`), `the Google block never calls api.${call}`);
+  }
+  assert.match(flow, /api\.beginMailOAuth\(\{\n\s+provider: 'google',\n\s+keyRef,\n\s+email: address\(\),/, 'the flow does not name its provider, keyRef and address');
+  assert.match(flow, /return \{\n\s+node,\n\s+oauth,[\s\S]*?stop\(\) \{/, 'the block does not return { node, oauth, stop }');
+  assert.match(flow, /const oauth = \(\) => \(\{ provider: 'google', clientId: clientIdInput\.value\.trim\(\) \}\)/, 'oauth() is not the account shape');
+
+  // The sign-in page opens through an https-only target=_blank anchor — what
+  // desktop/guard.js hands to the system browser — and the anchor stays on
+  // screen as the thing to press if the automatic open was blocked.
+  assert.match(flow, /\/\^https:\\\/\\\/\/\.test\(flow\.authUrl \|\| ''\)/, 'a non-https sign-in page would be opened');
+  assert.match(flow, /el\('a', \{ class: 'btn', href: flow\.authUrl, target: '_blank', rel: 'noopener noreferrer', text: /, 'the sign-in page is not a real new-tab link');
+  assert.match(flow, /page\?\.click\(\)/, 'the tab is never opened for the user');
+  assert.ok(!/window\.open\(/.test(flow), 'window.open is a popup the shell denies; the anchor is the route guard.js routes');
+
+  // Every 1.5 s, and the verdict is read off `status` or `state`, whichever the
+  // server sent — the device flow has always said `state`.
+  assert.match(flow, /\}, 1500\);/, 'the poll is not every 1.5 s');
+  assert.match(src, /\nconst flowStatus = \(flow\) => flow\?\.status \?\? flow\?\.state;/, 'flowStatus no longer reads both spellings');
+  assert.match(flow, /if \(flowStatus\(now\) === 'pending'\) return;/, 'the poll reads the field by one name only');
+  assert.match(flow, /flowStatus\(flow\)/, 'the landing reads the field by one name only');
+  const microsoft = /\nfunction microsoftSignIn\([\s\S]*?\n\}/m.exec(src);
+  assert.ok(microsoft, 'microsoftSignIn is missing');
+  assert.ok(!/\bnow\.state\b|\bflow\.state\b/.test(microsoft[0]), 'the Microsoft block still reads `state` by name, so the renamed field strands it');
+
+  // What it says, and what it hands back: the address the token is for, and
+  // the account shape the caller saves.
+  assert.match(flow, /`Signed in as \$\{flow\.user\}/, 'the status line does not say who is signed in');
+  assert.match(flow, /onConnected\?\.\(\{ keyRef, provider: 'google', clientId: oauth\(\)\.clientId, user: flow\.user \|\| '' \}\)/, 'onConnected does not hand back the account shape');
+  // And the address is never in anything this block builds a URL from.
+  assert.ok(!/href:[^\n]*address\(\)/.test(flow) && !/href:[^\n]*email/.test(flow), 'the address is put in a URL');
+});
+
+test('a Gmail address is offered Google first, and the app password stays one link beneath', () => {
+  const src = fs.readFileSync(path.join(UI, 'views/settings.js'), 'utf8');
+  const simple = /export function simpleMailForm\(\{ onSaved, onCancel, onAdvanced \}\)[\s\S]*?\n\}/m.exec(src);
+  assert.ok(simple, 'simpleMailForm is missing');
+  const paint = /function paintCard\(\)[\s\S]*?\n  \}/m.exec(simple[0]);
+  assert.ok(paint, 'paintCard is missing');
+
+  // The Google branch comes before the password one, reuses the one block,
+  // and paints through replace() like the password branch (a null page link).
+  const google = paint[0].indexOf("if (guess.signIn === 'google') {");
+  const password = paint[0].indexOf('replace(card, [\n      head,\n      note,\n      page ?');
+  assert.ok(google > 0, 'no branch for a provider that signs in with Google');
+  assert.ok(password > google, 'the password card is painted before the Google one is considered');
+  assert.match(paint[0], /google = googleSignIn\(\{\n\s+keyRef,\n\s+email,\n\s+clientReady: guess\.clientReady === true,/, 'the card does not reuse the Google block, or does not pass the server\'s clientReady');
+  const branch = paint[0].slice(google, password);
+  assert.match(branch, /replace\(card, \[\n\s+head,\n\s+note,\n\s+google\.node,\n\s+usePassword,\n\s+passwordPath,/, 'the Google block is not first, or the password path is not beneath it');
+
+  // The password path is the existing nodes, hidden with [hidden] until the
+  // link is pressed, and the link is the only thing that reveals it.
+  assert.match(branch, /button\('Use an app password instead', \{\n\s+class: 'link',/, 'there is no "Use an app password instead" link');
+  assert.match(branch, /passwordPath\.hidden = true;/, 'the password path is on screen before anyone asked for it');
+  assert.match(branch, /onClick: \(\) => \{ passwordPath\.hidden = false; usePassword\.hidden = true; \}/, 'the link does not reveal the password path');
+  assert.match(branch, /field\('App password', passInput,/, 'the password path is a second password field, not the existing one');
+  // Still exactly one route to the full form, and the simple form still
+  // makes none of the OAuth calls itself.
+  assert.equal(simple[0].split("button('Advanced'").length - 1, 2, 'the Google card added a route to the full form');
+  for (const call of ['beginMailOAuth', 'mailOAuthStatus', 'cancelMailOAuth']) {
+    assert.ok(!simple[0].includes(`api.${call}(`), `the simple form carries its own api.${call}`);
+  }
+  // Both blocks are stopped wherever the Microsoft one was.
+  for (const stop of ['microsoft?.stop();\n    google?.stop();', 'microsoft?.stop(); google?.stop(); onCancel();']) {
+    assert.ok(simple[0].includes(stop), `a Google poll outlives its card: ${stop}`);
+  }
+  // The onboarding step no longer promises that Gmail refuses everything but a paste.
+  const onboarding = fs.readFileSync(path.join(UI, 'views/onboarding.js'), 'utf8');
+  assert.ok(!/Gmail, iCloud and Yahoo will all refuse your normal password/.test(onboarding), 'onboarding still says Gmail only takes an app password');
+  assert.match(onboarding, /Gmail and Outlook sign you in with the provider itself/, 'onboarding does not say Gmail signs in');
+});
+
+test('the Google client secret is typed into a password field, sent once and not kept', () => {
+  const src = fs.readFileSync(path.join(UI, 'views/settings.js'), 'utf8');
+  const flow = googleBlock(src);
+  assert.match(flow, /const secretInput = el\('input', \{ class: 'input', type: 'password', autocomplete: 'off'/, 'the client secret is not a password field');
+  const start = /async function start\(\)[\s\S]*?\n  \}/m.exec(flow);
+  assert.ok(start, 'start() is missing');
+  const read = start[0].indexOf('const clientSecret = secretInput.value;');
+  const cleared = start[0].indexOf("secretInput.value = '';");
+  const sent = start[0].indexOf('await api.beginMailOAuth(');
+  assert.ok(read > 0, 'the secret is never read');
+  assert.ok(cleared > read && cleared < sent, 'the field still holds the secret while the request is out');
+  assert.match(start[0], /\.\.\.\(clientSecret \? \{ clientSecret \} : \{\}\)/, 'an empty secret is sent as a field');
+  // Never in what the block hands back, never in the account.
+  assert.ok(!/oauth = \(\) => \([^)]*[Ss]ecret/.test(flow), 'oauth() carries the secret into the saved account');
+  assert.ok(!/onConnected\?\.\([^)]*[Ss]ecret/.test(flow), 'onConnected carries the secret');
+  // The own-client fields are collapsed under one link, with [hidden].
+  assert.match(flow, /ownClient\.hidden = !clientId;/, 'the own-client fields are not collapsed');
+  assert.match(flow, /button\('Use your own Google Cloud client', \{\n\s+class: 'link',/, 'there is no link to reveal them');
+  // And with the shipped client ready they are not offered at all: one button.
+  assert.match(flow, /clientReady\n\s+\? \[signInButton, signInStatus\.node, flowBox\]/, 'a ready client still shows the registration fields');
+  assert.match(flow, /Zelos’s own Google app is not registered yet/, 'no sentence says why the fields are there');
+});
+
+test('a Google sign-in stops asking the server when its block is stopped', () => {
+  const src = fs.readFileSync(path.join(UI, 'views/settings.js'), 'utf8');
+  const flow = googleBlock(src);
+  assert.match(flow, /const stopPolling = \(\) => \{ if \(poll\) \{ clearInterval\(poll\); poll = null; \} \};/, 'there is no way to clear the timer');
+  assert.match(flow, /stop\(\) \{ stopPolling\(\); flowBox\.replaceChildren\(\); \}/, 'stop() does not clear the timer');
+  assert.match(flow, /poll = setInterval\(async \(\) => \{/, 'the poll is not the interval stop() clears');
+  // A finished flow, a cancelled one, and a 404 all stop it too.
+  const landed = /const landed = \(flow\) => \{\n\s+stopPolling\(\);/.test(flow);
+  assert.ok(landed, 'a landed flow keeps polling');
+  const cancel = /const cancel = async \(\) => \{\n\s+const id = flowId;\n\s+stopPolling\(\);/.test(flow);
+  assert.ok(cancel, 'Give up keeps polling');
+  assert.match(flow, /\} catch \(err\) \{\n\s+\/\/ A 404[\s\S]*?stopPolling\(\);/, 'a 404 keeps polling');
+  assert.match(flow, /if \(id\) await api\.cancelMailOAuth\(id\)\.catch/, 'Give up does not tell the server');
+});
+
+test('Connect on a mailbox signed in with Google saves an OAuth account and stores no password', async (t) => {
+  stubBrowserGlobals();
+  const settings = await import(fileUrl(UI, 'views/settings.js'));
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+
+  const calls = [];
+  const ok = (body) => ({ ok: true, status: 200, text: async () => JSON.stringify(body) });
+  globalThis.fetch = async (reqPath, init = {}) => {
+    const body = init.body ? JSON.parse(init.body) : null;
+    calls.push({ method: init.method || 'GET', path: reqPath, body });
+    if (reqPath === '/api/mail/test') {
+      return ok({ ok: true, capabilities: [], error: null, mailboxes: [
+        { name: 'INBOX', specialUse: 'inbox' },
+        { name: '[Gmail]/Sent Mail', specialUse: 'sent' },
+      ] });
+    }
+    if (reqPath === '/api/config') return ok({ config: { identity: { email: 'nemo@gmail.com' }, mail: body.mail }, errors: [], secretRefs: ['mail.m_7'] });
+    if (reqPath === '/api/health') return ok({ model: { configured: false } });
+    throw new Error(`unexpected ${reqPath}`);
+  };
+  t.after(() => { delete globalThis.fetch; });
+  store.state.config = { identity: { name: '', email: 'nemo@gmail.com' }, mail: [] };
+
+  const guess = { label: 'Gmail', host: 'imap.gmail.com', port: 993, secure: true, auth: 'password', signIn: 'google', clientReady: true, appPasswordUrl: 'https://example.com/app', note: '', known: true };
+  const outcome = await settings.connectSimpleMail({
+    id: 'm_7', keyRef: 'mail.m_7', email: 'nemo@gmail.com', password: '', guess,
+    auth: 'xoauth2', oauth: { provider: 'google', clientId: '' },
+  });
+  assert.equal(outcome.ok, true);
+  assert.equal(outcome.sentMailbox, '[Gmail]/Sent Mail');
+
+  // No password goes anywhere; the test and the saved account both say how
+  // the mailbox signs in, in the shape the sweep reads.
+  assert.ok(!calls.some((c) => c.path === '/api/secrets'), 'a password was stored for a signed-in mailbox');
+  const tested = calls.find((c) => c.path === '/api/mail/test').body;
+  assert.equal(tested.auth, 'xoauth2');
+  assert.deepEqual(tested.oauth, { provider: 'google', clientId: '' });
+  assert.equal(tested.keyRef, 'mail.m_7', 'the test names the ref the grant was filed under');
+  const account = calls.find((c) => c.path === '/api/config').body.mail[0];
+  assert.equal(account.auth, 'xoauth2');
+  assert.deepEqual(account.oauth, { provider: 'google', clientId: '' });
+  assert.equal(account.host, 'imap.gmail.com');
+
+  // And the simple form routes a finished Google sign-in through exactly
+  // this: a guess that said "password" becomes xoauth2 once the sign-in has
+  // landed, with the block's own oauth() and no password.
+  const src = fs.readFileSync(path.join(UI, 'views/settings.js'), 'utf8');
+  const simple = /export function simpleMailForm\(\{ onSaved, onCancel, onAdvanced \}\)[\s\S]*?\n\}/m.exec(src);
+  assert.ok(simple, 'simpleMailForm is missing');
+  assert.match(simple[0], /const viaGoogle = \(\) => guess\?\.signIn === 'google' && signedIn;/, 'the form cannot tell a Google sign-in has landed');
+  const connect = /async function connect\(\)[\s\S]*?\n  \}/m.exec(simple[0]);
+  assert.ok(connect, 'connect() is missing');
+  assert.match(connect[0], /const auth = viaGoogle\(\) \? 'xoauth2' : guess\.auth;/, 'a signed-in Gmail mailbox is still connected as a password account');
+  assert.match(connect[0], /const password = auth === 'xoauth2' \? '' : passInput\.value;/, 'a pasted password rides along with a sign-in');
+  assert.match(connect[0], /auth,\n\s+oauth: auth === 'xoauth2' \? signInBlock\(\)\?\.oauth\(\) \?\? null : null,/, 'connect() does not pass the block\'s oauth()');
+  assert.match(connect[0], /if \(auth === 'password' && passwordMissing\(\)\)/, 'a signed-in mailbox is refused for having no password');
+  // The prefill Advanced opens on carries the sign-in the same way.
+  assert.match(simple[0], /\.\.\.\(guess\?\.auth === 'xoauth2' \|\| viaGoogle\(\) \? \{ auth: 'xoauth2', oauth: signInBlock\(\)\?\.oauth\(\) \?\? null \} : \{\}\)/, 'Advanced loses a finished Google sign-in');
+});
+
+test('Advanced offers Sign in with Google, and an account signed in that way says so', async () => {
+  stubBrowserGlobals();
+  const settings = await import(fileUrl(UI, 'views/settings.js'));
+  const src = fs.readFileSync(path.join(UI, 'views/settings.js'), 'utf8');
+
+  // The option sits next to Microsoft's, and its value is the picker's own:
+  // config validates two methods, and this is not a third.
+  const values = settings.MAIL_AUTH_CHOICES.map((c) => c.value);
+  assert.deepEqual(values, ['password', 'google', 'xoauth2'], 'the picker does not offer Google next to Microsoft');
+  assert.equal(settings.MAIL_AUTH_CHOICES.find((c) => c.value === 'google').label, 'Sign in with Google');
+  const cfg = fs.readFileSync(path.join(ROOT, 'core/config.mjs'), 'utf8');
+  assert.ok(!/MAIL_AUTH_METHODS[^\n]*'google'/.test(cfg), 'the picker value leaked into config as a method');
+
+  const form = /function mailForm\(account, \{ onSaved, onCancel \}\)[\s\S]*?\n\}/m.exec(src);
+  assert.ok(form, 'mailForm is missing');
+  const body = form[0];
+  // The translation: the picker says google, the draft says xoauth2 + provider.
+  assert.match(body, /const authMethod = \(\) => \(authSelect\.value === 'password' \? 'password' : 'xoauth2'\);/, 'the Google choice is written to draft.auth as-is');
+  assert.match(body, /const provider = \(\) => \(authSelect\.value === 'google' \? 'google' : 'microsoft'\);/, 'the form cannot tell which provider was picked');
+  assert.match(body, /const googleAccount = \(\) => draft\.auth === 'xoauth2' && draft\.oauth\?\.provider === 'google';/, 'an account with no provider is not read as Microsoft');
+  assert.match(body, /value: draft\.auth === 'xoauth2' \? \(googleAccount\(\) \? 'google' : 'xoauth2'\) : 'password',/, 'editing a Google account opens the picker on Microsoft');
+  // The credential slot shows the same block the simple form does, and an
+  // account already signed in says so with a way to sign in again.
+  assert.match(body, /const buildGoogle = \(\) => googleSignIn\(\{/, 'the full form does not reuse the Google block');
+  assert.match(body, /signedInAs: googleAccount\(\) \? draft\.user : '',/, 'an existing Google account does not say who it is signed in as');
+  const flow = googleBlock(src);
+  assert.match(flow, /if \(signedInAs\) signInStatus\.good\(`Signed in · \$\{signedInAs\}`\);/, 'the block does not read "Signed in · <user>"');
+  assert.match(flow, /button\(signedInAs \? 'Sign in again' : 'Sign in with Google'/, 'there is no "Sign in again"');
+  assert.match(body, /credentialSlot\.replaceChildren\(google\.node\);/, 'the Google block is built but never placed');
+  // Whether a client is ready is the server's answer, asked once, about the
+  // provider rather than the account's address.
+  assert.match(body, /googleReady = \(await api\.guessMail\('you@gmail\.com'\)\)\.clientReady === true;/, 'clientReady is guessed on the page instead of asked of the server');
+  assert.match(body, /onConnected: \(oauth\) => \{ draft\.auth = 'xoauth2'; draft\.oauth = \{ provider: 'google', clientId: oauth\.clientId \}; \},/, 'a finished sign-in does not land on the draft');
+  // Test the connection tests the account that will be saved: with its auth.
+  assert.match(body, /\.\.\.\(authMethod\(\) === 'xoauth2' \? \{ auth: 'xoauth2', oauth: activeOAuth\(\) \} : \{\}\),/, 'Test the connection tests a signed-in account as a password one');
+  // Moving the picker stops whichever block is no longer showing.
+  assert.match(body, /if \(!xo \|\| viaGoogle\) microsoft\.stop\(\);\n\s+if \(!viaGoogle\) google\?\.stop\(\);/, 'a poll outlives its slot');
+});
+
+test('the Microsoft registration form is hidden when the server ships the client', () => {
+  const src = fs.readFileSync(path.join(UI, 'views/settings.js'), 'utf8');
+  const flow = /\nfunction microsoftSignIn\(\{ keyRef, user, clientId = '', tenantId = 'common', clientReady = false,[\s\S]*?\n\}/m.exec(src);
+  assert.ok(flow, 'microsoftSignIn does not take clientReady');
+  // Hidden with [hidden], so the CSS rule every disclosure relies on applies;
+  // the fields stay, because a tenant of one's own is typed into them.
+  assert.match(flow[0], /const registration = el\('div', \{ class: 'stack' \}, \[\n\s+field\('Application \(client\) ID', clientIdInput,/, 'the fields are not wrapped to be hidden');
+  assert.match(flow[0], /registration\.hidden = clientReady;/, 'the registration form is not hidden for a shipped client');
+  // The id is required only when there is no client to fall back on, and is
+  // sent only when typed — the provider is always named.
+  assert.match(flow[0], /if \(!clientReady && !clientIdInput\.value\.trim\(\)\)/, 'a shipped client still demands a client id');
+  assert.match(flow[0], /api\.beginMailOAuth\(\{\n\s+provider: 'microsoft',\n\s+keyRef,\n\s+\.\.\.\(chosen\.clientId \? \{ clientId: chosen\.clientId \} : \{\}\),/, 'the Microsoft flow does not name its provider, or sends an empty client id');
+  assert.match(flow[0], /const oauth = \(\) => \(\{ provider: 'microsoft', clientId:/, 'a Microsoft account is saved without its provider');
+  // And the simple form passes the server's word for it.
+  const simple = /export function simpleMailForm\(\{ onSaved, onCancel, onAdvanced \}\)[\s\S]*?\n\}/m.exec(src);
+  assert.ok(simple, 'simpleMailForm is missing');
+  assert.match(simple[0], /microsoft = microsoftSignIn\(\{\n\s+keyRef,\n\s+user: email,[\s\S]*?clientReady: guess\.clientReady === true,/, 'the card does not pass clientReady to the Microsoft block');
+});
+
+test('beginMailOAuth names the provider and carries the secret and address, and an old caller sends what it always sent', async (t) => {
+  stubBrowserGlobals();
+  const { api } = await import(fileUrl(UI, 'lib/api.js'));
+  let captured = null;
+  globalThis.fetch = async (reqPath, init = {}) => {
+    captured = { path: reqPath, method: init.method, body: init.body ? JSON.parse(init.body) : null };
+    return { ok: true, status: 200, text: async () => '{}' };
+  };
+  t.after(() => { delete globalThis.fetch; });
+
+  await api.beginMailOAuth({ provider: 'google', keyRef: 'mail.m_1', clientId: 'abc.apps', clientSecret: 'not-a-real-secret', email: 'nemo@gmail.com' });
+  assert.equal(captured.path, '/api/mail/oauth');
+  assert.equal(captured.method, 'POST');
+  assert.deepEqual(captured.body, { provider: 'google', keyRef: 'mail.m_1', clientId: 'abc.apps', clientSecret: 'not-a-real-secret', email: 'nemo@gmail.com' });
+  assert.ok(!reqPathHolds(captured.path, 'nemo@gmail.com'), 'the address is in the URL');
+
+  // The call the Microsoft block made before Google existed: the same three
+  // fields and nothing else, so the server's default provider still applies.
+  await api.beginMailOAuth({ keyRef: 'mail.m_2', clientId: '00000000-0000-0000-0000-000000000000', tenantId: 'common' });
+  assert.deepEqual(captured.body, { keyRef: 'mail.m_2', clientId: '00000000-0000-0000-0000-000000000000', tenantId: 'common' });
+
+  // The other two are untouched.
+  await api.mailOAuthStatus('f1');
+  assert.equal(captured.path, '/api/mail/oauth/f1');
+  await api.cancelMailOAuth('f1');
+  assert.equal(captured.method, 'DELETE');
+});
+
+/** True when a request path carries the given text anywhere — query string included. */
+function reqPathHolds(reqPath, text) {
+  return String(reqPath).includes(encodeURIComponent(text)) || String(reqPath).includes(text);
+}
