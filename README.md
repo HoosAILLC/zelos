@@ -33,6 +33,10 @@ wc -l test/*.mjs | tail -1
 
 ## Run it
 
+**Not a programmer?** Download the Mac or Windows app from
+[zelos-app.netlify.app](https://zelos-app.netlify.app/#download) and skip this section. The site
+says what to click the first time your computer warns you about it.
+
 ```bash
 node zelos.mjs
 ```
@@ -42,13 +46,16 @@ bundled SQLite is built without it before 22.16 and throughout the whole Node 23
 that lacks it, Zelos refuses to start and names the versions that work.
 
 It opens in your browser at `127.0.0.1` and stays there. Nothing to install, no account, no server.
-To connect a mailbox, type your email address. Gmail and Google Workspace get **Sign in with
-Google**; Outlook, Hotmail, Live, MSN and Microsoft 365 get **Sign in with Microsoft** — both run
-against a client Zelos ships, so there is nothing to register, and the Google one comes back to
-Zelos on `127.0.0.1`. Everything else — iCloud, Yahoo, Fastmail, a server of your own — gets one
-button to the page where your provider makes an app password, and **Connect** does the rest. Gmail
-takes either. [docs/OAUTH.md](docs/OAUTH.md) has what the sign-ins send where and what Google's
-review of them costs.
+To connect a mailbox, type your email address. Gmail, iCloud, Yahoo, Fastmail and a server of your
+own get one button to the page where your provider makes an app password, and **Connect** does the
+rest. **Sign in with Google** and **Sign in with Microsoft** are built and wired — the Google one
+comes back to Zelos on `127.0.0.1` — but the client registrations they run against are not shipped
+yet: `DEFAULT_OAUTH_CLIENTS` in `core/sources/oauth.mjs` is blank for both, so today each needs a
+registration of your own, pasted in under Settings → Mail. That matters most for a personal
+Outlook, Hotmail, Live or MSN address, which Microsoft no longer lets in with a password at all: a
+one-time, ten-minute registration at Microsoft's site is the way in until Zelos ships its own.
+[docs/OAUTH.md](docs/OAUTH.md) has what the sign-ins send where, what registering each takes, and
+what Google's review of them costs.
 
 ```bash
 zelos              # run it — this is the one you want
