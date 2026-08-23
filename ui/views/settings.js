@@ -1344,12 +1344,18 @@ export function simpleMailForm({ onSaved, onCancel, onAdvanced }) {
     }
   }
 
+  const formAdvanced = button('Advanced', { class: 'link', onClick: openAdvanced });
+
   function paintCard() {
     microsoft?.stop();
     microsoft = null;
     signedIn = false;
     fallback.replaceChildren();
     card.hidden = !guess;
+    // One route to the full form at a time: before a guess it is the link under
+    // the address; once a card is up, the card carries its own. Two "Advanced"
+    // buttons on one screen read as two different things.
+    formAdvanced.hidden = Boolean(guess);
     if (!guess) { card.replaceChildren(); return; }
 
     const head = el('div', { class: 'chosen-head' }, [
@@ -1427,7 +1433,7 @@ export function simpleMailForm({ onSaved, onCancel, onAdvanced }) {
     status.node,
     fallback,
     el('div', { class: 'row-inline' }, [
-      button('Advanced', { class: 'link', onClick: openAdvanced }),
+      formAdvanced,
       button('Cancel', { class: 'btn quiet', onClick: () => { microsoft?.stop(); onCancel(); } }),
     ]),
   ]);
