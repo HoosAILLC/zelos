@@ -843,7 +843,14 @@ Stated plainly, so nobody discovers these the hard way:
 - **A malicious or backdoored IMAP or CalDAV server.** Zelos parses whatever
   it is sent. The parsers are written defensively — byte-exact IMAP literal
   handling; a hard cap on recurrence expansion so a malformed `RRULE` cannot
-  loop forever; and an HTML-to-text conversion that is a single left-to-right
+  loop forever, with a scan budget underneath it so a hostile one cannot grind
+  either — one budget for the whole document, not one per rule, so splitting
+  the payload across ten thousand events buys nothing. A rule padded with
+  `BYDAY` entries that never match froze a sweep for **38 seconds** at under
+  1 MB, and the split variant for **about four minutes** at 7 MB, both inside
+  every documented cap; the worst either shape measures now is **under two
+  seconds** at the 8 MB cap, parsing included;
+  and an HTML-to-text conversion that is a single left-to-right
   pass, capped at **512 KB per HTML part**. That last one was quadratic until
   recently, and the difference is the whole argument for measuring rather than
   asserting: 1 MB of `<!--` repeated took **122 seconds** through the old
