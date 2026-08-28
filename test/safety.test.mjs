@@ -614,6 +614,23 @@ test('validateSweep: a long or multi-line bracket is still a placeholder', () =>
   assert.equal(res.value.items.length, 7, 'a rejected draft still never costs you the item');
 });
 
+test('validateSweep: a paragraph-long bracket is still a placeholder', () => {
+  /* The 80-character ceiling was replaced with 400, and the comment above the
+     regex declared there is no ceiling now. There was: a bracketed aside past
+     400 characters fit a perfectly legal 4,000-character body and shipped as
+     "Ready to send". The span is bounded by the body cap itself now, so the
+     comment is finally true of the regex below it. */
+  const draft = (body) => ({ to: 'dana@example.com', subject: 'Re: forecast', body });
+  const aside = `[Confirm the delivery date with the supplier before sending - ${'the thread does not say and I could not find it; '.repeat(9)}read it again first]`;
+  assert.ok(aside.length > 400, `the vector has to be past the moved ceiling, got ${aside.length}`);
+
+  const res = validateSweep({
+    items: [item({ key: 'long-aside', bucket: 'waiting', draft: draft(`Hi Dana,\n\nThe forecast is attached. ${aside}\n\nNemo`) })],
+  });
+  assert.equal(res.value.items[0].draft, null, 'a 400+ character aside reached the board as ready to send');
+  assert.ok(res.errors.some((e) => /placeholder/.test(e.message)));
+});
+
 test('validateSweep: a draft outside waiting/promised is kept but reported', () => {
   const res = validateSweep({
     items: [item({

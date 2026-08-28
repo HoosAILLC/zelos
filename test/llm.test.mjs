@@ -1352,6 +1352,74 @@ test('a 200 carrying an error body is a failure, not an empty answer', async () 
   );
 });
 
+test('stream(): a 200 carrying an error body is a failure, not an empty answer', async () => {
+  /* The same OpenRouter shape aimed at the streaming half. A plain JSON error
+     body has no `data:` frames at all, so the SSE loop used to end cleanly on
+     nothing and hand the Ask panel a finished, empty answer with no diagnosis
+     — which half of this file you happened to call decided whether you were
+     told. */
+  mock.plan.push({ status: 200, body: { error: { message: '402: insufficient credits', code: 402 } } });
+  await assert.rejects(
+    () => collect(stream({
+      protocol: 'openai',
+      baseUrl: mock.origin,
+      model: 'llama3.2',
+      messages: [{ role: 'user', content: 'hi' }],
+      retries: 0,
+    })),
+    (err) => {
+      assert.ok(err instanceof LLMError);
+      assert.match(err.message, /insufficient credits/, 'the provider detail must survive');
+      assert.match(err.message, /error body/, 'named the way complete() names it');
+      assert.equal(err.retriable, false, 'a rejected request does not get better on a retry');
+      return true;
+    },
+  );
+
+  // anthropic's request-level envelope, arriving as plain JSON rather than as
+  // an SSE `error` frame — the only shape stream() already threw on.
+  mock.plan.push({
+    status: 200,
+    body: { type: 'error', error: { type: 'overloaded_error', message: 'upstream is busy' } },
+  });
+  await assert.rejects(
+    () => collect(stream({
+      protocol: 'anthropic',
+      baseUrl: mock.origin,
+      model: 'claude-opus-5',
+      apiKey: 'k',
+      messages: [{ role: 'user', content: 'hi' }],
+      retries: 0,
+    })),
+    (err) => {
+      assert.ok(err instanceof LLMError);
+      assert.match(err.message, /upstream is busy/);
+      return true;
+    },
+  );
+
+  // The scrub complete() applies to provider-written text is applied here too.
+  mock.plan.push({
+    status: 200,
+    body: { error: { message: 'rejected request with Authorization: Bearer sk-live-do-not-log' } },
+  });
+  await assert.rejects(
+    () => collect(stream({
+      protocol: 'openai',
+      baseUrl: mock.origin,
+      model: 'llama3.2',
+      apiKey: 'sk-live-do-not-log',
+      messages: [{ role: 'user', content: 'hi' }],
+      retries: 0,
+    })),
+    (err) => {
+      assert.ok(!err.message.includes('sk-live-do-not-log'), `key leaked: ${err.message}`);
+      assert.match(err.message, /key withheld/);
+      return true;
+    },
+  );
+});
+
 test('an error body that quotes the request back does not quote the key back', async () => {
   // Same reasoning as readErrorDetail: this text is written by a third party,
   // it is shown in Settings, and a sweep writes it into runs.stats_json on disk.

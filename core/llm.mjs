@@ -960,9 +960,9 @@ export async function complete(opts = {}) {
   // to anyone downstream. It cost us twice: Settings' "Test the connection"
   // painted the broken endpoint green, and the sweep then told the user their
   // model was too small and to go buy a bigger one, for what was a topped-out
-  // account. stream() has always thrown on the identical body ("failed
-  // mid-stream" below); which half you happened to call must not decide
-  // whether you are told.
+  // account. stream() catches the identical body through its own plain-JSON
+  // guard; which half you happened to call must not decide whether you are
+  // told.
   const bodyError = errorInBody(raw);
   if (bodyError) {
     // Marked non-retriable, unlike the mid-stream case: an error that replaces
@@ -1089,6 +1089,35 @@ export async function* stream(opts = {}) {
       address: req.address,
       retriable: true,
     });
+  }
+
+  // The same 200-with-an-error-envelope complete() guards against, aimed at
+  // this half: a rejected stream:true request comes back as plain JSON, which
+  // carries no `data:` frames at all — so the loop below would end cleanly on
+  // nothing and hand the caller a finished, empty answer with no error. A
+  // healthy stream says text/event-stream; anything else is read whole and, if
+  // it is the error envelope, reported exactly as complete() reports it.
+  const contentType = String(res.headers.get('content-type') ?? '');
+  if (contentType && !contentType.includes('text/event-stream')) {
+    let raw;
+    try {
+      raw = await readJson(res, req.address);
+    } finally {
+      release();
+    }
+    const bodyError = errorInBody(raw);
+    if (bodyError) {
+      const detail = withoutCredentials(bodyError, credentialsIn(req.headers));
+      throw new LLMError(
+        `Model at ${req.address} returned a success status with an error body: ${detail.slice(0, ERROR_DETAIL_CHARS)}`,
+        { address: req.address, retriable: false },
+      );
+    }
+    // Not an error envelope — the old silent shape, kept: a server that
+    // answered a stream request with an ordinary JSON body never streamed
+    // anything, and inventing deltas for it would be a lie of a third kind.
+    yield { type: 'done', usage: { input: 0, output: 0 }, model: req.model, text: '' };
+    return;
   }
 
   const usage = { input: 0, output: 0 };

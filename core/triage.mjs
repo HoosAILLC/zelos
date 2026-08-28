@@ -839,6 +839,18 @@ function applyItemCap(counts, maxItems) {
   for (const [name, n] of Object.entries(counts)) {
     scaled[name] = n === 0 ? 0 : Math.max(1, Math.floor(n * ratio));
   }
+  // The floor of one per populated section can overrun a cap smaller than the
+  // number of populated sections — "at most 1" sent 4. The cap is the promise,
+  // so the floors give way, notes first and inbound mail never: mail is what
+  // the product is for, and the section() fallback tells the model a starved
+  // section is unknown rather than empty.
+  let excess = scaled.inbound + scaled.sent + scaled.events + scaled.captures - maxItems;
+  for (const name of ['captures', 'sent', 'events']) {
+    if (excess <= 0) break;
+    const cut = Math.min(scaled[name], excess);
+    scaled[name] -= cut;
+    excess -= cut;
+  }
   return scaled;
 }
 
@@ -979,8 +991,16 @@ export function buildSweepPrompt({
   const byTimeDesc = (a, b) => (instant(b.sentAt) ?? 0) - (instant(a.sentAt) ?? 0);
 
   const buildMessageEntries = (rows, allowance) => {
-    const chosen = rows.slice().sort(byTimeDesc);
+    // Entries stay in the ranked order the caller chose: fitSection cuts
+    // overflow from the tail, and the tail has to be the lowest-ranked mail.
+    // Sorted into reading order before the fit, the tail was the OLDEST, so
+    // the squeeze cut the top-ranked message while fresher bulk survived —
+    // under a truncation notice that said the opposite. The kept set is
+    // re-sorted by time after the fit; ranking picks who, chronology is
+    // display only.
+    const chosen = rows.slice();
     const entries = chosen.map((m) => ({
+      m,
       text: {
         bare: renderMessage(m, ctx, 'bare', 0),
         plain: renderMessage(m, ctx, 'plain', 0),
@@ -1034,12 +1054,14 @@ export function buildSweepPrompt({
   const inboundAllowance = takeAllowance('inbound');
   const inboundBuilt = buildMessageEntries(inbound.slice(0, capped.inbound).map((x) => x.m), inboundAllowance);
   const inboundFit = fitSection(inboundBuilt.entries, inboundAllowance);
+  inboundFit.kept.sort((a, b) => byTimeDesc(a.m, b.m)); // rank chose who; time is how it reads
   remaining -= inboundFit.chars;
 
   // 5. sent mail — where `promised` lives.
   const sentAllowance = takeAllowance('sent');
   const sentBuilt = buildMessageEntries(sent.slice(0, capped.sent).map((x) => x.m), sentAllowance);
   const sentFit = fitSection(sentBuilt.entries, sentAllowance);
+  sentFit.kept.sort((a, b) => byTimeDesc(a.m, b.m));
   remaining -= sentFit.chars;
 
   // 6. the user's own notes.

@@ -503,8 +503,8 @@ const SOURCE_REF_RE = /^(?:msg|evt|cap):[A-Za-z0-9._:@+-]{1,72}$/;
  * prose is a phrase, `TODO` is a note to self.
  */
 const PLACEHOLDER_RE = new RegExp([
-  '\\[[^\\]]{1,400}\\]',        // [anything], including across a line break
-  '\\{\\{[^}]{0,400}\\}\\}',    // {{mustache}}
+  '\\[[^\\]]{1,4000}\\]',       // [anything], including across a line break
+  '\\{\\{[^}]{0,4000}\\}\\}',   // {{mustache}}
   '\\b(?:TODO|TBD|FIXME)\\b',   // the model leaving itself a note
   '\\b[Ii]nsert\\b[^.\\n]{0,40}\\bhere\\b', // "insert the figure here"
 ].join('|'));

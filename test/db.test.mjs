@@ -209,6 +209,23 @@ test('a cheap header-only re-fetch does not blank a body already stored', () => 
   assert.match(row.subject, /bump/, 'headers still update');
 });
 
+test('a header-only re-fetch does not blank the search index either', () => {
+  /* The upsert's COALESCE keeps the stored body, but the index used to be
+     rebuilt from the INCOMING record — so the very re-fetch the COALESCE
+     defends against rewrote msg:<id> body-empty, and body-term search stopped
+     matching that mail until a manual reindex. The index must mirror the row. */
+  const db = fresh();
+  const { id } = upsertMessage(db, MSG);
+  assert.deepEqual(search(db, 'retainage').map((h) => h.ref), [`msg:${id}`]);
+
+  upsertMessage(db, { ...MSG, text: '', snippet: '', subject: 'Invoice 4471 is past due (bump)' });
+  assert.match(getMessage(db, id).body, /has not cleared/, 'the row kept the body');
+  assert.deepEqual(search(db, 'retainage').map((h) => h.ref), [`msg:${id}`],
+    'so the search doc must keep it too');
+  assert.deepEqual(search(db, 'bump').map((h) => h.ref), [`msg:${id}`],
+    'while the refreshed headers are still picked up');
+});
+
 test('message listing, threading and fetched-since counting', () => {
   const db = fresh();
   const res = upsertMessages(db, [
@@ -401,6 +418,31 @@ test('listBoard() orders by bucket, then severity, then what is due soonest', ()
   assert.equal(Object.keys(counts).length, BUCKETS.length);
   assert.deepEqual(counts, { now: 2, today: 1, soon: 0, waiting: 1, promised: 0, note: 1, money: 0 });
   assert.equal(bucketCounts(db, { states: ['done'] }).now, 1);
+});
+
+test('listBoard() breaks severity ties by instant, not by the digits of the offset', () => {
+  /* due_at is stored verbatim with whatever offset the model copied from the
+     mail — the prompt orders it to — so mixed offsets are the normal input. As
+     TEXT '2026-08-27T09:00:00-04:00' (13:00Z) sorts before
+     '2026-08-27T12:00:00Z' although it is the later instant, and the board's
+     ranking is what capNowBucket demotes from — so the item that actually
+     breaks first was listed last within the tie and was the one pushed off the
+     four-slot bar. Same trap, same fix as listMessages and the snooze wake:
+     through datetime(). */
+  const db = fresh();
+  const mk = (key, dueAt) => upsertItem(db, { ...ITEM, key, bucket: 'now', severity: 3, dueAt, headline: key }, { runId: 'r', now: '2026-08-26T10:00:00-04:00' });
+  mk('due-noon-utc', '2026-08-27T12:00:00Z'); // the earliest instant, lexically last
+  mk('due-13z', '2026-08-27T09:00:00-04:00');
+  mk('due-14z', '2026-08-27T10:00:00-04:00');
+  mk('due-15z', '2026-08-27T11:00:00-04:00');
+
+  assert.deepEqual(listBoard(db).map((i) => i.headline),
+    ['due-noon-utc', 'due-13z', 'due-14z', 'due-15z'],
+    'the tiebreak is what is due soonest as an instant, whatever offset it was written in');
+
+  // An undated item still sorts after every dated one.
+  mk('due-never', null);
+  assert.equal(listBoard(db).map((i) => i.headline).at(-1), 'due-never');
 });
 
 /* ------------------------------------------------------------------ snooze */

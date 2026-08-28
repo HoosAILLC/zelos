@@ -278,6 +278,62 @@ test('an over-large input degrades and says in the prompt what it cut', () => {
   assert.match(content, /do not invent the missing part/);
 });
 
+/**
+ * The drop order under the truncation notice's own claim. `fitSection` cuts
+ * overflow from the tail on the documented premise that entries arrive ranked —
+ * but the mail sections used to re-sort into reading order BEFORE fitting, so
+ * once even the bare headers overflowed, the tail was the OLDEST mail, not the
+ * lowest-ranked: the one message the ranker scored highest was cut while
+ * fresher bulk survived, and the prompt then told the model "highest-ranked
+ * first" and "Anything omitted ranked below what is here" about it.
+ */
+test('the bare-overflow cut drops the lowest-ranked mail, not the oldest', () => {
+  // The top-ranked message in the set: flagged, unread, directly addressed,
+  // asking a question — and five days old, so a chronological tail-cut eats it.
+  const client = message({
+    id: 'client1', thread_key: 'tclient',
+    from_name: 'Rafe Ondrik', from_email: 'rafe@thistlebank.example',
+    subject: 'Are we still good for the 12th?',
+    snippet: 'the joiner is waiting to cut',
+    body: 'The joiner is waiting to cut — are we still good for the 12th?',
+    sent_at: '2026-08-03T09:00:00-04:00',
+    flags: ['\\Flagged'],
+  });
+  const noise = Array.from({ length: 60 }, (_, i) => message({
+    id: `nl${i}`, thread_key: `tnl${i}`,
+    from_name: 'The Daily', from_email: `newsletter@daily${i}.example`,
+    to: [{ name: 'List', email: 'list@daily.example' }],
+    cc: [{ name: 'Nemo', email: 'nemo@example.com' }],
+    subject: `Issue ${i}`, snippet: 'stories inside',
+    body: 'Lots of stories inside. Unsubscribe',
+    sent_at: `2026-08-07T${String(8 + (i % 12)).padStart(2, '0')}:${String(i % 60).padStart(2, '0')}:00-04:00`,
+  }));
+
+  const build = (budgetChars) => buildSweepPrompt({
+    identity: IDENTITY, now: NOW, messages: [client, ...noise], privacy: PRIVACY, budgetChars,
+  });
+
+  // Control: with room for everything, the client message is in.
+  assert.ok(build(200_000).messages[0].content.includes('[msg:client1]'));
+
+  // Squeezed until even bare headers overflow, the cut is by rank: the flagged
+  // direct question survives and newsletters are what give way.
+  const tight = build(8000);
+  const content = tight.messages[0].content;
+  assert.equal(tight.budget.levels.inbound, 'bare', 'the squeeze must reach the drop branch');
+  assert.ok(tight.budget.shown.inbound < 61, 'and actually cut');
+  assert.ok(content.includes('[msg:client1]'),
+    'the highest-ranked message must survive the bare-level cut');
+  assert.match(content, /highest-ranked first/,
+    'and the truncation notice goes on saying so, truthfully now');
+
+  // Ranking picked who; chronology is still the reading order of what was kept.
+  const kept = [...content.matchAll(/\[msg:(nl\d+|client1)\]/g)].map((m) => m[1]);
+  assert.ok(kept.length >= 2);
+  assert.equal(kept[kept.length - 1], 'client1',
+    'the kept set still reads newest first, so the old message renders last');
+});
+
 test('a section that could not fit says "unknown", never "none"', () => {
   const long = (n, ch) => ch.repeat(n);
   const fat = {
@@ -312,6 +368,37 @@ test('maxItemsPerSweep limits how much material leaves the machine', () => {
     privacy: { ...PRIVACY, maxItemsPerSweep: 10 },
   });
   assert.ok(budget.shown.inbound <= 10, `expected <=10, got ${budget.shown.inbound}`);
+});
+
+/**
+ * The cap is a promise, not an estimate. Scaling floors every populated section
+ * at one, so a cap smaller than the number of populated sections used to
+ * overrun it: "at most 1" sent 4 — one per section — from the privacy control
+ * whose whole meaning is "how much of my life leaves this machine per run".
+ */
+test('a cap smaller than the number of populated sections still holds', () => {
+  const build = (maxItemsPerSweep) => buildSweepPrompt({
+    identity: IDENTITY, now: NOW,
+    messages: [
+      message({ id: 'in1' }),
+      message({ id: 'out1', direction: 'out', from_email: 'nemo@example.com', from_name: 'Nemo',
+        to: [{ name: 'Dana', email: 'dana@example.com' }], subject: 'W-9', body: 'Tomorrow.' }),
+    ],
+    events: [{
+      id: 'ev1', uid: 'u1', title: 'Pre-con', description: '', location: '',
+      starts_at: '2026-08-09T14:00:00-04:00', ends_at: '2026-08-09T15:00:00-04:00',
+      all_day: 0, organizer: 'pm@aldervance.example', attendees: [], rsvp: '', status: '',
+    }],
+    captures: [{ id: 'c1', text: 'Call the bank', created_at: '2026-08-08T08:00:00-04:00' }],
+    privacy: { ...PRIVACY, maxItemsPerSweep },
+  });
+  for (const cap of [1, 2, 3]) {
+    const { shown } = build(cap).budget;
+    const left = shown.inbound + shown.sent + shown.events + shown.captures;
+    assert.ok(left <= cap, `maxItemsPerSweep ${cap} let ${left} items leave the machine`);
+  }
+  // Inbound is the last section to give way: squeezed to one, the one is mail.
+  assert.equal(build(1).budget.shown.inbound, 1);
 });
 
 test('sent mail gets its own section, and its absence is stated rather than faked', () => {

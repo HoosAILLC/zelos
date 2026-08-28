@@ -408,11 +408,20 @@ export function upsertMessage(db, msg, { now = nowISO() } = {}) {
     fetched_at: str(msg.fetchedAt ?? msg.fetched_at ?? now),
   });
 
+  // The index mirrors the ROW, not the fetch. The COALESCE above keeps a
+  // stored snippet/body that a cheaper re-fetch arrived without — and indexing
+  // the incoming record blanked the search doc for exactly the re-fetch the
+  // COALESCE defends against. Read back only when the two can differ.
+  const kept = existed && (!str(msg.snippet) || !str(msg.text ?? msg.body))
+    ? prep(db, 'SELECT snippet, body FROM messages WHERE id = ?').get(id)
+    : null;
   indexDoc(db, {
     ref: `msg:${id}`,
     kind: 'message',
     title: `${str(msg.subject)} ${from.name} ${from.email}`.trim(),
-    body: `${str(msg.snippet)}\n${str(msg.text ?? msg.body)}`.trim(),
+    body: kept
+      ? `${str(kept.snippet)}\n${str(kept.body)}`.trim()
+      : `${str(msg.snippet)}\n${str(msg.text ?? msg.body)}`.trim(),
   });
 
   return { id, inserted: !existed };
@@ -695,10 +704,16 @@ export function listBoard(db, { states = ['open'], buckets = null, limit = 500, 
     where.push(`bucket IN (${bucketList.map(() => '?').join(',')})`);
     args.push(...bucketList);
   }
+  /* due_at through datetime(), for the reason listMessages gives at :441 —
+     the model copies each offset verbatim (the prompt orders it to), so mixed
+     offsets are the board's normal input, and as TEXT a -04:00 morning sorts
+     before a Z noon it actually follows. This ranking is the one capNowBucket
+     demotes from, so getting the tie wrong picked the wrong item to push off
+     the four-slot bar. The NULL branch stays first: undated rows sort last. */
   const sql = `
     SELECT * FROM items
     ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
-    ORDER BY ${BUCKET_RANK_SQL} ASC, severity DESC, (due_at IS NULL) ASC, due_at ASC, first_seen ASC
+    ORDER BY ${BUCKET_RANK_SQL} ASC, severity DESC, (due_at IS NULL) ASC, datetime(due_at) ASC, first_seen ASC
     LIMIT ?`;
   return prep(db, sql).all(...args, Math.max(1, Number(limit) || 500)).map(hydrateItem);
 }
