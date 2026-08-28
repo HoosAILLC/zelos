@@ -23,8 +23,8 @@ ask you to trust a supply chain you cannot see. Everything is Node built-ins —
 
 The consequence is that the IMAP client, the MIME and RFC 2047 decoders, the RFC 5545 parser with
 RRULE expansion, the CalDAV client and the model adapter are all written here, from the RFCs.
-About **27,800 lines** of JavaScript in `core/`, `ui/` and `zelos.mjs`, and a test suite that is
-**larger than the code it tests** — 28,858 lines in `test/`. Count them yourself:
+About **42,700 lines** of JavaScript in `core/`, `ui/` and `zelos.mjs`, and a test suite that is
+**larger than the code it tests** — about 44,400 lines in `test/`. Count them yourself:
 
 ```bash
 { find core ui -name '*.mjs' -o -name '*.js'; echo zelos.mjs; } | xargs wc -l | tail -1
@@ -100,7 +100,7 @@ to set, so the protection is the ACL on your user profile — see
 you.
 
 The local server binds `127.0.0.1` only, mints a new session token every launch, and rejects foreign
-origins. Every one of the 27 routes in the router's table needs that token. **One path is not in
+origins. Every route in the router's table needs that token. **One path is not in
 that table:** `POST /api/mcp`, the channel an AI client uses. It is lifted out of the pipeline
 *before* the session gate because it takes the separate AI token you mint in Settings, and the two
 credentials work in neither direction — the session gate returns 401 for an AI token, and the MCP
