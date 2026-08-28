@@ -262,6 +262,26 @@ export const MAIL_CALLBACK_PATH = '/oauth/callback';
 export const GOOGLE_CLIENT_SECRET_REF = 'oauth.google.clientSecret';
 
 /**
+ * Where the secret for the Google client a sign-in actually ran against is
+ * filed. The client from config or the shipped default keeps the install-wide
+ * ref above — or the name the operator chose — so nothing moves for an
+ * install with one registered client. A clientId PASTED into a sign-in form
+ * is a different Cloud project, and filing its secret under the install-wide
+ * name would overwrite the configured client's: the next refresh would then
+ * present one project's id with the other's secret, and Google answers
+ * `invalid_client` an hour after the card said "Connected". Derived from the
+ * id alone — hashed, because a client id is longer than a ref may be — so
+ * the connect that files the secret and the refresh that spends it can never
+ * disagree about the name.
+ */
+export function googleSecretRefFor(client, clientId = '') {
+  const id = String(clientId ?? '').trim();
+  if (!id || id === client?.clientId) return client?.clientSecretRef || GOOGLE_CLIENT_SECRET_REF;
+  const tag = crypto.createHash('sha256').update(id).digest('hex').slice(0, 16);
+  return `${GOOGLE_CLIENT_SECRET_REF}.${tag}`;
+}
+
+/**
  * The client ids Zelos ships for "Sign in with Google" and "Sign in with
  * Microsoft". Blank until Zelos's own registrations exist — the Google Cloud
  * project is in Testing and the Entra registration is unverified — at which

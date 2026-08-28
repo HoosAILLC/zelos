@@ -2267,7 +2267,9 @@ export async function accessTokenFor({
   const next = google
     ? await refreshGoogleAccessToken({
       clientId: id,
-      clientSecret: await clientSecretUnder(clientSecretRef || 'oauth.google.clientSecret'),
+      // The client's own ref first, then the shared name — which is where
+      // every secret filed before per-client refs existed still lives.
+      clientSecret: (await clientSecretUnder(clientSecretRef)) || (await clientSecretUnder('oauth.google.clientSecret')),
       refreshToken: stored.refreshToken,
       tokenUrl,
       timeoutMs,

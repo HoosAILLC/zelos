@@ -87,6 +87,7 @@ import {
    above in the exact shape the Microsoft flow files its own. */
 import {
   oauthClient,
+  googleSecretRefFor,
   createState,
   createVerifier,
   challengeFor,
@@ -1340,9 +1341,11 @@ function requireTlsFrom(body) {
  *
  * `provider` picks which of the two shapes the block is read as. Absent is
  * Microsoft — the field did not exist when the first accounts were connected.
- * A Google block may leave `clientId` out and take the client `oauthClient()`
- * resolves from config or the shipped default, which is what lets the test
- * button work before the account has been saved.
+ * Either block may leave `clientId` out and take the client `oauthClient()`
+ * resolves from config or the shipped default — which is what lets the test
+ * button work before the account has been saved, and what the account the
+ * sign-in buttons save (`clientId: ''` when the server's own client ran the
+ * flow) has always meant.
  */
 function mailAuthFrom(body, keyRef, config = null) {
   const method = body?.auth === undefined || body?.auth === null ? 'password' : body.auth;
@@ -1358,12 +1361,17 @@ function mailAuthFrom(body, keyRef, config = null) {
   const provider = mailProviderFrom(block, 'oauth.provider');
   if (provider === 'google') {
     const client = oauthClient(config, 'google');
-    const clientId = requireString(block, 'clientId', { max: 200, required: false }).trim() || client.clientId;
+    const own = requireString(block, 'clientId', { max: 200, required: false }).trim();
+    const clientId = own || client.clientId;
     if (!clientId) throw new HttpError(400, 'oauth.clientId is required — no Google client is configured');
-    return { method, oauth: { provider, clientId, clientSecretRef: client.clientSecretRef, tokenRef: keyRef } };
+    // The refresh spends the secret filed under the ref the connect used, so
+    // the two must derive it the same way — from the client, not the account.
+    return { method, oauth: { provider, clientId, clientSecretRef: googleSecretRefFor(client, own), tokenRef: keyRef } };
   }
-  const clientId = requireString(block, 'clientId', { max: 64 });
-  const tenantId = requireString(block, 'tenantId', { max: 128, required: false }) || 'common';
+  const client = oauthClient(config, 'microsoft');
+  const clientId = requireString(block, 'clientId', { max: 64, required: false }) || client.clientId;
+  if (!clientId) throw new HttpError(400, 'oauth.clientId is required — no Microsoft client is configured');
+  const tenantId = requireString(block, 'tenantId', { max: 128, required: false }) || client.tenantId || 'common';
   return { method, oauth: { provider, clientId, tenantId, tokenRef: keyRef } };
 }
 
@@ -1519,6 +1527,10 @@ class DeviceSignInPad {
       state: flow.state,
       status: flow.state,
       keyRef: flow.keyRef,
+      // The client the flow ran against — the config one, when the body
+      // carried none — so the page can save it on the account, exactly as
+      // the Google pad has always reported its own.
+      clientId: flow.clientId,
       userCode: flow.userCode,
       verificationUri: flow.verificationUri,
       message: flow.message,
@@ -1541,6 +1553,7 @@ class DeviceSignInPad {
       id: crypto.randomBytes(8).toString('hex'),
       state: 'pending',
       keyRef,
+      clientId,
       userCode: '',
       verificationUri: '',
       message: '',
@@ -1929,23 +1942,26 @@ async function handleMailOAuthBegin(ctx) {
   const provider = mailProviderFrom(body);
   if (provider === 'google') {
     const client = oauthClient(ctx.config(), 'google');
-    const clientId = requireString(body, 'clientId', { max: 200, required: false }).trim() || client.clientId;
+    const own = requireString(body, 'clientId', { max: 200, required: false }).trim();
+    const clientId = own || client.clientId;
     if (!clientId) {
       throw new HttpError(400, 'no Google client is configured — paste the client ID from your own Google Cloud project, or use a Zelos build that ships one');
     }
     /* The secret goes to the store before anything else happens, under the
-       one ref the refresh will read it back from — the same write the
-       Settings "save secret" button would make, and it is the only way the
-       value reaches this process. Validated as a string like every other
-       field, and never echoed. */
+       one ref the refresh will read it back from — scoped to the client it
+       belongs to, so a second pasted Cloud project cannot overwrite the
+       first's. The same write the Settings "save secret" button would make,
+       and the only way the value reaches this process. Validated as a string
+       like every other field, and never echoed. */
+    const clientSecretRef = googleSecretRefFor(client, own);
     const clientSecret = requireString(body, 'clientSecret', { max: 200, required: false });
-    if (clientSecret) await setSecret(client.clientSecretRef, clientSecret);
+    if (clientSecret) await setSecret(clientSecretRef, clientSecret);
     /* `email` is accepted so the UI can send what it knows, and then not used:
        putting it on the authorization URL as `login_hint` would put an
        address in a URL this server builds, and Google asks which account
        anyway. */
     requireString(body, 'email', { max: 320, required: false });
-    sendJSON(ctx.res, 200, ctx.browserSignIns.begin({ keyRef, clientId, clientSecretRef: client.clientSecretRef }));
+    sendJSON(ctx.res, 200, ctx.browserSignIns.begin({ keyRef, clientId, clientSecretRef }));
     return;
   }
   const client = oauthClient(ctx.config(), 'microsoft');

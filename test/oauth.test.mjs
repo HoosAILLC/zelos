@@ -49,7 +49,7 @@ const {
   startLoopbackReceiver, exchangeCode, refreshTokens,
   saveTokens, loadTokens, forgetTokens, tokensExpired,
   beginAuthorization, finishAuthorization, authorize, accessTokenFor,
-  DEFAULT_OAUTH_CLIENTS, oauthClient, GOOGLE_CLIENT_SECRET_REF, MAIL_CALLBACK_PATH,
+  DEFAULT_OAUTH_CLIENTS, oauthClient, GOOGLE_CLIENT_SECRET_REF, googleSecretRefFor, MAIL_CALLBACK_PATH,
 } = oauth;
 
 const { getSecret } = await import('../core/secrets.mjs');
@@ -358,6 +358,19 @@ test('oauthClient reads the operator\'s registration over the shipped default, a
   assert.equal(oauthClient({ oauth: { clients: { google: { clientId: 'x', clientSecretRef: 'oauth.google.mine' } } } }, 'google').clientSecretRef,
     'oauth.google.mine');
   assert.throws(() => oauthClient(cfg, 'gmail'), (err) => err.code === 'unknown_provider');
+
+  // Where a Google client's secret is filed: the configured client keeps the
+  // install-wide ref (or the name the operator chose); a PASTED client is a
+  // different Cloud project and gets a ref of its own, derived from the id
+  // alone so connect and refresh can never disagree about the name.
+  const client = oauthClient(cfg, 'google');
+  assert.equal(googleSecretRefFor(client, ''), GOOGLE_CLIENT_SECRET_REF, 'no paste: the configured client\'s own ref');
+  assert.equal(googleSecretRefFor(client, '4242-zelos.apps.googleusercontent.com'), GOOGLE_CLIENT_SECRET_REF,
+    'the configured client pasted back is still the configured client');
+  const scoped = googleSecretRefFor(client, 'other.apps.googleusercontent.com');
+  assert.match(scoped, /^oauth\.google\.clientSecret\.[0-9a-f]{16}$/);
+  assert.equal(scoped, googleSecretRefFor(client, '  other.apps.googleusercontent.com  '), 'trimmed before deriving');
+  assert.notEqual(scoped, googleSecretRefFor(client, 'third.apps.googleusercontent.com'), 'one ref per client');
 });
 
 test('a calendar WRITE scope is refused too — this surface is read-only', () => {
