@@ -844,9 +844,12 @@ Stated plainly, so nobody discovers these the hard way:
   it is sent. The parsers are written defensively — byte-exact IMAP literal
   handling; a hard cap on recurrence expansion so a malformed `RRULE` cannot
   loop forever, with a scan budget underneath it so a hostile one cannot grind
-  either — a rule padded with `BYDAY` entries that never match froze a sweep
-  for **38 seconds** at under 1 MB, inside every documented cap, and the full
-  8 MB worst case now measures **about 400 milliseconds**, parsing included;
+  either — one budget for the whole document, not one per rule, so splitting
+  the payload across ten thousand events buys nothing. A rule padded with
+  `BYDAY` entries that never match froze a sweep for **38 seconds** at under
+  1 MB, and the split variant for **about four minutes** at 7 MB, both inside
+  every documented cap; the worst either shape measures now is **under two
+  seconds** at the 8 MB cap, parsing included;
   and an HTML-to-text conversion that is a single left-to-right
   pass, capped at **512 KB per HTML part**. That last one was quadratic until
   recently, and the difference is the whole argument for measuring rather than

@@ -1102,6 +1102,25 @@ test('a huge BYDAY list cannot buy seconds of expansion per sweep', () => {
   assert.ok(Date.now() - started < 3000, 'the scan budget must trip fast');
 });
 
+test('the scan budget spans the document, not each rule', () => {
+  // The same payload split across many VEVENTs used to buy a fresh budget per
+  // rule: 800 copies of a never-matching 125-entry BYDAY list — well inside
+  // the subscribed-calendar byte cap — froze the sweep for ~19 seconds with
+  // every individual rule comfortably under its own allowance.
+  const started = Date.now();
+  const rule = `RRULE:FREQ=YEARLY;COUNT=5;BYDAY=${Array(125).fill('99MO').join(',')}`;
+  const events = parseICS_toEvents(
+    ics(
+      ...Array.from({ length: 800 }, (_, i) =>
+        vevent(`UID:runaway-4-${i}`, 'DTSTART;TZID=America/New_York:00010101T090000', rule, 'SUMMARY:Nothing, in bulk'),
+      ).flat(),
+    ),
+    { from: '2026-08-20', to: '2026-10-26', tzid: NY },
+  );
+  assert.equal(events.length, 0, 'nothing matches, and DTSTART itself is outside the window');
+  assert.ok(Date.now() - started < 3000, 'one budget must cover the whole document');
+});
+
 test('an unsupported FREQ degrades to a single occurrence', () => {
   const events = expandFixture(
     vevent(

@@ -41,7 +41,8 @@ const WEEKDAYS = ['SU', 'MO', 'TU', 'WE', 'TH', 'FR', 'SA'];
 /** Loop fuses. A malformed rule must cost milliseconds, not a hung process. */
 const MAX_PERIODS = 20_000;
 const MAX_EMPTY_PERIODS = 4_000; // ~8 leap years of daily periods, so Feb 29 rules still resolve
-const MAX_CANDIDATE_SCANS = 500_000; // total BY* work per rule — the lists are unbounded input, walked once per period
+const MAX_CANDIDATE_SCANS = 500_000; // BY* work one lone rule may buy — the lists are unbounded input, walked once per period
+const MAX_DOCUMENT_SCANS = 4_000_000; // the same work summed across every series expand() walks in one document
 
 const ics = log.child('[ics]');
 
@@ -644,7 +645,7 @@ function parseUtcOffset(raw) {
  * skipped without being enumerated. Instances before `minNominal` may still
  * be yielded (DTSTART always is); the caller keeps its own window check.
  */
-function* recurrenceNominals(start, rule, { maxNominal = Infinity, minNominal = -Infinity, maxCount = 1500 } = {}) {
+function* recurrenceNominals(start, rule, { maxNominal = Infinity, minNominal = -Infinity, maxCount = 1500, scans: sharedScans = null } = {}) {
   yield start;
   let emitted = 1;
   if (emitted >= maxCount) return;
@@ -715,17 +716,25 @@ function* recurrenceNominals(start, rule, { maxNominal = Infinity, minNominal = 
   // The period fuses bound how many periods run, not what one period costs.
   // BY* lists arrive uncapped and are walked once per period, so a document
   // full of entries that never match bought seconds of frozen sweep — this
-  // budget bounds the total scanning one rule may do, however the list is
-  // shaped. A real rule's whole horizon costs a few thousand.
+  // budget bounds the total scanning, however the list is shaped. A caller
+  // expanding a whole document passes ONE budget for every series in it:
+  // scoped per rule, the bound was defeated by splitting the same payload
+  // across many VEVENTs, each under its own fresh allowance. Each period
+  // charges at least one unit, so a document full of cheap-but-empty periods
+  // spends it too. A real rule's whole horizon costs a few thousand.
   let emptyRun = 0;
-  const scans = { left: MAX_CANDIDATE_SCANS };
+  const scans = sharedScans ?? { left: MAX_CANDIDATE_SCANS, warned: false };
   for (let period = 0; period < MAX_PERIODS; period++) {
     const periodStart = mk(periodY, periodMo, periodD);
     if (periodStart > maxNominal) return;
 
+    scans.left -= 1;
     const days = candidateDays(rule, periodY, periodMo, periodD, base, bymonth, bydayWeekdays, scans);
     if (scans.left < 0) {
-      ics.warn(`recurrence scanned ${MAX_CANDIDATE_SCANS} candidate days; giving up (FREQ=${rule.freq})`);
+      if (!scans.warned) {
+        scans.warned = true;
+        ics.warn(`recurrence scanning exhausted its budget; the series is cut short (FREQ=${rule.freq})`);
+      }
       return;
     }
     let selected = [...new Set(days.map((day) => mk(day.y, day.mo, day.d) + timeOfDay))].sort((a, b) => a - b);
@@ -992,7 +1001,7 @@ export function expand(vevents, { from, to, max = 1500, tzid, email = null, vtim
   // the last day of the window, the result looked complete. The sink keeps the
   // globally earliest `cap` instead, so what gets cut is the tail of the
   // *window*, not whichever meetings a shared calendar happens to list last.
-  const sink = { cap, items: [], horizon: toMsBound, dropped: 0 };
+  const sink = { cap, items: [], horizon: toMsBound, dropped: 0, scans: { left: MAX_DOCUMENT_SCANS, warned: false } };
 
   for (const [, group] of groups) {
     const ctx = {
@@ -1155,6 +1164,7 @@ function expandOne(master, ctx, sink, overrides) {
       maxNominal: generationBound,
       minNominal,
       maxCount: budget,
+      scans: sink.scans,
     })) {
       nominals.push(t);
     }
