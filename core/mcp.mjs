@@ -839,6 +839,11 @@ const TOOL_DEFS = [
           ...mailScopesFor(rt, messages),
           ...(events ? ['calendar'] : []),
           ...(drafts.length ? ['drafts'] : []),
+          /* A draft's recipient and subject ride in on the mail scope, not the
+             drafts one — see draftView, and zelos_drafts, which reports the
+             same disclosure the same way. Only when no mail source already
+             spent it, so the row never names a scope twice. */
+          ...(drafts.length && !messages && rt.state.on.has('mail.metadata') ? ['mail.metadata'] : []),
         ],
       };
     },
@@ -1499,6 +1504,10 @@ function callTool(params, rt) {
     client: rt.client,
     tokenId: rt.tokenId,
     logger: rt.logger,
+    // The configured zone, as every other stamp in this file — left to the
+    // recordAccess default this would read the machine's clock and file the
+    // row under the wrong day whenever the two zones disagree on the date.
+    at: nowISO(rt.tz),
     ...entry,
   });
 

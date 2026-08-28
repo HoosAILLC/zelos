@@ -2436,10 +2436,20 @@ function handleSampleDelete(ctx) {
 /** The path of the launcher, so Settings can print a config block that works. */
 function mcpClientHints(ctx) {
   const port = ctx.req.socket?.localPort ?? null;
+  /* Inside the packaged desktop shell there is no launcher script to name: the
+     build ships `core/` but not `zelos.mjs`, and `process.execPath` is the app
+     itself. That binary answers `mcp` in its own right — desktop/main.js
+     serves stdio when spawned with the one word — so the hint there is the
+     binary plus `mcp`, and a script path would name a file the install does
+     not have, pasted under a heading that says it is ready. `versions.electron`
+     is how this process knows it is the shell; `process.defaultApp` marks a
+     dev shell run from a checkout, where the launcher exists and the script
+     form still holds. Plain Node — the CLI — is unchanged. */
+  const packagedShell = Boolean(process.versions.electron) && !process.defaultApp;
   return {
     // How a desktop AI client spawns the stdio server (SPEC-v2 §2).
     command: process.execPath,
-    args: [path.join(ROOT, 'zelos.mjs'), 'mcp'],
+    args: packagedShell ? ['mcp'] : [path.join(ROOT, 'zelos.mjs'), 'mcp'],
     home: paths().home,
     // ...and the address for clients that would rather speak HTTP.
     httpUrl: port ? `http://${HOST}:${port}/api/mcp` : null,
@@ -2542,7 +2552,10 @@ async function handleAiTokenCreate(ctx) {
   const label = requireString(body, 'label', { max: 60 });
   let minted;
   try {
-    minted = await mintAiToken({ label, config: ctx.config() });
+    const config = ctx.config();
+    // The configured zone, not the machine's — the same rule, and the same
+    // wrong-day window, that recordAskSpend spells out above.
+    minted = await mintAiToken({ label, config, now: nowISO(config.identity?.timezone || localTimezone()) });
   } catch (err) {
     throw new HttpError(400, err.message);
   }
@@ -2788,7 +2801,10 @@ async function handleMcp(ctx) {
   // request started with would undo that.
   if (ctx.dueForTouch(verdict.token.id)) {
     try {
-      ctx.setConfig(touchToken(verdict.token.id, { config: ctx.config() }));
+      const current = ctx.config();
+      // Stamped in the configured zone, like every writer here — see
+      // recordAskSpend for why the machine's zone files it under the wrong day.
+      ctx.setConfig(touchToken(verdict.token.id, { config: current, now: nowISO(current.identity?.timezone || localTimezone()) }));
     } catch (err) {
       logger.warn('server: could not record when an AI token was last used', { error: err.message });
     }

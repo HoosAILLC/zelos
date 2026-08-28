@@ -565,6 +565,34 @@ test('GET /api/ai reports the switch, the scopes, the tokens and the log', async
   assert.equal((await api(ctx, 'DELETE', '/api/ai/tokens/t_aaaaaa', { token: null })).status, 401);
 });
 
+test('inside the packaged desktop shell, the paste block names the app itself', async (t) => {
+  await resetAi();
+  const ctx = await startServer(t);
+
+  /* The packaged build ships core/ but not zelos.mjs, and process.execPath
+     there is the shell binary — so a hint naming the launcher script points at
+     a file the install does not have, pasted under a heading that says it is
+     ready. The shell answers `mcp` in its own right (desktop/main.js), so the
+     block has to be the binary plus that one word. `process.versions.electron`
+     is how the server knows which copy it is; plain Node — this test as it
+     started, and every CLI install — keeps the launcher form. */
+  process.versions.electron = '43.3.0';
+  t.after(() => { delete process.versions.electron; });
+
+  const res = await api(ctx, 'GET', '/api/ai');
+  assert.equal(res.json.client.command, process.execPath);
+  assert.deepEqual(res.json.client.args, ['mcp'],
+    'the packaged shell ships no zelos.mjs to spawn — the binary itself answers "mcp"');
+
+  // A dev shell run from a checkout (`electron .`) sets process.defaultApp and
+  // sits next to a zelos.mjs that exists, so it keeps the launcher form too.
+  process.defaultApp = true;
+  t.after(() => { delete process.defaultApp; });
+  const dev = await api(ctx, 'GET', '/api/ai');
+  assert.ok(dev.json.client.args[0].endsWith('zelos.mjs'));
+  assert.equal(dev.json.client.args[1], 'mcp');
+});
+
 test('PUT /api/ai writes only what it is given, and refuses a scope that does not exist', async (t) => {
   await resetAi();
   const ctx = await startServer(t);
@@ -683,6 +711,28 @@ test('a real call updates lastUsedAt and lands in the access log', async (t) => 
   const refused = await api(ctx, 'GET', '/api/ai');
   assert.equal(refused.json.access.length, 2);
   assert.equal(refused.json.tokens[0].lastUsedAt, after.json.tokens[0].lastUsedAt);
+});
+
+test('token stamps are written in the configured zone, not the machine\'s', async (t) => {
+  await resetAi();
+  /* The rule recordAskSpend spells out in core/server.mjs: `nowISO()` with no
+     argument reads the MACHINE zone, and for the hours when that zone and the
+     configured one sit on different dates, the panel files the stamp under the
+     wrong day. Kiritimati (+14:00) is a zone no machine running this suite
+     sits in, so the assertion cannot pass by the two zones agreeing. */
+  const was = loadConfig().identity?.timezone ?? null;
+  saveConfig({ identity: { timezone: 'Pacific/Kiritimati' } });
+  t.after(() => { saveConfig({ identity: { timezone: was } }); });
+
+  const ctx = await startServer(t);
+  await api(ctx, 'PUT', '/api/ai', { body: { enabled: true } });
+  const made = await api(ctx, 'POST', '/api/ai/tokens', { body: { label: 'zoned' } });
+  assert.match(made.json.token.createdAt, /\+14:00$/, 'createdAt was stamped off the machine clock');
+
+  // The first authenticated call stamps lastUsedAt — in the same zone.
+  await mcpCall(ctx, RPC, { bearer: made.json.value });
+  const token = ai.aiConfig(loadConfig()).tokens.find((tk) => tk.id === made.json.token.id);
+  assert.match(token.lastUsedAt, /\+14:00$/, 'lastUsedAt was stamped off the machine clock');
 });
 
 test('a burst of calls stamps lastUsedAt once a minute, not once a second', async (t) => {
