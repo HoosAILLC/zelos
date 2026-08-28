@@ -1078,6 +1078,30 @@ test('a rule that can never match terminates instead of spinning', () => {
   assert.ok(Date.now() - started < 5000, 'the empty-period fuse must trip fast');
 });
 
+test('a huge BYDAY list cannot buy seconds of expansion per sweep', () => {
+  // The period fuses bound how many periods run, not what one period costs.
+  // This rule buys the most periods a document can: entries that never match
+  // (there is no 99th Monday of a year), a DTSTART two thousand years back so
+  // every year up to the window is walked, and a COUNT — which disables the
+  // fast-forward jump — so each of those years re-scans the whole list. At
+  // 100,000 entries that was ~19 seconds of frozen event loop, well inside the
+  // subscribed-calendar byte cap, on every sweep.
+  const started = Date.now();
+  const events = parseICS_toEvents(
+    ics(
+      ...vevent(
+        'UID:runaway-3',
+        'DTSTART;TZID=America/New_York:00010101T090000',
+        `RRULE:FREQ=YEARLY;COUNT=5;BYDAY=${Array(100_000).fill('99MO').join(',')}`,
+        'SUMMARY:Nothing, expensively',
+      ),
+    ),
+    { from: '2026-08-20', to: '2026-10-26', tzid: NY },
+  );
+  assert.equal(events.length, 0, 'nothing matches, and DTSTART itself is outside the window');
+  assert.ok(Date.now() - started < 3000, 'the scan budget must trip fast');
+});
+
 test('an unsupported FREQ degrades to a single occurrence', () => {
   const events = expandFixture(
     vevent(

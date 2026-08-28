@@ -41,6 +41,7 @@ const WEEKDAYS = ['SU', 'MO', 'TU', 'WE', 'TH', 'FR', 'SA'];
 /** Loop fuses. A malformed rule must cost milliseconds, not a hung process. */
 const MAX_PERIODS = 20_000;
 const MAX_EMPTY_PERIODS = 4_000; // ~8 leap years of daily periods, so Feb 29 rules still resolve
+const MAX_CANDIDATE_SCANS = 500_000; // total BY* work per rule — the lists are unbounded input, walked once per period
 
 const ics = log.child('[ics]');
 
@@ -711,18 +712,26 @@ function* recurrenceNominals(start, rule, { maxNominal = Infinity, minNominal = 
     }
   }
 
+  // The period fuses bound how many periods run, not what one period costs.
+  // BY* lists arrive uncapped and are walked once per period, so a document
+  // full of entries that never match bought seconds of frozen sweep — this
+  // budget bounds the total scanning one rule may do, however the list is
+  // shaped. A real rule's whole horizon costs a few thousand.
   let emptyRun = 0;
+  const scans = { left: MAX_CANDIDATE_SCANS };
   for (let period = 0; period < MAX_PERIODS; period++) {
     const periodStart = mk(periodY, periodMo, periodD);
     if (periodStart > maxNominal) return;
 
-    const days = candidateDays(rule, periodY, periodMo, periodD, base, bymonth, bydayWeekdays);
-    let selected = days
-      .map((day) => mk(day.y, day.mo, day.d) + timeOfDay)
-      .filter((t, idx, arr) => arr.indexOf(t) === idx)
-      .sort((a, b) => a - b);
+    const days = candidateDays(rule, periodY, periodMo, periodD, base, bymonth, bydayWeekdays, scans);
+    if (scans.left < 0) {
+      ics.warn(`recurrence scanned ${MAX_CANDIDATE_SCANS} candidate days; giving up (FREQ=${rule.freq})`);
+      return;
+    }
+    let selected = [...new Set(days.map((day) => mk(day.y, day.mo, day.d) + timeOfDay))].sort((a, b) => a - b);
 
     if (rule.bysetpos.length) {
+      scans.left -= rule.bysetpos.length;
       const picked = [];
       for (const pos of rule.bysetpos) {
         const idx = pos > 0 ? pos - 1 : selected.length + pos;
@@ -776,9 +785,10 @@ function* recurrenceNominals(start, rule, { maxNominal = Infinity, minNominal = 
   ics.warn(`recurrence hit the ${MAX_PERIODS}-period cap (FREQ=${rule.freq})`);
 }
 
-/** Days a rule selects inside one period, as {y, mo, d}. */
-function candidateDays(rule, periodY, periodMo, periodD, base, bymonth, bydayWeekdays) {
+/** Days a rule selects inside one period, as {y, mo, d}. Spends `scans` as it looks. */
+function candidateDays(rule, periodY, periodMo, periodD, base, bymonth, bydayWeekdays, scans) {
   if (rule.freq === 'DAILY') {
+    scans.left -= rule.bymonthday.length;
     if (bymonth.size && !bymonth.has(periodMo)) return [];
     if (bydayWeekdays.size && !bydayWeekdays.has(weekdayOf(periodY, periodMo, periodD))) return [];
     if (rule.bymonthday.length && !matchesMonthDay(rule.bymonthday, periodY, periodMo, periodD)) return [];
@@ -786,6 +796,7 @@ function candidateDays(rule, periodY, periodMo, periodD, base, bymonth, bydayWee
   }
 
   if (rule.freq === 'WEEKLY') {
+    scans.left -= 7 * rule.bymonthday.length;
     const out = [];
     const weekStart = mk(periodY, periodMo, periodD);
     for (let i = 0; i < 7; i++) {
@@ -800,7 +811,7 @@ function candidateDays(rule, periodY, periodMo, periodD, base, bymonth, bydayWee
 
   if (rule.freq === 'MONTHLY') {
     if (bymonth.size && !bymonth.has(periodMo)) return [];
-    return daysInOneMonth(rule, periodY, periodMo, base.d, bydayWeekdays);
+    return daysInOneMonth(rule, periodY, periodMo, base.d, bydayWeekdays, scans);
   }
 
   // YEARLY. With BYDAY but no BYMONTH/BYMONTHDAY the ordinal spans the whole
@@ -809,6 +820,7 @@ function candidateDays(rule, periodY, periodMo, periodD, base, bymonth, bydayWee
   if (rule.byday.length && !bymonth.size && !rule.bymonthday.length) {
     const out = [];
     for (const b of rule.byday) {
+      if ((scans.left -= b.ordinal !== 0 ? 1 : 366) < 0) break;
       if (b.ordinal !== 0) {
         const hit = nthWeekdayOfYear(periodY, b.weekday, b.ordinal);
         if (hit) out.push({ y: periodY, mo: hit.mo, d: hit.d });
@@ -826,15 +838,16 @@ function candidateDays(rule, periodY, periodMo, periodD, base, bymonth, bydayWee
 
   const months = bymonth.size ? [...bymonth].sort((a, b) => a - b) : [base.mo];
   const out = [];
-  for (const mo of months) out.push(...daysInOneMonth(rule, periodY, mo, base.d, bydayWeekdays));
+  for (const mo of months) out.push(...daysInOneMonth(rule, periodY, mo, base.d, bydayWeekdays, scans));
   return out;
 }
 
-function daysInOneMonth(rule, y, mo, defaultDay, bydayWeekdays) {
+function daysInOneMonth(rule, y, mo, defaultDay, bydayWeekdays, scans) {
   const len = daysInMonth(y, mo);
   let days = [];
 
   if (rule.bymonthday.length) {
+    scans.left -= rule.bymonthday.length;
     for (const n of rule.bymonthday) {
       const day = n > 0 ? n : len + n + 1;
       if (day >= 1 && day <= len) days.push(day);
@@ -844,6 +857,7 @@ function daysInOneMonth(rule, y, mo, defaultDay, bydayWeekdays) {
     if (bydayWeekdays.size) days = days.filter((d) => bydayWeekdays.has(weekdayOf(y, mo, d)));
   } else if (rule.byday.length) {
     for (const b of rule.byday) {
+      if ((scans.left -= b.ordinal === 0 ? len : 1) < 0) break;
       if (b.ordinal === 0) {
         for (let d = 1; d <= len; d++) if (weekdayOf(y, mo, d) === b.weekday) days.push(d);
       } else {

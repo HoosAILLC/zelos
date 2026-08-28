@@ -48,6 +48,7 @@ const {
   AuthError, RateLimitError, createHttp, createMeter, parseRetryAfter, originOf, secretHash,
 } = await import('../core/connectors/http.mjs');
 const { parseFeed } = await import('../core/connectors/rss.mjs');
+const { fetchIcsText } = await import('../core/connectors/ics.mjs');
 const { validateConfig, SECRET_KEYS } = await import('../core/config.mjs');
 
 let seq = 0;
@@ -969,6 +970,26 @@ test('only one redirect is followed, however many the host offers', async (t) =>
   await assert.rejects(() => client.get(`${home.origin}/start`), /returned 302/,
     'a redirect chain was followed past the single hop this transport allows');
   assert.equal(home.hits(), 2);
+});
+
+test("the sweep's .ics reader holds one deadline across a redirect, not one per hop", async (t) => {
+  /* `fetchIcsText` stays outside the transport on purpose (see its header), so
+     it must hand-roll this rule the way core/server.mjs and core/doctor.mjs
+     already do: a host that stalls just under the timeout and then answers 302
+     must not hand the redirect target a whole fresh deadline of its own. */
+  const home = await feedServer(t, {
+    handler: (req, res) => {
+      if (req.url === '/start') {
+        setTimeout(() => { res.writeHead(302, { location: '/end.ics' }); res.end(); }, 400);
+        return;
+      }
+      // The redirect's destination: never answers. Closed by the test's after.
+    },
+  });
+  const started = Date.now();
+  await assert.rejects(() => fetchIcsText(`${home.origin}/start`, { timeoutMs: 600 }));
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed < 800, `one 600ms deadline should cover both hops, took ${elapsed}ms`);
 });
 
 test('a body larger than the cap is refused off the stream, not after buying it', async (t) => {
