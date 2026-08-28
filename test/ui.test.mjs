@@ -1908,6 +1908,22 @@ test('Settings can set who you are, and the value has a reader on the other end'
 });
 
 /**
+ * The credential slot was painted only by the "How Zelos signs in" change
+ * listener: opened for an existing account, the form showed no password field
+ * and no sign-in block until the picker was touched. The paint must also run
+ * once after the tree is built — after, because the TLS field's initial hide
+ * walks `closest('.field')` and finds nothing in a half-built tree.
+ */
+test('the mail form paints its credential slot on open, not first on a picker change', () => {
+  const src = fs.readFileSync(path.join(ROOT, 'ui/views/settings.js'), 'utf8');
+  const form = /function mailForm\(account, \{ onSaved, onCancel \}\)[\s\S]*?\n\}/m.exec(src);
+  assert.ok(form, 'mailForm is missing');
+  const tree = form[0].split(`class: 'account-form'`)[1] ?? '';
+  assert.match(tree, /paintCredential\(\);/,
+    'the form never paints the slot for the state it opens in');
+});
+
+/**
  * `sentMailbox` is appended to every fetch by `mailboxesFor()` and had no writer
  * anywhere in `ui/` — the string appeared exactly once, in a blank-account
  * literal. The stored default is the bare word "Sent", which is wrong for Gmail,
@@ -3723,8 +3739,8 @@ test('the account editor asks the server whether Microsoft sign-in is ready, the
 
   const panel = settings.mailPanel({ rerender() {} });
   findButton(panel, 'Edit').fire('click');
-  // The picker already says Microsoft; painting the slot is what asks.
-  findInput(panel, (n) => n.tag === 'select' && n.value === 'xoauth2').fire('change');
+  // The picker already says Microsoft; opening the form paints the slot,
+  // and painting the slot is what asks — no change event required.
   await settle();
   assert.equal(calls.filter((c) => c.path === '/api/mail/guess').length, 1, 'whether a client is ready is the server\'s answer, asked once');
   findButton(panel, 'Sign in with Microsoft').fire('click');

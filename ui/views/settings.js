@@ -1794,7 +1794,7 @@ function mailForm(account, { onSaved, onCancel }) {
     paintCredential();
   });
 
-  return el('div', { class: 'account-form' }, [
+  const node = el('div', { class: 'account-form' }, [
     hostList,
     field('Name it', labelInput),
     field('IMAP host', hostInput),
@@ -1906,6 +1906,11 @@ function mailForm(account, { onSaved, onCancel }) {
     ]),
     status.node,
   ]);
+  // Paint the slot for the state the form OPENS in, or an existing account
+  // shows no password field and no sign-in until the picker above is touched.
+  // After the tree is built, so the TLS field's initial hide can find it.
+  paintCredential();
+  return node;
 }
 
 /* ---------------------------------------------------------- simple setup */
