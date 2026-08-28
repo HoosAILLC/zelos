@@ -17,6 +17,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { after, before, describe, it } from 'node:test';
+import { PassThrough } from 'node:stream';
 import { registerHooks } from 'node:module';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -454,6 +455,7 @@ export const recorded = {
   errorBoxes: [],
   permission: { request: null, check: null },
   beforeRequest: null,
+  headersReceived: null,
   quits: 0,
   appName: null,
   messageBoxes: [],
@@ -479,10 +481,12 @@ class WebContentsStub {
     this.handlers = new Map();
     this.windowOpenHandler = null;
     this.executed = [];
+    this.webRTCIPHandlingPolicy = null;
   }
   on(event, handler) { push(this.handlers, event, handler); return this; }
   once(event, handler) { push(this.handlers, event, handler); return this; }
   setWindowOpenHandler(handler) { this.windowOpenHandler = handler; }
+  setWebRTCIPHandlingPolicy(policy) { this.webRTCIPHandlingPolicy = policy; }
   executeJavaScript(code) { this.executed.push(code); return Promise.resolve(); }
   emit(event, ...args) { return fire(this.handlers, event, ...args); }
 }
@@ -625,6 +629,7 @@ export const session = {
     setPermissionCheckHandler(handler) { recorded.permission.check = handler; },
     webRequest: {
       onBeforeRequest(filter, handler) { recorded.beforeRequest = { filter, handler }; },
+      onHeadersReceived(filter, handler) { recorded.headersReceived = { filter, handler }; },
     },
   },
 };
@@ -894,6 +899,37 @@ describe('the shell, booted against a stub Electron', () => {
     assert.equal(verdicts.at(-1), false);
   });
 
+  it('shuts WebRTC off: the board\'s CSP gains webrtc \'block\', and the peer layer gets no UDP', () => {
+    /* WebRTC is not a URL request. ICE, STUN/TURN and data channels never
+       enter the onBeforeRequest pipeline the test above exercises, and
+       `connect-src 'self'` does not govern them either — so without these two
+       controls, a script in the board's origin could hand the session token to
+       `turn:attacker.example` as an ICE credential and neither layer would
+       fire. The CSP directive is the deny; the IP-handling policy is the layer
+       underneath it, for the page that has somehow shed its CSP. */
+    for (const win of recorded.windows) {
+      assert.equal(win.webContents.webRTCIPHandlingPolicy, 'disable_non_proxied_udp',
+        'a window\'s peer-connection layer was left with its default UDP reach');
+    }
+
+    const { filter, handler } = recorded.headersReceived ?? {};
+    assert.ok(handler, 'no header hook: the board\'s CSP never gains the webrtc directive');
+    assert.deepEqual(filter.urls, ['<all_urls>']);
+
+    // Appended to the policy the server sent, whatever case the header came in.
+    let out;
+    handler({ responseHeaders: { 'content-security-policy': ["default-src 'self'"] } },
+      (r) => { out = r.responseHeaders; });
+    assert.deepEqual(out['content-security-policy'], ["default-src 'self'", "webrtc 'block'"]);
+    handler({ responseHeaders: { 'Content-Security-Policy': ["default-src 'self'"] } },
+      (r) => { out = r.responseHeaders; });
+    assert.deepEqual(out['Content-Security-Policy'], ["default-src 'self'", "webrtc 'block'"]);
+
+    // And present even on a response that carried no policy at all.
+    handler({ responseHeaders: {} }, (r) => { out = r.responseHeaders; });
+    assert.deepEqual(out['Content-Security-Policy'], ["webrtc 'block'"]);
+  });
+
   it('denies every browser permission but the one the copy buttons need', () => {
     const granted = [];
     for (const permission of ['media', 'geolocation', 'notifications', 'clipboard-read', 'clipboard-sanitized-write']) {
@@ -1149,16 +1185,25 @@ describe('parseShellArgs', () => {
 
   it('reads the three flags in both spellings', () => {
     assert.deepEqual(parseShellArgs(['--home=/tmp/z', '--port=9999', '--sweep-now']), {
-      home: '/tmp/z', port: 9999, sweepNow: true,
+      home: '/tmp/z', port: 9999, sweepNow: true, mcp: false,
     });
     assert.deepEqual(parseShellArgs(['--home', '/tmp/z', '--port', '9999']), {
-      home: '/tmp/z', port: 9999, sweepNow: false,
+      home: '/tmp/z', port: 9999, sweepNow: false, mcp: false,
     });
+  });
+
+  it('notices the one bare word the pasted config block sends', () => {
+    // The "Ready to paste" block in Settings spawns this binary with `mcp` and
+    // nothing else — the packaged build ships no zelos.mjs for a client to
+    // name, so the shell itself has to answer it.
+    assert.deepEqual(parseShellArgs(['mcp']), { home: null, port: null, sweepNow: false, mcp: true });
+    assert.equal(parseShellArgs(['mcp', '--home=/tmp/z']).home, '/tmp/z');
+    assert.equal(parseShellArgs(['.', 'mcp']).mcp, true, 'a dev shell sees its app path first');
   });
 
   it('ignores what Chromium and macOS add, rather than refusing to start', () => {
     assert.deepEqual(parseShellArgs(['.', '-psn_0_1234', '--disable-gpu', '--inspect=9229', '--port=0']), {
-      home: null, port: 0, sweepNow: false,
+      home: null, port: 0, sweepNow: false, mcp: false,
     });
   });
 
@@ -1685,5 +1730,68 @@ describe('planRendererRestart', () => {
     const plan = planRendererRestart([...longAgo, now], now);
     assert.equal(plan.action, 'reload');
     assert.equal(plan.attempt, 1, 'crashes from ten minutes ago are not this crash');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * The shell as a stdio MCP server
+ *
+ * The "Ready to paste" block in Settings names the packaged binary plus the
+ * one word `mcp` (core/server.mjs mcpClientHints), because the build ships no
+ * zelos.mjs for a client to spawn. That block is only true if the shell
+ * actually serves JSON-RPC on stdio when spawned that way — this is the other
+ * end of that contract, run with the streams a real client would own.
+ * ------------------------------------------------------------------ */
+
+describe('the shell as a stdio MCP server', () => {
+  let main;
+  let sandbox;
+
+  before(async () => {
+    // The electron stub hooks are registered by the shell suite above; the
+    // module comes back from cache with them in place.
+    main = await import(pathToFileURL(path.join(REPO, 'desktop', 'main.js')).href);
+    sandbox = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'zelos-shell-mcp-')));
+    process.env.ZELOS_SECRETS_BACKEND = 'encrypted-file'; // never the real keychain
+  });
+
+  after(() => {
+    delete process.env.ZELOS_HOME; // serveMcp set it from --home
+    delete process.env.ZELOS_SECRETS_BACKEND;
+    try {
+      fs.rmSync(sandbox, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    } catch (err) {
+      if (err?.code !== 'EPERM' && err?.code !== 'EBUSY' && err?.code !== 'ENOTEMPTY') throw err;
+    }
+  });
+
+  it('answers the handshake on the streams it is handed, and stdout stays pure JSON-RPC', async () => {
+    const input = new PassThrough();
+    const output = new PassThrough();
+    let written = '';
+    output.on('data', (chunk) => { written += chunk; });
+
+    const flags = main.parseShellArgs(['mcp', `--home=${path.join(sandbox, 'home')}`]);
+    const serving = main.serveMcp(flags, { input, output });
+
+    input.write(`${JSON.stringify({
+      jsonrpc: '2.0', id: 1, method: 'initialize',
+      params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'test client', version: '0' } },
+    })}\n`);
+    input.write(`${JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list' })}\n`);
+    input.end(); // the client hanging up is what ends the server
+
+    const result = await serving;
+    assert.equal(result.ok, true, result.error?.stack);
+
+    // Rule 3 from zelos.mjs holds here too: every stdout line is a JSON-RPC
+    // message, because one stray banner corrupts the stream.
+    const lines = written.split('\n').filter((line) => line.trim());
+    const replies = lines.map((line) => JSON.parse(line));
+    assert.equal(replies.length, 2);
+    assert.equal(replies[0].result.serverInfo.name, 'zelos');
+    // A fresh home has AI access off, so the tool list is empty — proof the
+    // server read its config from the home the flags named.
+    assert.deepEqual(replies[1].result.tools, []);
   });
 });
