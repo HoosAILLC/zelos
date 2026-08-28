@@ -214,11 +214,23 @@ export async function loadConfig() {
   return state.config;
 }
 
+/** The board's content as a comparable string — `now` excluded, because the
+ *  server's clock moves on every fetch and is not a change in the board. */
+function boardStamp(board) {
+  return JSON.stringify({ ...board, now: null });
+}
+
 export async function loadBoard() {
   const board = await api.state();
-  state.board = { ...EMPTY_BOARD, ...board };
+  const next = { ...EMPTY_BOARD, ...board };
+  // `rev` moves only when the content did. The heartbeat refetches an
+  // unchanged board every three minutes and on every tab return, and a bump
+  // for each of those rebuilds the current view — including the onboarding
+  // flow, whose half-typed forms do not survive it. The fresh payload is
+  // still kept: `now` and `boardAt` are what keep the clock honest.
+  if (boardStamp(next) !== boardStamp(state.board)) state.rev += 1;
+  state.board = next;
   state.boardAt = Date.now();
-  state.rev += 1;
   return state.board;
 }
 
@@ -251,9 +263,14 @@ export async function saveConfig(patch) {
  */
 export function fatalFor(err) {
   if (err instanceof ApiError && err.status === 401) {
+    // Said in the words the plain-words guard allows, with the way back that
+    // actually exists where the reader is: the desktop shell has no terminal
+    // to reopen from — its Board menu reloads the board with a fresh key.
     return {
       title: 'This tab has lost its key',
-      detail: 'Zelos mints a new session token every launch. Reopen the app from the terminal window that started it — the URL there carries the token.',
+      detail: (typeof window !== 'undefined' && window.zelos)
+        ? 'Zelos hands each window a new key every time it starts, and the one this window holds is no longer good. Choose Board → Reload board and Zelos opens it again with a fresh key.'
+        : 'Zelos hands each window a new key every time it starts, and the one this tab holds is no longer good. Open the address printed in the terminal that started Zelos — that address carries a fresh key.',
     };
   }
   return {
@@ -625,7 +642,15 @@ export async function setItemState(id, next, { until = undefined, silent = false
       });
     }
   } catch (err) {
-    state.board = { ...state.board, items: before };
+    // The row goes back inside the CURRENT items, not via the pre-click
+    // snapshot: a refresh can land while the request is out, and restoring
+    // `before` wholesale would silently discard everything it brought.
+    state.board = {
+      ...state.board,
+      items: state.board.items.map((i) => (i.id === id && prior
+        ? { ...i, state: prior.state, snoozed_until: prior.snoozed_until ?? null }
+        : i)),
+    };
     notify(`Could not update that item: ${err.message}`, { tone: 'warn' });
   }
   state.rev += 1;

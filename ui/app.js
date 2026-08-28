@@ -367,11 +367,18 @@ function fatalScreen() {
 }
 
 function noTokenScreen() {
+  // Plain words: this is a state a non-expert genuinely reaches — a
+  // bookmarked board after a restart, mostly — and the way back differs by
+  // shell. The desktop app has a menu and no terminal (window.zelos is the
+  // mark its preload leaves); a browser tab has the address the terminal
+  // printed, which is what carries the key a bookmark strips.
   return el('div', { class: 'screen' }, [
     el('p', { class: 'screen-mark', text: 'ΖΗΛΟΣ' }),
     meander(),
     el('h1', { class: 'screen-title', text: 'This page has no session key' }),
-    el('p', { class: 'screen-line', text: 'Zelos mints a token every launch and puts it in the URL it printed. Any page in your browser can reach 127.0.0.1, so without that token this one is refused — which is the point. Open the address from the terminal that started Zelos.' }),
+    el('p', { class: 'screen-line', text: window.zelos
+      ? 'Zelos gives each window a one-time key when it starts, and this page opened without one — so it is refused, which is the point: the key keeps anything else on this computer away from your board. Choose Board → Reload board and the app opens it again with a fresh key.'
+      : 'Zelos gives each window a one-time key when it starts, and this page opened without one — so it is refused, which is the point: the key keeps other pages in your browser away from your board. Open the address printed in the terminal that started Zelos; a bookmark of this page does not carry the key.' }),
   ]);
 }
 
@@ -416,7 +423,9 @@ let paintedToast = null;
  * rebuild the view under the user's hands: the Owed draft they are typing, a
  * settings field half-filled, every open disclosure snapped shut. So a render
  * caused by data (a background sweep finishing, mostly) is QUEUED while a text
- * field inside <main> has focus, and runs when that field blurs. A forced
+ * field inside <main> has focus — or while focus sits anywhere inside an open
+ * editor, because Tab rests it on "Save account" between two fields — and runs
+ * when focus settles outside both. A forced
  * render — the user's own navigation — is never deferred: they asked for it.
  */
 let renderQueued = false;
@@ -424,7 +433,15 @@ let renderQueued = false;
 function editingInMain() {
   const active = document.activeElement;
   if (!active || !main || !main.contains(active)) return false;
-  return active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.tagName === 'SELECT';
+  if (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.tagName === 'SELECT') return true;
+  // A button inside an open editor still counts. Tabbing from a text field to
+  // "Save account" lands focus on the button, and flushing in that moment
+  // rebuilds the view — the open form and everything typed into it gone
+  // before the button can be pressed, the result of "Test the connection"
+  // written into detached nodes. Focus anywhere else in the view — an item
+  // row's tick, a panel-level button — still flushes, because those hold no
+  // half-finished typing to protect.
+  return Boolean(active.closest('form, .account-form'));
 }
 
 /**
@@ -469,7 +486,9 @@ function render({ force = false } = {}) {
     paintChrome();
     return;
   }
-  if (!force && layout === 'chrome' && state.phase === 'ready' && editingInMain()) {
+  // Both skeletons: the bare one is onboarding, whose email step holds a
+  // half-typed address exactly as a settings form does.
+  if (!force && (layout === 'chrome' || layout === 'bare') && state.phase === 'ready' && editingInMain()) {
     renderQueued = true;
     paintChrome();
     return;

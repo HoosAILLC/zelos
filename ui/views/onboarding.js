@@ -356,7 +356,11 @@ export function renderOnboarding(ctx) {
   }
 
   const missingModel = !state.health?.model?.configured;
-  const missingSources = ((state.config?.mail?.length || 0) + (state.config?.calendars?.length || 0)) === 0;
+  // Mail, calendars, AND the connector sources under Settings → Other things
+  // it can read — the same rule now.js's missingSetup() applies: a home
+  // reading only GitHub is a home with something to read.
+  const missingSources = ((state.config?.mail?.length || 0) + (state.config?.calendars?.length || 0)
+    + (state.config?.sources?.length || 0)) === 0;
   const ready = !missingModel && !missingSources;
 
   return shell(rerender, navigate, {

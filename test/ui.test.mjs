@@ -750,6 +750,36 @@ test('a 500\'s detail reaches the message a view renders, and a 4xx\'s is left a
   await assert.rejects(api.health(), (err) => err.message === 'bad gateway' && err.detail === null);
 });
 
+/**
+ * The same rule, other transport. The join above landed in request() and not in
+ * openStream's non-ok path, so a 500 on POST /api/ask still painted the two
+ * words "internal error" into the answer with the server's one pointer dropped.
+ */
+test('a stream that fails to open joins the 500\'s detail the way request() does', async (t) => {
+  stubBrowserGlobals();
+  const { openStream, ApiError } = await import(fileUrl(UI, 'lib/api.js'));
+  let answer = null;
+  globalThis.fetch = async () => ({ ok: false, status: answer.status, text: async () => JSON.stringify(answer.body) });
+  t.after(() => { delete globalThis.fetch; });
+
+  const pointer = 'the reason was written to /tmp/zelos-home/logs/desktop.log';
+  answer = { status: 500, body: { error: 'internal error', detail: pointer } };
+  await assert.rejects(openStream('/api/ask', { method: 'POST', body: { question: 'x' }, onEvent() {} }), (err) => {
+    assert.ok(err instanceof ApiError);
+    assert.equal(err.message, `internal error — ${pointer}`);
+    assert.equal(err.detail, pointer, 'and still there on its own for a reader that wants it apart');
+    return true;
+  });
+
+  // A 4xx stays its own sentence, and carries its structured detail apart.
+  answer = { status: 409, body: { error: 'a sweep is already running', detail: { running: true } } };
+  await assert.rejects(openStream('/api/sweep/stream', { onEvent() {} }), (err) => {
+    assert.equal(err.message, 'a sweep is already running');
+    assert.deepEqual(err.detail, { running: true });
+    return true;
+  });
+});
+
 test('the snooze chooser offers three future deadlines in the configured zone', async () => {
   stubBrowserGlobals();
   const items = await import(fileUrl(UI, 'lib/items.js'));
@@ -825,6 +855,38 @@ test('done raises an Undo that restores the exact prior state, deadline included
   store.notify(null);
 });
 
+/**
+ * The failure rollback used to restore the whole pre-click snapshot. A sweep's
+ * `done` → refreshBoard(), and the heartbeat, both replace `state.board.items`
+ * while the POST is in flight — so a rollback to the snapshot silently erased
+ * whatever they brought, with a toast that explained only the failed tick.
+ */
+test('a failed action rolls back the one row, not the whole pre-click board', async (t) => {
+  stubBrowserGlobals();
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+
+  store.state.board = {
+    ...store.state.board,
+    items: [{ id: 'x', bucket: 'now', state: 'open', headline: 'chase the survey invoice' }],
+  };
+  globalThis.fetch = async () => {
+    // A refresh lands while the request is out: fresher rows, then the POST fails.
+    store.state.board = {
+      ...store.state.board,
+      items: [
+        { id: 'x', bucket: 'now', state: 'open', headline: 'chase the survey invoice' },
+        { id: 'y', bucket: 'today', state: 'open', headline: 'the new arrival' },
+      ],
+    };
+    return { ok: false, status: 503, text: async () => '{"error":"the server is not there"}' };
+  };
+  t.after(() => { delete globalThis.fetch; store.notify(null); });
+
+  await store.setItemState('x', 'done');
+  assert.deepEqual(store.state.board.items.map((i) => [i.id, i.state]), [['x', 'open'], ['y', 'open']],
+    'the rollback must restore the one row inside the CURRENT items');
+});
+
 /* ------------------------------------------ 5. shell behaviour, from source */
 
 /**
@@ -853,6 +915,33 @@ test('a board-driven re-render defers while a text field in main has focus', () 
   assert.match(render[0], /editingInMain\(\)/, 'render must check for a focused field');
   assert.match(render[0], /renderQueued = true/, 'a mid-edit render must queue, not run');
   assert.match(app, /document\.addEventListener\('focusout'/, 'the queued render must flush on blur');
+});
+
+/**
+ * Two holes in the deferral above, both measured on v1.5.0. The guard was
+ * gated on `layout === 'chrome'`, so the onboarding flow — which runs the bare
+ * skeleton — got no deferral at all: any rev bump rebuilt the whole screen,
+ * typed address and open mail card included, even mid-keystroke. And
+ * editingInMain() counted only the three text-control tags, so Tab from a
+ * field to "Save account" rested focus on a BUTTON and the queued render
+ * flushed in that gap — the open editor and everything typed into it gone
+ * before the button could be pressed, the result of "Test the connection"
+ * written into detached nodes.
+ */
+test('the deferral covers onboarding, and holds while focus is on a button in an open editor', () => {
+  const app = fs.readFileSync(path.join(UI, 'app.js'), 'utf8');
+  const render = /function render\(\{ force = false \}[\s\S]*?\n\}/m.exec(app);
+  assert.ok(render, 'render is missing');
+  assert.match(render[0], /\(layout === 'chrome' \|\| layout === 'bare'\)/,
+    'the deferral must cover the onboarding skeleton, not only the chrome one');
+
+  const editing = /function editingInMain\(\)[\s\S]*?\n\}/m.exec(app);
+  assert.ok(editing, 'editingInMain is missing');
+  // Focus INSIDE an open editor still counts as editing; focus anywhere else
+  // in main — an item row's tick, a panel-level button — still flushes,
+  // because those hold no half-finished typing to protect.
+  assert.match(editing[0], /closest\('form, \.account-form'\)/,
+    'focus inside an open editor must still count as editing');
 });
 
 test('view navigation resets the scroll; same-view re-renders leave it alone', () => {
@@ -1171,6 +1260,40 @@ test('the heartbeat refetches through the store, so it defers like any board cha
 
   const app = fs.readFileSync(path.join(UI, 'app.js'), 'utf8');
   assert.match(app, /watchBoard\(\)/, 'the shell never starts the heartbeat');
+});
+
+/**
+ * The heartbeat's ordinary tick brings back the same board with a newer server
+ * clock. `rev` used to bump anyway, and `rev` is in the shell's renderKey — so
+ * every three minutes, and on every tab return, the view rebuilt for a board
+ * that said nothing new. On the chrome layout the deferral caught the typing
+ * case; on the bare one it emptied the onboarding email step under its own
+ * cursor, and on a tab return (focus on a link, not a field) no deferral can
+ * help — not bumping is the only fix that covers it.
+ */
+test('a refetch that brings the same board does not bump rev — only `now` moved', async (t) => {
+  stubBrowserGlobals();
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+
+  const board = (now, items = []) => ({
+    items, counts: {}, events: [], drafts: [], runs: { last: null },
+    notes: [], first: null, now,
+  });
+  let answer = board('2026-08-27T09:00:00-04:00');
+  globalThis.fetch = async () => ({ ok: true, status: 200, text: async () => JSON.stringify(answer) });
+  t.after(() => { delete globalThis.fetch; });
+
+  await store.loadBoard();
+  const after = store.state.rev;
+
+  answer = board('2026-08-27T09:03:00-04:00');
+  await store.loadBoard();
+  assert.equal(store.state.rev, after, 'an unchanged board must not bump rev');
+  assert.equal(store.state.board.now, '2026-08-27T09:03:00-04:00', 'the fresh clock is still kept');
+
+  answer = board('2026-08-27T09:06:00-04:00', [{ id: 'a', bucket: 'now', state: 'open' }]);
+  await store.loadBoard();
+  assert.equal(store.state.rev, after + 1, 'a board that actually changed must still bump');
 });
 
 /**
@@ -3272,6 +3395,112 @@ test('no screen in onboarding, and no mail card, shows a first-timer a protocol 
   // The step is module state: leave it where a fresh page starts, while the
   // DOM stub is still in place to render it.
   goTo(1);
+});
+
+/**
+ * The Done step's gate counted mail and calendars only, while ui/views/now.js
+ * and the server both count the connector sources under Settings → Other
+ * things it can read. A home reading only Slack was told "it still needs an
+ * email account" with the one button disabled — a false sentence over a check
+ * that would have succeeded.
+ */
+test('the Done step counts connector-only homes as having something to read', async (t) => {
+  withPlainDom(t);
+  globalThis.fetch = plainFetch({ presets: await llmPresets(), manifests: await connectorManifests() });
+  t.after(() => { delete globalThis.fetch; });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const onboarding = await import(fileUrl(UI, 'views/onboarding.js'));
+  store.state.config = { identity: {}, model: {}, mail: [], calendars: [], sources: [{ id: 's1', kind: 'slack' }] };
+  store.state.health = { model: { configured: true, label: 'Claude' }, backend: { name: 'encrypted-file' } };
+  store.state.secretRefs = [];
+
+  let view = null;
+  const ctx = { navigate() {}, rerender() { view = onboarding.renderOnboarding(ctx); } };
+  ctx.rerender();
+  const stepButton = (n) => plainWalk(view).filter((b) => b.tag === 'button' && (b.attributes.class || '').includes('ob-step-btn'))[n - 1];
+  stepButton(5).fire('click');
+
+  const seen = onScreen(view);
+  assert.doesNotMatch(seen, /can’t read anything yet/, 'a connector-only home has something to read');
+  const read = findButton(view, 'Read my mail now');
+  assert.ok(read, 'no "Read my mail now" button');
+  assert.equal(read.attributes.disabled, undefined, 'the button must be pressable');
+
+  // Leave the module's step where a fresh page starts.
+  stepButton(1).fire('click');
+});
+
+/**
+ * The one Owed defect the shell cannot fix: a queued render can flush the
+ * moment the draft textarea blurs, and the rebuilt card reads
+ * `state.board.drafts` — which held the body fetched BEFORE the edit, so the
+ * user watched their own words revert while the server was saving them.
+ * The card patches the board's copy before the request goes out.
+ */
+test('a draft edit lands in the board copy before the save returns, so a repaint cannot revert it', async (t) => {
+  withPlainDom(t);
+  const puts = [];
+  globalThis.fetch = async (reqPath, init = {}) => {
+    puts.push({ path: reqPath, method: init.method || 'GET', body: init.body ? JSON.parse(init.body) : null });
+    return { ok: true, status: 200, text: async () => '{}' };
+  };
+  t.after(() => { delete globalThis.fetch; });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const owed = await import(fileUrl(UI, 'views/owed.js'));
+  store.state.board = {
+    ...store.state.board,
+    items: [],
+    drafts: [{ id: 'd1', state: 'pending', to_email: 'sam@example.com', subject: 'the survey', body: 'The fetched body.', item_id: null }],
+  };
+
+  const view = owed.renderOwed({ tz: 'UTC', navigate() {}, rerender() {} });
+  const area = findInput(view, (n) => n.tag === 'textarea' && (n.attributes['aria-label'] || '').startsWith('Draft to'));
+  assert.ok(area, 'no draft textarea');
+  area.value = 'The body as edited.';
+  area.fire('input');
+  area.fire('blur');
+  assert.equal(store.state.board.drafts[0].body, 'The body as edited.',
+    'the board copy must already hold what a rebuilt card will paint');
+  await settle();
+  assert.deepEqual(puts.filter((p) => p.method === 'PUT').map((p) => p.body),
+    [{ body: 'The body as edited.', state: 'edited' }]);
+});
+
+/**
+ * The two lost-session screens. Neither is rendered by the walk above — one is
+ * app.js-internal, the other a store answer — but both are states a
+ * non-expert genuinely reaches (a bookmarked board after a restart), so their
+ * words are held to the same rule, at the source and at the export. And the
+ * desktop shell has no terminal to reopen from: its way back is Board →
+ * Reload board, so both screens must know which shell they are on.
+ */
+test('the two lost-session screens speak the register the walk enforces', async () => {
+  const app = fs.readFileSync(path.join(UI, 'app.js'), 'utf8');
+  const screen = /function noTokenScreen\(\)[\s\S]*?\n\}/m.exec(app);
+  assert.ok(screen, 'noTokenScreen is missing');
+  for (const [literal] of screen[0].matchAll(/'[^']*'/g)) {
+    assert.doesNotMatch(literal, JARGON, `noTokenScreen: ${literal.match(JARGON)?.[0]}`);
+    assert.doesNotMatch(literal, /127\.0\.0\.1/, 'a loopback address is the same register');
+  }
+  assert.match(screen[0], /window\.zelos/, 'the screen must branch on the shell it is in');
+  assert.match(screen[0], /Reload board/);
+
+  stubBrowserGlobals();
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const { ApiError } = await import(fileUrl(UI, 'lib/api.js'));
+  const lost = store.fatalFor(new ApiError('no', { status: 401 }));
+  assert.doesNotMatch(`${lost.title} ${lost.detail}`, JARGON,
+    `the 401 screen in a browser: ${`${lost.title} ${lost.detail}`.match(JARGON)?.[0]}`);
+  assert.match(lost.detail, /terminal/, 'a browser tab is pointed back to the printed address');
+  globalThis.window.zelos = { desktop: true };
+  try {
+    const desk = store.fatalFor(new ApiError('no', { status: 401 }));
+    assert.doesNotMatch(`${desk.title} ${desk.detail}`, JARGON,
+      `the 401 screen in the shell: ${`${desk.title} ${desk.detail}`.match(JARGON)?.[0]}`);
+    assert.match(desk.detail, /Reload board/, 'the desktop shell has no terminal — its menu is the way back');
+  } finally {
+    delete globalThis.window.zelos;
+  }
 });
 
 test('the guided AI card stores the key, tests, picks the model itself, saves and moves on — in that order', async (t) => {
