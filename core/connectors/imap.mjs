@@ -17,6 +17,8 @@
  */
 
 import { fetchRecent } from '../sources/imap.mjs';
+import { googleSecretRefFor, oauthClient } from '../sources/oauth.mjs';
+import { loadConfig } from '../config.mjs';
 
 /**
  * Mailboxes to read for one account: the configured list plus the sent folder,
@@ -51,7 +53,7 @@ export function authFor(account) {
 }
 
 /**
- * The three things `accessTokenFor` needs, assembled from the two config keeps.
+ * What `accessTokenFor` needs, assembled from the two config keeps.
  *
  * `tokenRef` IS `account.keyRef` and is deliberately not a fourth stored field.
  * The grant lives under the account's own ref — core/sources/imap.mjs:2001 says
@@ -60,21 +62,43 @@ export function authFor(account) {
  * `tokenRef` in config.json would be a second place for that to be wrong, and it
  * would be wrong silently.
  *
+ * An account the sign-in buttons saved carries `clientId: ''` when the
+ * server's own client ran the flow, so an empty id here means "the client
+ * this install signs in with" — resolved from config at read time, exactly
+ * as POST /api/mail/oauth resolved it at connect time. Without that fallback
+ * the card said "Connected" and every sweep after it threw `not_configured`
+ * before the stored grant was even consulted. A Google block also carries
+ * `clientSecretRef`, because its refresh spends the client's secret and the
+ * ref that secret was filed under is a fact about the CLIENT —
+ * `googleSecretRefFor` derives the same name at connect and at refresh.
+ *
+ * `config` is a parameter for the tests; the sweep passes nothing and the
+ * live file is read, as `runSweep` itself defaults to — and only when a
+ * fallback is actually needed, so a password account or a self-registered
+ * Microsoft one reads no config at all.
+ *
  * Null when there is nothing to sign in with, so a caller can tell "this account
  * is not an OAuth account" from "this account is one and is misconfigured" —
  * `fetchRecent` spreads `...(oauth || {})` and `normalizeClientId` then produces
  * the sentence about a missing registration.
  */
-export function oauthFor(account) {
+export function oauthFor(account, config = null) {
   const block = account?.oauth;
   if (!block || typeof block !== 'object') return null;
-  return {
-    // Absent is Microsoft: the field postdates the first connected accounts.
-    provider: typeof block.provider === 'string' && block.provider.trim() ? block.provider.trim().toLowerCase() : 'microsoft',
-    clientId: typeof block.clientId === 'string' ? block.clientId.trim() : '',
+  // Absent is Microsoft: the field postdates the first connected accounts.
+  const provider = typeof block.provider === 'string' && block.provider.trim() ? block.provider.trim().toLowerCase() : 'microsoft';
+  const own = typeof block.clientId === 'string' ? block.clientId.trim() : '';
+  const client = provider === 'google' || (provider === 'microsoft' && !own)
+    ? oauthClient(config ?? loadConfig(), provider)
+    : null;
+  const oauth = {
+    provider,
+    clientId: own || client?.clientId || '',
     tenantId: typeof block.tenantId === 'string' && block.tenantId.trim() ? block.tenantId.trim() : 'common',
     tokenRef: account?.keyRef ?? '',
   };
+  if (provider === 'google') oauth.clientSecretRef = googleSecretRefFor(client, own);
+  return oauth;
 }
 
 export function directionOf(message, mailbox, account, identityEmail) {

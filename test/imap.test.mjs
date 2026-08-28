@@ -65,7 +65,7 @@ const {
   xoauth2Payload,
 } = await import('../core/sources/imap.mjs');
 
-const { getSecret, setSecret } = await import('../core/secrets.mjs');
+const { getSecret, setSecret, deleteSecret } = await import('../core/secrets.mjs');
 
 after(() => {
   globalThis.fetch = realFetch;
@@ -2916,6 +2916,27 @@ test('a revoked Google grant is the reconnect case, and an account with no provi
     );
   } finally {
     await entra.close();
+    await google.close();
+  }
+});
+
+test('a Google secret filed under the shared ref is still found when the account names a scoped one', async () => {
+  const google = await startMockGoogleToken({ secret: 'GOCSPX-fixture-not-a-real-secret' });
+  const ref = freshRef();
+  try {
+    /* An account connected before per-client refs existed has its secret
+       under the shared name; the sweep now asks for the client's own ref
+       first. Falling back to the shared name is what keeps that account
+       refreshing after the update. */
+    await setSecret('oauth.google.clientSecret', 'GOCSPX-fixture-not-a-real-secret');
+    await saveOAuthTokens(ref, { accessToken: 'spent', refreshToken: '1//refresh-fixture', expiresAt: longAgo() });
+    const got = await accessTokenFor({
+      provider: 'google', clientId: GOOGLE_CLIENT_ID, clientSecretRef: `oauth.google.clientSecret.scoped${refSeq}`, tokenRef: ref, tokenUrl: google.tokenUrl,
+    });
+    assert.equal(got.accessToken, 'ya29.access-1');
+    assert.equal(google.seen[0].form.client_secret, 'GOCSPX-fixture-not-a-real-secret', 'the shared ref answers when the scoped one is empty');
+  } finally {
+    await deleteSecret('oauth.google.clientSecret').catch(() => {});
     await google.close();
   }
 });

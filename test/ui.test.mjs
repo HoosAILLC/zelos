@@ -1851,7 +1851,7 @@ test('the Outlook note tells the user to press something that exists', async () 
   // itself moved out of the form into `microsoftSignIn` when the simple mail
   // form learned to show the same block, so the assertion follows it: the
   // form builds the block through the factory, and the factory makes the calls.
-  assert.match(form[0], /const microsoft = microsoftSignIn\(\{/, 'the form no longer builds the sign-in block');
+  assert.match(form[0], /const buildMicrosoft = \(\) => microsoftSignIn\(\{/, 'the form no longer builds the sign-in block');
   const flow = /\nfunction microsoftSignIn\([\s\S]*?\n\}/m.exec(src);
   assert.ok(flow, 'microsoftSignIn is missing');
   for (const call of ['beginMailOAuth', 'mailOAuthStatus', 'cancelMailOAuth']) {
@@ -2578,7 +2578,7 @@ test('Sign in with Google has the shape of Sign in with Microsoft, and opens Goo
   }
   assert.match(flow, /api\.beginMailOAuth\(\{\n\s+provider: 'google',\n\s+keyRef,\n\s+email: address\(\),/, 'the flow does not name its provider, keyRef and address');
   assert.match(flow, /return \{\n\s+node,\n\s+oauth,[\s\S]*?stop\(\) \{/, 'the block does not return { node, oauth, stop }');
-  assert.match(flow, /const oauth = \(\) => \(\{ provider: 'google', clientId: clientIdInput\.value\.trim\(\) \}\)/, 'oauth() is not the account shape');
+  assert.match(flow, /const oauth = \(\) => \(\{ provider: 'google', clientId: clientIdInput\.value\.trim\(\) \|\| grantedClientId \}\)/, 'oauth() is not the account shape');
 
   // The sign-in page opens through an https-only target=_blank anchor — what
   // desktop/guard.js hands to the system browser — and the anchor stays on
@@ -2721,7 +2721,10 @@ test('Connect on a mailbox signed in with Google saves an OAuth account and stor
   const guess = { label: 'Gmail', host: 'imap.gmail.com', port: 993, secure: true, auth: 'password', signIn: 'google', clientReady: true, appPasswordUrl: 'https://example.com/app', note: '', known: true };
   const outcome = await settings.connectSimpleMail({
     id: 'm_7', keyRef: 'mail.m_7', email: 'nemo@gmail.com', password: '', guess,
-    auth: 'xoauth2', oauth: { provider: 'google', clientId: '' },
+    // The block's oauth() carries the client the sign-in actually ran
+    // against — the server's own, when the field on screen was empty —
+    // because a saved `clientId: ''` is an account the sweep cannot refresh.
+    auth: 'xoauth2', oauth: { provider: 'google', clientId: '4242-zelos.apps.googleusercontent.com' },
   });
   assert.equal(outcome.ok, true);
   assert.equal(outcome.sentMailbox, '[Gmail]/Sent Mail');
@@ -2731,11 +2734,11 @@ test('Connect on a mailbox signed in with Google saves an OAuth account and stor
   assert.ok(!calls.some((c) => c.path === '/api/secrets'), 'a password was stored for a signed-in mailbox');
   const tested = calls.find((c) => c.path === '/api/mail/test').body;
   assert.equal(tested.auth, 'xoauth2');
-  assert.deepEqual(tested.oauth, { provider: 'google', clientId: '' });
+  assert.deepEqual(tested.oauth, { provider: 'google', clientId: '4242-zelos.apps.googleusercontent.com' });
   assert.equal(tested.keyRef, 'mail.m_7', 'the test names the ref the grant was filed under');
   const account = calls.find((c) => c.path === '/api/config').body.mail[0];
   assert.equal(account.auth, 'xoauth2');
-  assert.deepEqual(account.oauth, { provider: 'google', clientId: '' });
+  assert.deepEqual(account.oauth, { provider: 'google', clientId: '4242-zelos.apps.googleusercontent.com' });
   assert.equal(account.host, 'imap.gmail.com');
 
   // And the simple form routes a finished Google sign-in through exactly
@@ -2791,7 +2794,7 @@ test('Advanced offers Sign in with Google, and an account signed in that way say
   // Test the connection tests the account that will be saved: with its auth.
   assert.match(body, /\.\.\.\(authMethod\(\) === 'xoauth2' \? \{ auth: 'xoauth2', oauth: activeOAuth\(\) \} : \{\}\),/, 'Test the connection tests a signed-in account as a password one');
   // Moving the picker stops whichever block is no longer showing.
-  assert.match(body, /if \(!xo \|\| viaGoogle\) microsoft\.stop\(\);\n\s+if \(!viaGoogle\) google\?\.stop\(\);/, 'a poll outlives its slot');
+  assert.match(body, /if \(!xo \|\| viaGoogle\) microsoft\?\.stop\(\);\n\s+if \(!viaGoogle\) google\?\.stop\(\);/, 'a poll outlives its slot');
 });
 
 test('the Microsoft registration form is hidden when the server ships the client', () => {
@@ -3361,6 +3364,222 @@ test('the guided AI card stores the key, tests, picks the model itself, saves an
   assert.doesNotMatch(onScreen(withLocal), JARGON, `the local guided card: ${onScreen(withLocal).match(JARGON)?.[0]}`);
 });
 
+/**
+ * The two sign-in blocks save the client the flow actually RAN AGAINST.
+ *
+ * When the server has a client of its own the id field is never on screen,
+ * so oauth() used to hand back `clientId: ''` — and connectSimpleMail saved
+ * it, the card said "Connected · N mailboxes", and every sweep after it
+ * threw before the stored grant was even consulted. The server has always
+ * answered begin/status with the resolved `clientId`; these tests pin that
+ * the blocks pick it up and that the saved account is self-describing.
+ */
+test('the simple card saves the client a Google sign-in ran against, not the empty field it never showed', async (t) => {
+  withPlainDom(t);
+  const RESOLVED = '4242-zelos.apps.googleusercontent.com';
+  const calls = [];
+  const ok = (body) => ({ ok: true, status: 200, text: async () => JSON.stringify(body) });
+  globalThis.fetch = async (reqPath, init = {}) => {
+    const body = init.body ? JSON.parse(init.body) : null;
+    calls.push({ method: init.method || 'GET', path: reqPath, body });
+    if (reqPath === '/api/mail/guess') return ok({ ...GUESSES['frank@gmail.com'], clientReady: true });
+    if (reqPath === '/api/guides') return ok(GUIDES);
+    if (reqPath === '/api/help') return ok(helpAnswer(body));
+    if (reqPath === '/api/mail/oauth') {
+      return ok({ id: 'f1', provider: 'google', state: 'connected', status: 'connected', keyRef: body.keyRef, clientId: RESOLVED, user: 'frank@gmail.com', error: null });
+    }
+    if (reqPath === '/api/mail/test') {
+      return ok({ ok: true, capabilities: [], error: null, mailboxes: [{ name: 'INBOX', specialUse: 'inbox' }, { name: '[Gmail]/Sent Mail', specialUse: 'sent' }] });
+    }
+    if (reqPath === '/api/config') return ok({ config: { identity: { email: 'frank@gmail.com' }, mail: body?.mail ?? [] }, errors: [], secretRefs: [] });
+    if (reqPath === '/api/health') return ok({ model: { configured: false } });
+    throw new Error(`unexpected ${reqPath}`);
+  };
+  t.after(() => { delete globalThis.fetch; });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const settings = await import(fileUrl(UI, 'views/settings.js'));
+  store.state.config = { identity: { name: '', email: '' }, mail: [], calendars: [], sources: [] };
+  store.state.health = { model: { configured: false }, backend: { name: 'encrypted-file' } };
+  store.state.secretRefs = [];
+
+  const form = settings.simpleMailForm({ onSaved() {}, onCancel() {} });
+  const email = findInput(form, (n) => n.attributes.type === 'email');
+  email.value = 'frank@gmail.com';
+  email.fire('change');
+  await settle();
+  findButton(form, 'Sign in with Google').fire('click');
+  await settle();
+  findButton(form, 'Connect').fire('click');
+  await settle();
+  assert.equal(calls.find((c) => c.path === '/api/mail/oauth').body.clientId, undefined, 'an empty field lets the server pick its own client');
+  assert.deepEqual(calls.find((c) => c.path === '/api/mail/test').body.oauth, { provider: 'google', clientId: RESOLVED },
+    'the account is tested with the client the grant was minted for');
+  assert.deepEqual(calls.find((c) => c.method === 'PUT' && c.path === '/api/config').body.mail[0].oauth, { provider: 'google', clientId: RESOLVED },
+    'and saved with it — a saved clientId of \'\' is an account the sweep cannot refresh');
+});
+
+test('the simple card saves the client a Microsoft sign-in ran against, the same way', async (t) => {
+  withPlainDom(t);
+  const RESOLVED = '11111111-2222-3333-4444-555555555555';
+  const calls = [];
+  const ok = (body) => ({ ok: true, status: 200, text: async () => JSON.stringify(body) });
+  globalThis.fetch = async (reqPath, init = {}) => {
+    const body = init.body ? JSON.parse(init.body) : null;
+    calls.push({ method: init.method || 'GET', path: reqPath, body });
+    if (reqPath === '/api/mail/guess') return ok({ ...GUESSES['frank@hotmail.com'], clientReady: true });
+    if (reqPath === '/api/guides') return ok(GUIDES);
+    if (reqPath === '/api/help') return ok(helpAnswer(body));
+    if (reqPath === '/api/mail/oauth') {
+      return ok({ id: 'f2', provider: 'microsoft', state: 'connected', status: 'connected', keyRef: body.keyRef, clientId: RESOLVED, error: null });
+    }
+    if (reqPath === '/api/mail/test') {
+      return ok({ ok: true, capabilities: [], error: null, mailboxes: [{ name: 'INBOX', specialUse: 'inbox' }, { name: 'Sent Items', specialUse: 'sent' }] });
+    }
+    if (reqPath === '/api/config') return ok({ config: { identity: { email: 'frank@hotmail.com' }, mail: body?.mail ?? [] }, errors: [], secretRefs: [] });
+    if (reqPath === '/api/health') return ok({ model: { configured: false } });
+    throw new Error(`unexpected ${reqPath}`);
+  };
+  t.after(() => { delete globalThis.fetch; });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const settings = await import(fileUrl(UI, 'views/settings.js'));
+  store.state.config = { identity: { name: '', email: '' }, mail: [], calendars: [], sources: [] };
+  store.state.health = { model: { configured: false }, backend: { name: 'encrypted-file' } };
+  store.state.secretRefs = [];
+
+  const form = settings.simpleMailForm({ onSaved() {}, onCancel() {} });
+  const email = findInput(form, (n) => n.attributes.type === 'email');
+  email.value = 'frank@hotmail.com';
+  email.fire('change');
+  await settle();
+  findButton(form, 'Sign in with Microsoft').fire('click');
+  await settle();
+  findButton(form, 'Connect').fire('click');
+  await settle();
+  assert.equal(calls.find((c) => c.path === '/api/mail/oauth').body.clientId, undefined, 'an empty field lets the server pick its own client');
+  assert.deepEqual(calls.find((c) => c.path === '/api/mail/test').body.oauth, { provider: 'microsoft', clientId: RESOLVED, tenantId: 'common' },
+    'Connect is not refused for a client id the user never saw');
+  assert.deepEqual(calls.find((c) => c.method === 'PUT' && c.path === '/api/config').body.mail[0].oauth, { provider: 'microsoft', clientId: RESOLVED, tenantId: 'common' });
+});
+
+test('the account editor asks the server whether Microsoft sign-in is ready, the way its Google branch does', async (t) => {
+  withPlainDom(t);
+  const RESOLVED = '11111111-2222-3333-4444-555555555555';
+  const calls = [];
+  const ok = (body) => ({ ok: true, status: 200, text: async () => JSON.stringify(body) });
+  globalThis.fetch = async (reqPath, init = {}) => {
+    const body = init.body ? JSON.parse(init.body) : null;
+    calls.push({ method: init.method || 'GET', path: reqPath, body });
+    if (reqPath === '/api/mail/guess') return ok({ ...GUESSES['frank@hotmail.com'], clientReady: true });
+    if (reqPath === '/api/guides') return ok(GUIDES);
+    if (reqPath === '/api/help') return ok(helpAnswer(body));
+    if (reqPath === '/api/mail/oauth') {
+      return ok({ id: 'f3', provider: 'microsoft', state: 'connected', status: 'connected', keyRef: body.keyRef, clientId: RESOLVED, error: null });
+    }
+    if (reqPath === '/api/config') return ok({ config: { identity: { email: 'frank@hotmail.com' }, mail: body?.mail ?? [] }, errors: [], secretRefs: [] });
+    if (reqPath === '/api/health') return ok({ model: { configured: false } });
+    throw new Error(`unexpected ${reqPath}`);
+  };
+  t.after(() => { delete globalThis.fetch; });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const settings = await import(fileUrl(UI, 'views/settings.js'));
+  const account = {
+    id: 'm_9', keyRef: 'mail.m_9', enabled: true, label: 'Hotmail', host: 'outlook.office365.com',
+    port: 993, secure: true, requireTls: null, user: 'frank@hotmail.com', auth: 'xoauth2',
+    oauth: { provider: 'microsoft', clientId: '', tenantId: 'common' },
+    mailboxes: ['INBOX'], sentMailbox: 'Sent Items', lookbackDays: 14, maxMessages: 400,
+  };
+  store.state.config = { identity: { name: '', email: 'frank@hotmail.com' }, mail: [account], calendars: [], sources: [] };
+  store.state.health = { model: { configured: false }, backend: { name: 'encrypted-file' } };
+  store.state.secretRefs = [];
+
+  const panel = settings.mailPanel({ rerender() {} });
+  findButton(panel, 'Edit').fire('click');
+  // The picker already says Microsoft; painting the slot is what asks.
+  findInput(panel, (n) => n.tag === 'select' && n.value === 'xoauth2').fire('change');
+  await settle();
+  assert.equal(calls.filter((c) => c.path === '/api/mail/guess').length, 1, 'whether a client is ready is the server\'s answer, asked once');
+  findButton(panel, 'Sign in with Microsoft').fire('click');
+  await settle();
+  const began = calls.find((c) => c.path === '/api/mail/oauth');
+  assert.ok(began, 'the editor refused a sign-in the server\'s own client could run — the reconnect path is dead-ended');
+  assert.equal(began.body.clientId, undefined, 'an empty field lets the server pick its own client');
+  findButton(panel, 'Save account').fire('click');
+  await settle();
+  assert.deepEqual(calls.find((c) => c.method === 'PUT' && c.path === '/api/config').body.mail.find((m) => m.id === 'm_9').oauth,
+    { provider: 'microsoft', clientId: RESOLVED, tenantId: 'common' },
+    'reconnecting from the editor saves the client the grant was minted for');
+});
+
+test('the account editor\'s Microsoft refusal shows the setup page, not the name of a file', async (t) => {
+  withPlainDom(t);
+  const calls = [];
+  const ok = (body) => ({ ok: true, status: 200, text: async () => JSON.stringify(body) });
+  globalThis.fetch = async (reqPath, init = {}) => {
+    const body = init.body ? JSON.parse(init.body) : null;
+    calls.push({ method: init.method || 'GET', path: reqPath, body });
+    if (reqPath === '/api/mail/guess') return ok({ ...GUESSES['frank@hotmail.com'] });
+    if (reqPath === '/api/guides') return ok(GUIDES);
+    if (reqPath === '/api/help') return ok(helpAnswer(body));
+    if (reqPath === '/api/config') return ok({ config: { identity: { email: 'frank@hotmail.com' }, mail: [] }, errors: [], secretRefs: [] });
+    if (reqPath === '/api/health') return ok({ model: { configured: false } });
+    throw new Error(`unexpected ${reqPath}`);
+  };
+  t.after(() => { delete globalThis.fetch; });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const settings = await import(fileUrl(UI, 'views/settings.js'));
+  const account = {
+    id: 'm_8', keyRef: 'mail.m_8', enabled: true, label: 'Hotmail', host: 'outlook.office365.com',
+    port: 993, secure: true, requireTls: null, user: 'frank@hotmail.com', auth: 'xoauth2',
+    oauth: { provider: 'microsoft', clientId: '', tenantId: 'common' },
+    mailboxes: ['INBOX'], sentMailbox: 'Sent Items', lookbackDays: 14, maxMessages: 400,
+  };
+  store.state.config = { identity: { name: '', email: 'frank@hotmail.com' }, mail: [account], calendars: [], sources: [] };
+  store.state.health = { model: { configured: false }, backend: { name: 'encrypted-file' } };
+  store.state.secretRefs = [];
+
+  const panel = settings.mailPanel({ rerender() {} });
+  findButton(panel, 'Edit').fire('click');
+  findInput(panel, (n) => n.tag === 'select' && n.value === 'xoauth2').fire('change');
+  await settle();
+  findButton(panel, 'Sign in with Microsoft').fire('click');
+  await settle();
+  assert.match(onScreen(panel), /One more step first/);
+  assert.ok(plainWalk(panel).some((n) => n.tag === 'a' && textOf(n) === 'Show me how ↗' && !plainHidden(n)),
+    'the refusal promises "the page below" and shows no page');
+  assert.doesNotMatch(onScreen(panel), /docs\/OAUTH\.md/, 'a repo file path stands where the link belongs');
+});
+
+test('removing a calendar deletes its stored password, as removing a mail account does', async (t) => {
+  withPlainDom(t);
+  const calls = [];
+  const ok = (body) => ({ ok: true, status: 200, text: async () => JSON.stringify(body) });
+  globalThis.fetch = async (reqPath, init = {}) => {
+    const body = init.body ? JSON.parse(init.body) : null;
+    calls.push({ method: init.method || 'GET', path: reqPath, body });
+    if (reqPath === '/api/config') return ok({ config: { identity: {}, mail: [], calendars: body?.calendars ?? [], sources: [] }, errors: [], secretRefs: [] });
+    if (reqPath.startsWith('/api/secrets/')) return ok({ ok: true });
+    if (reqPath === '/api/help') return ok(helpAnswer(body));
+    if (reqPath === '/api/health') return ok({ model: { configured: false } });
+    throw new Error(`unexpected ${reqPath}`);
+  };
+  t.after(() => { delete globalThis.fetch; });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const settings = await import(fileUrl(UI, 'views/settings.js'));
+  store.state.config = {
+    identity: {}, mail: [], sources: [],
+    calendars: [{ id: 'c_1', enabled: true, kind: 'caldav', label: 'iCloud', url: 'https://caldav.icloud.com/', user: 'nemo@icloud.com', keyRef: 'calendar.c_1' }],
+  };
+  store.state.health = { model: { configured: false }, backend: { name: 'encrypted-file' } };
+  store.state.secretRefs = ['calendar.c_1'];
+
+  const panel = settings.calendarPanel({ rerender() {} });
+  findButton(panel, 'Remove').fire('click');
+  await settle();
+  assert.ok(calls.some((c) => c.method === 'PUT' && c.path === '/api/config'), 'Remove did not save');
+  assert.ok(calls.some((c) => c.method === 'DELETE' && c.path === '/api/secrets/calendar.c_1'),
+    'the calendar is gone from config but its stored password stays in the secret store forever');
+});
+
 test('Settings opens on Email, reads in plain words, keeps every route, and puts Colour last', async (t) => {
   withPlainDom(t);
   globalThis.fetch = plainFetch({ presets: await llmPresets() });
@@ -3389,6 +3608,16 @@ test('Settings opens on Email, reads in plain words, keeps every route, and puts
   assert.ok(!plainWalk(view).some((n) => (n.attributes.class || '').includes('accent-swatch')), 'the colour picker is still in the Settings header');
   const colour = settings.renderSettings({ sub: 'appearance', navigate() {}, rerender() {} });
   assert.ok(plainWalk(colour).some((n) => (n.attributes.class || '').includes('accent-swatch')), 'the Colour tab has no picker');
+
+  // A stale or mistyped deep link (#/settings/appearence) opens the default
+  // panel with its tab selected — not the AI panel under no tab at all, with
+  // an aria-labelledby naming an element that does not exist.
+  const lost = settings.renderSettings({ sub: 'appearence', navigate() {}, rerender() {} });
+  const lostPanel = plainWalk(lost).find((n) => n.attributes.role === 'tabpanel');
+  assert.equal(lostPanel.attributes.id, 'settings-panel-mail', 'an unknown sub-route falls through to the AI panel');
+  const lostTab = plainWalk(lost).find((n) => n.attributes.role === 'tab' && n.attributes['aria-selected'] === 'true');
+  assert.ok(lostTab, 'no tab is selected for an unknown sub-route');
+  assert.equal(lostPanel.attributes['aria-labelledby'], lostTab.attributes.id, 'the panel and the selected tab disagree');
 
   // Share with another AI opens with the sentence that keeps it from being mistaken for the AI tab.
   const share = settings.renderSettings({ sub: 'ai', navigate() {}, rerender() {} });

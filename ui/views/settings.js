@@ -1294,8 +1294,12 @@ function microsoftSignIn({ keyRef, user, clientId = '', tenantId = 'common', cli
   const tenantInput = input({ value: tenantId || 'common', placeholder: 'common', autocomplete: 'off' });
   // `provider` travels with the account from here on, so a sweep can tell a
   // Microsoft grant from a Google one; an account saved before it existed has
-  // none, and the sweep reads that as Microsoft.
-  const oauth = () => ({ provider: 'microsoft', clientId: clientIdInput.value.trim(), tenantId: tenantInput.value.trim() || 'common' });
+  // none, and the sweep reads that as Microsoft. With the id field empty the
+  // server signs in with its own client and answers with the id it used —
+  // `grantedClientId` — so the saved account names the client its grant was
+  // actually minted for, instead of an empty string.
+  let grantedClientId = '';
+  const oauth = () => ({ provider: 'microsoft', clientId: clientIdInput.value.trim() || grantedClientId, tenantId: tenantInput.value.trim() || 'common' });
 
   const signInStatus = statusLine();
   const codeBox = el('div', { class: 'device-code' });
@@ -1312,6 +1316,7 @@ function microsoftSignIn({ keyRef, user, clientId = '', tenantId = 'common', cli
     flowId = null;
     codeBox.replaceChildren();
     if (flowStatus(flow) === 'connected') {
+      grantedClientId = flow.clientId || grantedClientId;
       signInStatus.good('Signed in. Zelos stays signed in on its own from here.');
       onConnected?.();
     } else if (flowStatus(flow) === 'cancelled') {
@@ -1461,7 +1466,12 @@ function microsoftSignIn({ keyRef, user, clientId = '', tenantId = 'common', cli
 function googleSignIn({ keyRef, email, clientReady = false, clientId = '', signedInAs = '', onStart = null, onConnected = null }) {
   const clientIdInput = input({ value: clientId, placeholder: '…apps.googleusercontent.com', autocomplete: 'off' });
   const secretInput = el('input', { class: 'input', type: 'password', autocomplete: 'off', placeholder: 'client secret' });
-  const oauth = () => ({ provider: 'google', clientId: clientIdInput.value.trim() });
+  // With the id field empty the server signs in with its own client and
+  // answers with the id it used — `grantedClientId` — so the saved account
+  // names the client its grant was actually minted for, instead of an empty
+  // string no refresh can spend.
+  let grantedClientId = '';
+  const oauth = () => ({ provider: 'google', clientId: clientIdInput.value.trim() || grantedClientId });
   const address = () => (typeof email === 'function' ? email() : String(email || '')).trim();
 
   const signInStatus = statusLine();
@@ -1477,6 +1487,7 @@ function googleSignIn({ keyRef, email, clientReady = false, clientId = '', signe
     flowBox.replaceChildren();
     const status = flowStatus(flow);
     if (status === 'connected') {
+      grantedClientId = flow.clientId || grantedClientId;
       signInStatus.good(flow.user
         ? `Signed in as ${flow.user}. Zelos stays signed in on its own from here.`
         : 'Signed in. Zelos stays signed in on its own from here.');
@@ -1691,14 +1702,39 @@ function mailForm(account, { onSaved, onCancel }) {
 
   // "Sign in with Microsoft" — the one device flow, shared with the simple
   // form; see microsoftSignIn above. What it learns lands on the draft.
-  const microsoft = microsoftSignIn({
+  // Built the way the Google block below is: whether Zelos has a Microsoft
+  // client to sign in with is the server's answer, asked once about a
+  // personal address for the same reason as Google's probe, and the one-time
+  // setup page is the server's too (GET /api/guides). Without both, this
+  // form refused a sign-in the configured client could run and its refusal
+  // named a file instead of showing the page.
+  let microsoft = null;
+  let microsoftReady = null;
+  const buildMicrosoft = () => microsoftSignIn({
     keyRef: draft.keyRef,
     user: () => draft.user,
     clientId: draft.oauth?.provider === 'google' ? '' : draft.oauth?.clientId || '',
     tenantId: draft.oauth?.tenantId || 'common',
+    clientReady: microsoftReady?.clientReady === true,
+    setupUrl: microsoftReady?.setupUrl || '',
     onStart: (oauth) => { draft.oauth = oauth; },
-    onConnected: () => { draft.auth = 'xoauth2'; },
+    onConnected: () => { draft.auth = 'xoauth2'; draft.oauth = microsoft.oauth(); },
   });
+  async function paintMicrosoft() {
+    if (microsoftReady === null) {
+      credentialSlot.replaceChildren(el('p', { class: 'quiet-note', text: 'Checking whether Zelos can sign in to Microsoft on this machine…' }));
+      try {
+        const [found, links] = await Promise.all([api.guessMail('you@outlook.com'), guideLinks()]);
+        microsoftReady = { clientReady: found.clientReady === true, setupUrl: links.microsoftSetup || '' };
+      } catch {
+        microsoftReady = { clientReady: false, setupUrl: '' };
+      }
+      // The picker moved on while the question was out.
+      if (authMethod() !== 'xoauth2' || provider() !== 'microsoft') return;
+    }
+    microsoft = microsoft || buildMicrosoft();
+    credentialSlot.replaceChildren(microsoft.node);
+  }
 
   // "Sign in with Google" — the same block the simple form shows, built when
   // the picker first lands on it. Whether Zelos has a Google client to sign
@@ -1720,7 +1756,7 @@ function mailForm(account, { onSaved, onCancel }) {
     onStart: (oauth) => { draft.oauth = oauth; },
     onConnected: (oauth) => { draft.auth = 'xoauth2'; draft.oauth = { provider: 'google', clientId: oauth.clientId }; },
   });
-  const activeOAuth = () => (provider() === 'google' ? google?.oauth() ?? draft.oauth : microsoft.oauth());
+  const activeOAuth = () => (provider() === 'google' ? google?.oauth() ?? draft.oauth : microsoft?.oauth() ?? draft.oauth);
   async function paintGoogle() {
     if (googleReady === null) {
       credentialSlot.replaceChildren(el('p', { class: 'quiet-note', text: 'Checking whether Zelos can sign in to Google on this machine…' }));
@@ -1747,9 +1783,10 @@ function mailForm(account, { onSaved, onCancel }) {
     const xo = authMethod() === 'xoauth2';
     const viaGoogle = xo && provider() === 'google';
     if (viaGoogle) paintGoogle();
-    else credentialSlot.replaceChildren(xo ? microsoft.node : passwordBlock);
+    else if (xo) paintMicrosoft();
+    else credentialSlot.replaceChildren(passwordBlock);
     tlsSelect.closest('.field')?.toggleAttribute('hidden', xo);
-    if (!xo || viaGoogle) microsoft.stop();
+    if (!xo || viaGoogle) microsoft?.stop();
     if (!viaGoogle) google?.stop();
   };
   authSelect.addEventListener('change', () => {
@@ -2692,6 +2729,8 @@ export function calendarPanel({ compact = false, onDone = null, rerender } = {})
           class: 'btn quiet',
           onClick: async () => {
             await saveConfig({ calendars: (state.config.calendars || []).filter((c) => c.id !== calendar.id) });
+            // The stored password goes with it, as a mail account's does.
+            if (calendar.keyRef) await api.deleteSecret(calendar.keyRef).catch(() => {});
             rerender?.();
           },
         }),
@@ -3261,7 +3300,10 @@ const tabId = (id) => `settings-tab-${id}`;
 const panelId = (id) => `settings-panel-${id}`;
 
 export function renderSettings(ctx) {
-  const panel = ctx.sub || DEFAULT_PANEL;
+  // Only a sub-route that names a real panel, or the strip highlights
+  // nothing and the ids below point at elements that do not exist — the
+  // dangling-relationship failure the comment above is about.
+  const panel = PANELS.some((p) => p.id === ctx.sub) ? ctx.sub : DEFAULT_PANEL;
   const rerender = ctx.rerender;
 
   // Arrow keys move between tabs, the way a tablist is expected to. Activation

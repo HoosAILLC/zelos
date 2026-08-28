@@ -32,6 +32,7 @@ const { createServer, listen } = await import('../core/server.mjs');
 const db = await import('../core/db.mjs');
 const { loadConfig } = await import('../core/config.mjs');
 const { getSecret, setSecret, deleteSecret } = await import('../core/secrets.mjs');
+const { googleSecretRefFor, oauthClient } = await import('../core/sources/oauth.mjs');
 const { todayKey, addDaysToKey, instant, localTimezone, offsetFor, wallClock } =
   await import('../core/time.mjs');
 
@@ -2615,15 +2616,21 @@ test('the Google callback exchanges the code with the verifier, files the grant 
   const google = await startMockGoogle(t, { requireSecret: GOOGLE_SECRET });
   const ctx = await googleServer(t, google);
   const keyRef = 'mail.m_g3';
+  /* The pasted client is not the configured one (there is none), so its
+     secret is filed under a ref scoped to that client — the shared name
+     stays free for the install's own registration, and a second pasted
+     project cannot overwrite the first's secret. */
+  const secretRef = googleSecretRefFor(oauthClient(null, 'google'), GOOGLE_CLIENT);
   t.after(() => deleteSecret(keyRef).catch(() => {}));
-  t.after(() => deleteSecret('oauth.google.clientSecret').catch(() => {}));
+  t.after(() => deleteSecret(secretRef).catch(() => {}));
 
   const began = await call(ctx, 'POST', '/api/mail/oauth', {
     body: { provider: 'google', keyRef, clientId: GOOGLE_CLIENT, clientSecret: GOOGLE_SECRET },
   });
   assert.equal(began.status, 200, began.text);
   assert.ok(!began.text.includes(GOOGLE_SECRET), 'the secret is never echoed');
-  assert.equal(await getSecret('oauth.google.clientSecret'), GOOGLE_SECRET, 'the secret went to the store under its ref');
+  assert.equal(await getSecret(secretRef), GOOGLE_SECRET, 'the secret went to the store under its client\'s own ref');
+  assert.equal(await getSecret('oauth.google.clientSecret'), null, 'the install-wide ref is not overwritten by a pasted client');
 
   const { back, landing, page } = await signInThrough(ctx, began.json.authUrl);
   assert.equal(landing.status, 200, page);
@@ -2722,8 +2729,10 @@ test('the Google callback takes no session token, and takes nothing it did not i
 
 test('a Google sign-in nobody comes back to expires, and an exchange Google refuses fails without leaking', async (t) => {
   const google = await startMockGoogle(t, { requireSecret: GOOGLE_SECRET });
+  const secretRef = googleSecretRefFor(oauthClient(null, 'google'), GOOGLE_CLIENT);
   t.after(() => deleteSecret('oauth.google.clientSecret').catch(() => {}));
   await deleteSecret('oauth.google.clientSecret').catch(() => {});
+  await deleteSecret(secretRef).catch(() => {});
 
   const short = await googleServer(t, google, { browserAuth: { ttlMs: 60 } });
   const began = await call(short, 'POST', '/api/mail/oauth', { body: { provider: 'google', keyRef: 'mail.m_g5', clientId: GOOGLE_CLIENT } });
@@ -2799,6 +2808,7 @@ test('Sign in with Microsoft answers as it did, now naming its provider and stat
   assert.equal(began.json.userCode, 'HXQR-2K9T');
   assert.equal(began.json.verificationUri, 'https://microsoft.com/devicelogin');
   assert.equal(began.json.keyRef, 'mail.m_ms1');
+  assert.equal(began.json.clientId, ENTRA_CLIENT, 'the page is told which client the flow ran against, so it can save it on the account');
   assert.ok(began.json.expiresAt);
   assert.ok(!began.text.includes('device-code-secret'), 'the device code never crosses to the page');
   const status = await call(ctx, 'GET', `/api/mail/oauth/${began.json.id}`);
@@ -2824,9 +2834,35 @@ test('Sign in with Microsoft answers as it did, now naming its provider and stat
   const fromConfig = await call(ready, 'POST', '/api/mail/oauth', { body: { provider: 'microsoft', keyRef: 'mail.m_ms2' } });
   assert.equal(fromConfig.status, 200, fromConfig.text);
   assert.equal(fromConfig.json.provider, 'microsoft');
+  assert.equal(fromConfig.json.clientId, ENTRA_CLIENT, 'the resolved client rides back to the page here too');
   assert.equal(seen.at(-1).path, '/consumers/oauth2/v2.0/devicecode');
   assert.equal(seen.at(-1).form.client_id, ENTRA_CLIENT);
   await call(ready, 'DELETE', `/api/mail/oauth/${fromConfig.json.id}`);
+});
+
+test('POST /api/mail/test takes the Microsoft client from config the way the begin route does', async (t) => {
+  const ENTRA_CLIENT = '11111111-2222-3333-4444-555555555555';
+  /* The simple card saves `oauth: { provider: 'microsoft', clientId: '' }`
+     when the server's own client ran the sign-in. The test button has to
+     accept that account the way the begin route did, or a mailbox that just
+     signed in is answered with a 400 about a field the user never saw. */
+  const ready = await startServer(t, {
+    config: baseConfig({ oauth: { clients: { microsoft: { clientId: ENTRA_CLIENT, tenantId: 'consumers' } } } }),
+  });
+  const res = await call(ready, 'POST', '/api/mail/test', {
+    body: { host: '127.0.0.1', port: 993, secure: true, user: 'nemo@hotmail.com', keyRef: 'mail.m_ms9', auth: 'xoauth2', oauth: { provider: 'microsoft' } },
+  });
+  assert.equal(res.status, 200, res.text);
+  assert.equal(res.json.ok, false);
+  assert.match(res.json.error, /has not been connected to Microsoft/, 'the refusal is about the missing grant, never about the client id');
+
+  // With nothing configured the refusal names the missing piece, like Google's.
+  const bare = await startServer(t);
+  const refused = await call(bare, 'POST', '/api/mail/test', {
+    body: { host: '127.0.0.1', port: 993, secure: true, user: 'nemo@hotmail.com', keyRef: 'mail.m_ms9', auth: 'xoauth2', oauth: { provider: 'microsoft' } },
+  });
+  assert.equal(refused.status, 400);
+  assert.match(refused.json.error, /oauth\.clientId is required/);
 });
 
 test('POST /api/mail/test on a Google account renews the grant at Google and signs in with the bearer token', async (t) => {
@@ -2835,6 +2871,11 @@ test('POST /api/mail/test on a Google account renews the grant at Google and sig
   const keyRef = 'mail.m_g7';
   t.after(() => deleteSecret(keyRef).catch(() => {}));
   const user = 'nemo@gmail.com';
+  // Filed where the begin route files a pasted client's secret, so the test
+  // button's refresh must read it back from the same scoped ref.
+  const secretRef = googleSecretRefFor(oauthClient(null, 'google'), GOOGLE_CLIENT);
+  await setSecret(secretRef, GOOGLE_SECRET);
+  t.after(() => deleteSecret(secretRef).catch(() => {}));
 
   // A mail server that speaks AUTH=XOAUTH2 and accepts the token the mock Google hands out.
   const received = [];
@@ -2891,6 +2932,7 @@ test('POST /api/mail/test on a Google account renews the grant at Google and sig
   assert.equal(tested.json.ok, true, tested.json.error);
   assert.ok(tested.json.mailboxes.some((m) => (typeof m === 'string' ? m : m.name) === 'INBOX'));
   assert.deepEqual(google.tokenRequests().map((r) => r.form.grant_type), ['authorization_code', 'refresh_token']);
+  assert.equal(google.tokenRequests()[1].form.client_secret, GOOGLE_SECRET, 'the refresh read the secret from the ref the connect filed it under');
   assert.deepEqual(sasl, [`user=${user}\x01auth=Bearer ya29.access-2\x01\x01`], 'the renewed token, not the spent one');
   assert.ok(!received.some((l) => /\bLOGIN\b/i.test(l)), 'no password was tried');
   assert.equal(JSON.parse(await getSecret(keyRef)).accessToken, 'ya29.access-2', 'and the renewal was written back');

@@ -1254,3 +1254,50 @@ test('no connector reaches the network except through the transport', () => {
   }
   assert.deepEqual(offenders, [], `these connectors open their own sockets:\n  ${offenders.join('\n  ')}`);
 });
+
+/* ------------------------------------------------------------------ *
+ * oauthFor — the sweep's half of "Sign in with Google / Microsoft"
+ * ------------------------------------------------------------------ */
+
+test('oauthFor resolves an empty clientId to the configured client, and carries the ref its secret is under', async () => {
+  const { oauthFor } = await import('../core/connectors/imap.mjs');
+  const { GOOGLE_CLIENT_SECRET_REF, googleSecretRefFor, oauthClient } = await import('../core/sources/oauth.mjs');
+  const config = {
+    oauth: {
+      clients: {
+        google: { clientId: '4242-zelos.apps.googleusercontent.com' },
+        microsoft: { clientId: '11111111-2222-3333-4444-555555555555', tenantId: 'consumers' },
+      },
+    },
+  };
+
+  /* The account the sign-in buttons save when the server's own client ran the
+     flow carries `clientId: ''`. The sweep has to read it with that same
+     client — resolved from config exactly as the begin route resolved it —
+     or the card says "Connected" and every sweep after it throws
+     not_configured before the stored grant is even consulted. */
+  const google = oauthFor({ keyRef: 'mail.m_1', oauth: { provider: 'google', clientId: '' } }, config);
+  assert.equal(google.clientId, '4242-zelos.apps.googleusercontent.com');
+  assert.equal(google.tokenRef, 'mail.m_1');
+  assert.equal(google.clientSecretRef, GOOGLE_CLIENT_SECRET_REF, 'the configured client keeps the install-wide secret ref');
+
+  const microsoft = oauthFor({ keyRef: 'mail.m_2', oauth: { provider: 'microsoft', clientId: '', tenantId: 'common' } }, config);
+  assert.equal(microsoft.clientId, '11111111-2222-3333-4444-555555555555');
+  assert.equal(microsoft.tenantId, 'common', 'the tenant the grant was minted under, not the config one');
+  assert.equal(microsoft.clientSecretRef, undefined, 'a Microsoft public client has no secret to file');
+
+  /* An account with a client of its own keeps it, and its Google secret is
+     read from the ref connect filed it under — scoped to that client, so a
+     second Cloud project's paste cannot overwrite the first's. */
+  const own = oauthFor({ keyRef: 'mail.m_3', oauth: { provider: 'google', clientId: 'other.apps.googleusercontent.com' } }, config);
+  assert.equal(own.clientId, 'other.apps.googleusercontent.com');
+  assert.equal(own.clientSecretRef, googleSecretRefFor(oauthClient(config, 'google'), 'other.apps.googleusercontent.com'));
+  assert.match(own.clientSecretRef, /^oauth\.google\.clientSecret\.[0-9a-f]{16}$/);
+
+  // A Microsoft account that names its own client needs no config, and a
+  // password account still has no block.
+  const registered = oauthFor({ keyRef: 'mail.m_4', oauth: { clientId: '22222222-2222-3333-4444-555555555555' } }, null);
+  assert.equal(registered.provider, 'microsoft');
+  assert.equal(registered.clientId, '22222222-2222-3333-4444-555555555555');
+  assert.equal(oauthFor({ keyRef: 'mail.m_5' }, config), null);
+});
