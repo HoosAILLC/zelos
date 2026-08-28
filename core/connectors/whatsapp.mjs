@@ -903,7 +903,7 @@ async function readExport(file) {
     const buf = Buffer.alloc(take);
     await readFully(handle, buf, stat.size - take);
     const text = decodeText(buf);
-    if (text.includes('')) throw new ExportError(`${label} is not text (it contains NUL bytes).`);
+    if (text.includes('\u0000')) throw new ExportError(`${label} is not text (it contains NUL bytes).`);
     return { text, name: chatNameFor(file, false), mtimeMs: stat.mtimeMs, stat, truncated: take < stat.size };
   } finally {
     await handle.close().catch(() => {});

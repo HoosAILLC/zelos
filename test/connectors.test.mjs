@@ -424,12 +424,16 @@ test('a crash between the fetch and the store leaves the cursor where it was', a
 
 test('a cursor larger than the ceiling is refused rather than stored', async (t) => {
   const db = fresh();
-  // 8 KB of ETag. Nothing legitimate does this; a connector caching a page of
-  // results in its cursor does, and that is a second message store with no
-  // index, no search and no cleanup.
-  const huge = `"${'x'.repeat(8192)}"`;
-  const feed = await feedServer(t, { etag: huge });
-  const config = baseConfig({ sources: [feedSource({ settings: { url: feed.url } })] });
+  /* 8 KB of URL. Nothing legitimate does this; a connector caching a page of
+     results in its cursor does, and that is a second message store with no
+     index, no search and no cleanup. The address is the one part of its cursor
+     the rss connector's own trim cannot give up — an 8 KB ETag it now trims to
+     fit (the validators-last trim has its own test) — so this is what still
+     proves the sweep-side ceiling holds whatever a connector returns. */
+  const feed = await feedServer(t, { etag: '"v1"' });
+  const config = baseConfig({
+    sources: [feedSource({ settings: { url: `${feed.origin}/${'x'.repeat(8192)}/feed.xml` } })],
+  });
 
   const result = await runSweep({ db, config, mode: 'light', deps: sweepDeps });
   assert.equal(result.ok, true, 'an oversized cursor is not a reason to fail the run');
@@ -660,6 +664,58 @@ test('a feed longer than the number the user chose is capped at it', async (t) =
   assert.equal(listMessages(db).length, 5);
 });
 
+test('REGRESSION: a hostile entry cannot put an unbounded subject or body in a row', async (t) => {
+  /* The connector capped the body slice and the snippet and nothing else.
+     `subject` was the collapsed <title> verbatim, and the link was concatenated
+     AFTER the body slice — measured, a 500,000-character title and a
+     300,000-character link produced row.subject.length = 500,000 and
+     row.text.length = 320,021 against BODY_CHARS = 20,000, bounded by nothing
+     but the transport's 8 MiB response ceiling. A feed is a stranger's XML, and
+     both fields land in `messages`, in the search index's title, and on every
+     surface that renders subjects. The numbers and the budget are folder.mjs's:
+     the title stops at 300, the link at 2,000, and the link is measured FIRST
+     so the pair can never pass the body's cap — slicing the pair afterwards
+     would silently drop the link for any body at the ceiling. */
+  const rss = connectorFor('rss');
+  const feed = await feedServer(t, {
+    body: `<rss version="2.0"><channel><title>${'F'.repeat(9_000)}</title>`
+      + `<item><title>${'T'.repeat(500_000)}</title><link>https://x.example/${'p'.repeat(300_000)}</link>`
+      + `<guid>g-huge</guid><description>${'d'.repeat(30_000)}</description></item>`
+      + '<item><title>Small</title><link>https://x.example/small</link><guid>g-small</guid>'
+      + `<description>${'d'.repeat(30_000)}</description></item>`
+      + '</channel></rss>',
+  });
+  const r = await rss.collect({
+    source: { id: 's_hostile', settings: { url: feed.url } },
+    label: 'Feed',
+    secret: null,
+    cursor: null,
+    window: { from: '2026-08-01T00:00:00Z', to: '2026-09-01T00:00:00Z' },
+    timezone: 'UTC',
+    identityEmail: 'nemo@example.com',
+    now: '2026-08-11T09:00:00Z',
+    emit() {},
+    signal: null,
+    log: { debug() {}, info() {}, warn() {}, error() {} },
+    http: createHttp({ origins: [feed.origin], limits: rss.limits }),
+    deps: {},
+  });
+
+  const rows = r.parts[0].rows;
+  const huge = rows.find((row) => row.messageId === 'g-huge');
+  assert.ok(huge.subject.length <= 300, `the subject is ${huge.subject.length} characters — an unbounded title reached the database`);
+  assert.ok(huge.text.length <= 20_000, `the body is ${huge.text.length} characters — the link is appended after the slice, so the cap is not a cap`);
+  assert.ok(huge.folder.length <= 300, `the folder is ${huge.folder.length} characters`);
+  assert.ok(huge.from.name.length <= 120, `the sender name is ${huge.from.name.length} characters`);
+
+  // And the budget spends the truncation on the body, never on the link: an
+  // ordinary link survives even when the body sits at the ceiling.
+  const small = rows.find((row) => row.messageId === 'g-small');
+  assert.ok(small.text.length <= 20_000, `the body is ${small.text.length} characters`);
+  assert.match(small.text, /https:\/\/x\.example\/small$/,
+    'the cap ate the link, which is the one line in the body a reader acts on');
+});
+
 test('REGRESSION: parseFeed is linear in the length of hostile input', () => {
   /* The first parser answered "which elements are items" with
      `<item(\s[^>]*)?>([\s\S]*?)</item\s*>` and matchAll, and a lazy quantifier
@@ -835,6 +891,51 @@ test('REGRESSION: a dateless entry keeps the instant it was first seen across re
   const third = await read('2026-08-13T09:00:00Z', second.cursor);
   assert.equal(third.parts[0].rows[0].date, '2026-08-12T09:00:00+00:00');
   assert.equal(Object.keys(third.cursor.seen).length, 1, 'an entry no longer in the feed is still in the cursor');
+});
+
+test('REGRESSION: the cursor is trimmed to what the sweep will store, validators last', async (t) => {
+  /* core/sweep.mjs refuses a cursor over 4,096 serialised characters OUTRIGHT,
+     with only a log line — so an oversized cursor is not a big cursor, it is NO
+     cursor: the validators gone (a full re-read every sweep, defeating the 304
+     economy) and every first-seen pin gone with them, so every dateless entry
+     is re-dated on each parse — the exact walk-back into the prompt window the
+     pin exists to prevent. Sixty-four pins are ~3 KB on their own, so a
+     token-bearing feed address plus a CDN's long ETag was enough to sink the
+     whole thing: measured, 70 dateless entries behind a 900-character ETag at a
+     1,400-character address serialised to 5,138. slack.mjs already trims in
+     packCursor; rss assumed the arithmetic instead of enforcing it. The pins go
+     first, oldest instant first, and the validators last — one 304 pays for
+     them every sweep. */
+  const rss = connectorFor('rss');
+  const items = Array.from({ length: 70 }, (_, i) => `<item><title>N${i}</title><guid>guid-${i}</guid></item>`).join('');
+  const etag = `W/"${'e'.repeat(900)}"`;
+  const feed = await feedServer(t, {
+    handler: (req, res) => {
+      res.writeHead(200, { 'content-type': 'application/rss+xml', etag });
+      res.end(`<rss version="2.0"><channel><title>T</title>${items}</channel></rss>`);
+    },
+  });
+  const r = await rss.collect({
+    source: { id: 's_long', settings: { url: `${feed.origin}/${'p'.repeat(1_400)}/feed.xml`, maxItems: 200 } },
+    label: 'Feed',
+    secret: null,
+    cursor: null,
+    window: { from: '2026-08-01T00:00:00Z', to: '2026-09-01T00:00:00Z' },
+    timezone: 'UTC',
+    identityEmail: 'nemo@example.com',
+    now: '2026-08-11T09:00:00Z',
+    emit() {},
+    signal: null,
+    log: { debug() {}, info() {}, warn() {}, error() {} },
+    http: createHttp({ origins: [feed.origin], limits: rss.limits }),
+    deps: {},
+  });
+
+  const size = JSON.stringify(r.cursor).length;
+  assert.ok(size <= 4096,
+    `a ${size}-character cursor — core/sweep.mjs drops it whole, and this feed loses ALL of its state on every sweep`);
+  assert.equal(r.cursor.etag, etag, 'the validators go last — they are what makes the next read cost nothing');
+  assert.ok(Object.keys(r.cursor.seen).length > 0, 'fitting the budget must not mean throwing every pin away');
 });
 
 test('REGRESSION: a feed address edited in Settings does not inherit the old address\'s validators', async (t) => {

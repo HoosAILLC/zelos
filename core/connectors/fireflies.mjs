@@ -96,6 +96,23 @@ const SNIPPET_CHARS = 400;
 const BODY_CHARS = 20_000;
 
 /**
+ * A meeting title, a name, an address — settable by anyone who invites the
+ * user to a meeting, which is the same threat posture as the error text above:
+ * a stranger's string, so bound it. The subject cap is linear.mjs's 200; a
+ * name or address stops at linear.mjs's 120.
+ */
+const SUBJECT_CHARS = 200;
+const NAME_CHARS = 120;
+
+/**
+ * The people in the room, bounded. `to_json` is a row column, and the bare
+ * `participants` list arrives inside an 8 MiB response with nothing else
+ * holding it down; past a hundred it is a webinar, not a meeting the board
+ * needs every address of.
+ */
+const MAX_ATTENDEES = 100;
+
+/**
  * How much of a stranger's error text survives.
  *
  * core/sweep.mjs caps what it STORES (`ERROR_CHARS = 500`), but `zelos doctor`
@@ -290,11 +307,12 @@ export function attendeesOf(transcript) {
   const out = [];
   const seen = new Set();
   const add = (name, email) => {
+    if (out.length >= MAX_ATTENDEES) return;
     const address = collapse(email).toLowerCase();
     const key = address || collapse(name).toLowerCase();
     if (!key || seen.has(key)) return;
     seen.add(key);
-    out.push({ name: collapse(name), email: collapse(email) });
+    out.push({ name: collapse(name).slice(0, NAME_CHARS), email: collapse(email).slice(0, NAME_CHARS) });
   };
   for (const a of Array.isArray(transcript?.meeting_attendees) ? transcript.meeting_attendees : []) {
     if (!a || typeof a !== 'object') continue;
@@ -415,7 +433,7 @@ export function rowFrom(transcript, { folder, now = new Date().toISOString() }) 
     from: { name: host?.name || hostEmail || 'Fireflies', email: hostEmail },
     to: hostKey ? attendees.filter((a) => a.email.toLowerCase() !== hostKey) : attendees,
     cc: [],
-    subject: collapse(transcript?.title) || '(untitled meeting)',
+    subject: collapse(transcript?.title).slice(0, SUBJECT_CHARS) || '(untitled meeting)',
     date: meetingDate(transcript) || str(now),
     snippet: collapse(snippet).slice(0, SNIPPET_CHARS),
     text: body,

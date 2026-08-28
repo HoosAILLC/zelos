@@ -636,6 +636,34 @@ test('a task with no id is dropped and counted, never given a colliding row id',
     'every row emitted has to survive the upsert; a shortfall is one row overwriting another');
 });
 
+test('REGRESSION: a hostile task cannot put an unbounded subject or body in a row', async (t) => {
+  /* rowFor capped only the description. The title became `subject` with no
+     ceiling, the labels and the address were concatenated into `text` AFTER the
+     description slice, and the finished body had no backstop — measured, a
+     400,000-character content and one 200,000-character label produced
+     subject 400,000 and text 200,099, bounded by nothing but the transport's
+     8 MiB response cap. The twin file caps every field and backstops the
+     finished body precisely so "adding one more uncapped part to `body` cannot
+     put the megabyte back" (linear.mjs); this pins todoist to the same rule. */
+  const hostile = {
+    id: 'big1',
+    content: 'C'.repeat(400_000),
+    description: 'D'.repeat(50_000),
+    priority: 1,
+    url: `https://app.todoist.com/app/task/${'u'.repeat(9_000)}`,
+    labels: ['L'.repeat(200_000), ...Array.from({ length: 200 }, (_, i) => `label-${i}`)],
+    due: { date: TODAY, string: 's'.repeat(9_000), is_recurring: true },
+  };
+  const { rows } = await collectOnce(t, [hostile]);
+  const [row] = rows;
+
+  assert.ok(row.subject.length <= 200, `the subject is ${row.subject.length} characters — an unbounded title reached the database`);
+  assert.ok(row.text.length <= 6_000, `the body is ${row.text.length} characters — a label or the address escaped the description's ceiling`);
+  // The backstop must not be what does the work: the address is the last line
+  // and a reader acts on it, so every part above it has its own cap.
+  assert.match(row.text, /app\.todoist\.com/, 'the trim ate the address, which is the one line a reader acts on');
+});
+
 test('a row never mentions `uid`, and two sweeps of the same tasks insert them once', async (t) => {
   /* THE RULE THAT HAS ALREADY COST THIS PROJECT TWICE. core/db.mjs:384 reads
      `Number.isFinite(Number(uid)) ? Number(uid) : null`, so `uid: null` becomes

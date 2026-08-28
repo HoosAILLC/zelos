@@ -317,6 +317,37 @@ test('REGRESSION: the body is capped, and the link survives the cap', async (t) 
   assert.ok(row.snippet.length <= 400);
   assert.match(row.text, /\/pull\/456$/,
     'the truncation ate the link, which is the one line in the body a human clicks');
+  /* The subject is built from the SAME title, and the body fix left it whole:
+     measured, the 500,000-character title above produced a 500,019-character
+     `messages.subject`, re-written into the FTS title on every sweep's upsert.
+     slack caps its subject at 120 and linear at 200; this is the same rule. */
+  assert.ok(row.subject.length <= 200,
+    `the subject is ${row.subject.length} characters — the exact payload the body cap was written about still lands in messages.subject whole`);
+});
+
+test('REGRESSION: the pager says so when it stops at its ceiling with GitHub still offering more', async (t) => {
+  /* The loop used to read four FULL pages and return `ok, 0` with no note when
+     the repo scope rejected everything — while the scoped repository's
+     notifications sat on page five, never fetched, and the page-1 validator was
+     stored, so later sweeps 304 past them until something changes. linear.mjs
+     names the identical silence as the defect it fixed ("Reading hasNextPage
+     and dropping it on the floor is what made the note below state a total it
+     knew was false") and slack notes both of its cuts; github — the file whose
+     own header calls a source that has quietly stopped the one failure mode
+     this product cannot afford — said nothing. */
+  const page = (n) => Array.from({ length: 50 }, (_, i) => notification({ id: `${n}-${i}` }));
+  const { origin, seen } = await githubServer(t, (req, res, n) => okJson(res, page(n)));
+  const scoped = await github.collect(ctxFor(origin, { settings: { repos: 'acme/widgets' } }));
+
+  assert.equal(seen.length, 4, 'the page ceiling itself moved');
+  assert.equal(scoped.parts.flatMap((p) => p.rows).length, 0);
+  assert.match(String(scoped.parts[0].note), /never fetched/,
+    `four full pages, everything filtered out, and the source reads "ok, 0": ${scoped.parts[0].note}`);
+
+  // A read that genuinely ended is not nagged about.
+  const { origin: quiet } = await githubServer(t, (req, res) => okJson(res, [notification()]));
+  const whole = await github.collect(ctxFor(quiet));
+  assert.equal(whole.parts[0].note, null, 'a complete read carries a warning about nothing');
 });
 
 /* ================================================================== *
