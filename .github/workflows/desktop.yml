@@ -38,9 +38,13 @@ jobs:
           node-version: '24'
 
       # The app itself has no dependencies; the SHELL has two build-time ones.
+      # No fallback after `npm ci`: the tracked lockfile is the pin an unsigned
+      # build is trusted on, so a lockfile that no longer matches must fail the
+      # build loudly here — not fall through to a fresh resolution that builds
+      # green with the workflow log as the only trace.
       - name: Install the shell's build tools
         working-directory: desktop
-        run: npm ci || npm install
+        run: npm ci
 
       # The suite runs before anything is packaged: an installer built from a
       # failing tree is worse than no installer.
