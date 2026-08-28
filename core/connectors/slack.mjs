@@ -950,6 +950,9 @@ export default {
     readList.sort((a, b) => rank(a.conv) - rank(b.conv) || a.folder.localeCompare(b.folder));
 
     const floorTs = isoToTs(new Date(nowMs - lookbackDays * 86_400_000).toISOString());
+    /* In tsToISO's own form, so a fallback date sorts beside the real ones it
+       lands among — core/db.mjs orders `sent_at` as text. */
+    const readAt = new Date(nowMs).toISOString();
     const parts = [];
     /* SEEDED FROM WHAT WAS ALREADY KNOWN, not empty.
        This object is the whole cursor, so anything missing from it at the end is
@@ -1024,7 +1027,7 @@ export default {
         }
 
         const direct = conv.is_im === true || conv.is_mpim === true;
-        const rows = kept.map((msg) => messageRow(msg, { channelId, folder, resolve, selfUser, selfBot, direct }));
+        const rows = kept.map((msg) => messageRow(msg, { channelId, folder, resolve, selfUser, selfBot, direct, readAt }));
 
         /* The high-water mark is the newest `ts` SEEN, not the newest kept: a
            channel whose last fortnight is entirely join notices would otherwise
@@ -1142,7 +1145,7 @@ export default {
  * `sources[]` entries with different ids, and `messageRowId` already mixes the
  * source id in.
  */
-function messageRow(msg, { channelId, folder, resolve, selfUser, selfBot, direct = false }) {
+function messageRow(msg, { channelId, folder, resolve, selfUser, selfBot, direct = false, readAt }) {
   const ts = collapse(msg.ts);
   const threadTs = collapse(msg.thread_ts);
   const body = messageBody(msg, resolve);
@@ -1194,7 +1197,14 @@ function messageRow(msg, { channelId, folder, resolve, selfUser, selfBot, direct
     to: [],
     cc: [],
     subject,
-    date: tsToISO(ts),
+    /* The read instant, never null. `tsToISO` answers null for a ts that does
+       not parse, and the filter above only asks that `msg.ts` be truthy — so a
+       mangled ts landed in `messages.sent_at` as NULL, where the prompt's
+       `sent_at >= ?` filter makes the row stored, counted, and never shown.
+       The fallback buys inclusion in the window, as rss.mjs and github.mjs
+       already do; the ts itself is still the identity above, so the row does
+       not move between sweeps. */
+    date: tsToISO(ts) || readAt,
     snippet: collapse(body).slice(0, SNIPPET_CHARS),
     text: body,
     hasAttachments: Array.isArray(msg.files) ? msg.files.length > 0 : false,

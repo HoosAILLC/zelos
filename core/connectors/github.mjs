@@ -88,6 +88,15 @@ const DEFAULT_KEEP = 50;
 const SNIPPET_CHARS = 400;
 
 /**
+ * The subject is built from the same payload title the note below was measured
+ * on, and the BODY_CHARS fix left it whole: a 500,000-character `subject.title`
+ * still produced a 500,019-character `messages.subject`, re-written into the
+ * search index's title on every sweep. slack.mjs caps its subject at 120 and
+ * linear.mjs at 200; this is the same rule.
+ */
+const SUBJECT_CHARS = 200;
+
+/**
  * The house cap on a message body, and this file was the only messages-sink
  * connector without one.
  *
@@ -493,7 +502,7 @@ export function notificationRow(notification, { identityEmail = '', now = new Da
     from: { name: folder, email: '' },
     to: ADDRESSED_TO_YOU.has(reason) ? me : [],
     cc: COPIED_IN.has(reason) ? me : [],
-    subject: `${label} · ${title}`,
+    subject: `${label} · ${title}`.slice(0, SUBJECT_CHARS),
     /* The read instant, never null. A null lands in `messages.sent_at` as
        NULL, core/db.mjs:441 filters the prompt with `sent_at >= ?`, and SQLite
        makes that NULL for a NULL row — the row is stored and counted and never
@@ -832,6 +841,7 @@ export default {
     let pollIntervalMs = pollIntervalOf(cursor);
     let dropped = 0;
     let aborted = false;
+    let truncated = false;
 
     for (let page = 1; page <= MAX_PAGES; page += 1) {
       if (ctx.signal?.aborted === true) { aborted = true; break; }
@@ -899,6 +909,8 @@ export default {
 
       if (batch.length < PER_PAGE) break; // that was the last page
       if (matched.length >= keep) break; // the user has what they asked for
+      // GitHub still had more to give and this was the last page allowed.
+      if (page === MAX_PAGES) truncated = true;
     }
 
     const rows = [];
@@ -952,8 +964,23 @@ export default {
 
     ctx.emit(`${ctx.label}: ${rows.length} notification${rows.length === 1 ? '' : 's'}`, rows.length, rows.length);
 
+    /* THE CUT IS SAID, NOT REPAIRED. Four full pages with more still on offer
+       means the oldest notifications were never fetched — and the page-1
+       validator stored below will 304 the next sweep past them, so "later" is
+       not when they arrive. The repo filter runs on this side of the wire, so
+       with a scope the source could read "ok, 0" while the scoped repository's
+       notifications sat on page five. linear.mjs names the identical silence
+       as the defect it fixed ("Reading hasNextPage and dropping it on the
+       floor…"), and slack notes both of its cuts; the note is the shape
+       core/sweep.mjs renders as neither a success nor a failure. */
+    const note = truncated
+      ? `GitHub has more unread notifications than the ${MAX_NOTIFICATIONS} Zelos reads in one sweep, so the oldest `
+        + 'were never fetched. They are not necessarily the least important — catching up on github.com shrinks the '
+        + 'pile, and “Include repositories you only watch” is the setting that grows it.'
+      : null;
+
     return {
-      parts: [{ label: '', rows, error: null, note: null }],
+      parts: [{ label: '', rows, error: null, note }],
       cursor: { lastModified, shape, pollIntervalMs, polledAtMs: nowMs },
     };
   },

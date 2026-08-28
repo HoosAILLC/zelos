@@ -1199,6 +1199,31 @@ test('attendees fold across both lists the vendor sends, on the address', () => 
     [{ name: '', email: 'A@Example.com' }], 'the same person twice is one attendee');
 });
 
+test('REGRESSION: a stranger cannot put an unbounded title or attendee list in a row', () => {
+  /* `subject` was the collapsed title with no ceiling — measured, a
+     300,000-character title reached `messages.subject` whole — and attendeesOf
+     folded but never bounded the list or its fields, so `to_json` was limited
+     only by the transport's 8 MiB ceiling. A meeting's title and its attendee
+     list are settable by anyone who invites the user to a meeting, which is
+     this file's own threat posture everywhere else ("a stranger's error text…
+     bound it"). The numbers are linear.mjs's. */
+  const titled = rowFrom({ id: 'tr_huge', title: 'F'.repeat(300_000), summary: {} }, { folder: 'Fireflies' });
+  assert.ok(titled.subject.length <= 200,
+    `the subject is ${titled.subject.length} characters — an unbounded title reached the database`);
+
+  const padded = {
+    meeting_attendees: Array.from({ length: 500 }, (_, n) => ({
+      displayName: `P${n}-`.padEnd(50_000, 'x'),
+      email: `p${n}@example.com`,
+    })),
+  };
+  const attendees = attendeesOf(padded);
+  assert.ok(attendees.length <= 100, `${attendees.length} attendees reached the row — to_json is a column, not an archive`);
+  for (const a of attendees.slice(0, 3)) {
+    assert.ok(a.name.length <= 120, `an attendee name of ${a.name.length} characters survived the fold`);
+  }
+});
+
 test('meetingDate reads either encoding, and neither is a crash', () => {
   assert.equal(Date.parse(meetingDate({ dateString: '2026-08-10T16:00:00.000Z' })), Date.parse('2026-08-10T16:00:00.000Z'));
   assert.equal(Date.parse(meetingDate({ date: Date.parse('2026-08-10T16:00:00.000Z') })), Date.parse('2026-08-10T16:00:00.000Z'));
