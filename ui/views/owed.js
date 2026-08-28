@@ -40,10 +40,20 @@ function draftCard(draft, itemsById) {
     if (inFlight) { dirty = true; return; }
     inFlight = true;
     dirty = false;
+    const body = area.value;
+    // The board's copy is patched before the request goes out: a deferred
+    // re-render can flush the moment this textarea blurs, and a rebuilt card
+    // reads `state.board.drafts` — which still held the body fetched before
+    // the edit, so the user watched their own words revert while the server
+    // was saving them.
+    state.board = {
+      ...state.board,
+      drafts: state.board.drafts.map((d) => (d.id === draft.id ? { ...d, body, state: 'edited' } : d)),
+    };
     status.textContent = 'Saving…';
     status.classList.remove('is-bad');
     try {
-      await api.updateDraft(draft.id, { body: area.value, state: 'edited' });
+      await api.updateDraft(draft.id, { body, state: 'edited' });
       status.textContent = 'Saved';
     } catch (err) {
       status.textContent = err.message;
