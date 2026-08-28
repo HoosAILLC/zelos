@@ -244,16 +244,17 @@ button.
 
 For **Gmail and Google Workspace** the button is **Sign in with Google**: it
 opens Google's consent page in your browser, you approve, the browser comes back
-to Zelos on `127.0.0.1`, and the mailbox is connected — no app password, nothing
-to register. For **Outlook, Hotmail, Live, MSN and Microsoft 365** it is **Sign
-in with Microsoft**: Zelos shows a short code, you type it at microsoft.com in a
-browser you already trust, and it connects. Microsoft no longer accepts passwords
-of any kind from a mail app on personal accounts, so there this is the only
-door. Both sign-ins run against a client Zelos ships, so you register nothing;
-[OAUTH.md](OAUTH.md) has what that took and what each one sends where. Until
-Google finishes reviewing Zelos, Google sign-in is limited to the accounts on
-its test list and asks you to sign in again every seven days — the app-password
-path below has neither limit.
+to Zelos on `127.0.0.1`, and the mailbox is connected. For **Outlook, Hotmail,
+Live, MSN and Microsoft 365** it is **Sign in with Microsoft**: Zelos shows a
+short code, you type it at microsoft.com in a browser you already trust, and it
+connects. Microsoft no longer accepts passwords of any kind from a mail app on
+personal accounts, so there this is the only door. Both sign-ins are built and
+wired, but the registrations they run against are not shipped yet, so today
+each needs a one-time registration of your own before its button works — the
+app walks you through the Microsoft one, about ten minutes at Microsoft's
+website, and steers Gmail to the app-password path below, which needs no wait.
+[OAUTH.md](OAUTH.md) has what each sign-in sends where and what shipping the
+registrations takes.
 
 For **everyone else** — and for Gmail too, if you prefer it — the button is
 **Get an app password**, which opens the exact page on your provider's site
@@ -380,10 +381,10 @@ things, all of them from **Settings → Sources**:
 
 Every one of them is a credential **you** mint in your own account, or a file on
 your own disk. For these eight, Zelos publishes no OAuth app — no client id, no
-consent screen, no "Connect with…" button. The two it does publish are for mail
-— Google and Microsoft sign-in, [OAUTH.md](OAUTH.md) — and they need no server
-either: the Google one comes back to the Zelos port on `127.0.0.1`, and the
-Microsoft one is a code you type. All of them are read-only, and that is enforced by the shape of
+consent screen, no "Connect with…" button. The two built for mail — Google and
+Microsoft sign-in, [OAUTH.md](OAUTH.md), whose own registrations are not
+shipped yet — need no server either: the Google one comes back to the Zelos
+port on `127.0.0.1`, and the Microsoft one is a code you type. All of them are read-only, and that is enforced by the shape of
 the interface rather than by convention.
 
 **[SOURCES.md](SOURCES.md)** is the page for these: one section each, with where
@@ -530,9 +531,10 @@ Zelos from source or from npm, `desktop/` never gets installed at all.
 ### 2. Count the places it *could* phone home
 
 A program can only send data through code that opens a network connection, and
-this one uses three primitives to do it: `fetch()`, `tls.connect` and
-`net.connect`. So you can list every one of them in the whole program. In the
-`zelos` folder:
+this one opens them with three primitives: `fetch()`, `tls.connect` and
+`net.connect` — plus one question asked through a fourth, `node:dns`, which the
+end of this section counts. So you can list every one of them in the whole
+program. In the `zelos` folder:
 
 ```
 grep -rn "fetch\s*(\|globalThis\.fetch\|tls\.connect\|net\.connect" core/ zelos.mjs
@@ -580,26 +582,36 @@ these still exists in the file this table says it is in.
 | `core/sources/oauth.mjs` | `postForm` | `oauth2.googleapis.com`, and only for a mailbox you set to **Sign in with Google** — the code exchange when you sign in, and the token refresh before a sweep; see [OAUTH.md](OAUTH.md) |
 
 Every one of them goes to an address that came from your own settings. There is
-no twelfth. The one directory in that table that grows is `core/connectors/`,
-and the test *no connector reaches the network except through ctx.http* in
-`test/repo.test.mjs` fails the build on a connector that calls `fetch` itself
-instead of going through `createHttp`; the test beside it runs the command
-above and fails when the count, the files or the function names on this page
-stop matching the tree.
+no twelfth through these three primitives — the one question that leaves
+another way is counted below. The one directory in that table that grows is
+`core/connectors/`, and the test *no connector reaches the network except
+through ctx.http* in `test/repo.test.mjs` fails the build on a connector that
+calls `fetch` itself instead of going through `createHttp`; the test beside it
+runs the commands on this page and fails when the counts, the files or the
+function names here stop matching the tree.
 
 **And "three primitives" is itself a claim you should check**, since a grep for
-three names proves nothing if a fourth is in use. The other ways Node can reach
-the network are `http.request`/`https.request`, `node:http2`, `node:dgram` and
-running another program that does it for you. Grep for those too:
+three names proves nothing if a fourth is in use — and here a fourth is. The
+other ways Node can reach the network are `http.request`/`https.request`,
+`node:http2`, `node:dgram`, `node:dns` and running another program that does it
+for you. Grep for those too:
 
 ```
-grep -rn "http\.request\|https\.request\|node:dgram\|node:http2\|child_process" core/ zelos.mjs
+grep -rn "http\.request\|https\.request\|node:dgram\|node:http2\|node:dns\|child_process" core/ zelos.mjs
 ```
 
-Two lines, both `import { spawn } from 'node:child_process'` — `core/secrets.mjs`,
-which runs your keychain helper, and `zelos.mjs`, which opens your browser.
-Neither is a network call, and neither takes an address from anything but this
-machine.
+Four lines come back. Two are `import { spawn } from 'node:child_process'` —
+`core/secrets.mjs`, which runs your keychain helper, and `zelos.mjs`, which
+opens your browser — and one is a comment in `core/server.mjs` that names the
+module. None of those three is a network call, and none takes an address from
+anything but this machine. The fourth, `import dns from 'node:dns'` in
+`core/sources/imap.mjs`, is real: when you type an address whose domain Zelos
+does not recognise, `discoverProvider` asks your system resolver who handles
+that domain's mail — its MX record, then the `_imaps._tcp` SRV record — once,
+during mail setup. The domain goes to the resolver your operating system
+already uses; the address does not.
+[SECURITY.md § 5](SECURITY.md#5-what-leaves-your-machine) counts it as its own
+item.
 
 If you want the survivors of the first grep without reading past the comments
 yourself:

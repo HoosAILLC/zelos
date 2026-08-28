@@ -6,8 +6,10 @@ disagree with each other, both are quoted and the cautious reading is taken.
 
 **The short version.** Zelos is for everyone, so the two providers most people use get a real
 sign-in button: Google (Gmail and Google Workspace) and Microsoft (Outlook.com, Hotmail, Live,
-MSN and Microsoft 365). Both work against **one client registration that Zelos ships**, so a user
-registers nothing — they press the button, approve in their browser, and the mailbox is connected.
+MSN and Microsoft 365). Both are built to run against **one client registration that Zelos
+ships** — press the button, approve in the browser, and the mailbox is connected. Those
+registrations are not shipped yet, so today each sign-in runs against a registration of your
+own; the rest of this page is what each flow sends where and what shipping Zelos's own takes.
 Everything else — iCloud, Yahoo, AOL, Fastmail, Zoho, Proton Bridge, a self-hosted server — keeps
 the app-password path, which is the floor and stays.
 

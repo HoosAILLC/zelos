@@ -16,11 +16,13 @@ These are properties of the code, not promises about it. They are worth reading
 once, because they answer most of the questions the sections below would
 otherwise have to answer eight times.
 
-**You mint the credential, in your own account.** Zelos publishes no OAuth app
-anywhere. There is no client id, no client secret, no consent screen, no
-callback and no "Connect with…" button, because there is no server for one to
-call back to. Every source below is a token you created and can revoke, or a
-file on your own disk.
+**You mint the credential, in your own account.** For these eight sources,
+Zelos publishes no OAuth app. There is no client id, no client secret, no
+consent screen, no callback and no "Connect with…" button. The mail sign-ins
+are the exception ([OAUTH.md](OAUTH.md)), and even they need no server of
+Zelos's: the Google one comes back to the Zelos port on `127.0.0.1`, and the
+Microsoft one is a code you type. Every source below is a token you created
+and can revoke, or a file on your own disk.
 
 **Nothing you did not type is contactable.** Each source declares the hosts it
 may reach, and the only thing that widens that list is an address *you* typed

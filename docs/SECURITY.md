@@ -902,14 +902,14 @@ router's 27 routes — the eight it omitted, including all three
 they were written. Measured: gutting both sample-data write handlers, and
 separately adding an unauthenticated carve-out that returned the whole config,
 each left the suite green (1022 pass / 0 fail as it stood then; the whole suite
-is 1097 tests today, of which this file is 37 and `test/ai-security.test.mjs`
-is 54). The table is now **parsed out of
-`core/server.mjs`'s `ROUTES` array**, a route the parser cannot read is a
-failure rather than a silent omission, and a separate test proves every path the
-parser produced really reaches the router (with `OPTIONS`, which matches no route
-and runs no handler). The one path deliberately outside `ROUTES` is `/api/mcp`,
-which takes the AI token instead — `test/ai-security.test.mjs` is where that one
-is attacked.
+is past 1,500 tests today — `node --test test/*.test.mjs` prints the exact
+count — of which this file is 37 and `test/ai-security.test.mjs` is 54). The
+table is now **parsed out of `core/server.mjs`'s `ROUTES` array**, a route the
+parser cannot read is a failure rather than a silent omission, and a separate
+test proves every path the parser produced really reaches the router (with
+`OPTIONS`, which matches no route and runs no handler). The one path
+deliberately outside `ROUTES` is `/api/mcp`, which takes the AI token instead —
+`test/ai-security.test.mjs` is where that one is attacked.
 
 Six of its assertions are regressions for holes that were open in an earlier
 revision of this program: the two CalDAV credential leaks, the `.ics` credential
