@@ -20,7 +20,7 @@
 import { el, button, meander, replace, focusQuietly } from './lib/dom.js';
 import {
   state, subscribe, refresh, watchSweeps, watchBoard, startSweep, railCounts, timezone,
-  needsOnboarding, applyAccent, currentAccent, notify, nowMark,
+  needsOnboarding, applyAccent, currentAccent, notify, nowMark, checkAgainLine,
 } from './lib/store.js';
 import { api, hasToken } from './lib/api.js';
 import { BUCKET_LABEL, sweepSummary, sweepDetail, tokenLine } from './lib/format.js';
@@ -137,12 +137,22 @@ function buildSweepLine() {
 }
 
 /** "Last checked 20 minutes ago · 3 emails", or the state of the check under way. */
-export function sweepLineText(s, last) {
+export function sweepLineText(s, last, scheduler = null) {
   if (s.running) return s.message || 'Checking your mail…';
+  // One paint after a check ends: what it found, before the line settles back
+  // to "Last checked…". paintSweepLine clears it once it has been shown.
+  if (s.finished) return s.finished;
   if (s.error) return s.error;
-  if (!last) return 'Not checked yet';
+  const again = checkAgainLine(scheduler);
+  const withAgain = (line) => (again ? `${line} · ${again}` : line);
+  if (!last) return withAgain('Not checked yet');
+  // The STORED run, so a failure survives a reload: the in-memory error above
+  // dies with the tab, and "Last checked 2h ago" over a failed run is a lie.
+  if (last.ok === false) return withAgain('The last check failed — details on Now');
   const summary = sweepSummary(last);
-  return `Last checked ${humanDelta(last.ended_at || last.started_at)}${summary ? ` · ${summary}` : ''}`;
+  // A light run reads far less than a full one; say so, in plain words.
+  const quick = last.kind === 'light' ? ' · quick look' : '';
+  return withAgain(`Last checked ${humanDelta(last.ended_at || last.started_at)}${quick}${summary ? ` · ${summary}` : ''}`);
 }
 
 /** The hover title: duration and spend, the two numbers that left the line. */
@@ -153,11 +163,14 @@ export function sweepLineTitle(last, tokens, todayKeyStr) {
 function paintSweepLine(parts) {
   const s = state.sweep;
   const last = state.board.runs?.last;
-  const text = sweepLineText(s, last);
+  const text = sweepLineText(s, last, state.health?.scheduler);
 
   const pct = s.running && s.total > 0 ? Math.min(100, Math.round((s.done / s.total) * 100)) : null;
 
-  parts.node.className = `sweepline${s.running ? ' is-running' : ''}${s.error ? ' is-bad' : ''}`;
+  // Bad styling for a live error AND for a stored failure: the second is what
+  // a reload leaves behind, and it must not repaint as an ordinary line.
+  const bad = Boolean(s.error) || (!s.running && !s.finished && last?.ok === false);
+  parts.node.className = `sweepline${s.running ? ' is-running' : ''}${bad ? ' is-bad' : ''}`;
   parts.textNode.setAttribute('aria-busy', s.running ? 'true' : 'false');
   announce(parts.textNode, text);
   // The title is set on the node the pointer rests on, outside the live
@@ -167,6 +180,10 @@ function paintSweepLine(parts) {
   else parts.node.removeAttribute('title');
   parts.barNode.className = `sweepbar${pct === null && s.running ? ' is-indeterminate' : ''}`;
   parts.fillNode.style.width = s.running ? `${pct ?? 100}%` : '0%';
+  // The finished note lasts exactly one paint: it has been shown (and queued
+  // for the live region above), so the next repaint — the minute tick, a
+  // click, any store emit — settles back to "Last checked…".
+  if (!s.running && s.finished) state.sweep = { ...s, finished: null };
 }
 
 /** Quick capture. It is a reminder to yourself; the next check reads it. */

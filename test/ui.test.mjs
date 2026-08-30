@@ -3208,6 +3208,7 @@ function plainFetch({ probe = [], guesses = {}, presets, manifests, guides = GUI
     }
     if (reqPath === '/api/health') return ok({ model: { configured: false }, home: '/tmp/zelos-home', backend: { name: 'encrypted-file', writable: true, note: 'This does NOT protect against a process already running as this user.' } });
     if (reqPath === '/api/state') return ok({ items: [], events: [], notes: [], counts: {}, runs: {} });
+    if (reqPath === '/api/data') return ok({ dbBytes: 3_215_360, walBytes: 0, messageCount: 214, oldestMessageAt: '2026-03-04T09:00:00-05:00', eventCount: 12, itemCount: 9, accounts: [{ id: 'mail-1', label: 'frank@gmail.com', messages: 214 }] });
     if (reqPath.startsWith('/api/ai')) return ok({ error: 'not found' }, 404);
     throw new Error(`unexpected ${init.method || 'GET'} ${reqPath}`);
   };
@@ -3886,10 +3887,10 @@ test('Settings opens on Email, reads in plain words, keeps every route, and puts
   assert.doesNotMatch(onScreen(privacy), /Characters of each|Most items per|telemetry|endpoint/, 'the expert numbers are on the Privacy card');
   assert.match(anywhere(privacy), /Characters of each email sent to the AI/, 'the expert numbers are gone rather than folded');
 
-  // About: one plain line on passwords, the spend as "AI usage this session", the essay folded and un-shouted.
+  // About: one plain line on passwords, the spend as "AI usage today", the essay folded and un-shouted.
   const about = settings.renderSettings({ sub: 'about', navigate() {}, rerender() {} });
   assert.match(onScreen(about), /Your passwords are locked in an encrypted file on this computer\./);
-  assert.match(onScreen(about), /AI usage this session/);
+  assert.match(onScreen(about), /AI usage today/);
   assert.doesNotMatch(onScreen(about), /AES|0600|\.seed|attacker|does NOT protect/, 'the security essay is on the About card');
   assert.match(anywhere(about), /does not protect against a process/, 'the store note is gone, or still in capitals');
   assert.match(anywhere(about), /Security details/);
@@ -4005,8 +4006,8 @@ test('no user-facing failure names an address the person did not type, and the b
   const app = fs.readFileSync(path.join(UI, 'app.js'), 'utf8');
   assert.match(app, /button\('Check now', \{/);
   assert.match(app, /state\.sweep\.running \? 'Checking…' : 'Check now'/);
-  assert.match(app, /if \(!last\) return 'Not checked yet';/);
-  assert.match(app, /return `Last checked \$\{humanDelta\(last\.ended_at \|\| last\.started_at\)\}/);
+  assert.match(app, /if \(!last\) return withAgain\('Not checked yet'\);/);
+  assert.match(app, /return withAgain\(`Last checked \$\{humanDelta\(last\.ended_at \|\| last\.started_at\)\}/);
   assert.match(app, /label: 'Promises', render: renderOwed/);
   assert.match(app, /button\('Add a reminder', \{/);
   assert.match(app, /class: 'btn solid', text: 'Save' \}/);
@@ -4351,4 +4352,262 @@ test('"Copy this message" copies the server\'s message, says so, and shows the m
   const gone = settings.askClaude({ step: 'general' });
   await settle();
   assert.equal(gone.hidden, true, 'a 404 left a line with no links on screen');
+});
+
+/* ------------------------------------------------- 9. the chrome tells the truth */
+
+/**
+ * Four quality-of-life claims, each pinned where it can rot: the header's
+ * check line must speak from STORED runs and the scheduler (not from whatever
+ * is still in memory), "new since the last check" must come from stored
+ * timestamps and never from the model's wording, About must mean "today" when
+ * it says today, and Your data must count what the folder actually holds.
+ */
+
+test('the words for the next check come from the scheduler, in plain words or not at all', async () => {
+  stubBrowserGlobals();
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  // No scheduler block — an older server, or health not loaded — is no claim.
+  assert.equal(store.checkAgainLine(null), '');
+  assert.equal(store.checkAgainLine(undefined), '');
+  assert.equal(store.checkAgainLine('soon'), '');
+  // Auto off beats a leftover target time: the off switch is the truth.
+  assert.equal(store.checkAgainLine({ auto: false, nextRunAt: '2026-08-28T14:40:00-04:00' }), 'automatic checks are off');
+  assert.equal(store.checkAgainLine({ auto: true, nextRunAt: '2026-08-28T14:40:00-04:00' }), 'checks again around 2:40 PM');
+  // Auto on but no armed target (a one-shot server) makes no promise.
+  assert.equal(store.checkAgainLine({ auto: true, nextRunAt: null }), '');
+});
+
+test('the check line reads the stored run: a failure survives a reload, a quick look says so', () => {
+  const app = fs.readFileSync(path.join(UI, 'app.js'), 'utf8');
+  const text = /export function sweepLineText\([\s\S]*?\n\}/m.exec(app);
+  assert.ok(text, 'sweepLineText is missing');
+  // The in-memory error dies with the tab; the stored run does not. After a
+  // reload a failed check must still say so, and point at the details.
+  assert.match(text[0], /last\.ok === false/, 'the line never consults the stored run');
+  assert.match(text[0], /The last check failed — details on Now/);
+  // A light run reads far less than a full one, and "Last checked 2h ago"
+  // over one quietly overstates how much was read.
+  assert.match(text[0], /last\.kind === 'light'/);
+  assert.match(text[0], /quick look/);
+  // The next check is stated from the scheduler, never invented.
+  assert.match(text[0], /checkAgainLine\(/);
+  // The one-paint finished note is what a check ends on.
+  assert.match(text[0], /s\.finished/);
+
+  const paint = /function paintSweepLine\(parts\)[\s\S]*?\n\}/m.exec(app);
+  assert.ok(paint, 'paintSweepLine is missing');
+  assert.match(paint[0], /state\.health\?\.scheduler/, 'the paint never hands the line the scheduler');
+  assert.match(paint[0], /last\?\.ok === false/, 'a stored failure must get the bad styling, not only a live one');
+  assert.match(paint[0], /finished: null/, 'the finished note must last one paint, not forever');
+});
+
+test('"new since the last check" is derived from stored timestamps, never the model\'s wording', async () => {
+  stubBrowserGlobals();
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const items = [
+    { id: 'old', bucket: 'now', state: 'open', first_seen: '2026-08-28T08:00:00-04:00' },
+    { id: 'fresh', bucket: 'today', state: 'open', first_seen: '2026-08-28T12:00:30-04:00' },
+    { id: 'ticked', bucket: 'now', state: 'done', first_seen: '2026-08-28T12:00:40-04:00' },
+    { id: 'undated', bucket: 'now', state: 'open' },
+  ];
+  const run = (ok) => ({ id: 'run_1', kind: 'full', ok, started_at: '2026-08-28T12:00:00-04:00' });
+
+  store.state.board = { ...store.state.board, items, runs: { last: run(true) } };
+  assert.deepEqual(store.newSinceLastCheck().map((i) => i.id), ['fresh'],
+    'new is: open, and first seen at or after the last successful run started');
+  store.state.board = { ...store.state.board, runs: { last: run(false) } };
+  assert.deepEqual(store.newSinceLastCheck(), [], 'a failed run marks nothing');
+  store.state.board = { ...store.state.board, runs: { last: null } };
+  assert.deepEqual(store.newSinceLastCheck(), [], 'no run at all marks nothing');
+  store.state.board = { ...store.state.board, runs: { last: { ...run(true), started_at: 'nonsense' } } };
+  assert.deepEqual(store.newSinceLastCheck(), [], 'an unreadable run timestamp marks nothing');
+
+  // The done branch says what the check found — counted from the rule above,
+  // and only when there was a prior successful run to compare against.
+  const src = fs.readFileSync(path.join(UI, 'lib/store.js'), 'utf8');
+  const done = /\} else if \(event === 'done'\) \{[\s\S]*?(?=\} else if \(event === 'failed'\))/m.exec(src);
+  assert.ok(done, 'the done branch of watchSweeps is missing');
+  assert.match(done[0], /newSinceLastCheck\(\)/, 'the count must come from the one derivation');
+  assert.match(done[0], /nothing new/);
+  assert.match(done[0], /new thing/);
+  assert.ok(done[0].indexOf('runs?.last') < done[0].indexOf('refreshBoard('),
+    'whether a prior successful run exists must be read BEFORE the refresh replaces it');
+});
+
+test('About says "AI usage today" and means it: a stale counter reads as quiet, not as spend', async (t) => {
+  withPlainDom(t);
+  globalThis.fetch = plainFetch({ presets: await llmPresets() });
+  t.after(() => { delete globalThis.fetch; });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const settings = await import(fileUrl(UI, 'views/settings.js'));
+  store.state.config = { identity: {}, model: {}, mail: [], calendars: [], sources: [] };
+  store.state.health = { model: { configured: false }, home: '/tmp/zelos-home', backend: { name: 'encrypted-file' } };
+  store.state.configErrors = [];
+
+  const lifetime = { tokensIn: 84_000, tokensOut: 9_100, runs: 40, modelRuns: 17 };
+  const boardWith = (tokens) => {
+    store.state.board = { items: [], events: [], notes: [], counts: {}, runs: {}, tokens, now: '2026-08-28T10:00:00-04:00' };
+    store.state.boardAt = Date.now();
+  };
+  const aboutText = () => onScreen(settings.renderSettings({ sub: 'about', navigate() {}, rerender() {} }));
+
+  // Today's counter: the spend, how often the AI was asked to think, and the
+  // running total since the start — with the no-price stance intact.
+  boardWith({ day: '2026-08-28', tokensIn: 12_400, tokensOut: 1_120, runs: 9, modelRuns: 3, lifetime });
+  let seen = aboutText();
+  assert.match(seen, /AI usage today/);
+  assert.doesNotMatch(seen, /AI usage this session/, 'the label still claims a session');
+  assert.match(seen, /12k tokens in · 1\.1k out/);
+  assert.match(seen, /asked to think 3 times/);
+  assert.match(seen, /84k tokens in · 9\.1k out/);
+  assert.match(seen, /asked to think 17 times/);
+  assert.match(seen, /What that costs depends on your AI service’s prices; Zelos does not see them\./);
+  assert.doesNotMatch(seen, /[$€£]/, 'a price was invented');
+
+  // Yesterday's counter on an untouched machine: today is quiet and says so,
+  // while the lifetime totals — which no day can stale — stay.
+  boardWith({ day: '2026-08-27', tokensIn: 500, tokensOut: 20, runs: 2, modelRuns: 1, lifetime });
+  seen = aboutText();
+  assert.match(seen, /Nothing sent to the AI yet today\./);
+  assert.doesNotMatch(seen, /500 tokens in/, 'yesterday\'s spend renders as current');
+  assert.doesNotMatch(seen, /asked to think 1 time\b/, 'yesterday\'s checks render as today\'s');
+  assert.match(seen, /84k tokens in · 9\.1k out/);
+
+  // No counter at all — a database from before the counter existed.
+  boardWith(null);
+  seen = aboutText();
+  assert.match(seen, /Nothing sent to the AI yet today\./);
+  assert.doesNotMatch(seen, /asked to think/);
+});
+
+test('Now folds "Finished recently" at the very bottom, and the tick on a done row reopens it', async (t) => {
+  withPlainDom(t);
+  const calls = [];
+  globalThis.fetch = async (reqPath, init = {}) => {
+    calls.push({ method: init.method || 'GET', path: reqPath, body: init.body ? JSON.parse(init.body) : null });
+    if (reqPath.startsWith('/api/items/')) return { ok: true, status: 200, text: async () => '{}' };
+    if (reqPath === '/api/state') return { ok: true, status: 200, text: async () => JSON.stringify({ items: [], events: [], notes: [], counts: {}, runs: {} }) };
+    return { ok: false, status: 404, text: async () => '{"error":"not found"}' };
+  };
+  t.after(() => { delete globalThis.fetch; });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const now = await import(fileUrl(UI, 'views/now.js'));
+
+  store.state.config = { identity: {}, model: { label: 'Claude' }, mail: [{ id: 'm1' }], calendars: [], sources: [] };
+  store.state.health = { model: { configured: true, label: 'Claude' } };
+  store.state.sweep = { running: false, phase: '', message: '', done: 0, total: 0, error: null, lastResult: null };
+  store.state.board = {
+    ...store.state.board,
+    items: [{ id: 'a', bucket: 'now', state: 'open', headline: 'Pay the invoice' }],
+    counts: { now: 1, today: 0, soon: 0, waiting: 0, promised: 0, note: 0, money: 0 },
+    events: [],
+    drafts: [],
+    notes: [],
+    runs: { last: { id: 'run_1', kind: 'full', ok: true, started_at: '2026-08-28T09:00:00-04:00', ended_at: '2026-08-28T09:01:00-04:00', stats: {} } },
+    first: 'a',
+    now: '2026-08-28T10:00:00-04:00',
+    finished: [
+      { id: 'f1', bucket: 'now', state: 'done', headline: 'Sent the survey', state_at: '2026-08-28T09:30:00-04:00' },
+      { id: 'f2', bucket: 'today', state: 'dismissed', headline: 'The newsletter', state_at: '2026-08-28T08:00:00-04:00' },
+    ],
+  };
+  store.state.boardAt = Date.now();
+
+  const view = now.renderNow({ tz: 'America/New_York', navigate() {} });
+  const fold = plainWalk(view).find((n) => n.tag === 'section' && (n.attributes.class || '').includes('is-finished'));
+  assert.ok(fold, 'no Finished recently section');
+  const toggle = plainWalk(fold).find((n) => n.tag === 'button' && textOf(n).includes('Finished recently'));
+  assert.ok(toggle, 'the fold has no toggle');
+  assert.match(textOf(toggle), /2/, 'the fold does not say how many rows it holds');
+  const panel = plainWalk(fold).find((n) => (n.attributes.class || '').includes('worth-body'));
+  assert.ok(panel, 'the fold has no body');
+  assert.ok('hidden' in panel.attributes, 'the section must start folded');
+  assert.match(anywhere(panel), /Sent the survey/);
+  assert.match(anywhere(panel), /The newsletter/);
+  // ...and the last section on the page: what you finished sits below even the snoozed.
+  assert.equal(view.children[view.children.length - 1], fold, 'Finished recently is not the last thing on Now');
+
+  toggle.fire('click');
+  assert.equal(toggle.attributes['aria-expanded'], 'true');
+  assert.equal(panel.hidden, false, 'opening the fold did not reveal the rows');
+
+  // The way back: the done row's tick is already a reopen button.
+  const tick = plainWalk(fold).find((n) => n.tag === 'button' && n.attributes.role === 'checkbox' && n.attributes['aria-checked'] === 'true');
+  assert.ok(tick, 'the done row lost its tick');
+  tick.fire('click');
+  await settle();
+  const posted = calls.find((c) => c.method === 'POST' && c.path === '/api/items/f1/state');
+  assert.ok(posted, 'ticking a finished row never reached the server');
+  assert.deepEqual(posted.body, { state: 'open' }, 'the tick on a done row must reopen it');
+
+  // Search keeps treating items[] as the board; the finished live beside it.
+  const search = fs.readFileSync(path.join(UI, 'views/search.js'), 'utf8');
+  assert.ok(!/finished/.test(search), 'search must not learn about the finished array');
+  // Dimmed like the snoozed: off the board, still on the record.
+  const css = fs.readFileSync(path.join(UI, 'app.css'), 'utf8');
+  assert.match(css, /\.worth\.is-finished \.row \{[^}]*opacity/, 'the finished rows are not dimmed');
+});
+
+test('a board without the finished field folds nothing and breaks nothing', async (t) => {
+  stubBrowserGlobals();
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  globalThis.fetch = async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ items: [], events: [], notes: [], counts: {}, runs: {}, now: '2026-08-28T10:00:00-04:00' }) });
+  t.after(() => { delete globalThis.fetch; });
+  await store.loadBoard();
+  assert.deepEqual(store.state.board.finished, [], 'an older server\'s payload must default to an empty list');
+  assert.deepEqual(store.finishedItems(), []);
+  store.state.board = { ...store.state.board, finished: [{ id: 'f1', state: 'done' }] };
+  assert.deepEqual(store.finishedItems().map((i) => i.id), ['f1']);
+  store.state.board = { ...store.state.board, finished: 'nonsense' };
+  assert.deepEqual(store.finishedItems(), [], 'a malformed field is an empty list, not a crash');
+});
+
+test('Your data counts what Zelos is holding, and stands unchanged when the route is missing', async (t) => {
+  withPlainDom(t);
+  const data = {
+    dbBytes: 320_000_000,
+    walBytes: 7_000_000,
+    messageCount: 2143,
+    oldestMessageAt: '2026-03-04T09:12:00-05:00',
+    eventCount: 480,
+    itemCount: 57,
+    accounts: [
+      { id: 'm1', label: 'frank@gmail.com', messages: 1801 },
+      { id: 'm2', label: 'the shop', messages: 342 },
+    ],
+  };
+  globalThis.fetch = async (reqPath, init = {}) => {
+    if (reqPath === '/api/data') return { ok: true, status: 200, text: async () => JSON.stringify(data) };
+    return plainFetch({})(reqPath, init);
+  };
+  t.after(() => { delete globalThis.fetch; });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const settings = await import(fileUrl(UI, 'views/settings.js'));
+  store.state.config = { identity: {}, model: {}, mail: [], calendars: [], sources: [] };
+  store.state.health = { model: { configured: false }, home: '/Users/nemo/Library/Zelos', backend: { name: 'encrypted-file' } };
+  store.state.configErrors = [];
+
+  const view = settings.renderSettings({ sub: 'data', navigate() {}, rerender() {} });
+  await settle();
+  const seen = onScreen(view);
+  // The one line the panel exists for: exact counts, the oldest month, the size.
+  assert.match(seen, /2,143 emails back to March 2026 · 312 MB on disk/);
+  assert.match(seen, /480 appointments · 57 items/);
+  // Per-account counts, in the account's own name.
+  assert.match(seen, /frank@gmail\.com/);
+  assert.match(seen, /1,801 emails/);
+  assert.match(seen, /the shop/);
+  assert.match(seen, /342 emails/);
+  assert.doesNotMatch(seen, JARGON, `the stats block: ${seen.match(JARGON)?.[0]}`);
+
+  // A build without the route: the panel stands, claiming nothing it cannot count.
+  globalThis.fetch = async (reqPath, init = {}) => {
+    if (reqPath === '/api/data') return { ok: false, status: 404, text: async () => '{"error":"not found"}' };
+    return plainFetch({})(reqPath, init);
+  };
+  const bare = settings.renderSettings({ sub: 'data', navigate() {}, rerender() {} });
+  await settle();
+  assert.match(onScreen(bare), /Everything Zelos knows is in one folder on this computer\./);
+  assert.doesNotMatch(onScreen(bare), /on disk/, 'a panel with no answer must not claim a size');
 });

@@ -27,8 +27,9 @@ import { el, button, meander, section, copyText, replace } from '../lib/dom.js';
    of /api/connectors, and a one-line wrapper in ui/lib/api.js would be a second
    place to look for a call that has exactly one call site. */
 import { api, request } from '../lib/api.js';
-import { state, saveConfig, loadConfig, setAccent, applyAccent, currentAccent, DEFAULT_ACCENT, markOnboarded } from '../lib/store.js';
+import { state, saveConfig, loadConfig, setAccent, applyAccent, currentAccent, DEFAULT_ACCENT, markOnboarded, nowMark } from '../lib/store.js';
 import { plural, tokenLine } from '../lib/format.js';
+import { monthName } from '../lib/time.js';
 import { aiAccessPanel } from './ai-access.js';
 
 /**
@@ -3085,6 +3086,56 @@ export function folderHint(platform = '') {
  */
 const canShowFolder = () => typeof window !== 'undefined' && typeof window.zelos?.showHome === 'function';
 
+/** "312 MB" — how big the folder's database really is, in the unit that fits. */
+function sizeOnDisk(bytes) {
+  const v = Math.max(0, Number(bytes) || 0);
+  if (v >= 1024 * 1024 * 1024) return `${(v / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+  if (v >= 1024 * 1024) return `${Math.round(v / (1024 * 1024))} MB`;
+  if (v >= 1024) return `${Math.round(v / 1024)} KB`;
+  return `${v} bytes`;
+}
+
+/** "2,143" — an exact count. The board's compact "2.1k" would be a guess here. */
+const exactCount = (n) => Math.max(0, Math.round(Number(n) || 0)).toLocaleString('en-US');
+
+/** "2,143 emails", with the exact count above rather than plural()'s bare number. */
+const counted = (n, word) => `${exactCount(n)} ${Number(n) === 1 ? word : `${word}s`}`;
+
+/** "March 2026" from a stored date, or '' when there is nothing that old. */
+function monthYear(iso) {
+  const m = /^(\d{4})-(\d{2})/.exec(String(iso || ''));
+  if (!m) return '';
+  const name = monthName(Number(m[2]));
+  return name ? `${name} ${m[1]}` : '';
+}
+
+/**
+ * The stats block for the Your data panel: what the folder actually holds,
+ * from GET /api/data's counts — filled in when the answer lands, and silent
+ * on a build without the route. Every check stores mail forever, and "how big
+ * has this gotten?" should not need Finder to answer.
+ */
+function dataStats() {
+  const slot = el('div', { class: 'data-stats' });
+  request('/api/data').then((d) => {
+    const since = monthYear(d?.oldestMessageAt);
+    const disk = sizeOnDisk((Number(d?.dbBytes) || 0) + (Number(d?.walBytes) || 0));
+    const accounts = Array.isArray(d?.accounts) ? d.accounts : [];
+    replace(slot, [
+      el('p', { class: 'quiet-note', text: `${counted(d?.messageCount, 'email')}${since ? ` back to ${since}` : ''} · ${disk} on disk` }),
+      el('p', { class: 'quiet-note', text: `${counted(d?.eventCount, 'appointment')} · ${counted(d?.itemCount, 'item')}` }),
+      accounts.length > 1 ? el('dl', { class: 'facts' }, accounts.flatMap((a) => [
+        el('dt', { text: String(a?.label || a?.id || 'account') }),
+        el('dd', { text: counted(a?.messages, 'email') }),
+      ])) : null,
+    ]);
+  }).catch(() => {
+    /* An older build without the route, or a hiccup: the panel stands on its
+       own, claiming nothing it cannot count. */
+  });
+  return slot;
+}
+
 function dataPanel() {
   const status = statusLine();
   const home = state.health?.home || '(unknown)';
@@ -3121,6 +3172,7 @@ function dataPanel() {
 
   return el('div', { class: 'panel' }, [
     el('p', { class: 'panel-lede', text: 'Everything Zelos knows is in one folder on this computer. Back it up by copying the folder; delete it and Zelos forgets everything.' }),
+    dataStats(),
     field('The Zelos folder', input({ value: home, readonly: true })),
     el('div', { class: 'row-inline' }, [
       canShowFolder()
@@ -3154,7 +3206,18 @@ function aboutPanel() {
   const backend = state.health?.backend || { name: 'unknown', writable: false, note: '' };
   // The day's AI usage, moved here from the header. A count of what went to
   // the AI, never a price: Zelos has no idea what anyone is paying per token.
-  const usage = tokenLine(state.board?.tokens, null);
+  // The day key is load-bearing: without it, a counter written yesterday reads
+  // as today's spend on a machine that has not checked yet today.
+  const tokens = state.board?.tokens;
+  const todayKey = nowMark().key;
+  const usage = tokenLine(tokens, todayKey);
+  // `modelRuns` counts the checks that actually asked the AI to think
+  // (core/sweep.mjs recordTokens). A question typed into Ask moves the token
+  // totals and deliberately not this count — it is not a check that happened.
+  const asked = usage && tokens?.day === todayKey ? Number(tokens.modelRuns) || 0 : 0;
+  const lifetime = tokens?.lifetime && typeof tokens.lifetime === 'object' ? tokens.lifetime : null;
+  const lifetimeUsage = tokenLine(lifetime);
+  const lifetimeAsked = lifetimeUsage ? Number(lifetime.modelRuns) || 0 : 0;
   return el('div', { class: 'panel panel-about' }, [
     el('dl', { class: 'facts' }, [
       el('dt', { text: 'Version' }), el('dd', { class: 'mono', text: state.health?.version || '—' }),
@@ -3166,8 +3229,13 @@ function aboutPanel() {
           ? `${state.health.model.label}${state.health.model.local ? ' · on this computer' : ''}`
           : 'none chosen yet',
       }),
-      el('dt', { text: 'AI usage this session' }),
-      el('dd', { text: usage ? `${usage}. What that costs depends on your AI service’s prices; Zelos does not see them.` : 'Nothing sent to the AI yet.' }),
+      el('dt', { text: 'AI usage today' }),
+      el('dd', { text: usage
+        ? `${usage}${asked ? ` · asked to think ${plural(asked, 'time')}` : ''}. What that costs depends on your AI service’s prices; Zelos does not see them.`
+        : 'Nothing sent to the AI yet today.' }),
+      // The running total is not the day's, so no day can stale it.
+      lifetimeUsage ? el('dt', { text: 'Since the start' }) : null,
+      lifetimeUsage ? el('dd', { text: `${lifetimeUsage}${lifetimeAsked ? ` · asked to think ${plural(lifetimeAsked, 'time')}` : ''}.` }) : null,
     ]),
     el('p', { class: 'panel-lede', text: plainSecretNotes(backend.name).about }),
     fold('Security details', [

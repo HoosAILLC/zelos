@@ -19,7 +19,7 @@ import { itemHero, itemRow, emptyState } from '../lib/items.js';
 // line under the empty state of a home with no AI, about the AI step.
 import { askClaude } from './settings.js';
 import { byUrgency, sweepSummary, plural } from '../lib/format.js';
-import { state, startSweep, itemsInBucket, snoozedItems, boardNotes } from '../lib/store.js';
+import { state, startSweep, itemsInBucket, snoozedItems, finishedItems, boardNotes } from '../lib/store.js';
 import { humanDelta, instant } from '../lib/time.js';
 
 const MAX_NOW_ROWS = 4;
@@ -282,6 +282,30 @@ export function renderNow(ctx) {
       el('span', { class: 'mono worth-count', text: String(snoozed.length) }),
     ]);
     body.appendChild(el('section', { class: 'section worth' }, [toggle, meander(), panel]));
+  }
+
+  // What you finished, folded last of all: recent done and dismissed rows,
+  // newest first as the server sends them — off the board but never off the
+  // record. The tick on a done row is already the way back: clicking it
+  // reopens the item, so a slipped click yesterday is one click to reverse.
+  const finished = finishedItems();
+  if (finished.length) {
+    const panel = el('div', { class: 'worth-body', hidden: true },
+      el('div', { class: 'stack' }, finished.map((item) => itemRow(item, { tz, showBucket: false }))));
+    const toggle = el('button', {
+      type: 'button',
+      class: 'worth-toggle',
+      'aria-expanded': 'false',
+      onclick() {
+        const open = this.getAttribute('aria-expanded') === 'true';
+        this.setAttribute('aria-expanded', open ? 'false' : 'true');
+        panel.hidden = open;
+      },
+    }, [
+      el('span', { text: 'Finished recently' }),
+      el('span', { class: 'mono worth-count', text: String(finished.length) }),
+    ]);
+    body.appendChild(el('section', { class: 'section worth is-finished' }, [toggle, meander(), panel]));
   }
 
   return body;
