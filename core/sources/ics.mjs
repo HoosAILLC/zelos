@@ -721,19 +721,25 @@ function* recurrenceNominals(start, rule, { maxNominal = Infinity, minNominal = 
   // scoped per rule, the bound was defeated by splitting the same payload
   // across many VEVENTs, each under its own fresh allowance. Each period
   // charges at least one unit, so a document full of cheap-but-empty periods
-  // spends it too. A real rule's whole horizon costs a few thousand.
+  // spends it too. A real rule's whole horizon costs a few thousand. The
+  // per-rule cap still holds UNDERNEATH the shared one: a lone hostile rule
+  // must trip in milliseconds, not spend the whole document's allowance —
+  // CI runners measured exactly that regression when the caps were merged.
   let emptyRun = 0;
   const scans = sharedScans ?? { left: MAX_CANDIDATE_SCANS, warned: false };
+  const ruleFloor = scans.left - MAX_CANDIDATE_SCANS;
   for (let period = 0; period < MAX_PERIODS; period++) {
     const periodStart = mk(periodY, periodMo, periodD);
     if (periodStart > maxNominal) return;
 
     scans.left -= 1;
     const days = candidateDays(rule, periodY, periodMo, periodD, base, bymonth, bydayWeekdays, scans);
-    if (scans.left < 0) {
-      if (!scans.warned) {
+    if (scans.left < 0 || scans.left < ruleFloor) {
+      if (scans.left < 0 && !scans.warned) {
         scans.warned = true;
         ics.warn(`recurrence scanning exhausted its budget; the series is cut short (FREQ=${rule.freq})`);
+      } else if (scans.left >= 0) {
+        ics.warn(`recurrence scanned ${MAX_CANDIDATE_SCANS} candidate days; giving up (FREQ=${rule.freq})`);
       }
       return;
     }
