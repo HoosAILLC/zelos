@@ -14,7 +14,8 @@
  */
 
 import { api, openStream, ApiError } from './api.js';
-import { minutesIntoDay, dayKey, addDaysToKey, localTimezone } from './time.js';
+import { minutesIntoDay, dayKey, addDaysToKey, localTimezone, instant, formatTime } from './time.js';
+import { plural } from './format.js';
 
 const ACCENT_KEY = 'zelos.accent';
 const ONBOARDED_KEY = 'zelos.onboarded';
@@ -26,6 +27,10 @@ const EMPTY_BOARD = Object.freeze({
   events: [],
   drafts: [],
   runs: { last: null },
+  // What was recently marked done or dismissed, newest first — a separate list
+  // on purpose, so everything that reads items[] keeps meaning "on the board".
+  // An older server sends no such field, and this default is that case.
+  finished: [],
   notes: [],
   first: null,
   now: null,
@@ -351,8 +356,27 @@ export function watchSweeps() {
                 total: Number(data?.total) || 0,
               };
             } else if (event === 'done') {
+              // Whether "— 2 new things" may be said is decided BEFORE the
+              // refresh replaces runs.last with the run that just ended: with
+              // no prior successful run to compare against — the first check
+              // ever, or a failure just before this one — everything would
+              // count as new, so the line stays plain instead.
+              const hadPrior = state.board.runs?.last?.ok === true;
               state.sweep = { running: false, phase: 'done', message: 'Finished checking', done: 0, total: 0, error: null, lastResult: data || null };
-              refreshBoard();
+              refreshBoard().then(() => {
+                if (!hadPrior) return;
+                // Counted from stored timestamps, never from the model's
+                // wording — see newSinceLastCheck. One paint only; the
+                // chrome clears it on the repaint after it is shown.
+                const fresh = newSinceLastCheck().length;
+                state.sweep = {
+                  ...state.sweep,
+                  finished: fresh
+                    ? `Finished checking — ${plural(fresh, 'new thing')}`
+                    : 'Finished checking — nothing new',
+                };
+                emit();
+              });
               loadHealth().catch(() => {});
             } else if (event === 'failed') {
               state.sweep = {
@@ -519,6 +543,18 @@ export function snoozedItems() {
   return state.board.items.filter((i) => i.state === 'snoozed');
 }
 
+/**
+ * What was recently finished — done or dismissed — newest first, exactly as
+ * /api/state sends it. A separate list, never folded into items[]: everything
+ * that reads items[] means "on the board", and search's idea of where a result
+ * lives depends on that staying true. An older server has no such field, and
+ * the answer is then an empty list, not a crash.
+ */
+export function finishedItems() {
+  const list = state.board.finished;
+  return Array.isArray(list) ? list : [];
+}
+
 export function openDrafts() {
   return state.board.drafts.filter((d) => d.state === 'pending' || d.state === 'edited');
 }
@@ -559,6 +595,39 @@ export function eventsToday() {
   const { key } = nowMark();
   if (!key) return [];
   return state.board.events.filter((e) => dayKey(e.starts_at) === key);
+}
+
+/**
+ * The open items that arrived with the last check — from STORED timestamps
+ * only, never from the model's wording, which rewrites the whole board every
+ * run. An item is new iff the last run exists, succeeded, and the item's
+ * first_seen is at or after that run's started_at; with no successful last
+ * run to compare against, nothing is new. first_seen survives re-runs on
+ * purpose (core/db.mjs), which is exactly what makes it usable here.
+ */
+export function newSinceLastCheck() {
+  const last = state.board.runs?.last;
+  if (!last || last.ok !== true) return [];
+  const since = instant(last.started_at);
+  if (since === null) return [];
+  return state.board.items.filter((i) => {
+    if (i.state !== 'open') return false;
+    const seen = instant(i.first_seen);
+    return seen !== null && seen >= since;
+  });
+}
+
+/**
+ * The words for the NEXT check, from /api/health's scheduler block — or ''
+ * when the server made no claim (an older build, health not loaded yet, a
+ * one-shot server with nothing armed). The off switch outranks a leftover
+ * target time: "automatic checks are off" is the truth that matters then.
+ */
+export function checkAgainLine(scheduler) {
+  if (!scheduler || typeof scheduler !== 'object') return '';
+  if (scheduler.auto === false) return 'automatic checks are off';
+  const at = formatTime(scheduler.nextRunAt);
+  return at ? `checks again around ${at}` : '';
 }
 
 /* ------------------------------------------------------------ event window */

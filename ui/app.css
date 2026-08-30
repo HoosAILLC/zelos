@@ -1971,3 +1971,14 @@ textarea.input:focus,
 }
 .hit-meta { color: var(--ink-3); font-size: 0.78rem; margin-top: 0.3rem; }
 .hit-tools { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-top: 0.55rem; }
+
+/* --- Finished recently (Now) ---------------------------------------------
+   The fold holds rows that are off the board — done and dismissed — so the
+   whole list dims the way a snoozed row does (.row.is-snoozed above), and the
+   ticks inside stay live: the tick on a done row is the reopen. */
+.worth.is-finished .row { opacity: 0.6; }
+
+/* The Your data stats: quiet lines above the folder field, with room of their own. */
+.data-stats { display: grid; gap: 0.35rem; margin-bottom: 1rem; }
+.data-stats:empty { display: none; }
+.data-stats .facts { margin-top: 0.35rem; }
