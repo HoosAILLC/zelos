@@ -826,6 +826,65 @@ function sectionText(fitted) {
 }
 
 /**
+ * One line naming keys and nothing else, grown a key at a time until the
+ * allowance says stop. `allowance` is what is left of the section's own share,
+ * so on a tiny context the line shrinks and then vanishes like everything else
+ * — it never spends another section's budget. -> {text, named}
+ */
+function keysLineFor(intro, keys, allowance) {
+  let text = '';
+  let named = 0;
+  for (const key of keys) {
+    const next = named === 0 ? `${intro}${clean(key, 120)}` : `${text}, ${clean(key, 120)}`;
+    if (next.length > allowance) break;
+    text = next;
+    named += 1;
+  }
+  return { text, named };
+}
+
+/**
+ * Fit a board-memory section: the full lines that fit, then one compact line
+ * naming every key that did not get one.
+ *
+ * A key the model was never shown cannot be reused: it rewords the same
+ * obligation, mints a fresh key, and the user watches yesterday's work — live
+ * or finished — come back as brand new. So once these sections outgrow their
+ * share, the full lines start paying for the tail's keys: a full line costs
+ * roughly ten times what its key costs, so trading the last few lines buys the
+ * whole tail its identity. Entries must carry `key`, and their `plain` and
+ * `bare` renderings are the same text, which is what makes the sizes here
+ * level-independent.
+ */
+function fitSectionKeepingKeys(entries, keys, allowance, intro) {
+  const fit = fitSection(entries, allowance);
+  const kept = fit.kept.slice();
+  let chars = fit.chars;
+  for (;;) {
+    const printed = new Set(kept.map((e) => e.key));
+    const missing = keys.filter((k) => !printed.has(k));
+    if (missing.length === 0) {
+      return { ...fit, kept, chars, dropped: entries.length - kept.length, keysLine: '', keysNamed: 0, keysMissing: 0 };
+    }
+    const line = keysLineFor(intro, missing, allowance - chars);
+    if (line.named === missing.length || kept.length === 0) {
+      return {
+        ...fit,
+        kept,
+        chars: chars + (line.text ? line.text.length + 1 : 0),
+        dropped: entries.length - kept.length,
+        keysLine: line.text,
+        keysNamed: line.named,
+        keysMissing: missing.length - line.named,
+      };
+    }
+    // Trade the last full line — the lowest-ranked one — for its key and room
+    // for several more.
+    chars -= kept.pop().text.bare.length + 1;
+  }
+}
+
+/**
  * Apply privacy.maxItemsPerSweep across the source sections. It is a privacy
  * control — "how much of my life leaves this machine per run" — so it counts
  * mail, events and notes, and it scales the sections proportionally instead of
@@ -1020,21 +1079,34 @@ export function buildSweepPrompt({
     return { entries, bodyChars: 0 };
   };
 
-  // 1. prior board — small, and it is what carries keys forward.
+  // 1. prior board — small, and it is what carries keys forward. Every open
+  //    key that does not earn a full line still travels on the keys line: an
+  //    unprinted key cannot be reused, and a live obligation whose key was
+  //    silently dropped comes back next run as a fresh mint.
   const priorEntries = prior.slice(0, SECTION_CAPS.prior).map((p) => {
     const text = renderPriorItem(p, ctx);
-    return { text: { bare: text, plain: text } };
+    return { key: p.key, text: { bare: text, plain: text } };
   });
-  const priorFit = fitSection(priorEntries, takeAllowance('prior'));
+  const priorFit = fitSectionKeepingKeys(
+    priorEntries,
+    prior.map((p) => p.key),
+    takeAllowance('prior'),
+    'Other live keys — reuse, never re-mint: ',
+  );
   remaining -= priorFit.chars;
 
   // 2. what the user already closed — smaller still, and it is what stops
   //    finished work being re-minted under a key nobody has seen before.
   const resolvedEntries = resolved.slice(0, SECTION_CAPS.resolved).map((r) => {
     const text = renderResolvedItem(r, ctx);
-    return { text: { bare: text, plain: text } };
+    return { key: r.key, text: { bare: text, plain: text } };
   });
-  const resolvedFit = fitSection(resolvedEntries, takeAllowance('resolved'));
+  const resolvedFit = fitSectionKeepingKeys(
+    resolvedEntries,
+    resolved.map((r) => r.key),
+    takeAllowance('resolved'),
+    'Other handled keys — closed, do not raise these again: ',
+  );
   remaining -= resolvedFit.chars;
 
   // 3. calendar — the only hard commitments in the whole input.
@@ -1086,7 +1158,10 @@ export function buildSweepPrompt({
   const describe = (label, total, fit, bodies, noun = 'bodies') => {
     if (total === 0) return;
     const bits = [];
-    if (fit.kept.length < total) bits.push(`${fit.kept.length} of ${total} shown, highest-ranked first`);
+    if (fit.keysNamed) {
+      bits.push(`${fit.kept.length} of ${total} shown in full, highest-ranked first; ${fit.keysNamed} more by key alone`);
+      if (fit.keysMissing) bits.push(`${fit.keysMissing} did not fit even as keys`);
+    } else if (fit.kept.length < total) bits.push(`${fit.kept.length} of ${total} shown, highest-ranked first`);
     if (bodies === 'omitted') bits.push(`${noun} omitted — the privacy setting says only headers and snippets may be sent`);
     else if (bodies === 'nofit') bits.push(`${noun} omitted to fit the context window — snippets only`);
     else if (typeof bodies === 'number' && bodies > 0 && bodies < bodyChars) {
@@ -1142,8 +1217,9 @@ export function buildSweepPrompt({
    * how a board confidently reports a quiet day that never happened.
    */
   const section = (heading, fit, total, label, whenEmpty) => {
-    if (fit.kept.length) {
-      parts.push(`${heading}\n${wrapUntrusted(label, sectionText(fit))}`);
+    const body = [sectionText(fit), fit.keysLine].filter(Boolean).join('\n\n');
+    if (body) {
+      parts.push(`${heading}\n${wrapUntrusted(label, body)}`);
     } else if (total > 0) {
       parts.push(`${heading}\n  ${total} exist${total === 1 ? 's' : ''} but none fit in the context window. Treat this section as unknown, not as empty, and say so in \`notes\`.`);
     } else {
@@ -1173,9 +1249,10 @@ export function buildSweepPrompt({
       '  not re-mint the same obligation under different wording — the mail behind one of these is',
       '  often still printed above, and it is history now, not an item.',
     ].join('\n');
+    const body = [sectionText(resolvedFit), resolvedFit.keysLine].filter(Boolean).join('\n\n');
     parts.push(
-      resolvedFit.kept.length
-        ? `${heading}\n${wrapUntrusted('items the user already closed (your own earlier output)', sectionText(resolvedFit))}`
+      body
+        ? `${heading}\n${wrapUntrusted('items the user already closed (your own earlier output)', body)}`
         : `${heading}\n  ${available.resolved} of them, and none fit in the context window. Where something looks like work that was probably already dealt with, leave it out rather than raising it fresh.`,
     );
   }

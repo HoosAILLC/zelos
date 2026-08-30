@@ -435,6 +435,43 @@ test('prior board goes in with its keys, so identity can be reused', () => {
   assert.match(content, /carried 6d/);
 });
 
+/**
+ * The other half of "reuse that exact key": a key the model was never shown
+ * cannot be reused. The prior-board share fits roughly fifteen full lines, so
+ * on a board of forty open items the tail used to be dropped silently — and
+ * every dropped key came back the next run as a fresh mint: the same live
+ * obligation, re-raised as brand new, at exactly the board size where the user
+ * most needs the memory to hold.
+ */
+test('a board of forty open items keeps every key in the prompt', () => {
+  const prior = Array.from({ length: 40 }, (_, i) => ({
+    id: `p${i}`, bucket: 'waiting', severity: 2, state: 'open', seen_runs: 3,
+    headline: `Chase person number ${i} for the signed agreement on the Redwood build`,
+    person: `Person ${i}`,
+    first_seen: '2026-08-02T09:00:00-04:00', due_at: '2026-08-12T09:00:00-04:00',
+    payload: { key: `redwood-agreement-person-${String(i).padStart(2, '0')}` },
+  }));
+  const { messages, budget } = buildSweepPrompt({
+    identity: IDENTITY, now: NOW, priorItems: prior, privacy: PRIVACY,
+  });
+  const content = messages[0].content;
+
+  assert.ok(budget.shown.prior < 40,
+    'the fixture must overflow the full-line share, or this test proves nothing');
+  for (const p of prior) {
+    assert.ok(content.includes(p.payload.key),
+      `${p.payload.key} never reached the prompt, and an unseen key cannot be reused`);
+  }
+  // The keys line is board memory derived from mail, so it lives inside the
+  // same fence as the full lines — data, never a second set of instructions.
+  const fenced = content.slice(content.indexOf('<<<ZELOS-UNTRUSTED'), content.indexOf('<<<END-ZELOS-UNTRUSTED'));
+  assert.ok(fenced.includes('Other live keys — reuse, never re-mint: '),
+    'the compact keys line must sit inside the prior-board fence');
+  // And the truncation notice tells the truth about the split.
+  assert.match(content, new RegExp(
+    `Prior board: ${budget.shown.prior} of 40 shown in full, highest-ranked first; \\d+ more by key alone`));
+});
+
 /** A finished item, in the shape core/sweep.mjs reads off the items table. */
 function resolved(over = {}) {
   return {
@@ -519,6 +556,51 @@ test('the already-handled list is capped and costs the model no mail', () => {
     'and not one message was dropped to make room for the closed keys');
   assert.match(withHandled.messages[0].content,
     new RegExp(`Already handled: ${withHandled.budget.shown.resolved} of 200 shown`));
+});
+
+test('closed keys past the full-line ceiling still travel, as keys alone', () => {
+  const handled = Array.from({ length: 60 }, (_, i) =>
+    resolved({ key: `finished-${String(i).padStart(2, '0')}`, headline: `Something the user finished, number ${i}` }));
+  const { messages, budget } = buildSweepPrompt({
+    identity: IDENTITY, now: NOW, resolvedItems: handled, privacy: PRIVACY,
+  });
+  const content = messages[0].content;
+
+  assert.ok(budget.shown.resolved <= 24, 'the full-line ceiling holds');
+  for (const r of handled) {
+    assert.ok(content.includes(r.key), `${r.key} vanished, so nothing stops the model re-raising it`);
+  }
+  assert.match(content, /Other handled keys — closed, do not raise these again: /);
+});
+
+/**
+ * Context is zero-sum, and the keys line is not allowed to win it: on a small
+ * local model's budget it spends only the prior board's own share, shrinks
+ * with everything else, and the notice says how much of the tail it lost —
+ * while the inbound-mail share is untouched.
+ */
+test('on a tiny context the keys line degrades inside its own share and costs the mail nothing', () => {
+  const prior = Array.from({ length: 120 }, (_, i) => ({
+    id: `p${i}`, bucket: 'waiting', severity: 2, state: 'open', seen_runs: 2,
+    headline: `Chase person number ${i} for the signed agreement on the Redwood build`,
+    person: `Person ${i}`, first_seen: '2026-08-02T09:00:00-04:00', due_at: '',
+    payload: { key: `redwood-agreement-person-${String(i).padStart(3, '0')}` },
+  }));
+  const mail = Array.from({ length: 8 }, (_, i) =>
+    message({ id: `tiny${i}`, thread_key: `tiny-t${i}`, subject: `Question ${i}`, body: 'Short.' }));
+  const build = (priorItems) => buildSweepPrompt({
+    identity: IDENTITY, now: NOW, messages: mail, priorItems, privacy: PRIVACY, budgetChars: 8000,
+  });
+
+  const without = build([]);
+  const withPrior = build(prior);
+  assert.equal(withPrior.budget.shown.inbound, without.budget.shown.inbound,
+    'the keys line must never eat the inbound-mail share');
+  assert.ok(withPrior.messages[0].content.length <= 8000 + 4000,
+    'the assembled context stays near its budget');
+  assert.match(withPrior.messages[0].content, /Other live keys — reuse, never re-mint: /);
+  assert.match(withPrior.messages[0].content, /\d+ did not fit even as keys/,
+    'when even the keys overflow the share, the notice says so instead of pretending');
 });
 
 test('events carry the offset off the string, and the day is named', () => {
