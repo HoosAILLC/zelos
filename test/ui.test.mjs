@@ -3637,12 +3637,17 @@ test('the hero can be told "Not a thing", through the same controls the rows get
   assert.ok(calls.some((c) => c.method === 'POST' && c.path === '/api/items/h9/state' && c.body?.state === 'dismissed'),
     'the dismissal never reached the server');
 
-  // Reused, not forked, so hero and rows cannot drift apart again.
+  // Reused, not forked, so hero and rows cannot drift apart again. The hero
+  // keeps its own top-level Snooze button — its most-used second action does
+  // not belong two clicks deep — but it must be the SHARED snoozeControl, and
+  // "Not a thing" must still arrive through the rows' own moreControls.
   const src = fs.readFileSync(path.join(UI, 'lib/items.js'), 'utf8');
   const heroFn = /export function itemHero[\s\S]*?\n\}/m.exec(src);
   assert.ok(heroFn, 'itemHero is missing');
   assert.match(heroFn[0], /moreControls\(item\)/, 'the hero must build the same controls the rows do');
-  assert.ok(!heroFn[0].includes('snoozeControl('), 'a private snooze fork is how the hero drifted');
+  assert.match(heroFn[0], /snoozeControl\(item\)/, 'the hero lost its top-level Snooze');
+  const snoozeToggle = findButton(hero, 'Snooze');
+  assert.ok(snoozeToggle, 'Snooze must stay one click away on the hero');
 });
 
 test('the snooze menu prints each promise and can be told a day of your own', async (t) => {

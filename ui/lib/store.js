@@ -15,7 +15,7 @@
 
 import { api, openStream, ApiError } from './api.js';
 import { minutesIntoDay, dayKey, addDaysToKey, localTimezone, instant, formatTime } from './time.js';
-import { plural } from './format.js';
+import { plural, isNewSince } from './format.js';
 
 const ACCENT_KEY = 'zelos.accent';
 const ONBOARDED_KEY = 'zelos.onboarded';
@@ -603,18 +603,13 @@ export function eventsToday() {
  * run. An item is new iff the last run exists, succeeded, and the item's
  * first_seen is at or after that run's started_at; with no successful last
  * run to compare against, nothing is new. first_seen survives re-runs on
- * purpose (core/db.mjs), which is exactly what makes it usable here.
+ * purpose (core/db.mjs), which is exactly what makes it usable here. The rule
+ * itself lives in ONE place — format.js's isNewSince, the same predicate the
+ * rows use for their "new" mark — so the count and the marks cannot drift.
  */
 export function newSinceLastCheck() {
   const last = state.board.runs?.last;
-  if (!last || last.ok !== true) return [];
-  const since = instant(last.started_at);
-  if (since === null) return [];
-  return state.board.items.filter((i) => {
-    if (i.state !== 'open') return false;
-    const seen = instant(i.first_seen);
-    return seen !== null && seen >= since;
-  });
+  return state.board.items.filter((i) => isNewSince(i, last));
 }
 
 /**

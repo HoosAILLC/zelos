@@ -297,8 +297,11 @@ export function itemHero(item, { tz } = {}) {
   // The SAME controls the dense rows get, not a private subset. The commonest
   // model error is a top pick that is noise, and a hero whose only exits were
   // a false "done" or a snooze fed the resolved noise back into the next
-  // prompt as if it had been real.
+  // prompt as if it had been real. Snooze alone also keeps its own button:
+  // it is the hero's most-used second action, and burying it two clicks deep
+  // to gain "Not a thing" would trade one demotion for another.
   const more = moreControls(item);
+  const snooze = snoozeControl(item);
 
   return el('article', { class: `hero sev-${severityOf(item)}` }, [
     el('p', { class: 'hero-eyebrow', text: 'Do this first' }),
@@ -313,6 +316,7 @@ export function itemHero(item, { tz } = {}) {
     ]),
     el('div', { class: 'hero-actions' }, [
       button('Done', { class: 'btn solid', onClick: () => setItemState(item.id, 'done') }),
+      snooze.toggle,
       link ? el('a', {
         class: 'btn quiet',
         href: link,
@@ -322,6 +326,7 @@ export function itemHero(item, { tz } = {}) {
       }) : null,
       more.toggle,
     ]),
+    snooze.panel,
     more.panel,
   ]);
 }

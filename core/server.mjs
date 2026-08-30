@@ -1010,43 +1010,6 @@ async function handleState(ctx) {
   });
 }
 
-/**
- * What Zelos is holding, in the counts the Your data panel prints: every check
- * stores mail forever, and "how big has this gotten?" should not need Finder.
- * The shape is pinned — {dbBytes, walBytes, messageCount, oldestMessageAt,
- * eventCount, itemCount, accounts:[{id,label,messages}]} — with walBytes 0
- * when the sidecar is absent and oldestMessageAt null on an empty database.
- * Session-token-gated like every route in ROUTES, read-only like /api/state.
- */
-async function handleData(ctx) {
-  const { db } = ctx;
-  const n = (row) => Number(row?.n) || 0;
-  const sizeOf = (file) => {
-    try {
-      return fs.statSync(file).size;
-    } catch {
-      // No file is a size of zero — the WAL sidecar comes and goes by design.
-      return 0;
-    }
-  };
-  const dbPath = paths().db;
-  const perAccount = db.prepare('SELECT COUNT(*) AS n FROM messages WHERE source_id = ?');
-  const accounts = (ctx.config().mail || []).map((a) => ({
-    id: a.id,
-    label: a.label || a.user || a.id,
-    messages: n(perAccount.get(a.id)),
-  }));
-  sendJSON(ctx.res, 200, {
-    dbBytes: sizeOf(dbPath),
-    walBytes: sizeOf(`${dbPath}-wal`),
-    messageCount: n(db.prepare('SELECT COUNT(*) AS n FROM messages').get()),
-    oldestMessageAt: db.prepare('SELECT MIN(sent_at) AS at FROM messages').get()?.at || null,
-    eventCount: n(db.prepare('SELECT COUNT(*) AS n FROM events').get()),
-    itemCount: n(db.prepare('SELECT COUNT(*) AS n FROM items').get()),
-    accounts,
-  });
-}
-
 async function handleSweepStart(ctx) {
   const body = await readJSON(ctx.req);
   const mode = body.mode === undefined ? 'auto' : body.mode;
@@ -2904,7 +2867,6 @@ const ID = '([A-Za-z0-9_.:-]{1,80})';
 const ROUTES = [
   ['GET', /^\/api\/health$/, handleHealth],
   ['GET', /^\/api\/state$/, handleState],
-  ['GET', /^\/api\/data$/, handleData],
   ['POST', /^\/api\/sweep$/, handleSweepStart],
   ['GET', /^\/api\/sweep\/stream$/, handleSweepStream],
   ['POST', new RegExp(`^/api/items/${ID}/state$`), handleItemState],
@@ -3327,8 +3289,10 @@ export function createServer({
 
 /**
  * Bind 127.0.0.1, walking up from `port` until a free one is found. Resolves
- * `{port, host, url}` — `url` carries the session token, because that URL is
- * the only way into the app.
+ * `{port, host, url, tokenUrl}` — `url` is the bare origin; `tokenUrl` is the
+ * one that carries the session token, and it is the only way into the app.
+ * Anything that hands a URL to a browser must hand the tokened one (or mint
+ * a one-shot handoff), never the bare origin.
  */
 export function listen(server, {
   port = Number(process.env.ZELOS_PORT) || DEFAULT_PORT,
