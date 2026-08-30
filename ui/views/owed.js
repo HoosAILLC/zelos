@@ -17,6 +17,43 @@ import { api } from '../lib/api.js';
 const SAVE_DEBOUNCE_MS = 900;
 
 /**
+ * Where a mailto address stops being honoured. Real email programs cut the
+ * whole thing off somewhere shortly past two thousand characters, and the
+ * failure is silent — the compose window opens with most of the reply gone.
+ * Under the limit the body rides along whole; past it, the longest clean
+ * start that fits, and the card says so.
+ */
+const MAILTO_LIMIT = 1900;
+
+/**
+ * The "Open in your email program" address: recipient, subject and body,
+ * with the body's line breaks as CRLF the way RFC 6068 spells them. Returns
+ * `{href, truncated}` — truncated when only the start of the body fits.
+ */
+export function mailtoDraft(to, subject, body) {
+  const head = `mailto:${encodeURIComponent(to || '')}?subject=${encodeURIComponent(subject || '')}&body=`;
+  const crlf = String(body || '').replace(/\r?\n/g, '\r\n');
+  const whole = head + encodeURIComponent(crlf);
+  if (whole.length <= MAILTO_LIMIT) return { href: whole, truncated: false };
+  // Binary search for the longest start that fits once encoded — the encoded
+  // length is not proportional to the raw one, so no arithmetic shortcut.
+  const fit = (n) => {
+    let cut = crlf.slice(0, n);
+    // Never end on half of a two-part character: encodeURIComponent refuses it.
+    if (/[\uD800-\uDBFF]$/.test(cut)) cut = cut.slice(0, -1);
+    return cut;
+  };
+  let lo = 0;
+  let hi = crlf.length;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if ((head + encodeURIComponent(fit(mid))).length <= MAILTO_LIMIT) lo = mid;
+    else hi = mid - 1;
+  }
+  return { href: head + encodeURIComponent(fit(lo)), truncated: true };
+}
+
+/**
  * One draft. Local edit state lives on the node, not in the store — re-rendering
  * the whole view under someone's cursor because a sweep finished would be worse
  * than a stale count.
@@ -31,6 +68,16 @@ function draftCard(draft, itemsById) {
   });
   area.value = draft.body || '';
   autogrow(area, { min: 120 });
+
+  // The mailto is rebuilt from the LIVE textarea at the moment it is used, so
+  // the words that travel are the words on screen — not the body as fetched.
+  const mailto = () => mailtoDraft(draft.to_email, draft.subject, area.value);
+  const note = el('p', {
+    class: 'quiet-note draft-note',
+    text: 'Only the start of the reply fits in a new email — Copy the text and paste the whole thing.',
+  });
+  const syncNote = () => { note.hidden = !(draft.to_email && mailto().truncated); };
+  syncNote();
 
   let timer = null;
   let inFlight = false;
@@ -67,6 +114,7 @@ function draftCard(draft, itemsById) {
   area.addEventListener('input', () => {
     status.textContent = 'Editing…';
     status.classList.remove('is-bad');
+    syncNote();
     clearTimeout(timer);
     timer = setTimeout(save, SAVE_DEBOUNCE_MS);
   });
@@ -101,8 +149,14 @@ function draftCard(draft, itemsById) {
       draft.to_email
         ? el('a', {
           class: 'btn quiet',
-          href: `mailto:${encodeURIComponent(draft.to_email)}?subject=${encodeURIComponent(draft.subject || '')}`,
+          href: mailto().href,
           text: 'Open in your email program',
+          // At CLICK time, so edits ride along: navigation reads the href
+          // after the handler runs, and the handler has just rewritten it.
+          onclick() {
+            this.setAttribute('href', mailto().href);
+            syncNote();
+          },
         })
         : null,
       button('Discard', {
@@ -117,6 +171,7 @@ function draftCard(draft, itemsById) {
         },
       }),
     ]),
+    note,
   ]);
 }
 

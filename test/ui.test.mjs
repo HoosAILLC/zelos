@@ -424,6 +424,48 @@ test('sweepSummary reads as a sentence, and survives a run with no stats', () =>
   assert.equal(fmt.sweepDetail(null), '');
 });
 
+test('every item wears where it came from, and "derived" wears that nothing was saved', () => {
+  // The stamp comes from the stored kind and the receipt count, never the
+  // model's prose. A three-receipt item and an unreceipted assertion looked
+  // pixel-identical before this — the opposite of how trust should price them.
+  assert.deepEqual(fmt.sourceStamp({ kind: 'mail', sourceRefs: ['msg:a', 'msg:b', 'msg:c'] }),
+    { text: 'from your mail (3)', derived: false });
+  assert.deepEqual(fmt.sourceStamp({ kind: 'mail', sourceRefs: ['msg:a'] }),
+    { text: 'from your mail', derived: false });
+  assert.deepEqual(fmt.sourceStamp({ kind: 'calendar', sourceRefs: ['evt:a'] }),
+    { text: 'from your calendar', derived: false });
+  assert.deepEqual(fmt.sourceStamp({ kind: 'capture', sourceRefs: ['cap:a'] }),
+    { text: 'from a note you typed', derived: false });
+  assert.deepEqual(fmt.sourceStamp({ kind: 'mixed', sourceRefs: ['msg:a', 'evt:b'] }),
+    { text: 'from more than one place (2)', derived: false });
+  // "derived" is core/triage.mjs's word for "every cited receipt failed to
+  // resolve" — the one stamp that must not read like provenance.
+  assert.deepEqual(fmt.sourceStamp({ kind: 'derived', sourceRefs: [] }),
+    { text: 'no source saved', derived: true });
+  // A kind this build does not know makes no claim rather than a wrong one.
+  assert.equal(fmt.sourceStamp({ kind: 'item', sourceRefs: [] }), null);
+  assert.equal(fmt.sourceStamp(null), null);
+});
+
+test('"new" comes from stored timestamps against the last successful check, never wording', () => {
+  const run = { ok: true, started_at: '2026-08-11T12:00:00Z' };
+  assert.equal(fmt.isNewSince({ state: 'open', first_seen: '2026-08-11T12:30:00Z' }, run), true);
+  assert.equal(fmt.isNewSince({ state: 'open', first_seen: '2026-08-11T12:00:00Z' }, run), true,
+    'first seen the instant the check started is still that check\'s news');
+  assert.equal(fmt.isNewSince({ state: 'open', first_seen: '2026-08-11T11:59:00Z' }, run), false);
+  // Only an OPEN item can be news; the model re-citing a snoozed one is not.
+  assert.equal(fmt.isNewSince({ state: 'snoozed', first_seen: '2026-08-11T12:30:00Z' }, run), false);
+  assert.equal(fmt.isNewSince({ state: 'done', first_seen: '2026-08-11T12:30:00Z' }, run), false);
+  // No prior successful check means no mark at all — against a board that has
+  // only just learned to look, everything would read as news.
+  assert.equal(fmt.isNewSince({ state: 'open', first_seen: '2026-08-11T12:30:00Z' }, null), false);
+  assert.equal(fmt.isNewSince({ state: 'open', first_seen: '2026-08-11T12:30:00Z' },
+    { ok: false, started_at: '2026-08-11T12:00:00Z' }), false);
+  assert.equal(fmt.isNewSince({ state: 'open', first_seen: '2026-08-11T12:30:00Z' },
+    { ok: null, started_at: '2026-08-11T12:00:00Z' }), false, 'a check still running has not succeeded yet');
+  assert.equal(fmt.isNewSince({ state: 'open', first_seen: null }, run), false);
+});
+
 /* -------------------------------------------------------- 3. source guards */
 
 function uiFiles() {
@@ -792,6 +834,13 @@ test('the snooze chooser offers three future deadlines in the configured zone', 
   assert.equal(tomorrow.until, '2026-08-12T09:00:00-04:00');
   assert.equal(nextWeek.until, '2026-08-17T09:00:00-04:00');
   assert.equal(ui.weekdayOfKey(ui.dayKey(nextWeek.until)), 1, 'next week means a Monday');
+
+  // Each choice prints the clock it is promising. The deadline was always
+  // concrete; "Tomorrow morning" only became legible as 9 AM after the click,
+  // which is the wrong side of it.
+  assert.equal(later.when, '4 PM');
+  assert.equal(tomorrow.when, '9 AM');
+  assert.equal(nextWeek.when, 'Mon, Aug 17 9 AM');
 
   // From a Monday, "next week" is the FOLLOWING Monday, not later today.
   const monday = Date.parse('2026-08-10T16:00:00Z');
@@ -3483,6 +3532,196 @@ test('a draft edit lands in the board copy before the save returns, so a repaint
   await settle();
   assert.deepEqual(puts.filter((p) => p.method === 'PUT').map((p) => p.body),
     [{ body: 'The body as edited.', state: 'edited' }]);
+});
+
+/** A fetch for the board-row tests below: records every call, answers /api/state with an empty board. */
+const rowFetch = (calls) => async (reqPath, init = {}) => {
+  calls.push({ method: init.method || 'GET', path: reqPath, body: init.body ? JSON.parse(init.body) : null });
+  if (reqPath === '/api/state') {
+    return { ok: true, status: 200, text: async () => JSON.stringify({ items: [], events: [], notes: [], counts: {}, drafts: [], runs: {} }) };
+  }
+  return { ok: true, status: 200, text: async () => '{}' };
+};
+
+test('a mailto body past what email programs honour is cut clean and flagged', async () => {
+  stubBrowserGlobals();
+  const owed = await import(fileUrl(UI, 'views/owed.js'));
+  assert.deepEqual(owed.mailtoDraft('a@b.c', 'Hi', 'One.\nTwo.'),
+    { href: 'mailto:a%40b.c?subject=Hi&body=One.%0D%0ATwo.', truncated: false });
+
+  const long = owed.mailtoDraft('a@b.c', 'Hi', 'word '.repeat(2000));
+  assert.equal(long.truncated, true);
+  assert.ok(long.href.length <= 1900, `${long.href.length} characters is past where email programs cut`);
+  const sent = decodeURIComponent(long.href.slice(long.href.indexOf('&body=') + 6));
+  assert.ok(sent.length > 1000, 'the start must actually ride along');
+  assert.ok('word '.repeat(2000).startsWith(sent), 'the cut must be a clean prefix');
+
+  // The cut never splits a two-part character — half of one is not encodable.
+  const emoji = owed.mailtoDraft('a@b.c', '', '🙂'.repeat(1000));
+  assert.equal(emoji.truncated, true);
+  assert.match(decodeURIComponent(emoji.href.slice(emoji.href.indexOf('&body=') + 6)), /^(?:🙂)*$/u);
+
+  // No recipient still yields an address a client can open.
+  assert.match(owed.mailtoDraft('', '', 'x').href, /^mailto:\?subject=&body=x$/);
+});
+
+test('the mailto rides the live textarea at click time, and says so when only the start fits', async (t) => {
+  withPlainDom(t);
+  globalThis.fetch = async () => ({ ok: true, status: 200, text: async () => '{}' });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const owed = await import(fileUrl(UI, 'views/owed.js'));
+  t.after(() => { delete globalThis.fetch; store.notify(null); });
+  store.state.board = {
+    ...store.state.board,
+    items: [],
+    drafts: [{ id: 'd1', state: 'pending', to_email: 'sam@example.com', subject: 'the survey', body: 'First line.\nSecond line.', item_id: null }],
+  };
+
+  const view = owed.renderOwed({ tz: 'UTC', navigate() {}, rerender() {} });
+  const open = plainWalk(view).find((n) => n.tag === 'a' && textOf(n) === 'Open in your email program');
+  assert.ok(open, 'no mailto link');
+
+  // The click reads the textarea NOW — first the fetched body, CRLF-encoded...
+  open.fire('click');
+  assert.equal(open.getAttribute('href'),
+    'mailto:sam%40example.com?subject=the%20survey&body=First%20line.%0D%0ASecond%20line.');
+
+  // ...then the edited one, with no save round-trip in between. Sending the
+  // reply used to be copy, switch, click, click, paste.
+  const area = findInput(view, (n) => n.tag === 'textarea');
+  area.value = 'The reply as edited.';
+  area.fire('input');
+  open.fire('click');
+  assert.match(open.getAttribute('href'), /&body=The%20reply%20as%20edited\.$/);
+  area.fire('blur');
+  await settle();
+
+  // A short reply carries no warning...
+  const note = plainWalk(view).find((n) => (n.attributes.class || '').includes('draft-note'));
+  assert.ok(note, 'the honesty note is missing from the card');
+  assert.equal(note.hidden, true);
+
+  // ...and a long one says the start is filled in, before the click happens.
+  area.value = 'A reply that will not fit. '.repeat(200);
+  area.fire('input');
+  assert.equal(note.hidden, false);
+  assert.match(textOf(note), /start/);
+  open.fire('click');
+  const href = open.getAttribute('href');
+  assert.ok(href.length <= 1900, `a ${href.length}-character address will be cut by the email program itself`);
+  assert.ok('A reply that will not fit. '.repeat(200)
+    .startsWith(decodeURIComponent(href.slice(href.indexOf('&body=') + 6))));
+  area.fire('blur');
+  await settle();
+
+  // Copy stays the first-class door.
+  const actions = plainWalk(view).find((n) => (n.attributes.class || '') === 'draft-actions');
+  assert.equal(textOf(actions.children[0]), 'Copy the text');
+  assert.match(actions.children[0].attributes.class, /solid/);
+});
+
+test('the hero can be told "Not a thing", through the same controls the rows get', async (t) => {
+  withPlainDom(t);
+  const calls = [];
+  globalThis.fetch = rowFetch(calls);
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const items = await import(fileUrl(UI, 'lib/items.js'));
+  t.after(() => { delete globalThis.fetch; store.notify(null); });
+
+  const hero = items.itemHero({ id: 'h9', bucket: 'now', state: 'open', headline: 'Noise' }, { tz: 'UTC' });
+  const dismiss = findButton(hero, 'Not a thing');
+  assert.ok(dismiss, 'the hero has no way to say the top pick is noise');
+  dismiss.fire('click');
+  await settle();
+  assert.ok(calls.some((c) => c.method === 'POST' && c.path === '/api/items/h9/state' && c.body?.state === 'dismissed'),
+    'the dismissal never reached the server');
+
+  // Reused, not forked, so hero and rows cannot drift apart again.
+  const src = fs.readFileSync(path.join(UI, 'lib/items.js'), 'utf8');
+  const heroFn = /export function itemHero[\s\S]*?\n\}/m.exec(src);
+  assert.ok(heroFn, 'itemHero is missing');
+  assert.match(heroFn[0], /moreControls\(item\)/, 'the hero must build the same controls the rows do');
+  assert.ok(!heroFn[0].includes('snoozeControl('), 'a private snooze fork is how the hero drifted');
+});
+
+test('the snooze menu prints each promise and can be told a day of your own', async (t) => {
+  withPlainDom(t);
+  const calls = [];
+  globalThis.fetch = rowFetch(calls);
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const items = await import(fileUrl(UI, 'lib/items.js'));
+  const priorConfig = store.state.config;
+  store.state.config = { identity: { timezone: 'America/New_York' } };
+  t.after(() => { store.state.config = priorConfig; delete globalThis.fetch; store.notify(null); });
+
+  const row = items.itemRow({ id: 's1', bucket: 'now', state: 'open', headline: 'Call Sam' }, { tz: 'America/New_York' });
+  plainWalk(row).find((n) => (n.attributes.class || '') === 'disclosure').fire('click');
+  findButton(row, 'Snooze').fire('click');
+
+  // The three fixed choices say when, before the click.
+  assert.equal(findButtons(row, /^Later today · \d{1,2}(:\d{2})? [AP]M$/).length, 1, 'Later today does not print its clock');
+  assert.equal(findButtons(row, /^Tomorrow morning · 9 AM$/).length, 1);
+  assert.equal(findButtons(row, /^Next week · \w{3}, \w{3} \d{1,2} 9 AM$/).length, 1);
+
+  // The fourth: any day, back on the board at 9 that morning.
+  const pick = findButton(row, 'Pick a day…');
+  assert.ok(pick, 'there is no way to say Saturday');
+  pick.fire('click');
+  const day = findInput(row, (n) => n.attributes.type === 'date');
+  assert.ok(day, 'no date field behind Pick a day…');
+  const min = ui.addDaysToKey(ui.todayKey('America/New_York'), 1);
+  assert.equal(day.getAttribute('min'), min, 'yesterday must not be on offer');
+
+  const picked = ui.addDaysToKey(min, 30);
+  day.value = picked;
+  day.fire('input');
+  findButton(row, 'Back that morning · 9 AM').fire('click');
+  await settle();
+  const post = calls.find((c) => c.method === 'POST' && c.path === '/api/items/s1/state');
+  assert.ok(post, 'the picked day never reached the server');
+  assert.equal(post.body.state, 'snoozed');
+  assert.match(post.body.until, new RegExp(`^${picked}T09:00:00[-+]\\d{2}:\\d{2}$`),
+    'the promise is 9:00 that morning, carrying the configured zone');
+  assert.equal(ui.dayKey(post.body.until), picked);
+});
+
+test('a row and the hero wear "new" and their source at the end of the line', async (t) => {
+  withPlainDom(t);
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const items = await import(fileUrl(UI, 'lib/items.js'));
+  const priorBoard = store.state.board;
+  store.state.board = { ...store.state.board, runs: { last: { ok: true, started_at: '2026-08-11T12:00:00Z' } } };
+  t.after(() => { store.state.board = priorBoard; });
+
+  const row = items.itemRow({
+    id: 'r1', bucket: 'now', state: 'open', headline: 'Call Sam', person: 'Sam',
+    kind: 'mail', sourceRefs: ['msg:a', 'msg:b', 'msg:c'], first_seen: '2026-08-11T12:30:00Z',
+  }, { tz: 'UTC' });
+  const meta = plainWalk(row).find((n) => (n.attributes.class || '') === 'meta mono');
+  assert.ok(meta, 'no meta line');
+  const bits = meta.children.map(textOf);
+  assert.equal(bits.at(-1), '· from your mail (3)', 'the source stamp ends the line, dimmest');
+  assert.equal(bits.at(-2), '· new');
+
+  // Seen before the check started: not news, however the model worded it.
+  const old = items.itemRow({
+    id: 'r2', bucket: 'now', state: 'open', headline: 'Old', kind: 'mail',
+    sourceRefs: ['msg:a'], first_seen: '2026-08-11T11:00:00Z',
+  }, { tz: 'UTC' });
+  const oldMeta = plainWalk(old).find((n) => (n.attributes.class || '') === 'meta mono');
+  assert.ok(!oldMeta.children.map(textOf).some((b) => b === 'new' || b === '· new'),
+    'an item the last check merely re-cited is wearing the mark');
+
+  const hero = items.itemHero({
+    id: 'h1', bucket: 'now', state: 'open', headline: 'Top', kind: 'derived',
+    sourceRefs: [], first_seen: '2026-08-11T12:30:00Z',
+  }, { tz: 'UTC' });
+  const hm = plainWalk(hero).find((n) => (n.attributes.class || '') === 'hero-meta mono');
+  const texts = hm.children.map(textOf);
+  assert.ok(texts.includes('new'), 'the hero hides the newness the rows show');
+  assert.ok(texts.includes('no source saved'), 'an unreceipted assertion must say so');
+  const derived = hm.children.find((n) => textOf(n) === 'no source saved');
+  assert.match(derived.attributes.class, /meta-derived/, '"no source saved" must not dress like provenance');
 });
 
 /**

@@ -12,12 +12,12 @@
  */
 
 import { el, button, meander, replace } from './dom.js';
-import { setItemState, timezone } from './store.js';
+import { setItemState, state, timezone } from './store.js';
 import {
   todayKey, addDaysToKey, weekdayOfKey, dayKey, offsetFor, toZonedISO, formatTime, formatDay,
 } from './time.js';
 import {
-  BUCKET_TAG, severityOf, carriedFor, dueLabel, isOverdue, personLabel,
+  BUCKET_TAG, severityOf, carriedFor, dueLabel, isOverdue, personLabel, sourceStamp, isNewSince,
 } from './format.js';
 
 /* Every deadline on a row goes through dueBit() below, which is the only place
@@ -80,6 +80,21 @@ export function dueBit(item, { tz, now = Date.now() } = {}) {
   return { text, hot: isOverdue(item, now, zone) };
 }
 
+/**
+ * The line's two quietest bits, shared verbatim by the dense row and the hero
+ * so the two surfaces cannot drift: "new" — stored timestamps against the last
+ * successful check, per isNewSince, never the model's wording — and where the
+ * item came from. They go last on purpose, dimmest: the row must still read as
+ * one calm line.
+ */
+function trailBits(item) {
+  const bits = [];
+  if (isNewSince(item, state.board.runs?.last)) bits.push({ text: 'new', class: 'meta-new' });
+  const source = sourceStamp(item);
+  if (source) bits.push({ text: source.text, class: source.derived ? 'meta-derived' : '' });
+  return bits;
+}
+
 function metaLine(item, { tz }) {
   const bits = [];
   const due = dueBit(item, { tz });
@@ -92,6 +107,7 @@ function metaLine(item, { tz }) {
     const until = untilLabel(item.snoozed_until, tz);
     if (until) bits.push({ text: until, class: 'meta-carried' });
   }
+  bits.push(...trailBits(item));
   if (!bits.length) return null;
   return el('p', { class: 'meta mono' }, bits.map((b, i) => el('span', {
     class: `meta-bit ${b.class}`.trim(),
@@ -117,25 +133,32 @@ function morningISO(key, tz) {
  * The three snooze deadlines on offer, computed in the user's configured zone
  * at the moment the chooser opens — "later today" from a chooser opened at
  * lunch and one opened at dinner are different instants, and both mean four
- * hours from now.
+ * hours from now. Each carries `when`, the clock it is promising, printed on
+ * the button so "Tomorrow morning" is legibly 9 AM before the click rather
+ * than after the surprise.
  */
 export function snoozeChoices(tz, now = Date.now()) {
   const today = dayKey(toZonedISO(new Date(now), tz));
   const wd = weekdayOfKey(today);
   // "Next week" is Monday morning, and from a Monday it means the NEXT one.
   const monday = addDaysToKey(today, ((1 - wd + 7) % 7) || 7);
+  const later = toZonedISO(new Date(now + 4 * 3_600_000), tz);
+  const tomorrow = morningISO(addDaysToKey(today, 1), tz);
+  const nextWeek = morningISO(monday, tz);
   return [
-    { label: 'Later today', until: toZonedISO(new Date(now + 4 * 3_600_000), tz) },
-    { label: 'Tomorrow morning', until: morningISO(addDaysToKey(today, 1), tz) },
-    { label: 'Next week', until: morningISO(monday, tz) },
+    { label: 'Later today', when: formatTime(later), until: later },
+    { label: 'Tomorrow morning', when: formatTime(tomorrow), until: tomorrow },
+    { label: 'Next week', when: `${formatDay(nextWeek)} ${formatTime(nextWeek)}`, until: nextWeek },
   ];
 }
 
 /**
- * The snooze control: a quiet button that unfolds three concrete deadlines
- * rather than acting on the click itself. "Snooze" with no time attached was
- * the old behaviour, and it produced rows that slept until someone remembered
- * they existed.
+ * The snooze control: a quiet button that unfolds concrete deadlines rather
+ * than acting on the click itself. "Snooze" with no time attached was the old
+ * behaviour, and it produced rows that slept until someone remembered they
+ * existed. The fourth choice unfolds a day of your own — "deal with it
+ * Saturday" — which comes back the way "Tomorrow morning" does: 9:00 that
+ * morning, through the same morningISO. One promise, one clock.
  */
 function snoozeControl(item) {
   const panel = el('div', { class: 'snooze-menu', hidden: true });
@@ -148,11 +171,41 @@ function snoozeControl(item) {
       const open = this.getAttribute('aria-expanded') === 'true';
       this.setAttribute('aria-expanded', open ? 'false' : 'true');
       if (!open) {
-        replace(panel, snoozeChoices(timezone()).map(({ label, until }) =>
-          button(label, {
+        const tz = timezone();
+        const min = addDaysToKey(todayKey(tz), 1);
+        const day = el('input', {
+          type: 'date',
+          class: 'input snooze-day',
+          min,
+          'aria-label': 'The day it comes back',
+          oninput() { confirm.disabled = !this.value; },
+        });
+        const confirm = button('Back that morning · 9 AM', {
+          class: 'btn quiet',
+          disabled: true,
+          onClick: () => {
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(day.value) || day.value < min) return;
+            setItemState(item.id, 'snoozed', { until: morningISO(day.value, tz) });
+          },
+        });
+        const pick = el('div', { class: 'snooze-pick', hidden: true }, [day, confirm]);
+        replace(panel, [
+          ...snoozeChoices(tz).map(({ label, when, until }) =>
+            button(`${label} · ${when}`, {
+              class: 'btn quiet',
+              onClick: () => setItemState(item.id, 'snoozed', { until }),
+            })),
+          button('Pick a day…', {
             class: 'btn quiet',
-            onClick: () => setItemState(item.id, 'snoozed', { until }),
-          })));
+            'aria-expanded': 'false',
+            onClick() {
+              const showing = this.getAttribute('aria-expanded') === 'true';
+              this.setAttribute('aria-expanded', showing ? 'false' : 'true');
+              pick.hidden = showing;
+            },
+          }),
+          pick,
+        ]);
       }
       panel.hidden = open;
     },
@@ -241,7 +294,11 @@ export function itemHero(item, { tz } = {}) {
   const link = linkFor(item);
   const carried = carriedFor(item, todayKey(tz));
   const due = dueBit(item, { tz });
-  const snooze = snoozeControl(item);
+  // The SAME controls the dense rows get, not a private subset. The commonest
+  // model error is a top pick that is noise, and a hero whose only exits were
+  // a false "done" or a snooze fed the resolved noise back into the next
+  // prompt as if it had been real.
+  const more = moreControls(item);
 
   return el('article', { class: `hero sev-${severityOf(item)}` }, [
     el('p', { class: 'hero-eyebrow', text: 'Do this first' }),
@@ -252,10 +309,10 @@ export function itemHero(item, { tz } = {}) {
       due ? el('span', { class: due.hot ? 'meta-hot' : '', text: due.text }) : null,
       personLabel(item) ? el('span', { text: personLabel(item) }) : null,
       carried ? el('span', { class: 'meta-carried', text: carried }) : null,
+      ...trailBits(item).map((b) => el('span', { class: b.class || null, text: b.text })),
     ]),
     el('div', { class: 'hero-actions' }, [
       button('Done', { class: 'btn solid', onClick: () => setItemState(item.id, 'done') }),
-      snooze.toggle,
       link ? el('a', {
         class: 'btn quiet',
         href: link,
@@ -263,8 +320,9 @@ export function itemHero(item, { tz } = {}) {
         target: '_blank',
         text: 'Open',
       }) : null,
+      more.toggle,
     ]),
-    snooze.panel,
+    more.panel,
   ]);
 }
 
