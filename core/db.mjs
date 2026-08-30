@@ -729,6 +729,23 @@ export function bucketCounts(db, { states = ['open'] } = {}) {
   return counts;
 }
 
+/**
+ * What was finished recently — the done and dismissed rows, newest decision
+ * first. The query is core/sweep.mjs's RECENTLY_RESOLVED_SQL without the
+ * window: `state_at` is when the user decided, and both the guard and the
+ * ORDER BY go through datetime() for the reason given there — the stored
+ * timestamps carry the user's offset, and character order would misplace two
+ * decisions made either side of a timezone change.
+ */
+export function listFinished(db, { limit = 20 } = {}) {
+  const sql = `
+    SELECT * FROM items
+    WHERE state IN ('done', 'dismissed') AND state_at IS NOT NULL
+    ORDER BY datetime(state_at) DESC
+    LIMIT ?`;
+  return prep(db, sql).all(Math.max(1, Number(limit) || 20)).map(hydrateItem);
+}
+
 /* ---------------------------------------------------------------- drafts */
 
 /** A draft is never sent by Zelos; this only records what was prepared. */
@@ -861,6 +878,55 @@ export function setKV(db, k, v) {
 
 export function deleteKV(db, k) {
   return prep(db, 'DELETE FROM kv WHERE k = ?').run(str(k)).changes > 0;
+}
+
+/* ------------------------------------------------------------ what is held */
+
+/**
+ * The counts behind the Your data panel: how many of each row, how the mail
+ * splits across its sources, and how far back it goes. The oldest message is
+ * picked through datetime() for the reason listMessages gives above — sent_at
+ * keeps each sender's offset verbatim, so the row with the smallest digits is
+ * not the oldest instant. A sent_at datetime() cannot read is skipped rather
+ * than reported: garbage would otherwise sort before every real date.
+ */
+export function dataCounts(db) {
+  const count = (sql) => Number(prep(db, sql).get().n) || 0;
+  const oldest = prep(db, `
+    SELECT sent_at FROM messages
+    WHERE datetime(sent_at) IS NOT NULL
+    ORDER BY datetime(sent_at) ASC
+    LIMIT 1`).get();
+  const messagesBySource = {};
+  for (const row of prep(db, 'SELECT source_id, COUNT(*) AS n FROM messages GROUP BY source_id').all()) {
+    messagesBySource[str(row.source_id)] = Number(row.n) || 0;
+  }
+  return {
+    messageCount: count('SELECT COUNT(*) AS n FROM messages'),
+    eventCount: count('SELECT COUNT(*) AS n FROM events'),
+    itemCount: count('SELECT COUNT(*) AS n FROM items'),
+    oldestMessageAt: oldest ? oldest.sent_at : null,
+    messagesBySource,
+  };
+}
+
+/**
+ * How much of the disk the database is, read from the handle's own file so a
+ * test home and the real one are answered alike. WAL keeps recent writes in
+ * the `-wal` sidecar until a checkpoint folds them in, so the honest size is
+ * both files; either being absent — a memory database, a sidecar already
+ * checkpointed away — is a zero, never an error.
+ */
+export function databaseSizes(db) {
+  const file = str(prep(db, "SELECT file FROM pragma_database_list WHERE name = 'main'").get()?.file);
+  const size = (p) => {
+    try {
+      return p ? fs.statSync(p).size : 0;
+    } catch {
+      return 0;
+    }
+  };
+  return { dbBytes: size(file), walBytes: size(file ? `${file}-wal` : '') };
 }
 
 /* ---------------------------------------------------------------- search */

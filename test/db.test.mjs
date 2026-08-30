@@ -15,13 +15,13 @@ const {
   messageRowId, eventRowId, itemRowId,
   upsertMessage, upsertMessages, getMessage, listMessages, messagesInThread, countMessagesFetchedSince,
   upsertEvent, upsertEvents, getEvent, listEvents, countEventsFetchedSince,
-  upsertItem, getItem, getItemByKey, setItemState, listBoard, bucketCounts,
+  upsertItem, getItem, getItemByKey, setItemState, listBoard, bucketCounts, listFinished,
   upsertDraft, getDraft, listDrafts, updateDraft,
   insertCapture, listCaptures, markCaptureProcessed,
   startRun, finishRun, getRun, lastRun, listRuns,
   getKV, setKV, deleteKV,
   indexDoc, removeDoc, search, reindex, ftsQuery, resolveRef,
-  hasFts5,
+  hasFts5, dataCounts, databaseSizes,
 } = db_;
 
 let seq = 0;
@@ -445,6 +445,34 @@ test('listBoard() breaks severity ties by instant, not by the digits of the offs
   assert.equal(listBoard(db).map((i) => i.headline).at(-1), 'due-never');
 });
 
+test('listFinished() is the done and dismissed rows, newest decision first, capped', () => {
+  const db = fresh();
+  const mk = (key, state, stateAt) => {
+    const { id } = upsertItem(db, { ...ITEM, key, headline: key }, { runId: 'r', now: '2026-08-01T10:00:00-04:00' });
+    if (state !== 'open') setItemState(db, id, state, { now: stateAt });
+    return id;
+  };
+  mk('still-open', 'open');
+  mk('asleep', 'snoozed', '2026-08-05T10:00:00-04:00');
+  mk('done-early', 'done', '2026-08-05T09:00:00-04:00');
+  // These two disagree lexically and as instants: 09:00-04:00 is 13:00Z, an
+  // hour AFTER the Z row, though its digits sort before. The instant must win,
+  // for the reason core/sweep.mjs gives at RECENTLY_RESOLVED_SQL.
+  mk('dismissed-noon-utc', 'dismissed', '2026-08-06T12:00:00Z');
+  mk('done-13z', 'done', '2026-08-06T09:00:00-04:00');
+
+  const finished = listFinished(db);
+  assert.deepEqual(finished.map((i) => i.headline),
+    ['done-13z', 'dismissed-noon-utc', 'done-early'],
+    'done and dismissed only, newest state_at as an instant first');
+  assert.deepEqual(finished[0].payload, { amount: 18400 }, 'the same hydrated shape listBoard returns');
+  assert.deepEqual(finished[0].sourceRefs, ['msg:abc']);
+
+  assert.equal(listFinished(db, { limit: 2 }).length, 2);
+  for (let i = 0; i < 22; i += 1) mk(`fin-${i}`, 'done', `2026-08-07T10:${String(i).padStart(2, '0')}:00Z`);
+  assert.equal(listFinished(db).length, 20, 'the default cap holds however much has been finished');
+});
+
 /* ------------------------------------------------------------------ snooze */
 
 test('the wake compares instants, not strings — mixed offsets cannot mislead it', () => {
@@ -608,6 +636,49 @@ test('kv round-trips and deletes', () => {
   assert.equal(getKV(db, 'lastFullRun'), '2026-08-06T10:00:00-04:00');
   assert.equal(deleteKV(db, 'lastFullRun'), true);
   assert.equal(deleteKV(db, 'lastFullRun'), false);
+});
+
+/* ------------------------------------------------------------ what is held */
+
+test('dataCounts() reports what is held, per source, and how far back the mail goes', () => {
+  const db = fresh();
+  upsertMessage(db, MSG); // m_work, sent 2026-08-05T09:12:00-04:00 = 13:12Z
+  // Sent at 13:00Z — the OLDER instant, though its digits sort after the row
+  // above. The oldest message must be picked as an instant, not as characters.
+  upsertMessage(db, { ...MSG, uid: 1042, messageId: '<def@example.com>', sourceId: 'm_home', date: '2026-08-05T13:00:00Z' });
+  upsertEvent(db, EVT);
+  upsertItem(db, ITEM, { runId: 'r' });
+
+  const counts = dataCounts(db);
+  assert.equal(counts.messageCount, 2);
+  assert.equal(counts.eventCount, 1);
+  assert.equal(counts.itemCount, 1);
+  assert.equal(counts.oldestMessageAt, '2026-08-05T13:00:00Z', 'oldest by instant, not by the digits of the offset');
+  assert.deepEqual(counts.messagesBySource, { m_work: 1, m_home: 1 });
+
+  const empty = dataCounts(fresh());
+  assert.equal(empty.messageCount, 0);
+  assert.equal(empty.oldestMessageAt, null, 'no mail means null, never an invented date');
+  assert.deepEqual(empty.messagesBySource, {});
+});
+
+test('databaseSizes() measures the file and its -wal sidecar; a memory database is zero', () => {
+  const file = path.join(HOME_ROOT, 'sizes.db');
+  const db = open(file);
+  dbs.push(db);
+  migrate(db);
+  upsertMessage(db, MSG);
+
+  const { dbBytes, walBytes } = databaseSizes(db);
+  assert.equal(dbBytes, fs.statSync(file).size);
+  assert.equal(walBytes, fs.statSync(`${file}-wal`).size);
+  assert.ok(dbBytes > 0);
+  assert.ok(walBytes > 0, 'WAL mode parks recent writes in the sidecar');
+
+  const mem = open(':memory:');
+  dbs.push(mem);
+  migrate(mem);
+  assert.deepEqual(databaseSizes(mem), { dbBytes: 0, walBytes: 0 });
 });
 
 /* ------------------------------------------------------------------ search */

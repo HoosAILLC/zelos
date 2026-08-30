@@ -1244,6 +1244,85 @@ test('/api/state returns the board', async (t) => {
   assert.ok(Array.isArray(res.json.events));
 });
 
+test('/api/state carries what was finished recently, newest decision first, at most 20', async (t) => {
+  const ctx = await startServer(t);
+  const mk = (key, state, at) => {
+    const { id } = db.upsertItem(ctx.db, { key, bucket: 'today', headline: key }, { runId: 'r' });
+    if (state !== 'open') db.setItemState(ctx.db, id, state, { now: at });
+    return id;
+  };
+  mk('still-open', 'open');
+  mk('done-early', 'done', '2026-08-25T09:00:00-04:00');
+  // These two disagree lexically and as instants — 09:00-04:00 is 13:00Z, an
+  // hour after the Z row, though its digits sort before. The instant must win.
+  mk('dismissed-noon-utc', 'dismissed', '2026-08-26T12:00:00Z');
+  mk('done-13z', 'done', '2026-08-26T09:00:00-04:00');
+
+  const res = await call(ctx, 'GET', '/api/state');
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.json.finished.map((i) => i.headline),
+    ['done-13z', 'dismissed-noon-utc', 'done-early'],
+    'done and dismissed only, newest state_at first');
+  assert.ok(!res.json.items.some((i) => i.headline === 'done-early'), 'finished rows are not board rows');
+  // The same hydrated shape as items[]: decoded columns, never the raw JSON ones.
+  assert.ok(Array.isArray(res.json.finished[0].sourceRefs));
+  assert.equal(res.json.finished[0].payload_json, undefined);
+
+  for (let i = 0; i < 22; i += 1) mk(`fin-${i}`, 'done', `2026-08-27T10:${String(i).padStart(2, '0')}:00Z`);
+  const capped = await call(ctx, 'GET', '/api/state');
+  assert.equal(capped.json.finished.length, 20);
+  assert.equal(capped.json.finished[0].headline, 'fin-21');
+});
+
+// The Finished fold's "put it back": the tick on a done row POSTs state open,
+// and the route must accept it — reopening is the user clicking, nothing else.
+test('the state route reopens a done item', async (t) => {
+  const ctx = await startServer(t);
+  const { id } = db.upsertItem(ctx.db, { key: 'k-done', bucket: 'today', headline: 'Pay the invoice' }, { runId: 'r' });
+  db.setItemState(ctx.db, id, 'done');
+  const res = await call(ctx, 'POST', `/api/items/${id}/state`, { body: { state: 'open' } });
+  assert.equal(res.status, 200);
+  assert.equal(res.json.state, 'open');
+  assert.equal(db.getItem(ctx.db, id).state, 'open');
+});
+
+test('/api/data says what Zelos is holding, and only with the token', async (t) => {
+  const cfg = baseConfig();
+  cfg.mail = [
+    { id: 'm_work', label: 'Work', host: 'imap.example', user: 'nemo@example.com' },
+    { id: 'm_home', label: '', host: 'mail.home.example', user: 'nemo@home.example' },
+    { id: 'm_new', label: '', host: '', user: '' },
+  ];
+  const ctx = await startServer(t, { config: cfg });
+  db.upsertMessages(ctx.db, [
+    { sourceId: 'm_work', uid: 1, messageId: '<a@x.example>', subject: 'A', date: '2026-08-05T09:12:00-04:00' },
+    { sourceId: 'm_work', uid: 2, messageId: '<b@x.example>', subject: 'B', date: '2026-08-06T10:00:00-04:00' },
+    // Sent at 13:00Z — the oldest instant here, though its digits sort last.
+    { sourceId: 'm_home', uid: 3, messageId: '<c@x.example>', subject: 'C', date: '2026-08-05T13:00:00Z' },
+  ]);
+  db.upsertEvent(ctx.db, { calendarId: 'c_1', uid: 'e1', title: 'Budget review', startsAt: '2026-08-11T14:00:00-04:00' });
+  db.upsertItem(ctx.db, { key: 'k1', bucket: 'now', headline: 'Reply to Ada' }, { runId: 'r' });
+
+  const res = await call(ctx, 'GET', '/api/data');
+  assert.equal(res.status, 200);
+  assert.equal(res.json.messageCount, 3);
+  assert.equal(res.json.eventCount, 1);
+  assert.equal(res.json.itemCount, 1);
+  assert.equal(res.json.oldestMessageAt, '2026-08-05T13:00:00Z', 'oldest by instant, not by the digits of the offset');
+  assert.equal(typeof res.json.dbBytes, 'number');
+  assert.equal(typeof res.json.walBytes, 'number');
+  // Every configured account is answered for, labelled the way the doctor
+  // labels one, including an account that has fetched nothing yet.
+  assert.deepEqual(res.json.accounts, [
+    { id: 'm_work', label: 'Work', messages: 2 },
+    { id: 'm_home', label: 'mail.home.example', messages: 1 },
+    { id: 'm_new', label: 'm_new', messages: 0 },
+  ]);
+
+  const denied = await call(ctx, 'GET', '/api/data', { token: null });
+  assert.equal(denied.status, 401);
+});
+
 /**
  * REGRESSION (#27). `events` is one window around today, and the payload never
  * said so — so ui/views/calendar.js, whose ‹ and › are unclamped and which has
