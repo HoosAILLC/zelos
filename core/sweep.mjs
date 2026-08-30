@@ -94,10 +94,15 @@ const NOW_BOARD_LIMIT = 4;
  * closed item comes back is for the model to read the mail that produced it and
  * write it up again, and no mail older than that window is in front of it. A
  * resolution older than the oldest message in the prompt cannot be re-raised from
- * that message, so paying context for it would buy nothing. Forty is a ceiling on
- * a busy fortnight, not a target; the prompt's budget trims further if it has to.
+ * that message, so paying context for it would buy nothing. The ceiling matches
+ * the 120 open items the prior board itself may carry, and is affordable for the
+ * same reason that number is: past the few that get full lines, a closed item
+ * costs the prompt only its key on the compact keys line, and the prompt's
+ * budget trims further if it has to. It was 40 when every named item cost a
+ * full line — and a busy three weeks can close more than 40, so everything past
+ * the ceiling was re-raised as if the user had never done it.
  */
-const RESOLVED_LIMIT = 40;
+const RESOLVED_LIMIT = 120;
 
 /**
  * How large a cursor may be, serialised.

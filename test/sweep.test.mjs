@@ -587,6 +587,31 @@ test('the most recently closed item survives the limit whatever offset it was cl
     'the newest decision the user made was dropped by the limit');
 });
 
+/**
+ * The old ceiling of forty was priced for full lines; a busy three weeks can
+ * close more items than that, and everything past the ceiling never reached the
+ * prompt at all — the same silent gap the compact keys line exists to close.
+ * Now that a closed item past the full lines costs only its key, the ceiling
+ * matches the 120 the prior board itself may carry.
+ */
+test('a busy three weeks of finished work is fenced off whole, not just the last forty', async () => {
+  const db = fresh();
+  const keys = [...Array(60).keys()].map((i) => `finished-${String(i).padStart(2, '0')}`);
+  const first = fakeModel(board(keys.map((key) => item({ key, headline: `Finish ${key}` }))));
+  const config = baseConfig({ mail: [mailAccount()] });
+  const fetchMail = async () => [fetched()];
+  await runSweep({ db, config, mode: 'full', deps: { getSecret: SECRETS, complete: first, fetchMail } });
+  for (const key of keys) setItemState(db, itemRowId(key), 'done');
+
+  const second = fakeModel(board([]));
+  await runSweep({ db, config, mode: 'full', deps: { getSecret: SECRETS, complete: second, fetchMail } });
+
+  const prompt = second.calls[0].messages[0].content;
+  for (const key of keys) {
+    assert.ok(prompt.includes(key), `${key} never reached the prompt, so nothing stops it being re-raised`);
+  }
+});
+
 test('a model that is told what was handled does not resurrect it under a new key', async () => {
   const db = fresh();
   const WORK = 'Answer Priya Raman on the Jul 28 dates';
