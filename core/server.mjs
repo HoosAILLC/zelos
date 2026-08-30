@@ -62,6 +62,7 @@ import { getSecret, setSecret, deleteSecret, listRefs, backend } from './secrets
 import {
   listBoard, bucketCounts, listEvents, listDrafts, updateDraft, lastRun,
   setItemState, insertCapture, search, getKV, getItem, resolveRef,
+  listFinished, dataCounts, databaseSizes,
 } from './db.mjs';
 import {
   // `mintToken` is renamed: this file already exports one for the browser
@@ -984,6 +985,10 @@ async function handleState(ctx) {
   sendJSON(ctx.res, 200, {
     items,
     counts: bucketCounts(db, { states: ['open'] }),
+    // The done and dismissed tail the Now view folds, dimmed, under the board —
+    // newest decision first, at most 20. Not board rows: search and the rail
+    // keep reading items[] alone.
+    finished: listFinished(db),
     events: listEvents(db, { from, to, limit: 1000 }),
     drafts: listDrafts(db, { states: ['pending', 'edited'], limit: 200 }),
     runs: { last: lastRun(db) },
@@ -2391,6 +2396,24 @@ function handleSearch(ctx) {
   sendJSON(ctx.res, 200, { q, results: search(ctx.db, q, { limit }) });
 }
 
+/**
+ * What Zelos is holding, in numbers — the stats behind the Your data panel.
+ * Read-only: row counts, the two file sizes, and how far back the mail goes.
+ * `accounts` walks the CONFIGURED mail accounts rather than the rows, so an
+ * account that has fetched nothing yet is still answered for — with a zero,
+ * and with the label the doctor would use for it.
+ */
+function handleData(ctx) {
+  const { dbBytes, walBytes } = databaseSizes(ctx.db);
+  const { messageCount, eventCount, itemCount, oldestMessageAt, messagesBySource } = dataCounts(ctx.db);
+  const accounts = (ctx.config().mail || []).map((a) => ({
+    id: a.id,
+    label: a.label || a.host || a.id,
+    messages: messagesBySource[a.id] || 0,
+  }));
+  sendJSON(ctx.res, 200, { dbBytes, walBytes, messageCount, oldestMessageAt, eventCount, itemCount, accounts });
+}
+
 /* ------------------------------------------------------- /api/sample-data
  *
  * SPEC-v2 §4. The "Try it with sample data" button in onboarding, so somebody
@@ -2868,6 +2891,8 @@ const ROUTES = [
   ['POST', /^\/api\/ask$/, handleAsk],
   ['PUT', new RegExp(`^/api/drafts/${ID}$`), handleDraftPut],
   ['GET', /^\/api\/search$/, handleSearch],
+  // What the database is holding — the Your data panel's numbers. Read-only.
+  ['GET', /^\/api\/data$/, handleData],
   // SPEC-v2 §4. Onboarding's "try it with sample data", and the clear.
   ['GET', /^\/api\/sample-data$/, handleSampleGet],
   ['POST', /^\/api\/sample-data$/, handleSamplePost],
