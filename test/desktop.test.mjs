@@ -417,6 +417,48 @@ describe('menus', () => {
     );
   });
 
+  it('names the views the board names, in the board\'s own order', () => {
+    /* ui/app.js VIEWS is the rail; the Go menu is a copy of it, and a copy
+       drifts — this menu said 'Owed' for a season after the board renamed the
+       view 'Promises', and never offered Search at all. Pinned at the source,
+       the way the preload test pins its channel name. */
+    const app = fs.readFileSync(path.join(REPO, 'ui', 'app.js'), 'utf8');
+    const block = /const VIEWS = \[([\s\S]*?)\];/.exec(app);
+    assert.ok(block, 'ui/app.js no longer declares its VIEWS where this can read them');
+    const rail = [...block[1].matchAll(/\{ id: '([a-z]+)', label: '([A-Za-z]+)'/g)]
+      .map(([, id, label]) => ({ id, label }));
+    assert.ok(rail.length >= 6, 'the rail should list at least six views');
+    assert.deepEqual(VIEWS.map(({ id, label }) => ({ id, label })), rail,
+      'the Go menu and the rail must list the same views under the same names');
+  });
+
+  it('gives Search the find shortcut, and everything else its place in the rail', () => {
+    const go = buildAppMenuTemplate({ platform: 'darwin', actions: {} })
+      .find((menu) => menu.label === 'Go');
+    const search = go.submenu.find((item) => item.label === 'Search');
+    assert.ok(search, 'the Go menu has no way into Search');
+    assert.equal(search.accelerator, 'CmdOrCtrl+F');
+    // Search still counts as a position, so ⌘6 is the sixth thing on screen.
+    for (const [i, item] of go.submenu.entries()) {
+      if (item.label === 'Search') continue;
+      assert.equal(item.accelerator, `CmdOrCtrl+${i + 1}`, `${item.label} lost the number of its place`);
+    }
+  });
+
+  it('offers the board to the system browser, through an action the shell supplies', () => {
+    const fired = [];
+    const template = buildAppMenuTemplate({
+      platform: 'darwin',
+      actions: { openInBrowser: () => fired.push('browser') },
+    });
+    const item = template
+      .find((menu) => menu.label === 'Board')
+      .submenu.find((entry) => entry.label === 'Open in your web browser');
+    assert.ok(item, 'there is no way to open the board in a browser');
+    item.click();
+    assert.deepEqual(fired, ['browser']);
+  });
+
   it('routes every view to showView, and reload to the URL the shell holds', () => {
     const seen = [];
     const template = buildAppMenuTemplate({
@@ -462,6 +504,7 @@ export const recorded = {
   badgeCount: null,
   dockBadge: null,
   loginItem: null,
+  messageBoxResponse: 0,
 };
 
 function push(map, event, handler) {
@@ -606,7 +649,7 @@ export const dialog = {
   showErrorBox(title, content) { recorded.errorBoxes.push({ title, content }); },
   showMessageBox(options) {
     recorded.messageBoxes.push(options);
-    return Promise.resolve({ response: 0, options });
+    return Promise.resolve({ response: recorded.messageBoxResponse ?? 0, options });
   },
 };
 
@@ -986,6 +1029,29 @@ describe('the shell, booted against a stub Electron', () => {
     assert.equal(contents.executed.length, before + 1, 'an unknown view id must do nothing at all');
   });
 
+  it('hands the browser a one-time address, never the bare board or the token', async () => {
+    /* The Board menu and the crash dialog both say the board works in a
+       browser. The bare address does not — without the session token it lands
+       on the refusal screen — and the token itself must never reach a command
+       line, where every process on the machine can read it. So the shell asks
+       the core it embeds for the same ten-second single-use handoff the CLI
+       launcher mints, and hands THAT to the system browser. */
+    const before = recorded.external.length;
+    booted.actions.openInBrowser();
+    assert.equal(recorded.external.length, before + 1, 'nothing reached the system browser');
+    const opened = recorded.external.at(-1);
+    assert.ok(opened.startsWith(booted.zelos.url), 'the address must be the board\'s own origin');
+    assert.match(new URL(opened).pathname, /^\/h\/[0-9a-f]{64}$/, 'the address must be a minted handoff');
+    assert.ok(!opened.includes(booted.zelos.token), 'the session token must never reach an argument vector');
+
+    // And it is a real one: the server trades it for the token, exactly once.
+    const traded = await fetch(opened, { redirect: 'manual' });
+    assert.equal(traded.status, 302);
+    assert.equal(new URL(traded.headers.get('location'), opened).searchParams.get('t'), booted.zelos.token);
+    const again = await fetch(opened, { redirect: 'manual' });
+    assert.equal(again.status, 404, 'a handoff spends exactly once');
+  });
+
   it('badges the icon after a sweep, and clears it when the board is looked at', async () => {
     const { upsertItem } = await import(pathToFileURL(path.join(REPO, 'core', 'db.mjs')).href);
     upsertItem(booted.zelos.db, {
@@ -1056,6 +1122,8 @@ describe('the shell, booted against a stub Electron', () => {
     assert.equal(explained.length, 2, 'a looping renderer must be explained, not reloaded forever');
     assert.match(explained[0].title, /keeps stopping/);
     assert.match(explained[0].detail, /crashed/);
+    assert.deepEqual(explained[0].buttons, ['OK', 'Open in your web browser'],
+      'the dialog must offer the browser it talks about');
     assert.equal(win.loaded.length, before + 1, 'the shell reloaded past its own limit');
   });
 
@@ -1078,6 +1146,29 @@ describe('the shell, booted against a stub Electron', () => {
 
     assert.ok(recorded.messageBoxes.length > boxes,
       'a renderer that keeps dying after each successful load must eventually be explained');
+  });
+
+  it('the crash dialog\'s browser button opens a fresh handoff', async () => {
+    /* The dialog used to print the bare board address and claim it works in a
+       browser — it does not; without the token it is the refusal screen. Now
+       the claim is a button, and the button mints when it is clicked, so the
+       handoff's ten seconds start as the browser is about to spend it. */
+    const contents = recorded.windows[0].webContents;
+    recorded.messageBoxResponse = 1; // the second button: Open in your web browser
+    const before = recorded.external.length;
+    try {
+      // The crashes above are still inside the minute, so these hit the limit.
+      for (let i = 0; i < 4; i++) contents.emit('render-process-gone', {}, { reason: 'crashed' });
+      await new Promise((resolve) => { setImmediate(resolve); });
+    } finally {
+      recorded.messageBoxResponse = 0;
+    }
+    const opened = recorded.external.slice(before);
+    assert.ok(opened.length > 0, 'the dialog\'s button opened nothing');
+    for (const url of opened) {
+      assert.match(new URL(url).pathname, /^\/h\/[0-9a-f]{64}$/,
+        'the dialog must open a handoff, not the bare address');
+    }
   });
 
   it('closing honours the residency rule rather than a hardcoded answer', async () => {

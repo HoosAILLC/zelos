@@ -344,15 +344,19 @@ function createWindow() {
           `Zelos reloaded it ${CRASH_RELOAD_DELAYS_MS.length} times and it stopped again each time, so it has`,
           'stopped trying rather than loop.',
           '',
-          `The sweeps are still running: ${zelos?.url ?? 'the board'} works in a browser, and the`,
-          'tray menu still sweeps.',
+          'The sweeps are still running: the button below opens the board in your',
+          'web browser, and the tray menu still sweeps.',
           '',
           `Reason given: ${details?.reason ?? 'unknown'}`,
           `Logs: ${zelos?.paths.logsDir ?? ''}`,
           '',
           'Board ▸ Reload board tries again.',
         ].join('\n'),
-        buttons: ['OK'],
+        buttons: ['OK', 'Open in your web browser'],
+      }).then(({ response }) => {
+        // The same action as the Board menu, and minted only now: a handoff
+        // lives ten seconds, and this dialog can sit unread for an afternoon.
+        if (response === 1) actions?.openInBrowser?.();
       });
       return;
     }
@@ -612,6 +616,26 @@ function buildActions() {
     showView,
     reloadBoard: () => {
       if (mainWindow && !mainWindow.isDestroyed()) mainWindow.loadURL(zelos.tokenUrl);
+    },
+    /**
+     * The same board, in the system browser. The bare address lands on the
+     * refusal screen — it carries no session token — and the token itself must
+     * never reach a command line, where `ps` hands it to every process on the
+     * machine. So this asks the core this process embeds for the same
+     * ten-second single-use handoff the CLI launcher mints (see HandoffPad in
+     * core/server.mjs), resolved against the address the core bound. Minted on
+     * the click, not before, so its ten seconds start as the browser opens.
+     * A mint that fails opens nothing: falling back to the token on the
+     * command line would trade the failure for the leak the handoff exists to
+     * prevent.
+     */
+    openInBrowser: () => {
+      try {
+        const at = zelos?.server?.zelos?.mintHandoff?.();
+        if (typeof at === 'string' && at) shell.openExternal(new URL(at, zelos.url).href);
+      } catch (err) {
+        zelos?.logger.warn('desktop: could not mint a browser handoff', { error: err.message });
+      }
     },
     /**
      * The OS's own login-items list is the state; nothing is mirrored into

@@ -6,7 +6,7 @@
  * does carry Check now / Open Zelos / Quit — checkable without Electron.
  *
  * The macOS menu is not decoration. Without a real Edit menu, ⌘C and ⌘V do
- * nothing in a text field, and the Owed view is mostly text fields.
+ * nothing in a text field, and the Promises view is mostly text fields.
  */
 
 /**
@@ -18,12 +18,19 @@ export function supportsLoginItem(platform = process.platform) {
   return platform === 'darwin' || platform === 'win32';
 }
 
-/** The board's views, in the order the UI lists them. Used for ⌘1…⌘6. */
+/** The board's views, in the order the UI lists them (ui/app.js VIEWS — the
+ * test holds the two lists together). Used for ⌘1…⌘7, except Search. */
 export const VIEWS = Object.freeze([
   { id: 'now', label: 'Now' },
   { id: 'today', label: 'Today' },
-  { id: 'owed', label: 'Owed' },
+  // 'Promises', as the board says it — the id 'owed' is the route, not a name
+  // anyone sees.
+  { id: 'owed', label: 'Promises' },
   { id: 'calendar', label: 'Calendar' },
+  // Search answers to ⌘F, the shortcut every find field answers to. It still
+  // counts as a position, so Ask and Settings keep the numbers of the places
+  // they are seen in.
+  { id: 'search', label: 'Search', accelerator: 'CmdOrCtrl+F' },
   { id: 'ask', label: 'Ask' },
   { id: 'settings', label: 'Settings' },
 ]);
@@ -65,6 +72,11 @@ export function buildAppMenuTemplate({ platform = process.platform, appName = 'Z
       // would reload a URL that no longer carries one. This reloads the URL the
       // shell holds, token included.
       { label: 'Reload board', accelerator: 'CmdOrCtrl+R', click: () => actions.reloadBoard?.() },
+      // The same board, in the default browser. The bare address refuses
+      // without the session token, so the action mints a one-time handoff
+      // through the core this process embeds (see HandoffPad, core/server.mjs)
+      // — the token itself never touches a command line.
+      { label: 'Open in your web browser', click: () => actions.openInBrowser?.() },
       { type: 'separator' },
       { label: 'Show data folder', click: () => actions.openDataFolder?.() },
       { label: 'Show logs', click: () => actions.openLogs?.() },
@@ -89,7 +101,7 @@ export function buildAppMenuTemplate({ platform = process.platform, appName = 'Z
     label: 'Go',
     submenu: VIEWS.map((view, i) => ({
       label: view.label,
-      accelerator: `CmdOrCtrl+${i + 1}`,
+      accelerator: view.accelerator ?? `CmdOrCtrl+${i + 1}`,
       click: () => actions.showView?.(view.id),
     })),
   });
