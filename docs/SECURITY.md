@@ -843,7 +843,14 @@ Stated plainly, so nobody discovers these the hard way:
 - **A malicious or backdoored IMAP or CalDAV server.** Zelos parses whatever
   it is sent. The parsers are written defensively — byte-exact IMAP literal
   handling; a hard cap on recurrence expansion so a malformed `RRULE` cannot
-  loop forever; and an HTML-to-text conversion that is a single left-to-right
+  loop forever, with a scan budget underneath it so a hostile one cannot grind
+  either — one budget for the whole document, not one per rule, so splitting
+  the payload across ten thousand events buys nothing. A rule padded with
+  `BYDAY` entries that never match froze a sweep for **38 seconds** at under
+  1 MB, and the split variant for **about four minutes** at 7 MB, both inside
+  every documented cap; the worst either shape measures now is **under two
+  seconds** at the 8 MB cap, parsing included;
+  and an HTML-to-text conversion that is a single left-to-right
   pass, capped at **512 KB per HTML part**. That last one was quadratic until
   recently, and the difference is the whole argument for measuring rather than
   asserting: 1 MB of `<!--` repeated took **122 seconds** through the old
@@ -895,14 +902,14 @@ router's 27 routes — the eight it omitted, including all three
 they were written. Measured: gutting both sample-data write handlers, and
 separately adding an unauthenticated carve-out that returned the whole config,
 each left the suite green (1022 pass / 0 fail as it stood then; the whole suite
-is 1097 tests today, of which this file is 37 and `test/ai-security.test.mjs`
-is 54). The table is now **parsed out of
-`core/server.mjs`'s `ROUTES` array**, a route the parser cannot read is a
-failure rather than a silent omission, and a separate test proves every path the
-parser produced really reaches the router (with `OPTIONS`, which matches no route
-and runs no handler). The one path deliberately outside `ROUTES` is `/api/mcp`,
-which takes the AI token instead — `test/ai-security.test.mjs` is where that one
-is attacked.
+is past 1,500 tests today — `node --test test/*.test.mjs` prints the exact
+count — of which this file is 37 and `test/ai-security.test.mjs` is 54). The
+table is now **parsed out of `core/server.mjs`'s `ROUTES` array**, a route the
+parser cannot read is a failure rather than a silent omission, and a separate
+test proves every path the parser produced really reaches the router (with
+`OPTIONS`, which matches no route and runs no handler). The one path
+deliberately outside `ROUTES` is `/api/mcp`, which takes the AI token instead —
+`test/ai-security.test.mjs` is where that one is attacked.
 
 Six of its assertions are regressions for holes that were open in an earlier
 revision of this program: the two CalDAV credential leaks, the `.ics` credential

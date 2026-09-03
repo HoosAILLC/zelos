@@ -48,9 +48,32 @@ const MAX_ENTRIES = 200;
  */
 const SEEN_MAX = 64;
 
+/**
+ * core/sweep.mjs's ceiling on a serialised cursor, restated. Past it the
+ * cursor is DROPPED whole, not trimmed, with only a log line — see the trim at
+ * the bottom of `collect` for what that would cost this connector.
+ */
+const CURSOR_MAX_CHARS = 4096;
+
 /** The snippet the board shows; the body it can open. */
 const SNIPPET_CHARS = 400;
 const BODY_CHARS = 20_000;
+
+/**
+ * The rest of what one entry may put in a row, because BODY_CHARS alone was a
+ * cap two of the four fields honoured. `subject` was the collapsed <title>
+ * verbatim, and the link was concatenated AFTER the body slice — measured, a
+ * 500,000-character title and a 300,000-character link produced a 500,000-char
+ * subject and a 320,021-char text against the 20,000 above, bounded by nothing
+ * but the transport's 8 MiB response ceiling. A feed is a stranger's XML and
+ * both fields land in `messages`, in the search index's title, and on every
+ * surface that renders subjects. The numbers are folder.mjs's, for folder.mjs's
+ * reasons: 300 is longer than any title a person writes, 2,000 is past every
+ * address length worth naming.
+ */
+const TITLE_CHARS = 300;
+const LINK_CHARS = 2_000;
+const NAME_CHARS = 120;
 
 const sha256 = (s) => crypto.createHash('sha256').update(String(s)).digest('hex').slice(0, 32);
 
@@ -402,7 +425,7 @@ export default {
     }
 
     const feed = parseFeed(res.text);
-    const folder = feed.title || new URL(url).host;
+    const folder = (feed.title || new URL(url).host).slice(0, TITLE_CHARS);
     const keep = Math.max(1, Math.min(Number(ctx.source?.settings?.maxItems) || 50, MAX_ENTRIES));
 
     /* AN ENTRY WITH NO DATE IS STILL DATED, AND THE DATE MUST NOT MOVE.
@@ -460,19 +483,26 @@ export default {
         date = pinned || feedDate || readAt;
         if (remembered < SEEN_MAX) { seen[key] = date; remembered += 1; }
       }
-      const body = entry.body.slice(0, BODY_CHARS);
+      /* The link is inside the body's budget rather than exempt from it, as
+         folder.mjs:499 has it: it is measured first and the body takes what is
+         left, so `text` cannot pass BODY_CHARS however long either half is.
+         Slicing the pair afterwards would silently drop the link for any body
+         at the ceiling — the half a reader acts on. */
+      const link = entry.link.slice(0, LINK_CHARS);
+      const tail = link ? `\n\n${link}` : '';
+      const body = entry.body.slice(0, Math.max(0, BODY_CHARS - tail.length));
       return {
         messageId,
         threadKey: messageId,
         folder,
         direction: 'in',
-        from: { name: entry.author || folder, email: '' },
+        from: { name: (entry.author || folder).slice(0, NAME_CHARS), email: '' },
         to: [],
         cc: [],
-        subject: entry.title || entry.link || '(untitled)',
+        subject: (entry.title || entry.link || '(untitled)').slice(0, TITLE_CHARS),
         date,
         snippet: collapse(body).slice(0, SNIPPET_CHARS),
-        text: entry.link ? `${body}\n\n${entry.link}`.trim() : body,
+        text: `${body}${tail}`.trim(),
         hasAttachments: false,
         flags: [],
       };
@@ -490,6 +520,25 @@ export default {
     const next = etag || lastModified || remembered
       ? { etag: etag || null, lastModified: lastModified || null, url, ...(remembered ? { seen } : {}) }
       : null;
+
+    /* Trimmed until it will actually be stored. core/sweep.mjs refuses a
+       cursor over CURSOR_MAX_CHARS OUTRIGHT — validators, pins and all — so an
+       oversized cursor is not a big cursor, it is NO cursor: a full re-read
+       every sweep, and every dateless entry re-dated on each parse, which is
+       the walk-back SEEN_MAX exists to prevent. The arithmetic above SEEN_MAX
+       assumed the validators and the address stay small, and a token-bearing
+       feed address behind a CDN's long ETag does not. So the pins go first,
+       oldest instant first — the entries most likely to have left the window —
+       and the validators go last, because one 304 pays for them on every
+       sweep. slack.mjs's packCursor is the same trim against the same ceiling. */
+    if (next) {
+      const size = () => JSON.stringify(next).length;
+      const oldestFirst = Object.keys(next.seen ?? {})
+        .sort((a, b) => String(next.seen[a]).localeCompare(String(next.seen[b])));
+      while (size() > CURSOR_MAX_CHARS && oldestFirst.length) delete next.seen[oldestFirst.shift()];
+      if (size() > CURSOR_MAX_CHARS) next.etag = null;
+      if (size() > CURSOR_MAX_CHARS) next.lastModified = null;
+    }
 
     return { parts: [{ label: '', rows, error: null, note: null }], cursor: next };
   },

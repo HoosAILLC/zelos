@@ -20,8 +20,10 @@
  *     board's own window and carrying nothing the page chose.
  *   - The session cancels every outbound request that is not the board itself —
  *     on every scheme Chromium will put on the network, WebSockets included,
- *     and not only the http(s) a scheme wildcard would have shown it — and
- *     denies every permission but the one the Owed view's copy buttons use.
+ *     and not only the http(s) a scheme wildcard would have shown it. WebRTC,
+ *     which never becomes a request at all, is blocked in the board's CSP and
+ *     stripped of UDP underneath that. The session also denies every
+ *     permission but the one the Owed view's copy buttons use.
  *     Spellcheck is off because Chromium fetches its dictionaries from Google,
  *     and this app does not talk to anyone the user did not configure.
  *   - Nothing here assumes it succeeded. There may be no tray icon, so closing
@@ -37,7 +39,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import {
   app, BrowserWindow, Menu, Tray, dialog, ipcMain, nativeImage, nativeTheme, screen, session, shell,
@@ -122,14 +124,17 @@ let crashTimer = null;
  * ------------------------------------------------------------------ */
 
 /**
- * The same three flags the CLI has. Unknown arguments are ignored rather than
- * rejected: Chromium adds its own switches, macOS appends `-psn_…` when an app
- * is launched from Finder, and neither is an error.
+ * The same three flags the CLI has, plus its one subcommand: `mcp`, the bare
+ * word the "Ready to paste" block in Settings spawns this binary with (see
+ * serveMcp). Unknown arguments are ignored rather than rejected: Chromium adds
+ * its own switches, macOS appends `-psn_…` when an app is launched from
+ * Finder, and neither is an error.
  */
 export function parseShellArgs(argv = []) {
-  const flags = { home: null, port: null, sweepNow: false };
+  const flags = { home: null, port: null, sweepNow: false, mcp: false };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
+    if (arg === 'mcp') { flags.mcp = true; continue; }
     if (typeof arg !== 'string' || !arg.startsWith('--')) continue;
     const eq = arg.indexOf('=');
     const name = eq === -1 ? arg : arg.slice(0, eq);
@@ -339,15 +344,19 @@ function createWindow() {
           `Zelos reloaded it ${CRASH_RELOAD_DELAYS_MS.length} times and it stopped again each time, so it has`,
           'stopped trying rather than loop.',
           '',
-          `The sweeps are still running: ${zelos?.url ?? 'the board'} works in a browser, and the`,
-          'tray menu still sweeps.',
+          'The sweeps are still running: the button below opens the board in your',
+          'web browser, and the tray menu still sweeps.',
           '',
           `Reason given: ${details?.reason ?? 'unknown'}`,
           `Logs: ${zelos?.paths.logsDir ?? ''}`,
           '',
           'Board ▸ Reload board tries again.',
         ].join('\n'),
-        buttons: ['OK'],
+        buttons: ['OK', 'Open in your web browser'],
+      }).then(({ response }) => {
+        // The same action as the Board menu, and minted only now: a handoff
+        // lives ten seconds, and this dialog can sit unread for an afternoon.
+        if (response === 1) actions?.openInBrowser?.();
       });
       return;
     }
@@ -457,7 +466,8 @@ function hardenSession(ses) {
 
   // The renderer's CSP already says `default-src 'self'`. This is the same rule
   // enforced a second time, one layer down, where a CSP bypass would not reach:
-  // no request leaves this window for anywhere but the board.
+  // no request leaves this window for anywhere but the board. (What is not a
+  // request at all — WebRTC — cannot be cancelled here; it is dealt with below.)
   //
   // The pattern is `<all_urls>` and not the `*://*/*` that reads like it means
   // the same thing. It does not: `*` in a match pattern's scheme position is
@@ -474,6 +484,26 @@ function hardenSession(ses) {
       zelos?.logger.warn('desktop: cancelled an outbound request from the board', { url: verdict.url });
     }
     callback({ cancel: verdict.action !== 'internal' });
+  });
+
+  // The one channel Chromium will put on the network that is NOT a request:
+  // WebRTC. ICE, STUN/TURN and data channels never enter the pipeline above on
+  // any pattern, and `connect-src 'self'` does not govern them either — so a
+  // script in the board's origin could hand data to `turn:attacker.example` as
+  // an ICE credential with neither layer firing. So the board's responses gain
+  // a second CSP that does govern it: `webrtc 'block'` shuts the whole API's
+  // network path off in the renderer, and a policy carrying only that
+  // directive can loosen nothing beside it. (Appended by the shell rather than
+  // baked into the server's headers because the promise being kept — nothing
+  // leaves this window — is the shell's own.) The layer underneath it, for a
+  // page that has somehow shed its CSP, is the IP-handling policy set on every
+  // webContents in bootstrap.
+  ses.webRequest.onHeadersReceived({ urls: ['<all_urls>'] }, (details, callback) => {
+    const responseHeaders = { ...details.responseHeaders };
+    const key = Object.keys(responseHeaders).find((name) => name.toLowerCase() === 'content-security-policy')
+      ?? 'Content-Security-Policy';
+    responseHeaders[key] = [...(responseHeaders[key] ?? []), "webrtc 'block'"];
+    callback({ responseHeaders });
   });
 }
 
@@ -588,6 +618,26 @@ function buildActions() {
       if (mainWindow && !mainWindow.isDestroyed()) mainWindow.loadURL(zelos.tokenUrl);
     },
     /**
+     * The same board, in the system browser. The bare address lands on the
+     * refusal screen — it carries no session token — and the token itself must
+     * never reach a command line, where `ps` hands it to every process on the
+     * machine. So this asks the core this process embeds for the same
+     * ten-second single-use handoff the CLI launcher mints (see HandoffPad in
+     * core/server.mjs), resolved against the address the core bound. Minted on
+     * the click, not before, so its ten seconds start as the browser opens.
+     * A mint that fails opens nothing: falling back to the token on the
+     * command line would trade the failure for the leak the handoff exists to
+     * prevent.
+     */
+    openInBrowser: () => {
+      try {
+        const at = zelos?.server?.zelos?.mintHandoff?.();
+        if (typeof at === 'string' && at) shell.openExternal(new URL(at, zelos.url).href);
+      } catch (err) {
+        zelos?.logger.warn('desktop: could not mint a browser handoff', { error: err.message });
+      }
+    },
+    /**
      * The OS's own login-items list is the state; nothing is mirrored into
      * config.json, so the two can never disagree. Reading it is wrapped because
      * the call does not exist on every platform and throws on some of them.
@@ -669,10 +719,55 @@ function beginShutdown() {
 }
 
 /* ------------------------------------------------------------------ *
+ * The stdio MCP server
+ * ------------------------------------------------------------------ */
+
+/**
+ * `Zelos mcp` — the packaged app doubling as the stdio MCP server.
+ *
+ * The build ships `core/` but not `zelos.mjs` (see extraResources in
+ * package.json), so the "Ready to paste" block in Settings names this binary
+ * plus the one word — and this is the code that makes that block true. Three
+ * things are deliberately not done here: no window and no tray, and the dock
+ * icon is hidden before anything can draw one, because this process is a pipe;
+ * no single-instance lock, because the copy the person is using holds it and
+ * this one has to run beside it; and nothing is ever written to stdout — it is
+ * the JSON-RPC channel, and one stray line corrupts the stream, which is
+ * `zelos.mjs`'s rule 3 holding here too. The server ends when the client
+ * closes stdin, exactly as the CLI's `commandMcp` does.
+ *
+ * `io` exists for the tests, which own both streams; a real spawn passes
+ * nothing and serveStdio takes the process's own.
+ */
+export async function serveMcp(flags, io = {}) {
+  if (flags.home) process.env.ZELOS_HOME = path.resolve(flags.home);
+  app.dock?.hide?.();
+  const load = (rel) => import(pathToFileURL(path.join(ROOT, 'core', rel)).href);
+  try {
+    const [{ serveStdio }, { log }] = await Promise.all([load('mcp.mjs'), load('log.mjs')]);
+    await serveStdio({ logger: log, ...io });
+    app.exit?.(0);
+    return { ok: true, mcp: true };
+  } catch (err) {
+    process.stderr.write(`zelos mcp: ${err?.stack ?? err}\n`);
+    app.exit?.(1);
+    return { ok: false, mcp: true, error: err };
+  }
+}
+
+/* ------------------------------------------------------------------ *
  * Boot
  * ------------------------------------------------------------------ */
 
 async function bootstrap() {
+  const flags = parseShellArgs(process.argv.slice(1));
+
+  // Spawned by an AI client, not opened by a person: serve JSON-RPC on stdio
+  // and never become a window. Decided before the single-instance lock below,
+  // because this copy has to run beside the Zelos the person is using rather
+  // than lose the lock to it and quit.
+  if (flags.mcp) return serveMcp(flags);
+
   // One Zelos per machine: two would fight over the same database and the
   // second would bind a different port, so the URL in the banner would be a lie.
   // This half only ever sees another Electron app — a CLI `zelos` is invisible
@@ -712,7 +807,6 @@ async function bootstrap() {
   // while the ready event is still ahead of us; the core boots alongside it
   // rather than after it, because none of that work needs Chromium.
   const ready = app.whenReady();
-  const flags = parseShellArgs(process.argv.slice(1));
   const booting = startCore({
     root: ROOT,
     home: flags.home,
@@ -768,6 +862,12 @@ async function bootstrap() {
   // nothing has created a webContents before this line.
   const logger = zelos.logger;
   app.on('web-contents-created', (_event, contents) => {
+    // The second WebRTC lock (the CSP directive in hardenSession is the
+    // first): even a page that shed its CSP gets no UDP to speak over.
+    // `disable_non_proxied_udp` allows peer traffic only through a UDP proxy,
+    // and this app configures none. TCP-only ICE is what remains — the pinned
+    // Electron has no switch for it, which is why the CSP block above matters.
+    contents.setWebRTCIPHandlingPolicy('disable_non_proxied_udp');
     guardWebContents(contents, {
       // Read at event time, not captured: after shutdown there is no port, and
       // "no port" means nothing counts as internal.

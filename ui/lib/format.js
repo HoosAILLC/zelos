@@ -112,6 +112,44 @@ export function personLabel(item) {
   return name || email || '';
 }
 
+/**
+ * Where an item came from, from its stored kind and receipt count — never from
+ * the model's prose. A three-receipt item and an unreceipted assertion used to
+ * look pixel-identical, which is the opposite of how trust should price them.
+ * `derived` is core/triage.mjs's word for "every cited receipt failed to
+ * resolve", and it comes back flagged so the board can dress it differently:
+ * it is the absence of provenance, not a variety of it. A kind this build does
+ * not know makes no claim rather than a wrong one.
+ */
+export function sourceStamp(item) {
+  const refs = Array.isArray(item?.sourceRefs) ? item.sourceRefs.length : 0;
+  const count = refs > 1 ? ` (${refs})` : '';
+  const kind = item?.kind;
+  if (kind === 'mail') return { text: `from your mail${count}`, derived: false };
+  if (kind === 'calendar') return { text: `from your calendar${count}`, derived: false };
+  if (kind === 'capture') return { text: `from a note you typed${count}`, derived: false };
+  if (kind === 'mixed') return { text: `from more than one place${count}`, derived: false };
+  if (kind === 'derived') return { text: 'no source saved', derived: true };
+  return null;
+}
+
+/**
+ * Whether an open item arrived with the last check — STORED timestamps only,
+ * never the model's wording, which rewrites the whole board every run. The
+ * rule: the last run exists, succeeded, and the item was first seen at or
+ * after the instant that run started. No successful run on record means no
+ * mark at all — against a board that has only just learned to look,
+ * everything would read as news.
+ */
+export function isNewSince(item, run) {
+  if (!item || item.state !== 'open') return false;
+  if (!run || run.ok !== true) return false;
+  const seen = instant(item.first_seen);
+  const started = instant(run.started_at);
+  if (seen === null || started === null) return false;
+  return seen >= started;
+}
+
 /* ------------------------------------------------------------------ events */
 
 /** Minutes [start, end) of an event within one day-key, clamped to that day. */

@@ -104,12 +104,12 @@ is the operator's call — prepare it, do not publish. Any document that prints 
 without saying this is sending a reader to an error.
 
 - `package.json`: `name: "zelos-app"`, `bin: { "zelos": "./zelos.mjs" }`, `files` allowlisting
-  exactly what ships (including the negation `"!core/sources/oauth.mjs"` — see §3), and **still no
-  dependencies**. `engines.node` is **`">=22.16.0 <23 || >=24"`**, not the `>= 22.5.0` this spec
+  exactly what ships (§3's negation of `core/sources/oauth.mjs` is gone — sign-in shipped, so the
+  file ships too), and **still no dependencies**. `engines.node` is **`">=22.16.0 <23 || >=24"`**, not the `>= 22.5.0` this spec
   first asked for: the board's index needs SQLite FTS5, and Node's bundled SQLite is built without
   it before 22.16 and throughout the whole Node 23 line. The exclusion of 23 is deliberate.
 - `npx zelos-app` must start the app. `npm i -g zelos-app && zelos` must work too.
-- `npm pack --dry-run` currently reports **49 files, ~430 kB packed, 1.3 MB unpacked**. Editing
+- `npm pack --dry-run` currently reports **69 files, ~740 kB packed, 2.3 MB unpacked**. Editing
   `docs/*.md` moves that number, since they ship — measure, don't quote.
 - Subcommands, parsed in `zelos.mjs`: bare (run), `mcp` (stdio MCP), `sweep` (one sweep, print a
   summary, exit), `doctor` (check Node version, home dir perms, model reachability, source

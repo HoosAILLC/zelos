@@ -408,11 +408,20 @@ export function upsertMessage(db, msg, { now = nowISO() } = {}) {
     fetched_at: str(msg.fetchedAt ?? msg.fetched_at ?? now),
   });
 
+  // The index mirrors the ROW, not the fetch. The COALESCE above keeps a
+  // stored snippet/body that a cheaper re-fetch arrived without — and indexing
+  // the incoming record blanked the search doc for exactly the re-fetch the
+  // COALESCE defends against. Read back only when the two can differ.
+  const kept = existed && (!str(msg.snippet) || !str(msg.text ?? msg.body))
+    ? prep(db, 'SELECT snippet, body FROM messages WHERE id = ?').get(id)
+    : null;
   indexDoc(db, {
     ref: `msg:${id}`,
     kind: 'message',
     title: `${str(msg.subject)} ${from.name} ${from.email}`.trim(),
-    body: `${str(msg.snippet)}\n${str(msg.text ?? msg.body)}`.trim(),
+    body: kept
+      ? `${str(kept.snippet)}\n${str(kept.body)}`.trim()
+      : `${str(msg.snippet)}\n${str(msg.text ?? msg.body)}`.trim(),
   });
 
   return { id, inserted: !existed };
@@ -695,10 +704,16 @@ export function listBoard(db, { states = ['open'], buckets = null, limit = 500, 
     where.push(`bucket IN (${bucketList.map(() => '?').join(',')})`);
     args.push(...bucketList);
   }
+  /* due_at through datetime(), for the reason listMessages gives at :441 —
+     the model copies each offset verbatim (the prompt orders it to), so mixed
+     offsets are the board's normal input, and as TEXT a -04:00 morning sorts
+     before a Z noon it actually follows. This ranking is the one capNowBucket
+     demotes from, so getting the tie wrong picked the wrong item to push off
+     the four-slot bar. The NULL branch stays first: undated rows sort last. */
   const sql = `
     SELECT * FROM items
     ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
-    ORDER BY ${BUCKET_RANK_SQL} ASC, severity DESC, (due_at IS NULL) ASC, due_at ASC, first_seen ASC
+    ORDER BY ${BUCKET_RANK_SQL} ASC, severity DESC, (due_at IS NULL) ASC, datetime(due_at) ASC, first_seen ASC
     LIMIT ?`;
   return prep(db, sql).all(...args, Math.max(1, Number(limit) || 500)).map(hydrateItem);
 }
@@ -712,6 +727,23 @@ export function bucketCounts(db, { states = ['open'] } = {}) {
     if (Object.hasOwn(counts, row.bucket)) counts[row.bucket] = Number(row.n);
   }
   return counts;
+}
+
+/**
+ * What was finished recently — the done and dismissed rows, newest decision
+ * first. The query is core/sweep.mjs's RECENTLY_RESOLVED_SQL without the
+ * window: `state_at` is when the user decided, and both the guard and the
+ * ORDER BY go through datetime() for the reason given there — the stored
+ * timestamps carry the user's offset, and character order would misplace two
+ * decisions made either side of a timezone change.
+ */
+export function listFinished(db, { limit = 20 } = {}) {
+  const sql = `
+    SELECT * FROM items
+    WHERE state IN ('done', 'dismissed') AND state_at IS NOT NULL
+    ORDER BY datetime(state_at) DESC
+    LIMIT ?`;
+  return prep(db, sql).all(Math.max(1, Number(limit) || 20)).map(hydrateItem);
 }
 
 /* ---------------------------------------------------------------- drafts */
@@ -846,6 +878,55 @@ export function setKV(db, k, v) {
 
 export function deleteKV(db, k) {
   return prep(db, 'DELETE FROM kv WHERE k = ?').run(str(k)).changes > 0;
+}
+
+/* ------------------------------------------------------------ what is held */
+
+/**
+ * The counts behind the Your data panel: how many of each row, how the mail
+ * splits across its sources, and how far back it goes. The oldest message is
+ * picked through datetime() for the reason listMessages gives above — sent_at
+ * keeps each sender's offset verbatim, so the row with the smallest digits is
+ * not the oldest instant. A sent_at datetime() cannot read is skipped rather
+ * than reported: garbage would otherwise sort before every real date.
+ */
+export function dataCounts(db) {
+  const count = (sql) => Number(prep(db, sql).get().n) || 0;
+  const oldest = prep(db, `
+    SELECT sent_at FROM messages
+    WHERE datetime(sent_at) IS NOT NULL
+    ORDER BY datetime(sent_at) ASC
+    LIMIT 1`).get();
+  const messagesBySource = {};
+  for (const row of prep(db, 'SELECT source_id, COUNT(*) AS n FROM messages GROUP BY source_id').all()) {
+    messagesBySource[str(row.source_id)] = Number(row.n) || 0;
+  }
+  return {
+    messageCount: count('SELECT COUNT(*) AS n FROM messages'),
+    eventCount: count('SELECT COUNT(*) AS n FROM events'),
+    itemCount: count('SELECT COUNT(*) AS n FROM items'),
+    oldestMessageAt: oldest ? oldest.sent_at : null,
+    messagesBySource,
+  };
+}
+
+/**
+ * How much of the disk the database is, read from the handle's own file so a
+ * test home and the real one are answered alike. WAL keeps recent writes in
+ * the `-wal` sidecar until a checkpoint folds them in, so the honest size is
+ * both files; either being absent — a memory database, a sidecar already
+ * checkpointed away — is a zero, never an error.
+ */
+export function databaseSizes(db) {
+  const file = str(prep(db, "SELECT file FROM pragma_database_list WHERE name = 'main'").get()?.file);
+  const size = (p) => {
+    try {
+      return p ? fs.statSync(p).size : 0;
+    } catch {
+      return 0;
+    }
+  };
+  return { dbBytes: size(file), walBytes: size(file ? `${file}-wal` : '') };
 }
 
 /* ---------------------------------------------------------------- search */

@@ -62,6 +62,7 @@ import { getSecret, setSecret, deleteSecret, listRefs, backend } from './secrets
 import {
   listBoard, bucketCounts, listEvents, listDrafts, updateDraft, lastRun,
   setItemState, insertCapture, search, getKV, getItem, resolveRef,
+  listFinished, dataCounts, databaseSizes,
 } from './db.mjs';
 import {
   // `mintToken` is renamed: this file already exports one for the browser
@@ -87,6 +88,7 @@ import {
    above in the exact shape the Microsoft flow files its own. */
 import {
   oauthClient,
+  googleSecretRefFor,
   createState,
   createVerifier,
   challengeFor,
@@ -983,6 +985,10 @@ async function handleState(ctx) {
   sendJSON(ctx.res, 200, {
     items,
     counts: bucketCounts(db, { states: ['open'] }),
+    // The done and dismissed tail the Now view folds, dimmed, under the board —
+    // newest decision first, at most 20. Not board rows: search and the rail
+    // keep reading items[] alone.
+    finished: listFinished(db),
     events: listEvents(db, { from, to, limit: 1000 }),
     drafts: listDrafts(db, { states: ['pending', 'edited'], limit: 200 }),
     runs: { last: lastRun(db) },
@@ -1340,9 +1346,11 @@ function requireTlsFrom(body) {
  *
  * `provider` picks which of the two shapes the block is read as. Absent is
  * Microsoft — the field did not exist when the first accounts were connected.
- * A Google block may leave `clientId` out and take the client `oauthClient()`
- * resolves from config or the shipped default, which is what lets the test
- * button work before the account has been saved.
+ * Either block may leave `clientId` out and take the client `oauthClient()`
+ * resolves from config or the shipped default — which is what lets the test
+ * button work before the account has been saved, and what the account the
+ * sign-in buttons save (`clientId: ''` when the server's own client ran the
+ * flow) has always meant.
  */
 function mailAuthFrom(body, keyRef, config = null) {
   const method = body?.auth === undefined || body?.auth === null ? 'password' : body.auth;
@@ -1358,12 +1366,17 @@ function mailAuthFrom(body, keyRef, config = null) {
   const provider = mailProviderFrom(block, 'oauth.provider');
   if (provider === 'google') {
     const client = oauthClient(config, 'google');
-    const clientId = requireString(block, 'clientId', { max: 200, required: false }).trim() || client.clientId;
+    const own = requireString(block, 'clientId', { max: 200, required: false }).trim();
+    const clientId = own || client.clientId;
     if (!clientId) throw new HttpError(400, 'oauth.clientId is required — no Google client is configured');
-    return { method, oauth: { provider, clientId, clientSecretRef: client.clientSecretRef, tokenRef: keyRef } };
+    // The refresh spends the secret filed under the ref the connect used, so
+    // the two must derive it the same way — from the client, not the account.
+    return { method, oauth: { provider, clientId, clientSecretRef: googleSecretRefFor(client, own), tokenRef: keyRef } };
   }
-  const clientId = requireString(block, 'clientId', { max: 64 });
-  const tenantId = requireString(block, 'tenantId', { max: 128, required: false }) || 'common';
+  const client = oauthClient(config, 'microsoft');
+  const clientId = requireString(block, 'clientId', { max: 64, required: false }) || client.clientId;
+  if (!clientId) throw new HttpError(400, 'oauth.clientId is required — no Microsoft client is configured');
+  const tenantId = requireString(block, 'tenantId', { max: 128, required: false }) || client.tenantId || 'common';
   return { method, oauth: { provider, clientId, tenantId, tokenRef: keyRef } };
 }
 
@@ -1519,6 +1532,10 @@ class DeviceSignInPad {
       state: flow.state,
       status: flow.state,
       keyRef: flow.keyRef,
+      // The client the flow ran against — the config one, when the body
+      // carried none — so the page can save it on the account, exactly as
+      // the Google pad has always reported its own.
+      clientId: flow.clientId,
       userCode: flow.userCode,
       verificationUri: flow.verificationUri,
       message: flow.message,
@@ -1541,6 +1558,7 @@ class DeviceSignInPad {
       id: crypto.randomBytes(8).toString('hex'),
       state: 'pending',
       keyRef,
+      clientId,
       userCode: '',
       verificationUri: '',
       message: '',
@@ -1929,23 +1947,26 @@ async function handleMailOAuthBegin(ctx) {
   const provider = mailProviderFrom(body);
   if (provider === 'google') {
     const client = oauthClient(ctx.config(), 'google');
-    const clientId = requireString(body, 'clientId', { max: 200, required: false }).trim() || client.clientId;
+    const own = requireString(body, 'clientId', { max: 200, required: false }).trim();
+    const clientId = own || client.clientId;
     if (!clientId) {
       throw new HttpError(400, 'no Google client is configured — paste the client ID from your own Google Cloud project, or use a Zelos build that ships one');
     }
     /* The secret goes to the store before anything else happens, under the
-       one ref the refresh will read it back from — the same write the
-       Settings "save secret" button would make, and it is the only way the
-       value reaches this process. Validated as a string like every other
-       field, and never echoed. */
+       one ref the refresh will read it back from — scoped to the client it
+       belongs to, so a second pasted Cloud project cannot overwrite the
+       first's. The same write the Settings "save secret" button would make,
+       and the only way the value reaches this process. Validated as a string
+       like every other field, and never echoed. */
+    const clientSecretRef = googleSecretRefFor(client, own);
     const clientSecret = requireString(body, 'clientSecret', { max: 200, required: false });
-    if (clientSecret) await setSecret(client.clientSecretRef, clientSecret);
+    if (clientSecret) await setSecret(clientSecretRef, clientSecret);
     /* `email` is accepted so the UI can send what it knows, and then not used:
        putting it on the authorization URL as `login_hint` would put an
        address in a URL this server builds, and Google asks which account
        anyway. */
     requireString(body, 'email', { max: 320, required: false });
-    sendJSON(ctx.res, 200, ctx.browserSignIns.begin({ keyRef, clientId, clientSecretRef: client.clientSecretRef }));
+    sendJSON(ctx.res, 200, ctx.browserSignIns.begin({ keyRef, clientId, clientSecretRef }));
     return;
   }
   const client = oauthClient(ctx.config(), 'microsoft');
@@ -2375,6 +2396,24 @@ function handleSearch(ctx) {
   sendJSON(ctx.res, 200, { q, results: search(ctx.db, q, { limit }) });
 }
 
+/**
+ * What Zelos is holding, in numbers — the stats behind the Your data panel.
+ * Read-only: row counts, the two file sizes, and how far back the mail goes.
+ * `accounts` walks the CONFIGURED mail accounts rather than the rows, so an
+ * account that has fetched nothing yet is still answered for — with a zero,
+ * and with the label the doctor would use for it.
+ */
+function handleData(ctx) {
+  const { dbBytes, walBytes } = databaseSizes(ctx.db);
+  const { messageCount, eventCount, itemCount, oldestMessageAt, messagesBySource } = dataCounts(ctx.db);
+  const accounts = (ctx.config().mail || []).map((a) => ({
+    id: a.id,
+    label: a.label || a.host || a.id,
+    messages: messagesBySource[a.id] || 0,
+  }));
+  sendJSON(ctx.res, 200, { dbBytes, walBytes, messageCount, oldestMessageAt, eventCount, itemCount, accounts });
+}
+
 /* ------------------------------------------------------- /api/sample-data
  *
  * SPEC-v2 §4. The "Try it with sample data" button in onboarding, so somebody
@@ -2436,10 +2475,20 @@ function handleSampleDelete(ctx) {
 /** The path of the launcher, so Settings can print a config block that works. */
 function mcpClientHints(ctx) {
   const port = ctx.req.socket?.localPort ?? null;
+  /* Inside the packaged desktop shell there is no launcher script to name: the
+     build ships `core/` but not `zelos.mjs`, and `process.execPath` is the app
+     itself. That binary answers `mcp` in its own right — desktop/main.js
+     serves stdio when spawned with the one word — so the hint there is the
+     binary plus `mcp`, and a script path would name a file the install does
+     not have, pasted under a heading that says it is ready. `versions.electron`
+     is how this process knows it is the shell; `process.defaultApp` marks a
+     dev shell run from a checkout, where the launcher exists and the script
+     form still holds. Plain Node — the CLI — is unchanged. */
+  const packagedShell = Boolean(process.versions.electron) && !process.defaultApp;
   return {
     // How a desktop AI client spawns the stdio server (SPEC-v2 §2).
     command: process.execPath,
-    args: [path.join(ROOT, 'zelos.mjs'), 'mcp'],
+    args: packagedShell ? ['mcp'] : [path.join(ROOT, 'zelos.mjs'), 'mcp'],
     home: paths().home,
     // ...and the address for clients that would rather speak HTTP.
     httpUrl: port ? `http://${HOST}:${port}/api/mcp` : null,
@@ -2542,7 +2591,10 @@ async function handleAiTokenCreate(ctx) {
   const label = requireString(body, 'label', { max: 60 });
   let minted;
   try {
-    minted = await mintAiToken({ label, config: ctx.config() });
+    const config = ctx.config();
+    // The configured zone, not the machine's — the same rule, and the same
+    // wrong-day window, that recordAskSpend spells out above.
+    minted = await mintAiToken({ label, config, now: nowISO(config.identity?.timezone || localTimezone()) });
   } catch (err) {
     throw new HttpError(400, err.message);
   }
@@ -2788,7 +2840,10 @@ async function handleMcp(ctx) {
   // request started with would undo that.
   if (ctx.dueForTouch(verdict.token.id)) {
     try {
-      ctx.setConfig(touchToken(verdict.token.id, { config: ctx.config() }));
+      const current = ctx.config();
+      // Stamped in the configured zone, like every writer here — see
+      // recordAskSpend for why the machine's zone files it under the wrong day.
+      ctx.setConfig(touchToken(verdict.token.id, { config: current, now: nowISO(current.identity?.timezone || localTimezone()) }));
     } catch (err) {
       logger.warn('server: could not record when an AI token was last used', { error: err.message });
     }
@@ -2836,6 +2891,8 @@ const ROUTES = [
   ['POST', /^\/api\/ask$/, handleAsk],
   ['PUT', new RegExp(`^/api/drafts/${ID}$`), handleDraftPut],
   ['GET', /^\/api\/search$/, handleSearch],
+  // What the database is holding — the Your data panel's numbers. Read-only.
+  ['GET', /^\/api\/data$/, handleData],
   // SPEC-v2 §4. Onboarding's "try it with sample data", and the clear.
   ['GET', /^\/api\/sample-data$/, handleSampleGet],
   ['POST', /^\/api\/sample-data$/, handleSamplePost],
@@ -3232,8 +3289,10 @@ export function createServer({
 
 /**
  * Bind 127.0.0.1, walking up from `port` until a free one is found. Resolves
- * `{port, host, url}` — `url` carries the session token, because that URL is
- * the only way into the app.
+ * `{port, host, url, tokenUrl}` — `url` is the bare origin; `tokenUrl` is the
+ * one that carries the session token, and it is the only way into the app.
+ * Anything that hands a URL to a browser must hand the tokened one (or mint
+ * a one-shot handoff), never the bare origin.
  */
 export function listen(server, {
   port = Number(process.env.ZELOS_PORT) || DEFAULT_PORT,

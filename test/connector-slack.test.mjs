@@ -369,6 +369,41 @@ test('a row carries no `uid`, and a second sweep of the same message inserts not
   assert.equal(listMessages(db, { sourceId: 's_slack' }).length, 4);
 });
 
+test('REGRESSION: a message whose ts does not parse is still dated, so it can reach the prompt', async (t) => {
+  /* `tsToISO` answers null for a ts that is non-numeric or not positive, and
+     `messageRow` had no fallback: the usable filter only asks that `msg.ts` be
+     truthy, so a proxy-mangled ts passed it, minted a perfectly good
+     `slack:<channel>:<ts>` id, and landed with `sent_at` NULL — stored, counted
+     in stats, and invisible to the prompt forever, because core/db.mjs filters
+     with `datetime(sent_at) >= datetime(?)` and SQLite evaluates that to NULL
+     for a NULL row. Every sibling messages-sink connector guards this class
+     (rss, github, fireflies, linear, folder); slack was the one left. Asserted
+     against the real database, because the defect lives in what SQLite does
+     with a NULL. */
+  const mock = await slackServer(t, {
+    'auth.test': AUTH_OK,
+    'users.info': NAMES,
+    'conversations.list': listOf(CH_OPS),
+    'conversations.history': historyOf(
+      { user: 'U_DANA', ts: ts('2026-08-11T09:00:01Z'), text: 'A parseable instant.' },
+      { user: 'U_DANA', ts: 'garbage', text: 'A proxy-mangled one.' },
+      { user: 'U_DANA', ts: '0', text: 'An epoch of nothing.' },
+    ),
+  });
+
+  const rows = rowsOf(await slack.collect(ctxFor(mock)));
+  assert.equal(rows.length, 3);
+  for (const row of rows) {
+    assert.ok(row.date, `${row.messageId} carries no date at all, so it will be stored and never shown`);
+  }
+
+  const db = freshDb();
+  upsertMessages(db, stamp(rows));
+  const sinceISO = new Date(NOW_MS - 21 * 86_400_000).toISOString();
+  assert.equal(listMessages(db, { sinceISO, limit: 500 }).length, 3,
+    'the sweep reported three messages and the prompt was handed fewer — a null `sent_at` fails `sent_at >= ?` in SQLite, silently');
+});
+
 test('what the token owner wrote is `out`, and it is what `promised` is mined from', async (t) => {
   const mock = await slackServer(t, {
     'auth.test': AUTH_OK,

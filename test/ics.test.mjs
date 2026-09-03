@@ -1078,6 +1078,49 @@ test('a rule that can never match terminates instead of spinning', () => {
   assert.ok(Date.now() - started < 5000, 'the empty-period fuse must trip fast');
 });
 
+test('a huge BYDAY list cannot buy seconds of expansion per sweep', () => {
+  // The period fuses bound how many periods run, not what one period costs.
+  // This rule buys the most periods a document can: entries that never match
+  // (there is no 99th Monday of a year), a DTSTART two thousand years back so
+  // every year up to the window is walked, and a COUNT — which disables the
+  // fast-forward jump — so each of those years re-scans the whole list. At
+  // 100,000 entries that was ~19 seconds of frozen event loop, well inside the
+  // subscribed-calendar byte cap, on every sweep.
+  const started = Date.now();
+  const events = parseICS_toEvents(
+    ics(
+      ...vevent(
+        'UID:runaway-3',
+        'DTSTART;TZID=America/New_York:00010101T090000',
+        `RRULE:FREQ=YEARLY;COUNT=5;BYDAY=${Array(100_000).fill('99MO').join(',')}`,
+        'SUMMARY:Nothing, expensively',
+      ),
+    ),
+    { from: '2026-08-20', to: '2026-10-26', tzid: NY },
+  );
+  assert.equal(events.length, 0, 'nothing matches, and DTSTART itself is outside the window');
+  assert.ok(Date.now() - started < 3000, 'the scan budget must trip fast');
+});
+
+test('the scan budget spans the document, not each rule', () => {
+  // The same payload split across many VEVENTs used to buy a fresh budget per
+  // rule: 800 copies of a never-matching 125-entry BYDAY list — well inside
+  // the subscribed-calendar byte cap — froze the sweep for ~19 seconds with
+  // every individual rule comfortably under its own allowance.
+  const started = Date.now();
+  const rule = `RRULE:FREQ=YEARLY;COUNT=5;BYDAY=${Array(125).fill('99MO').join(',')}`;
+  const events = parseICS_toEvents(
+    ics(
+      ...Array.from({ length: 800 }, (_, i) =>
+        vevent(`UID:runaway-4-${i}`, 'DTSTART;TZID=America/New_York:00010101T090000', rule, 'SUMMARY:Nothing, in bulk'),
+      ).flat(),
+    ),
+    { from: '2026-08-20', to: '2026-10-26', tzid: NY },
+  );
+  assert.equal(events.length, 0, 'nothing matches, and DTSTART itself is outside the window');
+  assert.ok(Date.now() - started < 3000, 'one budget must cover the whole document');
+});
+
 test('an unsupported FREQ degrades to a single occurrence', () => {
   const events = expandFixture(
     vevent(

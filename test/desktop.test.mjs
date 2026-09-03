@@ -17,6 +17,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { after, before, describe, it } from 'node:test';
+import { PassThrough } from 'node:stream';
 import { registerHooks } from 'node:module';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -416,6 +417,48 @@ describe('menus', () => {
     );
   });
 
+  it('names the views the board names, in the board\'s own order', () => {
+    /* ui/app.js VIEWS is the rail; the Go menu is a copy of it, and a copy
+       drifts — this menu said 'Owed' for a season after the board renamed the
+       view 'Promises', and never offered Search at all. Pinned at the source,
+       the way the preload test pins its channel name. */
+    const app = fs.readFileSync(path.join(REPO, 'ui', 'app.js'), 'utf8');
+    const block = /const VIEWS = \[([\s\S]*?)\];/.exec(app);
+    assert.ok(block, 'ui/app.js no longer declares its VIEWS where this can read them');
+    const rail = [...block[1].matchAll(/\{ id: '([a-z]+)', label: '([A-Za-z]+)'/g)]
+      .map(([, id, label]) => ({ id, label }));
+    assert.ok(rail.length >= 6, 'the rail should list at least six views');
+    assert.deepEqual(VIEWS.map(({ id, label }) => ({ id, label })), rail,
+      'the Go menu and the rail must list the same views under the same names');
+  });
+
+  it('gives Search the find shortcut, and everything else its place in the rail', () => {
+    const go = buildAppMenuTemplate({ platform: 'darwin', actions: {} })
+      .find((menu) => menu.label === 'Go');
+    const search = go.submenu.find((item) => item.label === 'Search');
+    assert.ok(search, 'the Go menu has no way into Search');
+    assert.equal(search.accelerator, 'CmdOrCtrl+F');
+    // Search still counts as a position, so ⌘6 is the sixth thing on screen.
+    for (const [i, item] of go.submenu.entries()) {
+      if (item.label === 'Search') continue;
+      assert.equal(item.accelerator, `CmdOrCtrl+${i + 1}`, `${item.label} lost the number of its place`);
+    }
+  });
+
+  it('offers the board to the system browser, through an action the shell supplies', () => {
+    const fired = [];
+    const template = buildAppMenuTemplate({
+      platform: 'darwin',
+      actions: { openInBrowser: () => fired.push('browser') },
+    });
+    const item = template
+      .find((menu) => menu.label === 'Board')
+      .submenu.find((entry) => entry.label === 'Open in your web browser');
+    assert.ok(item, 'there is no way to open the board in a browser');
+    item.click();
+    assert.deepEqual(fired, ['browser']);
+  });
+
   it('routes every view to showView, and reload to the URL the shell holds', () => {
     const seen = [];
     const template = buildAppMenuTemplate({
@@ -454,12 +497,14 @@ export const recorded = {
   errorBoxes: [],
   permission: { request: null, check: null },
   beforeRequest: null,
+  headersReceived: null,
   quits: 0,
   appName: null,
   messageBoxes: [],
   badgeCount: null,
   dockBadge: null,
   loginItem: null,
+  messageBoxResponse: 0,
 };
 
 function push(map, event, handler) {
@@ -479,10 +524,12 @@ class WebContentsStub {
     this.handlers = new Map();
     this.windowOpenHandler = null;
     this.executed = [];
+    this.webRTCIPHandlingPolicy = null;
   }
   on(event, handler) { push(this.handlers, event, handler); return this; }
   once(event, handler) { push(this.handlers, event, handler); return this; }
   setWindowOpenHandler(handler) { this.windowOpenHandler = handler; }
+  setWebRTCIPHandlingPolicy(policy) { this.webRTCIPHandlingPolicy = policy; }
   executeJavaScript(code) { this.executed.push(code); return Promise.resolve(); }
   emit(event, ...args) { return fire(this.handlers, event, ...args); }
 }
@@ -602,7 +649,7 @@ export const dialog = {
   showErrorBox(title, content) { recorded.errorBoxes.push({ title, content }); },
   showMessageBox(options) {
     recorded.messageBoxes.push(options);
-    return Promise.resolve({ response: 0, options });
+    return Promise.resolve({ response: recorded.messageBoxResponse ?? 0, options });
   },
 };
 
@@ -625,6 +672,7 @@ export const session = {
     setPermissionCheckHandler(handler) { recorded.permission.check = handler; },
     webRequest: {
       onBeforeRequest(filter, handler) { recorded.beforeRequest = { filter, handler }; },
+      onHeadersReceived(filter, handler) { recorded.headersReceived = { filter, handler }; },
     },
   },
 };
@@ -894,6 +942,37 @@ describe('the shell, booted against a stub Electron', () => {
     assert.equal(verdicts.at(-1), false);
   });
 
+  it('shuts WebRTC off: the board\'s CSP gains webrtc \'block\', and the peer layer gets no UDP', () => {
+    /* WebRTC is not a URL request. ICE, STUN/TURN and data channels never
+       enter the onBeforeRequest pipeline the test above exercises, and
+       `connect-src 'self'` does not govern them either — so without these two
+       controls, a script in the board's origin could hand the session token to
+       `turn:attacker.example` as an ICE credential and neither layer would
+       fire. The CSP directive is the deny; the IP-handling policy is the layer
+       underneath it, for the page that has somehow shed its CSP. */
+    for (const win of recorded.windows) {
+      assert.equal(win.webContents.webRTCIPHandlingPolicy, 'disable_non_proxied_udp',
+        'a window\'s peer-connection layer was left with its default UDP reach');
+    }
+
+    const { filter, handler } = recorded.headersReceived ?? {};
+    assert.ok(handler, 'no header hook: the board\'s CSP never gains the webrtc directive');
+    assert.deepEqual(filter.urls, ['<all_urls>']);
+
+    // Appended to the policy the server sent, whatever case the header came in.
+    let out;
+    handler({ responseHeaders: { 'content-security-policy': ["default-src 'self'"] } },
+      (r) => { out = r.responseHeaders; });
+    assert.deepEqual(out['content-security-policy'], ["default-src 'self'", "webrtc 'block'"]);
+    handler({ responseHeaders: { 'Content-Security-Policy': ["default-src 'self'"] } },
+      (r) => { out = r.responseHeaders; });
+    assert.deepEqual(out['Content-Security-Policy'], ["default-src 'self'", "webrtc 'block'"]);
+
+    // And present even on a response that carried no policy at all.
+    handler({ responseHeaders: {} }, (r) => { out = r.responseHeaders; });
+    assert.deepEqual(out['Content-Security-Policy'], ["webrtc 'block'"]);
+  });
+
   it('denies every browser permission but the one the copy buttons need', () => {
     const granted = [];
     for (const permission of ['media', 'geolocation', 'notifications', 'clipboard-read', 'clipboard-sanitized-write']) {
@@ -948,6 +1027,29 @@ describe('the shell, booted against a stub Electron', () => {
     booted.actions.showView('../../etc/passwd');
     booted.actions.showView('now"; fetch("http://evil.example");//');
     assert.equal(contents.executed.length, before + 1, 'an unknown view id must do nothing at all');
+  });
+
+  it('hands the browser a one-time address, never the bare board or the token', async () => {
+    /* The Board menu and the crash dialog both say the board works in a
+       browser. The bare address does not — without the session token it lands
+       on the refusal screen — and the token itself must never reach a command
+       line, where every process on the machine can read it. So the shell asks
+       the core it embeds for the same ten-second single-use handoff the CLI
+       launcher mints, and hands THAT to the system browser. */
+    const before = recorded.external.length;
+    booted.actions.openInBrowser();
+    assert.equal(recorded.external.length, before + 1, 'nothing reached the system browser');
+    const opened = recorded.external.at(-1);
+    assert.ok(opened.startsWith(booted.zelos.url), 'the address must be the board\'s own origin');
+    assert.match(new URL(opened).pathname, /^\/h\/[0-9a-f]{64}$/, 'the address must be a minted handoff');
+    assert.ok(!opened.includes(booted.zelos.token), 'the session token must never reach an argument vector');
+
+    // And it is a real one: the server trades it for the token, exactly once.
+    const traded = await fetch(opened, { redirect: 'manual' });
+    assert.equal(traded.status, 302);
+    assert.equal(new URL(traded.headers.get('location'), opened).searchParams.get('t'), booted.zelos.token);
+    const again = await fetch(opened, { redirect: 'manual' });
+    assert.equal(again.status, 404, 'a handoff spends exactly once');
   });
 
   it('badges the icon after a sweep, and clears it when the board is looked at', async () => {
@@ -1020,6 +1122,8 @@ describe('the shell, booted against a stub Electron', () => {
     assert.equal(explained.length, 2, 'a looping renderer must be explained, not reloaded forever');
     assert.match(explained[0].title, /keeps stopping/);
     assert.match(explained[0].detail, /crashed/);
+    assert.deepEqual(explained[0].buttons, ['OK', 'Open in your web browser'],
+      'the dialog must offer the browser it talks about');
     assert.equal(win.loaded.length, before + 1, 'the shell reloaded past its own limit');
   });
 
@@ -1042,6 +1146,29 @@ describe('the shell, booted against a stub Electron', () => {
 
     assert.ok(recorded.messageBoxes.length > boxes,
       'a renderer that keeps dying after each successful load must eventually be explained');
+  });
+
+  it('the crash dialog\'s browser button opens a fresh handoff', async () => {
+    /* The dialog used to print the bare board address and claim it works in a
+       browser — it does not; without the token it is the refusal screen. Now
+       the claim is a button, and the button mints when it is clicked, so the
+       handoff's ten seconds start as the browser is about to spend it. */
+    const contents = recorded.windows[0].webContents;
+    recorded.messageBoxResponse = 1; // the second button: Open in your web browser
+    const before = recorded.external.length;
+    try {
+      // The crashes above are still inside the minute, so these hit the limit.
+      for (let i = 0; i < 4; i++) contents.emit('render-process-gone', {}, { reason: 'crashed' });
+      await new Promise((resolve) => { setImmediate(resolve); });
+    } finally {
+      recorded.messageBoxResponse = 0;
+    }
+    const opened = recorded.external.slice(before);
+    assert.ok(opened.length > 0, 'the dialog\'s button opened nothing');
+    for (const url of opened) {
+      assert.match(new URL(url).pathname, /^\/h\/[0-9a-f]{64}$/,
+        'the dialog must open a handoff, not the bare address');
+    }
   });
 
   it('closing honours the residency rule rather than a hardcoded answer', async () => {
@@ -1149,16 +1276,25 @@ describe('parseShellArgs', () => {
 
   it('reads the three flags in both spellings', () => {
     assert.deepEqual(parseShellArgs(['--home=/tmp/z', '--port=9999', '--sweep-now']), {
-      home: '/tmp/z', port: 9999, sweepNow: true,
+      home: '/tmp/z', port: 9999, sweepNow: true, mcp: false,
     });
     assert.deepEqual(parseShellArgs(['--home', '/tmp/z', '--port', '9999']), {
-      home: '/tmp/z', port: 9999, sweepNow: false,
+      home: '/tmp/z', port: 9999, sweepNow: false, mcp: false,
     });
+  });
+
+  it('notices the one bare word the pasted config block sends', () => {
+    // The "Ready to paste" block in Settings spawns this binary with `mcp` and
+    // nothing else — the packaged build ships no zelos.mjs for a client to
+    // name, so the shell itself has to answer it.
+    assert.deepEqual(parseShellArgs(['mcp']), { home: null, port: null, sweepNow: false, mcp: true });
+    assert.equal(parseShellArgs(['mcp', '--home=/tmp/z']).home, '/tmp/z');
+    assert.equal(parseShellArgs(['.', 'mcp']).mcp, true, 'a dev shell sees its app path first');
   });
 
   it('ignores what Chromium and macOS add, rather than refusing to start', () => {
     assert.deepEqual(parseShellArgs(['.', '-psn_0_1234', '--disable-gpu', '--inspect=9229', '--port=0']), {
-      home: null, port: 0, sweepNow: false,
+      home: null, port: 0, sweepNow: false, mcp: false,
     });
   });
 
@@ -1685,5 +1821,68 @@ describe('planRendererRestart', () => {
     const plan = planRendererRestart([...longAgo, now], now);
     assert.equal(plan.action, 'reload');
     assert.equal(plan.attempt, 1, 'crashes from ten minutes ago are not this crash');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * The shell as a stdio MCP server
+ *
+ * The "Ready to paste" block in Settings names the packaged binary plus the
+ * one word `mcp` (core/server.mjs mcpClientHints), because the build ships no
+ * zelos.mjs for a client to spawn. That block is only true if the shell
+ * actually serves JSON-RPC on stdio when spawned that way — this is the other
+ * end of that contract, run with the streams a real client would own.
+ * ------------------------------------------------------------------ */
+
+describe('the shell as a stdio MCP server', () => {
+  let main;
+  let sandbox;
+
+  before(async () => {
+    // The electron stub hooks are registered by the shell suite above; the
+    // module comes back from cache with them in place.
+    main = await import(pathToFileURL(path.join(REPO, 'desktop', 'main.js')).href);
+    sandbox = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'zelos-shell-mcp-')));
+    process.env.ZELOS_SECRETS_BACKEND = 'encrypted-file'; // never the real keychain
+  });
+
+  after(() => {
+    delete process.env.ZELOS_HOME; // serveMcp set it from --home
+    delete process.env.ZELOS_SECRETS_BACKEND;
+    try {
+      fs.rmSync(sandbox, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    } catch (err) {
+      if (err?.code !== 'EPERM' && err?.code !== 'EBUSY' && err?.code !== 'ENOTEMPTY') throw err;
+    }
+  });
+
+  it('answers the handshake on the streams it is handed, and stdout stays pure JSON-RPC', async () => {
+    const input = new PassThrough();
+    const output = new PassThrough();
+    let written = '';
+    output.on('data', (chunk) => { written += chunk; });
+
+    const flags = main.parseShellArgs(['mcp', `--home=${path.join(sandbox, 'home')}`]);
+    const serving = main.serveMcp(flags, { input, output });
+
+    input.write(`${JSON.stringify({
+      jsonrpc: '2.0', id: 1, method: 'initialize',
+      params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'test client', version: '0' } },
+    })}\n`);
+    input.write(`${JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list' })}\n`);
+    input.end(); // the client hanging up is what ends the server
+
+    const result = await serving;
+    assert.equal(result.ok, true, result.error?.stack);
+
+    // Rule 3 from zelos.mjs holds here too: every stdout line is a JSON-RPC
+    // message, because one stray banner corrupts the stream.
+    const lines = written.split('\n').filter((line) => line.trim());
+    const replies = lines.map((line) => JSON.parse(line));
+    assert.equal(replies.length, 2);
+    assert.equal(replies[0].result.serverInfo.name, 'zelos');
+    // A fresh home has AI access off, so the tool list is empty — proof the
+    // server read its config from the home the flags named.
+    assert.deepEqual(replies[1].result.tools, []);
   });
 });

@@ -48,6 +48,7 @@ const {
   AuthError, RateLimitError, createHttp, createMeter, parseRetryAfter, originOf, secretHash,
 } = await import('../core/connectors/http.mjs');
 const { parseFeed } = await import('../core/connectors/rss.mjs');
+const { fetchIcsText } = await import('../core/connectors/ics.mjs');
 const { validateConfig, SECRET_KEYS } = await import('../core/config.mjs');
 
 let seq = 0;
@@ -424,12 +425,16 @@ test('a crash between the fetch and the store leaves the cursor where it was', a
 
 test('a cursor larger than the ceiling is refused rather than stored', async (t) => {
   const db = fresh();
-  // 8 KB of ETag. Nothing legitimate does this; a connector caching a page of
-  // results in its cursor does, and that is a second message store with no
-  // index, no search and no cleanup.
-  const huge = `"${'x'.repeat(8192)}"`;
-  const feed = await feedServer(t, { etag: huge });
-  const config = baseConfig({ sources: [feedSource({ settings: { url: feed.url } })] });
+  /* 8 KB of URL. Nothing legitimate does this; a connector caching a page of
+     results in its cursor does, and that is a second message store with no
+     index, no search and no cleanup. The address is the one part of its cursor
+     the rss connector's own trim cannot give up — an 8 KB ETag it now trims to
+     fit (the validators-last trim has its own test) — so this is what still
+     proves the sweep-side ceiling holds whatever a connector returns. */
+  const feed = await feedServer(t, { etag: '"v1"' });
+  const config = baseConfig({
+    sources: [feedSource({ settings: { url: `${feed.origin}/${'x'.repeat(8192)}/feed.xml` } })],
+  });
 
   const result = await runSweep({ db, config, mode: 'light', deps: sweepDeps });
   assert.equal(result.ok, true, 'an oversized cursor is not a reason to fail the run');
@@ -660,6 +665,58 @@ test('a feed longer than the number the user chose is capped at it', async (t) =
   assert.equal(listMessages(db).length, 5);
 });
 
+test('REGRESSION: a hostile entry cannot put an unbounded subject or body in a row', async (t) => {
+  /* The connector capped the body slice and the snippet and nothing else.
+     `subject` was the collapsed <title> verbatim, and the link was concatenated
+     AFTER the body slice — measured, a 500,000-character title and a
+     300,000-character link produced row.subject.length = 500,000 and
+     row.text.length = 320,021 against BODY_CHARS = 20,000, bounded by nothing
+     but the transport's 8 MiB response ceiling. A feed is a stranger's XML, and
+     both fields land in `messages`, in the search index's title, and on every
+     surface that renders subjects. The numbers and the budget are folder.mjs's:
+     the title stops at 300, the link at 2,000, and the link is measured FIRST
+     so the pair can never pass the body's cap — slicing the pair afterwards
+     would silently drop the link for any body at the ceiling. */
+  const rss = connectorFor('rss');
+  const feed = await feedServer(t, {
+    body: `<rss version="2.0"><channel><title>${'F'.repeat(9_000)}</title>`
+      + `<item><title>${'T'.repeat(500_000)}</title><link>https://x.example/${'p'.repeat(300_000)}</link>`
+      + `<guid>g-huge</guid><description>${'d'.repeat(30_000)}</description></item>`
+      + '<item><title>Small</title><link>https://x.example/small</link><guid>g-small</guid>'
+      + `<description>${'d'.repeat(30_000)}</description></item>`
+      + '</channel></rss>',
+  });
+  const r = await rss.collect({
+    source: { id: 's_hostile', settings: { url: feed.url } },
+    label: 'Feed',
+    secret: null,
+    cursor: null,
+    window: { from: '2026-08-01T00:00:00Z', to: '2026-09-01T00:00:00Z' },
+    timezone: 'UTC',
+    identityEmail: 'nemo@example.com',
+    now: '2026-08-11T09:00:00Z',
+    emit() {},
+    signal: null,
+    log: { debug() {}, info() {}, warn() {}, error() {} },
+    http: createHttp({ origins: [feed.origin], limits: rss.limits }),
+    deps: {},
+  });
+
+  const rows = r.parts[0].rows;
+  const huge = rows.find((row) => row.messageId === 'g-huge');
+  assert.ok(huge.subject.length <= 300, `the subject is ${huge.subject.length} characters — an unbounded title reached the database`);
+  assert.ok(huge.text.length <= 20_000, `the body is ${huge.text.length} characters — the link is appended after the slice, so the cap is not a cap`);
+  assert.ok(huge.folder.length <= 300, `the folder is ${huge.folder.length} characters`);
+  assert.ok(huge.from.name.length <= 120, `the sender name is ${huge.from.name.length} characters`);
+
+  // And the budget spends the truncation on the body, never on the link: an
+  // ordinary link survives even when the body sits at the ceiling.
+  const small = rows.find((row) => row.messageId === 'g-small');
+  assert.ok(small.text.length <= 20_000, `the body is ${small.text.length} characters`);
+  assert.match(small.text, /https:\/\/x\.example\/small$/,
+    'the cap ate the link, which is the one line in the body a reader acts on');
+});
+
 test('REGRESSION: parseFeed is linear in the length of hostile input', () => {
   /* The first parser answered "which elements are items" with
      `<item(\s[^>]*)?>([\s\S]*?)</item\s*>` and matchAll, and a lazy quantifier
@@ -837,6 +894,51 @@ test('REGRESSION: a dateless entry keeps the instant it was first seen across re
   assert.equal(Object.keys(third.cursor.seen).length, 1, 'an entry no longer in the feed is still in the cursor');
 });
 
+test('REGRESSION: the cursor is trimmed to what the sweep will store, validators last', async (t) => {
+  /* core/sweep.mjs refuses a cursor over 4,096 serialised characters OUTRIGHT,
+     with only a log line — so an oversized cursor is not a big cursor, it is NO
+     cursor: the validators gone (a full re-read every sweep, defeating the 304
+     economy) and every first-seen pin gone with them, so every dateless entry
+     is re-dated on each parse — the exact walk-back into the prompt window the
+     pin exists to prevent. Sixty-four pins are ~3 KB on their own, so a
+     token-bearing feed address plus a CDN's long ETag was enough to sink the
+     whole thing: measured, 70 dateless entries behind a 900-character ETag at a
+     1,400-character address serialised to 5,138. slack.mjs already trims in
+     packCursor; rss assumed the arithmetic instead of enforcing it. The pins go
+     first, oldest instant first, and the validators last — one 304 pays for
+     them every sweep. */
+  const rss = connectorFor('rss');
+  const items = Array.from({ length: 70 }, (_, i) => `<item><title>N${i}</title><guid>guid-${i}</guid></item>`).join('');
+  const etag = `W/"${'e'.repeat(900)}"`;
+  const feed = await feedServer(t, {
+    handler: (req, res) => {
+      res.writeHead(200, { 'content-type': 'application/rss+xml', etag });
+      res.end(`<rss version="2.0"><channel><title>T</title>${items}</channel></rss>`);
+    },
+  });
+  const r = await rss.collect({
+    source: { id: 's_long', settings: { url: `${feed.origin}/${'p'.repeat(1_400)}/feed.xml`, maxItems: 200 } },
+    label: 'Feed',
+    secret: null,
+    cursor: null,
+    window: { from: '2026-08-01T00:00:00Z', to: '2026-09-01T00:00:00Z' },
+    timezone: 'UTC',
+    identityEmail: 'nemo@example.com',
+    now: '2026-08-11T09:00:00Z',
+    emit() {},
+    signal: null,
+    log: { debug() {}, info() {}, warn() {}, error() {} },
+    http: createHttp({ origins: [feed.origin], limits: rss.limits }),
+    deps: {},
+  });
+
+  const size = JSON.stringify(r.cursor).length;
+  assert.ok(size <= 4096,
+    `a ${size}-character cursor — core/sweep.mjs drops it whole, and this feed loses ALL of its state on every sweep`);
+  assert.equal(r.cursor.etag, etag, 'the validators go last — they are what makes the next read cost nothing');
+  assert.ok(Object.keys(r.cursor.seen).length > 0, 'fitting the budget must not mean throwing every pin away');
+});
+
 test('REGRESSION: a feed address edited in Settings does not inherit the old address\'s validators', async (t) => {
   /* Nothing clears `source.<id>.cursor` on a settings save, so the cursor
      minted at the old address was replayed against the new one. A server
@@ -969,6 +1071,26 @@ test('only one redirect is followed, however many the host offers', async (t) =>
   await assert.rejects(() => client.get(`${home.origin}/start`), /returned 302/,
     'a redirect chain was followed past the single hop this transport allows');
   assert.equal(home.hits(), 2);
+});
+
+test("the sweep's .ics reader holds one deadline across a redirect, not one per hop", async (t) => {
+  /* `fetchIcsText` stays outside the transport on purpose (see its header), so
+     it must hand-roll this rule the way core/server.mjs and core/doctor.mjs
+     already do: a host that stalls just under the timeout and then answers 302
+     must not hand the redirect target a whole fresh deadline of its own. */
+  const home = await feedServer(t, {
+    handler: (req, res) => {
+      if (req.url === '/start') {
+        setTimeout(() => { res.writeHead(302, { location: '/end.ics' }); res.end(); }, 400);
+        return;
+      }
+      // The redirect's destination: never answers. Closed by the test's after.
+    },
+  });
+  const started = Date.now();
+  await assert.rejects(() => fetchIcsText(`${home.origin}/start`, { timeoutMs: 600 }));
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed < 800, `one 600ms deadline should cover both hops, took ${elapsed}ms`);
 });
 
 test('a body larger than the cap is refused off the stream, not after buying it', async (t) => {
@@ -1253,4 +1375,51 @@ test('no connector reaches the network except through the transport', () => {
     if (/(^|[^.\w])fetch\s*\(/.test(code) || /globalThis\.fetch/.test(code)) offenders.push(name);
   }
   assert.deepEqual(offenders, [], `these connectors open their own sockets:\n  ${offenders.join('\n  ')}`);
+});
+
+/* ------------------------------------------------------------------ *
+ * oauthFor — the sweep's half of "Sign in with Google / Microsoft"
+ * ------------------------------------------------------------------ */
+
+test('oauthFor resolves an empty clientId to the configured client, and carries the ref its secret is under', async () => {
+  const { oauthFor } = await import('../core/connectors/imap.mjs');
+  const { GOOGLE_CLIENT_SECRET_REF, googleSecretRefFor, oauthClient } = await import('../core/sources/oauth.mjs');
+  const config = {
+    oauth: {
+      clients: {
+        google: { clientId: '4242-zelos.apps.googleusercontent.com' },
+        microsoft: { clientId: '11111111-2222-3333-4444-555555555555', tenantId: 'consumers' },
+      },
+    },
+  };
+
+  /* The account the sign-in buttons save when the server's own client ran the
+     flow carries `clientId: ''`. The sweep has to read it with that same
+     client — resolved from config exactly as the begin route resolved it —
+     or the card says "Connected" and every sweep after it throws
+     not_configured before the stored grant is even consulted. */
+  const google = oauthFor({ keyRef: 'mail.m_1', oauth: { provider: 'google', clientId: '' } }, config);
+  assert.equal(google.clientId, '4242-zelos.apps.googleusercontent.com');
+  assert.equal(google.tokenRef, 'mail.m_1');
+  assert.equal(google.clientSecretRef, GOOGLE_CLIENT_SECRET_REF, 'the configured client keeps the install-wide secret ref');
+
+  const microsoft = oauthFor({ keyRef: 'mail.m_2', oauth: { provider: 'microsoft', clientId: '', tenantId: 'common' } }, config);
+  assert.equal(microsoft.clientId, '11111111-2222-3333-4444-555555555555');
+  assert.equal(microsoft.tenantId, 'common', 'the tenant the grant was minted under, not the config one');
+  assert.equal(microsoft.clientSecretRef, undefined, 'a Microsoft public client has no secret to file');
+
+  /* An account with a client of its own keeps it, and its Google secret is
+     read from the ref connect filed it under — scoped to that client, so a
+     second Cloud project's paste cannot overwrite the first's. */
+  const own = oauthFor({ keyRef: 'mail.m_3', oauth: { provider: 'google', clientId: 'other.apps.googleusercontent.com' } }, config);
+  assert.equal(own.clientId, 'other.apps.googleusercontent.com');
+  assert.equal(own.clientSecretRef, googleSecretRefFor(oauthClient(config, 'google'), 'other.apps.googleusercontent.com'));
+  assert.match(own.clientSecretRef, /^oauth\.google\.clientSecret\.[0-9a-f]{16}$/);
+
+  // A Microsoft account that names its own client needs no config, and a
+  // password account still has no block.
+  const registered = oauthFor({ keyRef: 'mail.m_4', oauth: { clientId: '22222222-2222-3333-4444-555555555555' } }, null);
+  assert.equal(registered.provider, 'microsoft');
+  assert.equal(registered.clientId, '22222222-2222-3333-4444-555555555555');
+  assert.equal(oauthFor({ keyRef: 'mail.m_5' }, config), null);
 });

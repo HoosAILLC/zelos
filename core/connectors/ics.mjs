@@ -34,14 +34,20 @@ export async function fetchIcsText(rawUrl, { user, pass, signal, timeoutMs = ICS
     headers.authorization = `Basic ${Buffer.from(`${user}:${pass ?? ''}`).toString('base64')}`;
   }
 
+  // ONE deadline for the pair, not one per hop: a host that stalls just under
+  // the timeout and then answers 302 must not hand the redirect target a whole
+  // fresh timeout of its own. core/server.mjs and core/doctor.mjs hold one
+  // signal across their two hops for the same reason.
+  const signals = [AbortSignal.timeout(timeoutMs)];
+  if (signal) signals.push(signal);
+  const deadline = AbortSignal.any(signals);
+
   const request = async (target, withAuth) => {
-    const signals = [AbortSignal.timeout(timeoutMs)];
-    if (signal) signals.push(signal);
     const sendHeaders = withAuth ? headers : { accept: headers.accept };
     return fetch(target, {
       headers: sendHeaders,
       redirect: 'manual',
-      signal: AbortSignal.any(signals),
+      signal: deadline,
     });
   };
 

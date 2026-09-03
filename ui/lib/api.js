@@ -287,8 +287,18 @@ export async function openStream(path, { method = 'GET', body = undefined, signa
     } catch {
       parsed = null;
     }
-    throw new ApiError(parsed?.error || `stream ${path} failed (${res.status})`, {
+    let message = parsed && typeof parsed.error === 'string'
+      ? parsed.error
+      : `stream ${path} failed (${res.status})`;
+    // The same join request() makes for a 5xx, for the same reason: a 500's
+    // `error` is the two words "internal error", and its `detail` is the one
+    // thing the server does say — where the reason was written.
+    if (res.status >= 500 && parsed && typeof parsed.error === 'string' && typeof parsed.detail === 'string') {
+      message = `${parsed.error} — ${parsed.detail}`;
+    }
+    throw new ApiError(message, {
       status: res.status,
+      detail: parsed?.detail ?? null,
       path,
     });
   }

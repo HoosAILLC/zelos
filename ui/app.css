@@ -681,6 +681,9 @@ textarea.input, .draft-body, .ask-field, .capture-field {
 .meta { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.35rem; font-size: 0.6875rem; color: var(--ink-3); }
 .meta-hot { color: var(--accent-text); font-weight: 600; }
 .meta-carried { color: var(--olive); }
+.meta-new { color: var(--accent-text); }
+/* "no source saved" is the absence of provenance, not a variety of it. */
+.meta-derived { color: var(--ink-2); font-style: italic; }
 
 .row-tools { display: flex; align-items: center; gap: 0.25rem; }
 .row-tools .btn { min-height: 2.25rem; padding: 0.3rem 0.6rem; font-size: 0.8125rem; }
@@ -715,6 +718,20 @@ textarea.input, .draft-body, .ask-field, .capture-field {
   flex-basis: 100%;
 }
 .hero .snooze-menu { margin-top: 0.6rem; }
+
+/* The picked-day row unfolds inside the menu the way the menu unfolds inside
+   row-more: onto its own line, a follow-up question rather than a sibling. */
+.snooze-pick {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  flex-basis: 100%;
+}
+.snooze-pick .input { width: auto; min-height: 2.25rem; padding: 0.3rem 0.7rem; font-size: 0.8125rem; }
+
+/* The hero borrows row-more from the dense rows; the tick-column indent means
+   nothing here. */
+.hero .row-more { padding: 0.6rem 0 0; }
 
 .chip {
   padding: 0.1rem 0.45rem;
@@ -1207,6 +1224,7 @@ textarea.input, .draft-body, .ask-field, .capture-field {
 .draft-body { margin-top: 0.7rem; overflow: hidden; }
 .draft-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.7rem; }
 .draft-actions .btn { min-height: 2.5rem; padding: 0.35rem 0.8rem; font-size: 0.875rem; }
+.draft-note { margin-top: 0.5rem; }
 
 /* --- ask ----------------------------------------------------------------- */
 
@@ -1953,3 +1971,14 @@ textarea.input:focus,
 }
 .hit-meta { color: var(--ink-3); font-size: 0.78rem; margin-top: 0.3rem; }
 .hit-tools { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-top: 0.55rem; }
+
+/* --- Finished recently (Now) ---------------------------------------------
+   The fold holds rows that are off the board — done and dismissed — so the
+   whole list dims the way a snoozed row does (.row.is-snoozed above), and the
+   ticks inside stay live: the tick on a done row is the reopen. */
+.worth.is-finished .row { opacity: 0.6; }
+
+/* The Your data stats: quiet lines above the folder field, with room of their own. */
+.data-stats { display: grid; gap: 0.35rem; margin-bottom: 1rem; }
+.data-stats:empty { display: none; }
+.data-stats .facts { margin-top: 0.35rem; }

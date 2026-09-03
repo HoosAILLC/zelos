@@ -424,6 +424,48 @@ test('sweepSummary reads as a sentence, and survives a run with no stats', () =>
   assert.equal(fmt.sweepDetail(null), '');
 });
 
+test('every item wears where it came from, and "derived" wears that nothing was saved', () => {
+  // The stamp comes from the stored kind and the receipt count, never the
+  // model's prose. A three-receipt item and an unreceipted assertion looked
+  // pixel-identical before this — the opposite of how trust should price them.
+  assert.deepEqual(fmt.sourceStamp({ kind: 'mail', sourceRefs: ['msg:a', 'msg:b', 'msg:c'] }),
+    { text: 'from your mail (3)', derived: false });
+  assert.deepEqual(fmt.sourceStamp({ kind: 'mail', sourceRefs: ['msg:a'] }),
+    { text: 'from your mail', derived: false });
+  assert.deepEqual(fmt.sourceStamp({ kind: 'calendar', sourceRefs: ['evt:a'] }),
+    { text: 'from your calendar', derived: false });
+  assert.deepEqual(fmt.sourceStamp({ kind: 'capture', sourceRefs: ['cap:a'] }),
+    { text: 'from a note you typed', derived: false });
+  assert.deepEqual(fmt.sourceStamp({ kind: 'mixed', sourceRefs: ['msg:a', 'evt:b'] }),
+    { text: 'from more than one place (2)', derived: false });
+  // "derived" is core/triage.mjs's word for "every cited receipt failed to
+  // resolve" — the one stamp that must not read like provenance.
+  assert.deepEqual(fmt.sourceStamp({ kind: 'derived', sourceRefs: [] }),
+    { text: 'no source saved', derived: true });
+  // A kind this build does not know makes no claim rather than a wrong one.
+  assert.equal(fmt.sourceStamp({ kind: 'item', sourceRefs: [] }), null);
+  assert.equal(fmt.sourceStamp(null), null);
+});
+
+test('"new" comes from stored timestamps against the last successful check, never wording', () => {
+  const run = { ok: true, started_at: '2026-08-11T12:00:00Z' };
+  assert.equal(fmt.isNewSince({ state: 'open', first_seen: '2026-08-11T12:30:00Z' }, run), true);
+  assert.equal(fmt.isNewSince({ state: 'open', first_seen: '2026-08-11T12:00:00Z' }, run), true,
+    'first seen the instant the check started is still that check\'s news');
+  assert.equal(fmt.isNewSince({ state: 'open', first_seen: '2026-08-11T11:59:00Z' }, run), false);
+  // Only an OPEN item can be news; the model re-citing a snoozed one is not.
+  assert.equal(fmt.isNewSince({ state: 'snoozed', first_seen: '2026-08-11T12:30:00Z' }, run), false);
+  assert.equal(fmt.isNewSince({ state: 'done', first_seen: '2026-08-11T12:30:00Z' }, run), false);
+  // No prior successful check means no mark at all — against a board that has
+  // only just learned to look, everything would read as news.
+  assert.equal(fmt.isNewSince({ state: 'open', first_seen: '2026-08-11T12:30:00Z' }, null), false);
+  assert.equal(fmt.isNewSince({ state: 'open', first_seen: '2026-08-11T12:30:00Z' },
+    { ok: false, started_at: '2026-08-11T12:00:00Z' }), false);
+  assert.equal(fmt.isNewSince({ state: 'open', first_seen: '2026-08-11T12:30:00Z' },
+    { ok: null, started_at: '2026-08-11T12:00:00Z' }), false, 'a check still running has not succeeded yet');
+  assert.equal(fmt.isNewSince({ state: 'open', first_seen: null }, run), false);
+});
+
 /* -------------------------------------------------------- 3. source guards */
 
 function uiFiles() {
@@ -750,6 +792,36 @@ test('a 500\'s detail reaches the message a view renders, and a 4xx\'s is left a
   await assert.rejects(api.health(), (err) => err.message === 'bad gateway' && err.detail === null);
 });
 
+/**
+ * The same rule, other transport. The join above landed in request() and not in
+ * openStream's non-ok path, so a 500 on POST /api/ask still painted the two
+ * words "internal error" into the answer with the server's one pointer dropped.
+ */
+test('a stream that fails to open joins the 500\'s detail the way request() does', async (t) => {
+  stubBrowserGlobals();
+  const { openStream, ApiError } = await import(fileUrl(UI, 'lib/api.js'));
+  let answer = null;
+  globalThis.fetch = async () => ({ ok: false, status: answer.status, text: async () => JSON.stringify(answer.body) });
+  t.after(() => { delete globalThis.fetch; });
+
+  const pointer = 'the reason was written to /tmp/zelos-home/logs/desktop.log';
+  answer = { status: 500, body: { error: 'internal error', detail: pointer } };
+  await assert.rejects(openStream('/api/ask', { method: 'POST', body: { question: 'x' }, onEvent() {} }), (err) => {
+    assert.ok(err instanceof ApiError);
+    assert.equal(err.message, `internal error — ${pointer}`);
+    assert.equal(err.detail, pointer, 'and still there on its own for a reader that wants it apart');
+    return true;
+  });
+
+  // A 4xx stays its own sentence, and carries its structured detail apart.
+  answer = { status: 409, body: { error: 'a sweep is already running', detail: { running: true } } };
+  await assert.rejects(openStream('/api/sweep/stream', { onEvent() {} }), (err) => {
+    assert.equal(err.message, 'a sweep is already running');
+    assert.deepEqual(err.detail, { running: true });
+    return true;
+  });
+});
+
 test('the snooze chooser offers three future deadlines in the configured zone', async () => {
   stubBrowserGlobals();
   const items = await import(fileUrl(UI, 'lib/items.js'));
@@ -762,6 +834,13 @@ test('the snooze chooser offers three future deadlines in the configured zone', 
   assert.equal(tomorrow.until, '2026-08-12T09:00:00-04:00');
   assert.equal(nextWeek.until, '2026-08-17T09:00:00-04:00');
   assert.equal(ui.weekdayOfKey(ui.dayKey(nextWeek.until)), 1, 'next week means a Monday');
+
+  // Each choice prints the clock it is promising. The deadline was always
+  // concrete; "Tomorrow morning" only became legible as 9 AM after the click,
+  // which is the wrong side of it.
+  assert.equal(later.when, '4 PM');
+  assert.equal(tomorrow.when, '9 AM');
+  assert.equal(nextWeek.when, 'Mon, Aug 17 9 AM');
 
   // From a Monday, "next week" is the FOLLOWING Monday, not later today.
   const monday = Date.parse('2026-08-10T16:00:00Z');
@@ -825,6 +904,38 @@ test('done raises an Undo that restores the exact prior state, deadline included
   store.notify(null);
 });
 
+/**
+ * The failure rollback used to restore the whole pre-click snapshot. A sweep's
+ * `done` → refreshBoard(), and the heartbeat, both replace `state.board.items`
+ * while the POST is in flight — so a rollback to the snapshot silently erased
+ * whatever they brought, with a toast that explained only the failed tick.
+ */
+test('a failed action rolls back the one row, not the whole pre-click board', async (t) => {
+  stubBrowserGlobals();
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+
+  store.state.board = {
+    ...store.state.board,
+    items: [{ id: 'x', bucket: 'now', state: 'open', headline: 'chase the survey invoice' }],
+  };
+  globalThis.fetch = async () => {
+    // A refresh lands while the request is out: fresher rows, then the POST fails.
+    store.state.board = {
+      ...store.state.board,
+      items: [
+        { id: 'x', bucket: 'now', state: 'open', headline: 'chase the survey invoice' },
+        { id: 'y', bucket: 'today', state: 'open', headline: 'the new arrival' },
+      ],
+    };
+    return { ok: false, status: 503, text: async () => '{"error":"the server is not there"}' };
+  };
+  t.after(() => { delete globalThis.fetch; store.notify(null); });
+
+  await store.setItemState('x', 'done');
+  assert.deepEqual(store.state.board.items.map((i) => [i.id, i.state]), [['x', 'open'], ['y', 'open']],
+    'the rollback must restore the one row inside the CURRENT items');
+});
+
 /* ------------------------------------------ 5. shell behaviour, from source */
 
 /**
@@ -853,6 +964,33 @@ test('a board-driven re-render defers while a text field in main has focus', () 
   assert.match(render[0], /editingInMain\(\)/, 'render must check for a focused field');
   assert.match(render[0], /renderQueued = true/, 'a mid-edit render must queue, not run');
   assert.match(app, /document\.addEventListener\('focusout'/, 'the queued render must flush on blur');
+});
+
+/**
+ * Two holes in the deferral above, both measured on v1.5.0. The guard was
+ * gated on `layout === 'chrome'`, so the onboarding flow — which runs the bare
+ * skeleton — got no deferral at all: any rev bump rebuilt the whole screen,
+ * typed address and open mail card included, even mid-keystroke. And
+ * editingInMain() counted only the three text-control tags, so Tab from a
+ * field to "Save account" rested focus on a BUTTON and the queued render
+ * flushed in that gap — the open editor and everything typed into it gone
+ * before the button could be pressed, the result of "Test the connection"
+ * written into detached nodes.
+ */
+test('the deferral covers onboarding, and holds while focus is on a button in an open editor', () => {
+  const app = fs.readFileSync(path.join(UI, 'app.js'), 'utf8');
+  const render = /function render\(\{ force = false \}[\s\S]*?\n\}/m.exec(app);
+  assert.ok(render, 'render is missing');
+  assert.match(render[0], /\(layout === 'chrome' \|\| layout === 'bare'\)/,
+    'the deferral must cover the onboarding skeleton, not only the chrome one');
+
+  const editing = /function editingInMain\(\)[\s\S]*?\n\}/m.exec(app);
+  assert.ok(editing, 'editingInMain is missing');
+  // Focus INSIDE an open editor still counts as editing; focus anywhere else
+  // in main — an item row's tick, a panel-level button — still flushes,
+  // because those hold no half-finished typing to protect.
+  assert.match(editing[0], /closest\('form, \.account-form'\)/,
+    'focus inside an open editor must still count as editing');
 });
 
 test('view navigation resets the scroll; same-view re-renders leave it alone', () => {
@@ -1171,6 +1309,40 @@ test('the heartbeat refetches through the store, so it defers like any board cha
 
   const app = fs.readFileSync(path.join(UI, 'app.js'), 'utf8');
   assert.match(app, /watchBoard\(\)/, 'the shell never starts the heartbeat');
+});
+
+/**
+ * The heartbeat's ordinary tick brings back the same board with a newer server
+ * clock. `rev` used to bump anyway, and `rev` is in the shell's renderKey — so
+ * every three minutes, and on every tab return, the view rebuilt for a board
+ * that said nothing new. On the chrome layout the deferral caught the typing
+ * case; on the bare one it emptied the onboarding email step under its own
+ * cursor, and on a tab return (focus on a link, not a field) no deferral can
+ * help — not bumping is the only fix that covers it.
+ */
+test('a refetch that brings the same board does not bump rev — only `now` moved', async (t) => {
+  stubBrowserGlobals();
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+
+  const board = (now, items = []) => ({
+    items, counts: {}, events: [], drafts: [], runs: { last: null },
+    notes: [], first: null, now,
+  });
+  let answer = board('2026-08-27T09:00:00-04:00');
+  globalThis.fetch = async () => ({ ok: true, status: 200, text: async () => JSON.stringify(answer) });
+  t.after(() => { delete globalThis.fetch; });
+
+  await store.loadBoard();
+  const after = store.state.rev;
+
+  answer = board('2026-08-27T09:03:00-04:00');
+  await store.loadBoard();
+  assert.equal(store.state.rev, after, 'an unchanged board must not bump rev');
+  assert.equal(store.state.board.now, '2026-08-27T09:03:00-04:00', 'the fresh clock is still kept');
+
+  answer = board('2026-08-27T09:06:00-04:00', [{ id: 'a', bucket: 'now', state: 'open' }]);
+  await store.loadBoard();
+  assert.equal(store.state.rev, after + 1, 'a board that actually changed must still bump');
 });
 
 /**
@@ -1785,6 +1957,22 @@ test('Settings can set who you are, and the value has a reader on the other end'
 });
 
 /**
+ * The credential slot was painted only by the "How Zelos signs in" change
+ * listener: opened for an existing account, the form showed no password field
+ * and no sign-in block until the picker was touched. The paint must also run
+ * once after the tree is built — after, because the TLS field's initial hide
+ * walks `closest('.field')` and finds nothing in a half-built tree.
+ */
+test('the mail form paints its credential slot on open, not first on a picker change', () => {
+  const src = fs.readFileSync(path.join(ROOT, 'ui/views/settings.js'), 'utf8');
+  const form = /function mailForm\(account, \{ onSaved, onCancel \}\)[\s\S]*?\n\}/m.exec(src);
+  assert.ok(form, 'mailForm is missing');
+  const tree = form[0].split(`class: 'account-form'`)[1] ?? '';
+  assert.match(tree, /paintCredential\(\);/,
+    'the form never paints the slot for the state it opens in');
+});
+
+/**
  * `sentMailbox` is appended to every fetch by `mailboxesFor()` and had no writer
  * anywhere in `ui/` — the string appeared exactly once, in a blank-account
  * literal. The stored default is the bare word "Sent", which is wrong for Gmail,
@@ -1851,7 +2039,7 @@ test('the Outlook note tells the user to press something that exists', async () 
   // itself moved out of the form into `microsoftSignIn` when the simple mail
   // form learned to show the same block, so the assertion follows it: the
   // form builds the block through the factory, and the factory makes the calls.
-  assert.match(form[0], /const microsoft = microsoftSignIn\(\{/, 'the form no longer builds the sign-in block');
+  assert.match(form[0], /const buildMicrosoft = \(\) => microsoftSignIn\(\{/, 'the form no longer builds the sign-in block');
   const flow = /\nfunction microsoftSignIn\([\s\S]*?\n\}/m.exec(src);
   assert.ok(flow, 'microsoftSignIn is missing');
   for (const call of ['beginMailOAuth', 'mailOAuthStatus', 'cancelMailOAuth']) {
@@ -2578,7 +2766,7 @@ test('Sign in with Google has the shape of Sign in with Microsoft, and opens Goo
   }
   assert.match(flow, /api\.beginMailOAuth\(\{\n\s+provider: 'google',\n\s+keyRef,\n\s+email: address\(\),/, 'the flow does not name its provider, keyRef and address');
   assert.match(flow, /return \{\n\s+node,\n\s+oauth,[\s\S]*?stop\(\) \{/, 'the block does not return { node, oauth, stop }');
-  assert.match(flow, /const oauth = \(\) => \(\{ provider: 'google', clientId: clientIdInput\.value\.trim\(\) \}\)/, 'oauth() is not the account shape');
+  assert.match(flow, /const oauth = \(\) => \(\{ provider: 'google', clientId: clientIdInput\.value\.trim\(\) \|\| grantedClientId \}\)/, 'oauth() is not the account shape');
 
   // The sign-in page opens through an https-only target=_blank anchor — what
   // desktop/guard.js hands to the system browser — and the anchor stays on
@@ -2721,7 +2909,10 @@ test('Connect on a mailbox signed in with Google saves an OAuth account and stor
   const guess = { label: 'Gmail', host: 'imap.gmail.com', port: 993, secure: true, auth: 'password', signIn: 'google', clientReady: true, appPasswordUrl: 'https://example.com/app', note: '', known: true };
   const outcome = await settings.connectSimpleMail({
     id: 'm_7', keyRef: 'mail.m_7', email: 'nemo@gmail.com', password: '', guess,
-    auth: 'xoauth2', oauth: { provider: 'google', clientId: '' },
+    // The block's oauth() carries the client the sign-in actually ran
+    // against — the server's own, when the field on screen was empty —
+    // because a saved `clientId: ''` is an account the sweep cannot refresh.
+    auth: 'xoauth2', oauth: { provider: 'google', clientId: '4242-zelos.apps.googleusercontent.com' },
   });
   assert.equal(outcome.ok, true);
   assert.equal(outcome.sentMailbox, '[Gmail]/Sent Mail');
@@ -2731,11 +2922,11 @@ test('Connect on a mailbox signed in with Google saves an OAuth account and stor
   assert.ok(!calls.some((c) => c.path === '/api/secrets'), 'a password was stored for a signed-in mailbox');
   const tested = calls.find((c) => c.path === '/api/mail/test').body;
   assert.equal(tested.auth, 'xoauth2');
-  assert.deepEqual(tested.oauth, { provider: 'google', clientId: '' });
+  assert.deepEqual(tested.oauth, { provider: 'google', clientId: '4242-zelos.apps.googleusercontent.com' });
   assert.equal(tested.keyRef, 'mail.m_7', 'the test names the ref the grant was filed under');
   const account = calls.find((c) => c.path === '/api/config').body.mail[0];
   assert.equal(account.auth, 'xoauth2');
-  assert.deepEqual(account.oauth, { provider: 'google', clientId: '' });
+  assert.deepEqual(account.oauth, { provider: 'google', clientId: '4242-zelos.apps.googleusercontent.com' });
   assert.equal(account.host, 'imap.gmail.com');
 
   // And the simple form routes a finished Google sign-in through exactly
@@ -2791,7 +2982,7 @@ test('Advanced offers Sign in with Google, and an account signed in that way say
   // Test the connection tests the account that will be saved: with its auth.
   assert.match(body, /\.\.\.\(authMethod\(\) === 'xoauth2' \? \{ auth: 'xoauth2', oauth: activeOAuth\(\) \} : \{\}\),/, 'Test the connection tests a signed-in account as a password one');
   // Moving the picker stops whichever block is no longer showing.
-  assert.match(body, /if \(!xo \|\| viaGoogle\) microsoft\.stop\(\);\n\s+if \(!viaGoogle\) google\?\.stop\(\);/, 'a poll outlives its slot');
+  assert.match(body, /if \(!xo \|\| viaGoogle\) microsoft\?\.stop\(\);\n\s+if \(!viaGoogle\) google\?\.stop\(\);/, 'a poll outlives its slot');
 });
 
 test('the Microsoft registration form is hidden when the server ships the client', () => {
@@ -3066,6 +3257,7 @@ function plainFetch({ probe = [], guesses = {}, presets, manifests, guides = GUI
     }
     if (reqPath === '/api/health') return ok({ model: { configured: false }, home: '/tmp/zelos-home', backend: { name: 'encrypted-file', writable: true, note: 'This does NOT protect against a process already running as this user.' } });
     if (reqPath === '/api/state') return ok({ items: [], events: [], notes: [], counts: {}, runs: {} });
+    if (reqPath === '/api/data') return ok({ dbBytes: 3_215_360, walBytes: 0, messageCount: 214, oldestMessageAt: '2026-03-04T09:00:00-05:00', eventCount: 12, itemCount: 9, accounts: [{ id: 'mail-1', label: 'frank@gmail.com', messages: 214 }] });
     if (reqPath.startsWith('/api/ai')) return ok({ error: 'not found' }, 404);
     throw new Error(`unexpected ${init.method || 'GET'} ${reqPath}`);
   };
@@ -3274,6 +3466,307 @@ test('no screen in onboarding, and no mail card, shows a first-timer a protocol 
   goTo(1);
 });
 
+/**
+ * The Done step's gate counted mail and calendars only, while ui/views/now.js
+ * and the server both count the connector sources under Settings → Other
+ * things it can read. A home reading only Slack was told "it still needs an
+ * email account" with the one button disabled — a false sentence over a check
+ * that would have succeeded.
+ */
+test('the Done step counts connector-only homes as having something to read', async (t) => {
+  withPlainDom(t);
+  globalThis.fetch = plainFetch({ presets: await llmPresets(), manifests: await connectorManifests() });
+  t.after(() => { delete globalThis.fetch; });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const onboarding = await import(fileUrl(UI, 'views/onboarding.js'));
+  store.state.config = { identity: {}, model: {}, mail: [], calendars: [], sources: [{ id: 's1', kind: 'slack' }] };
+  store.state.health = { model: { configured: true, label: 'Claude' }, backend: { name: 'encrypted-file' } };
+  store.state.secretRefs = [];
+
+  let view = null;
+  const ctx = { navigate() {}, rerender() { view = onboarding.renderOnboarding(ctx); } };
+  ctx.rerender();
+  const stepButton = (n) => plainWalk(view).filter((b) => b.tag === 'button' && (b.attributes.class || '').includes('ob-step-btn'))[n - 1];
+  stepButton(5).fire('click');
+
+  const seen = onScreen(view);
+  assert.doesNotMatch(seen, /can’t read anything yet/, 'a connector-only home has something to read');
+  const read = findButton(view, 'Read my mail now');
+  assert.ok(read, 'no "Read my mail now" button');
+  assert.equal(read.attributes.disabled, undefined, 'the button must be pressable');
+
+  // Leave the module's step where a fresh page starts.
+  stepButton(1).fire('click');
+});
+
+/**
+ * The one Owed defect the shell cannot fix: a queued render can flush the
+ * moment the draft textarea blurs, and the rebuilt card reads
+ * `state.board.drafts` — which held the body fetched BEFORE the edit, so the
+ * user watched their own words revert while the server was saving them.
+ * The card patches the board's copy before the request goes out.
+ */
+test('a draft edit lands in the board copy before the save returns, so a repaint cannot revert it', async (t) => {
+  withPlainDom(t);
+  const puts = [];
+  globalThis.fetch = async (reqPath, init = {}) => {
+    puts.push({ path: reqPath, method: init.method || 'GET', body: init.body ? JSON.parse(init.body) : null });
+    return { ok: true, status: 200, text: async () => '{}' };
+  };
+  t.after(() => { delete globalThis.fetch; });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const owed = await import(fileUrl(UI, 'views/owed.js'));
+  store.state.board = {
+    ...store.state.board,
+    items: [],
+    drafts: [{ id: 'd1', state: 'pending', to_email: 'sam@example.com', subject: 'the survey', body: 'The fetched body.', item_id: null }],
+  };
+
+  const view = owed.renderOwed({ tz: 'UTC', navigate() {}, rerender() {} });
+  const area = findInput(view, (n) => n.tag === 'textarea' && (n.attributes['aria-label'] || '').startsWith('Draft to'));
+  assert.ok(area, 'no draft textarea');
+  area.value = 'The body as edited.';
+  area.fire('input');
+  area.fire('blur');
+  assert.equal(store.state.board.drafts[0].body, 'The body as edited.',
+    'the board copy must already hold what a rebuilt card will paint');
+  await settle();
+  assert.deepEqual(puts.filter((p) => p.method === 'PUT').map((p) => p.body),
+    [{ body: 'The body as edited.', state: 'edited' }]);
+});
+
+/** A fetch for the board-row tests below: records every call, answers /api/state with an empty board. */
+const rowFetch = (calls) => async (reqPath, init = {}) => {
+  calls.push({ method: init.method || 'GET', path: reqPath, body: init.body ? JSON.parse(init.body) : null });
+  if (reqPath === '/api/state') {
+    return { ok: true, status: 200, text: async () => JSON.stringify({ items: [], events: [], notes: [], counts: {}, drafts: [], runs: {} }) };
+  }
+  return { ok: true, status: 200, text: async () => '{}' };
+};
+
+test('a mailto body past what email programs honour is cut clean and flagged', async () => {
+  stubBrowserGlobals();
+  const owed = await import(fileUrl(UI, 'views/owed.js'));
+  assert.deepEqual(owed.mailtoDraft('a@b.c', 'Hi', 'One.\nTwo.'),
+    { href: 'mailto:a%40b.c?subject=Hi&body=One.%0D%0ATwo.', truncated: false });
+
+  const long = owed.mailtoDraft('a@b.c', 'Hi', 'word '.repeat(2000));
+  assert.equal(long.truncated, true);
+  assert.ok(long.href.length <= 1900, `${long.href.length} characters is past where email programs cut`);
+  const sent = decodeURIComponent(long.href.slice(long.href.indexOf('&body=') + 6));
+  assert.ok(sent.length > 1000, 'the start must actually ride along');
+  assert.ok('word '.repeat(2000).startsWith(sent), 'the cut must be a clean prefix');
+
+  // The cut never splits a two-part character — half of one is not encodable.
+  const emoji = owed.mailtoDraft('a@b.c', '', '🙂'.repeat(1000));
+  assert.equal(emoji.truncated, true);
+  assert.match(decodeURIComponent(emoji.href.slice(emoji.href.indexOf('&body=') + 6)), /^(?:🙂)*$/u);
+
+  // No recipient still yields an address a client can open.
+  assert.match(owed.mailtoDraft('', '', 'x').href, /^mailto:\?subject=&body=x$/);
+});
+
+test('the mailto rides the live textarea at click time, and says so when only the start fits', async (t) => {
+  withPlainDom(t);
+  globalThis.fetch = async () => ({ ok: true, status: 200, text: async () => '{}' });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const owed = await import(fileUrl(UI, 'views/owed.js'));
+  t.after(() => { delete globalThis.fetch; store.notify(null); });
+  store.state.board = {
+    ...store.state.board,
+    items: [],
+    drafts: [{ id: 'd1', state: 'pending', to_email: 'sam@example.com', subject: 'the survey', body: 'First line.\nSecond line.', item_id: null }],
+  };
+
+  const view = owed.renderOwed({ tz: 'UTC', navigate() {}, rerender() {} });
+  const open = plainWalk(view).find((n) => n.tag === 'a' && textOf(n) === 'Open in your email program');
+  assert.ok(open, 'no mailto link');
+
+  // The click reads the textarea NOW — first the fetched body, CRLF-encoded...
+  open.fire('click');
+  assert.equal(open.getAttribute('href'),
+    'mailto:sam%40example.com?subject=the%20survey&body=First%20line.%0D%0ASecond%20line.');
+
+  // ...then the edited one, with no save round-trip in between. Sending the
+  // reply used to be copy, switch, click, click, paste.
+  const area = findInput(view, (n) => n.tag === 'textarea');
+  area.value = 'The reply as edited.';
+  area.fire('input');
+  open.fire('click');
+  assert.match(open.getAttribute('href'), /&body=The%20reply%20as%20edited\.$/);
+  area.fire('blur');
+  await settle();
+
+  // A short reply carries no warning...
+  const note = plainWalk(view).find((n) => (n.attributes.class || '').includes('draft-note'));
+  assert.ok(note, 'the honesty note is missing from the card');
+  assert.equal(note.hidden, true);
+
+  // ...and a long one says the start is filled in, before the click happens.
+  area.value = 'A reply that will not fit. '.repeat(200);
+  area.fire('input');
+  assert.equal(note.hidden, false);
+  assert.match(textOf(note), /start/);
+  open.fire('click');
+  const href = open.getAttribute('href');
+  assert.ok(href.length <= 1900, `a ${href.length}-character address will be cut by the email program itself`);
+  assert.ok('A reply that will not fit. '.repeat(200)
+    .startsWith(decodeURIComponent(href.slice(href.indexOf('&body=') + 6))));
+  area.fire('blur');
+  await settle();
+
+  // Copy stays the first-class door.
+  const actions = plainWalk(view).find((n) => (n.attributes.class || '') === 'draft-actions');
+  assert.equal(textOf(actions.children[0]), 'Copy the text');
+  assert.match(actions.children[0].attributes.class, /solid/);
+});
+
+test('the hero can be told "Not a thing", through the same controls the rows get', async (t) => {
+  withPlainDom(t);
+  const calls = [];
+  globalThis.fetch = rowFetch(calls);
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const items = await import(fileUrl(UI, 'lib/items.js'));
+  t.after(() => { delete globalThis.fetch; store.notify(null); });
+
+  const hero = items.itemHero({ id: 'h9', bucket: 'now', state: 'open', headline: 'Noise' }, { tz: 'UTC' });
+  const dismiss = findButton(hero, 'Not a thing');
+  assert.ok(dismiss, 'the hero has no way to say the top pick is noise');
+  dismiss.fire('click');
+  await settle();
+  assert.ok(calls.some((c) => c.method === 'POST' && c.path === '/api/items/h9/state' && c.body?.state === 'dismissed'),
+    'the dismissal never reached the server');
+
+  // Reused, not forked, so hero and rows cannot drift apart again. The hero
+  // keeps its own top-level Snooze button — its most-used second action does
+  // not belong two clicks deep — but it must be the SHARED snoozeControl, and
+  // "Not a thing" must still arrive through the rows' own moreControls.
+  const src = fs.readFileSync(path.join(UI, 'lib/items.js'), 'utf8');
+  const heroFn = /export function itemHero[\s\S]*?\n\}/m.exec(src);
+  assert.ok(heroFn, 'itemHero is missing');
+  assert.match(heroFn[0], /moreControls\(item\)/, 'the hero must build the same controls the rows do');
+  assert.match(heroFn[0], /snoozeControl\(item\)/, 'the hero lost its top-level Snooze');
+  const snoozeToggle = findButton(hero, 'Snooze');
+  assert.ok(snoozeToggle, 'Snooze must stay one click away on the hero');
+});
+
+test('the snooze menu prints each promise and can be told a day of your own', async (t) => {
+  withPlainDom(t);
+  const calls = [];
+  globalThis.fetch = rowFetch(calls);
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const items = await import(fileUrl(UI, 'lib/items.js'));
+  const priorConfig = store.state.config;
+  store.state.config = { identity: { timezone: 'America/New_York' } };
+  t.after(() => { store.state.config = priorConfig; delete globalThis.fetch; store.notify(null); });
+
+  const row = items.itemRow({ id: 's1', bucket: 'now', state: 'open', headline: 'Call Sam' }, { tz: 'America/New_York' });
+  plainWalk(row).find((n) => (n.attributes.class || '') === 'disclosure').fire('click');
+  findButton(row, 'Snooze').fire('click');
+
+  // The three fixed choices say when, before the click.
+  assert.equal(findButtons(row, /^Later today · \d{1,2}(:\d{2})? [AP]M$/).length, 1, 'Later today does not print its clock');
+  assert.equal(findButtons(row, /^Tomorrow morning · 9 AM$/).length, 1);
+  assert.equal(findButtons(row, /^Next week · \w{3}, \w{3} \d{1,2} 9 AM$/).length, 1);
+
+  // The fourth: any day, back on the board at 9 that morning.
+  const pick = findButton(row, 'Pick a day…');
+  assert.ok(pick, 'there is no way to say Saturday');
+  pick.fire('click');
+  const day = findInput(row, (n) => n.attributes.type === 'date');
+  assert.ok(day, 'no date field behind Pick a day…');
+  const min = ui.addDaysToKey(ui.todayKey('America/New_York'), 1);
+  assert.equal(day.getAttribute('min'), min, 'yesterday must not be on offer');
+
+  const picked = ui.addDaysToKey(min, 30);
+  day.value = picked;
+  day.fire('input');
+  findButton(row, 'Back that morning · 9 AM').fire('click');
+  await settle();
+  const post = calls.find((c) => c.method === 'POST' && c.path === '/api/items/s1/state');
+  assert.ok(post, 'the picked day never reached the server');
+  assert.equal(post.body.state, 'snoozed');
+  assert.match(post.body.until, new RegExp(`^${picked}T09:00:00[-+]\\d{2}:\\d{2}$`),
+    'the promise is 9:00 that morning, carrying the configured zone');
+  assert.equal(ui.dayKey(post.body.until), picked);
+});
+
+test('a row and the hero wear "new" and their source at the end of the line', async (t) => {
+  withPlainDom(t);
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const items = await import(fileUrl(UI, 'lib/items.js'));
+  const priorBoard = store.state.board;
+  store.state.board = { ...store.state.board, runs: { last: { ok: true, started_at: '2026-08-11T12:00:00Z' } } };
+  t.after(() => { store.state.board = priorBoard; });
+
+  const row = items.itemRow({
+    id: 'r1', bucket: 'now', state: 'open', headline: 'Call Sam', person: 'Sam',
+    kind: 'mail', sourceRefs: ['msg:a', 'msg:b', 'msg:c'], first_seen: '2026-08-11T12:30:00Z',
+  }, { tz: 'UTC' });
+  const meta = plainWalk(row).find((n) => (n.attributes.class || '') === 'meta mono');
+  assert.ok(meta, 'no meta line');
+  const bits = meta.children.map(textOf);
+  assert.equal(bits.at(-1), '· from your mail (3)', 'the source stamp ends the line, dimmest');
+  assert.equal(bits.at(-2), '· new');
+
+  // Seen before the check started: not news, however the model worded it.
+  const old = items.itemRow({
+    id: 'r2', bucket: 'now', state: 'open', headline: 'Old', kind: 'mail',
+    sourceRefs: ['msg:a'], first_seen: '2026-08-11T11:00:00Z',
+  }, { tz: 'UTC' });
+  const oldMeta = plainWalk(old).find((n) => (n.attributes.class || '') === 'meta mono');
+  assert.ok(!oldMeta.children.map(textOf).some((b) => b === 'new' || b === '· new'),
+    'an item the last check merely re-cited is wearing the mark');
+
+  const hero = items.itemHero({
+    id: 'h1', bucket: 'now', state: 'open', headline: 'Top', kind: 'derived',
+    sourceRefs: [], first_seen: '2026-08-11T12:30:00Z',
+  }, { tz: 'UTC' });
+  const hm = plainWalk(hero).find((n) => (n.attributes.class || '') === 'hero-meta mono');
+  const texts = hm.children.map(textOf);
+  assert.ok(texts.includes('new'), 'the hero hides the newness the rows show');
+  assert.ok(texts.includes('no source saved'), 'an unreceipted assertion must say so');
+  const derived = hm.children.find((n) => textOf(n) === 'no source saved');
+  assert.match(derived.attributes.class, /meta-derived/, '"no source saved" must not dress like provenance');
+});
+
+/**
+ * The two lost-session screens. Neither is rendered by the walk above — one is
+ * app.js-internal, the other a store answer — but both are states a
+ * non-expert genuinely reaches (a bookmarked board after a restart), so their
+ * words are held to the same rule, at the source and at the export. And the
+ * desktop shell has no terminal to reopen from: its way back is Board →
+ * Reload board, so both screens must know which shell they are on.
+ */
+test('the two lost-session screens speak the register the walk enforces', async () => {
+  const app = fs.readFileSync(path.join(UI, 'app.js'), 'utf8');
+  const screen = /function noTokenScreen\(\)[\s\S]*?\n\}/m.exec(app);
+  assert.ok(screen, 'noTokenScreen is missing');
+  for (const [literal] of screen[0].matchAll(/'[^']*'/g)) {
+    assert.doesNotMatch(literal, JARGON, `noTokenScreen: ${literal.match(JARGON)?.[0]}`);
+    assert.doesNotMatch(literal, /127\.0\.0\.1/, 'a loopback address is the same register');
+  }
+  assert.match(screen[0], /window\.zelos/, 'the screen must branch on the shell it is in');
+  assert.match(screen[0], /Reload board/);
+
+  stubBrowserGlobals();
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const { ApiError } = await import(fileUrl(UI, 'lib/api.js'));
+  const lost = store.fatalFor(new ApiError('no', { status: 401 }));
+  assert.doesNotMatch(`${lost.title} ${lost.detail}`, JARGON,
+    `the 401 screen in a browser: ${`${lost.title} ${lost.detail}`.match(JARGON)?.[0]}`);
+  assert.match(lost.detail, /terminal/, 'a browser tab is pointed back to the printed address');
+  globalThis.window.zelos = { desktop: true };
+  try {
+    const desk = store.fatalFor(new ApiError('no', { status: 401 }));
+    assert.doesNotMatch(`${desk.title} ${desk.detail}`, JARGON,
+      `the 401 screen in the shell: ${`${desk.title} ${desk.detail}`.match(JARGON)?.[0]}`);
+    assert.match(desk.detail, /Reload board/, 'the desktop shell has no terminal — its menu is the way back');
+  } finally {
+    delete globalThis.window.zelos;
+  }
+});
+
 test('the guided AI card stores the key, tests, picks the model itself, saves and moves on — in that order', async (t) => {
   withPlainDom(t);
   const calls = [];
@@ -3361,6 +3854,222 @@ test('the guided AI card stores the key, tests, picks the model itself, saves an
   assert.doesNotMatch(onScreen(withLocal), JARGON, `the local guided card: ${onScreen(withLocal).match(JARGON)?.[0]}`);
 });
 
+/**
+ * The two sign-in blocks save the client the flow actually RAN AGAINST.
+ *
+ * When the server has a client of its own the id field is never on screen,
+ * so oauth() used to hand back `clientId: ''` — and connectSimpleMail saved
+ * it, the card said "Connected · N mailboxes", and every sweep after it
+ * threw before the stored grant was even consulted. The server has always
+ * answered begin/status with the resolved `clientId`; these tests pin that
+ * the blocks pick it up and that the saved account is self-describing.
+ */
+test('the simple card saves the client a Google sign-in ran against, not the empty field it never showed', async (t) => {
+  withPlainDom(t);
+  const RESOLVED = '4242-zelos.apps.googleusercontent.com';
+  const calls = [];
+  const ok = (body) => ({ ok: true, status: 200, text: async () => JSON.stringify(body) });
+  globalThis.fetch = async (reqPath, init = {}) => {
+    const body = init.body ? JSON.parse(init.body) : null;
+    calls.push({ method: init.method || 'GET', path: reqPath, body });
+    if (reqPath === '/api/mail/guess') return ok({ ...GUESSES['frank@gmail.com'], clientReady: true });
+    if (reqPath === '/api/guides') return ok(GUIDES);
+    if (reqPath === '/api/help') return ok(helpAnswer(body));
+    if (reqPath === '/api/mail/oauth') {
+      return ok({ id: 'f1', provider: 'google', state: 'connected', status: 'connected', keyRef: body.keyRef, clientId: RESOLVED, user: 'frank@gmail.com', error: null });
+    }
+    if (reqPath === '/api/mail/test') {
+      return ok({ ok: true, capabilities: [], error: null, mailboxes: [{ name: 'INBOX', specialUse: 'inbox' }, { name: '[Gmail]/Sent Mail', specialUse: 'sent' }] });
+    }
+    if (reqPath === '/api/config') return ok({ config: { identity: { email: 'frank@gmail.com' }, mail: body?.mail ?? [] }, errors: [], secretRefs: [] });
+    if (reqPath === '/api/health') return ok({ model: { configured: false } });
+    throw new Error(`unexpected ${reqPath}`);
+  };
+  t.after(() => { delete globalThis.fetch; });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const settings = await import(fileUrl(UI, 'views/settings.js'));
+  store.state.config = { identity: { name: '', email: '' }, mail: [], calendars: [], sources: [] };
+  store.state.health = { model: { configured: false }, backend: { name: 'encrypted-file' } };
+  store.state.secretRefs = [];
+
+  const form = settings.simpleMailForm({ onSaved() {}, onCancel() {} });
+  const email = findInput(form, (n) => n.attributes.type === 'email');
+  email.value = 'frank@gmail.com';
+  email.fire('change');
+  await settle();
+  findButton(form, 'Sign in with Google').fire('click');
+  await settle();
+  findButton(form, 'Connect').fire('click');
+  await settle();
+  assert.equal(calls.find((c) => c.path === '/api/mail/oauth').body.clientId, undefined, 'an empty field lets the server pick its own client');
+  assert.deepEqual(calls.find((c) => c.path === '/api/mail/test').body.oauth, { provider: 'google', clientId: RESOLVED },
+    'the account is tested with the client the grant was minted for');
+  assert.deepEqual(calls.find((c) => c.method === 'PUT' && c.path === '/api/config').body.mail[0].oauth, { provider: 'google', clientId: RESOLVED },
+    'and saved with it — a saved clientId of \'\' is an account the sweep cannot refresh');
+});
+
+test('the simple card saves the client a Microsoft sign-in ran against, the same way', async (t) => {
+  withPlainDom(t);
+  const RESOLVED = '11111111-2222-3333-4444-555555555555';
+  const calls = [];
+  const ok = (body) => ({ ok: true, status: 200, text: async () => JSON.stringify(body) });
+  globalThis.fetch = async (reqPath, init = {}) => {
+    const body = init.body ? JSON.parse(init.body) : null;
+    calls.push({ method: init.method || 'GET', path: reqPath, body });
+    if (reqPath === '/api/mail/guess') return ok({ ...GUESSES['frank@hotmail.com'], clientReady: true });
+    if (reqPath === '/api/guides') return ok(GUIDES);
+    if (reqPath === '/api/help') return ok(helpAnswer(body));
+    if (reqPath === '/api/mail/oauth') {
+      return ok({ id: 'f2', provider: 'microsoft', state: 'connected', status: 'connected', keyRef: body.keyRef, clientId: RESOLVED, error: null });
+    }
+    if (reqPath === '/api/mail/test') {
+      return ok({ ok: true, capabilities: [], error: null, mailboxes: [{ name: 'INBOX', specialUse: 'inbox' }, { name: 'Sent Items', specialUse: 'sent' }] });
+    }
+    if (reqPath === '/api/config') return ok({ config: { identity: { email: 'frank@hotmail.com' }, mail: body?.mail ?? [] }, errors: [], secretRefs: [] });
+    if (reqPath === '/api/health') return ok({ model: { configured: false } });
+    throw new Error(`unexpected ${reqPath}`);
+  };
+  t.after(() => { delete globalThis.fetch; });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const settings = await import(fileUrl(UI, 'views/settings.js'));
+  store.state.config = { identity: { name: '', email: '' }, mail: [], calendars: [], sources: [] };
+  store.state.health = { model: { configured: false }, backend: { name: 'encrypted-file' } };
+  store.state.secretRefs = [];
+
+  const form = settings.simpleMailForm({ onSaved() {}, onCancel() {} });
+  const email = findInput(form, (n) => n.attributes.type === 'email');
+  email.value = 'frank@hotmail.com';
+  email.fire('change');
+  await settle();
+  findButton(form, 'Sign in with Microsoft').fire('click');
+  await settle();
+  findButton(form, 'Connect').fire('click');
+  await settle();
+  assert.equal(calls.find((c) => c.path === '/api/mail/oauth').body.clientId, undefined, 'an empty field lets the server pick its own client');
+  assert.deepEqual(calls.find((c) => c.path === '/api/mail/test').body.oauth, { provider: 'microsoft', clientId: RESOLVED, tenantId: 'common' },
+    'Connect is not refused for a client id the user never saw');
+  assert.deepEqual(calls.find((c) => c.method === 'PUT' && c.path === '/api/config').body.mail[0].oauth, { provider: 'microsoft', clientId: RESOLVED, tenantId: 'common' });
+});
+
+test('the account editor asks the server whether Microsoft sign-in is ready, the way its Google branch does', async (t) => {
+  withPlainDom(t);
+  const RESOLVED = '11111111-2222-3333-4444-555555555555';
+  const calls = [];
+  const ok = (body) => ({ ok: true, status: 200, text: async () => JSON.stringify(body) });
+  globalThis.fetch = async (reqPath, init = {}) => {
+    const body = init.body ? JSON.parse(init.body) : null;
+    calls.push({ method: init.method || 'GET', path: reqPath, body });
+    if (reqPath === '/api/mail/guess') return ok({ ...GUESSES['frank@hotmail.com'], clientReady: true });
+    if (reqPath === '/api/guides') return ok(GUIDES);
+    if (reqPath === '/api/help') return ok(helpAnswer(body));
+    if (reqPath === '/api/mail/oauth') {
+      return ok({ id: 'f3', provider: 'microsoft', state: 'connected', status: 'connected', keyRef: body.keyRef, clientId: RESOLVED, error: null });
+    }
+    if (reqPath === '/api/config') return ok({ config: { identity: { email: 'frank@hotmail.com' }, mail: body?.mail ?? [] }, errors: [], secretRefs: [] });
+    if (reqPath === '/api/health') return ok({ model: { configured: false } });
+    throw new Error(`unexpected ${reqPath}`);
+  };
+  t.after(() => { delete globalThis.fetch; });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const settings = await import(fileUrl(UI, 'views/settings.js'));
+  const account = {
+    id: 'm_9', keyRef: 'mail.m_9', enabled: true, label: 'Hotmail', host: 'outlook.office365.com',
+    port: 993, secure: true, requireTls: null, user: 'frank@hotmail.com', auth: 'xoauth2',
+    oauth: { provider: 'microsoft', clientId: '', tenantId: 'common' },
+    mailboxes: ['INBOX'], sentMailbox: 'Sent Items', lookbackDays: 14, maxMessages: 400,
+  };
+  store.state.config = { identity: { name: '', email: 'frank@hotmail.com' }, mail: [account], calendars: [], sources: [] };
+  store.state.health = { model: { configured: false }, backend: { name: 'encrypted-file' } };
+  store.state.secretRefs = [];
+
+  const panel = settings.mailPanel({ rerender() {} });
+  findButton(panel, 'Edit').fire('click');
+  // The picker already says Microsoft; opening the form paints the slot,
+  // and painting the slot is what asks — no change event required.
+  await settle();
+  assert.equal(calls.filter((c) => c.path === '/api/mail/guess').length, 1, 'whether a client is ready is the server\'s answer, asked once');
+  findButton(panel, 'Sign in with Microsoft').fire('click');
+  await settle();
+  const began = calls.find((c) => c.path === '/api/mail/oauth');
+  assert.ok(began, 'the editor refused a sign-in the server\'s own client could run — the reconnect path is dead-ended');
+  assert.equal(began.body.clientId, undefined, 'an empty field lets the server pick its own client');
+  findButton(panel, 'Save account').fire('click');
+  await settle();
+  assert.deepEqual(calls.find((c) => c.method === 'PUT' && c.path === '/api/config').body.mail.find((m) => m.id === 'm_9').oauth,
+    { provider: 'microsoft', clientId: RESOLVED, tenantId: 'common' },
+    'reconnecting from the editor saves the client the grant was minted for');
+});
+
+test('the account editor\'s Microsoft refusal shows the setup page, not the name of a file', async (t) => {
+  withPlainDom(t);
+  const calls = [];
+  const ok = (body) => ({ ok: true, status: 200, text: async () => JSON.stringify(body) });
+  globalThis.fetch = async (reqPath, init = {}) => {
+    const body = init.body ? JSON.parse(init.body) : null;
+    calls.push({ method: init.method || 'GET', path: reqPath, body });
+    if (reqPath === '/api/mail/guess') return ok({ ...GUESSES['frank@hotmail.com'] });
+    if (reqPath === '/api/guides') return ok(GUIDES);
+    if (reqPath === '/api/help') return ok(helpAnswer(body));
+    if (reqPath === '/api/config') return ok({ config: { identity: { email: 'frank@hotmail.com' }, mail: [] }, errors: [], secretRefs: [] });
+    if (reqPath === '/api/health') return ok({ model: { configured: false } });
+    throw new Error(`unexpected ${reqPath}`);
+  };
+  t.after(() => { delete globalThis.fetch; });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const settings = await import(fileUrl(UI, 'views/settings.js'));
+  const account = {
+    id: 'm_8', keyRef: 'mail.m_8', enabled: true, label: 'Hotmail', host: 'outlook.office365.com',
+    port: 993, secure: true, requireTls: null, user: 'frank@hotmail.com', auth: 'xoauth2',
+    oauth: { provider: 'microsoft', clientId: '', tenantId: 'common' },
+    mailboxes: ['INBOX'], sentMailbox: 'Sent Items', lookbackDays: 14, maxMessages: 400,
+  };
+  store.state.config = { identity: { name: '', email: 'frank@hotmail.com' }, mail: [account], calendars: [], sources: [] };
+  store.state.health = { model: { configured: false }, backend: { name: 'encrypted-file' } };
+  store.state.secretRefs = [];
+
+  const panel = settings.mailPanel({ rerender() {} });
+  findButton(panel, 'Edit').fire('click');
+  findInput(panel, (n) => n.tag === 'select' && n.value === 'xoauth2').fire('change');
+  await settle();
+  findButton(panel, 'Sign in with Microsoft').fire('click');
+  await settle();
+  assert.match(onScreen(panel), /One more step first/);
+  assert.ok(plainWalk(panel).some((n) => n.tag === 'a' && textOf(n) === 'Show me how ↗' && !plainHidden(n)),
+    'the refusal promises "the page below" and shows no page');
+  assert.doesNotMatch(onScreen(panel), /docs\/OAUTH\.md/, 'a repo file path stands where the link belongs');
+});
+
+test('removing a calendar deletes its stored password, as removing a mail account does', async (t) => {
+  withPlainDom(t);
+  const calls = [];
+  const ok = (body) => ({ ok: true, status: 200, text: async () => JSON.stringify(body) });
+  globalThis.fetch = async (reqPath, init = {}) => {
+    const body = init.body ? JSON.parse(init.body) : null;
+    calls.push({ method: init.method || 'GET', path: reqPath, body });
+    if (reqPath === '/api/config') return ok({ config: { identity: {}, mail: [], calendars: body?.calendars ?? [], sources: [] }, errors: [], secretRefs: [] });
+    if (reqPath.startsWith('/api/secrets/')) return ok({ ok: true });
+    if (reqPath === '/api/help') return ok(helpAnswer(body));
+    if (reqPath === '/api/health') return ok({ model: { configured: false } });
+    throw new Error(`unexpected ${reqPath}`);
+  };
+  t.after(() => { delete globalThis.fetch; });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const settings = await import(fileUrl(UI, 'views/settings.js'));
+  store.state.config = {
+    identity: {}, mail: [], sources: [],
+    calendars: [{ id: 'c_1', enabled: true, kind: 'caldav', label: 'iCloud', url: 'https://caldav.icloud.com/', user: 'nemo@icloud.com', keyRef: 'calendar.c_1' }],
+  };
+  store.state.health = { model: { configured: false }, backend: { name: 'encrypted-file' } };
+  store.state.secretRefs = ['calendar.c_1'];
+
+  const panel = settings.calendarPanel({ rerender() {} });
+  findButton(panel, 'Remove').fire('click');
+  await settle();
+  assert.ok(calls.some((c) => c.method === 'PUT' && c.path === '/api/config'), 'Remove did not save');
+  assert.ok(calls.some((c) => c.method === 'DELETE' && c.path === '/api/secrets/calendar.c_1'),
+    'the calendar is gone from config but its stored password stays in the secret store forever');
+});
+
 test('Settings opens on Email, reads in plain words, keeps every route, and puts Colour last', async (t) => {
   withPlainDom(t);
   globalThis.fetch = plainFetch({ presets: await llmPresets() });
@@ -3390,6 +4099,16 @@ test('Settings opens on Email, reads in plain words, keeps every route, and puts
   const colour = settings.renderSettings({ sub: 'appearance', navigate() {}, rerender() {} });
   assert.ok(plainWalk(colour).some((n) => (n.attributes.class || '').includes('accent-swatch')), 'the Colour tab has no picker');
 
+  // A stale or mistyped deep link (#/settings/appearence) opens the default
+  // panel with its tab selected — not the AI panel under no tab at all, with
+  // an aria-labelledby naming an element that does not exist.
+  const lost = settings.renderSettings({ sub: 'appearence', navigate() {}, rerender() {} });
+  const lostPanel = plainWalk(lost).find((n) => n.attributes.role === 'tabpanel');
+  assert.equal(lostPanel.attributes.id, 'settings-panel-mail', 'an unknown sub-route falls through to the AI panel');
+  const lostTab = plainWalk(lost).find((n) => n.attributes.role === 'tab' && n.attributes['aria-selected'] === 'true');
+  assert.ok(lostTab, 'no tab is selected for an unknown sub-route');
+  assert.equal(lostPanel.attributes['aria-labelledby'], lostTab.attributes.id, 'the panel and the selected tab disagree');
+
   // Share with another AI opens with the sentence that keeps it from being mistaken for the AI tab.
   const share = settings.renderSettings({ sub: 'ai', navigate() {}, rerender() {} });
   const first = plainWalk(share).find((n) => n.attributes.role === 'tabpanel').children[0];
@@ -3412,10 +4131,10 @@ test('Settings opens on Email, reads in plain words, keeps every route, and puts
   assert.doesNotMatch(onScreen(privacy), /Characters of each|Most items per|telemetry|endpoint/, 'the expert numbers are on the Privacy card');
   assert.match(anywhere(privacy), /Characters of each email sent to the AI/, 'the expert numbers are gone rather than folded');
 
-  // About: one plain line on passwords, the spend as "AI usage this session", the essay folded and un-shouted.
+  // About: one plain line on passwords, the spend as "AI usage today", the essay folded and un-shouted.
   const about = settings.renderSettings({ sub: 'about', navigate() {}, rerender() {} });
   assert.match(onScreen(about), /Your passwords are locked in an encrypted file on this computer\./);
-  assert.match(onScreen(about), /AI usage this session/);
+  assert.match(onScreen(about), /AI usage today/);
   assert.doesNotMatch(onScreen(about), /AES|0600|\.seed|attacker|does NOT protect/, 'the security essay is on the About card');
   assert.match(anywhere(about), /does not protect against a process/, 'the store note is gone, or still in capitals');
   assert.match(anywhere(about), /Security details/);
@@ -3531,8 +4250,8 @@ test('no user-facing failure names an address the person did not type, and the b
   const app = fs.readFileSync(path.join(UI, 'app.js'), 'utf8');
   assert.match(app, /button\('Check now', \{/);
   assert.match(app, /state\.sweep\.running \? 'Checking…' : 'Check now'/);
-  assert.match(app, /if \(!last\) return 'Not checked yet';/);
-  assert.match(app, /return `Last checked \$\{humanDelta\(last\.ended_at \|\| last\.started_at\)\}/);
+  assert.match(app, /if \(!last\) return withAgain\('Not checked yet'\);/);
+  assert.match(app, /return withAgain\(`Last checked \$\{humanDelta\(last\.ended_at \|\| last\.started_at\)\}/);
   assert.match(app, /label: 'Promises', render: renderOwed/);
   assert.match(app, /button\('Add a reminder', \{/);
   assert.match(app, /class: 'btn solid', text: 'Save' \}/);
@@ -3877,4 +4596,262 @@ test('"Copy this message" copies the server\'s message, says so, and shows the m
   const gone = settings.askClaude({ step: 'general' });
   await settle();
   assert.equal(gone.hidden, true, 'a 404 left a line with no links on screen');
+});
+
+/* ------------------------------------------------- 9. the chrome tells the truth */
+
+/**
+ * Four quality-of-life claims, each pinned where it can rot: the header's
+ * check line must speak from STORED runs and the scheduler (not from whatever
+ * is still in memory), "new since the last check" must come from stored
+ * timestamps and never from the model's wording, About must mean "today" when
+ * it says today, and Your data must count what the folder actually holds.
+ */
+
+test('the words for the next check come from the scheduler, in plain words or not at all', async () => {
+  stubBrowserGlobals();
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  // No scheduler block — an older server, or health not loaded — is no claim.
+  assert.equal(store.checkAgainLine(null), '');
+  assert.equal(store.checkAgainLine(undefined), '');
+  assert.equal(store.checkAgainLine('soon'), '');
+  // Auto off beats a leftover target time: the off switch is the truth.
+  assert.equal(store.checkAgainLine({ auto: false, nextRunAt: '2026-08-28T14:40:00-04:00' }), 'automatic checks are off');
+  assert.equal(store.checkAgainLine({ auto: true, nextRunAt: '2026-08-28T14:40:00-04:00' }), 'checks again around 2:40 PM');
+  // Auto on but no armed target (a one-shot server) makes no promise.
+  assert.equal(store.checkAgainLine({ auto: true, nextRunAt: null }), '');
+});
+
+test('the check line reads the stored run: a failure survives a reload, a quick look says so', () => {
+  const app = fs.readFileSync(path.join(UI, 'app.js'), 'utf8');
+  const text = /export function sweepLineText\([\s\S]*?\n\}/m.exec(app);
+  assert.ok(text, 'sweepLineText is missing');
+  // The in-memory error dies with the tab; the stored run does not. After a
+  // reload a failed check must still say so, and point at the details.
+  assert.match(text[0], /last\.ok === false/, 'the line never consults the stored run');
+  assert.match(text[0], /The last check failed — details on Now/);
+  // A light run reads far less than a full one, and "Last checked 2h ago"
+  // over one quietly overstates how much was read.
+  assert.match(text[0], /last\.kind === 'light'/);
+  assert.match(text[0], /quick look/);
+  // The next check is stated from the scheduler, never invented.
+  assert.match(text[0], /checkAgainLine\(/);
+  // The one-paint finished note is what a check ends on.
+  assert.match(text[0], /s\.finished/);
+
+  const paint = /function paintSweepLine\(parts\)[\s\S]*?\n\}/m.exec(app);
+  assert.ok(paint, 'paintSweepLine is missing');
+  assert.match(paint[0], /state\.health\?\.scheduler/, 'the paint never hands the line the scheduler');
+  assert.match(paint[0], /last\?\.ok === false/, 'a stored failure must get the bad styling, not only a live one');
+  assert.match(paint[0], /finished: null/, 'the finished note must last one paint, not forever');
+});
+
+test('"new since the last check" is derived from stored timestamps, never the model\'s wording', async () => {
+  stubBrowserGlobals();
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const items = [
+    { id: 'old', bucket: 'now', state: 'open', first_seen: '2026-08-28T08:00:00-04:00' },
+    { id: 'fresh', bucket: 'today', state: 'open', first_seen: '2026-08-28T12:00:30-04:00' },
+    { id: 'ticked', bucket: 'now', state: 'done', first_seen: '2026-08-28T12:00:40-04:00' },
+    { id: 'undated', bucket: 'now', state: 'open' },
+  ];
+  const run = (ok) => ({ id: 'run_1', kind: 'full', ok, started_at: '2026-08-28T12:00:00-04:00' });
+
+  store.state.board = { ...store.state.board, items, runs: { last: run(true) } };
+  assert.deepEqual(store.newSinceLastCheck().map((i) => i.id), ['fresh'],
+    'new is: open, and first seen at or after the last successful run started');
+  store.state.board = { ...store.state.board, runs: { last: run(false) } };
+  assert.deepEqual(store.newSinceLastCheck(), [], 'a failed run marks nothing');
+  store.state.board = { ...store.state.board, runs: { last: null } };
+  assert.deepEqual(store.newSinceLastCheck(), [], 'no run at all marks nothing');
+  store.state.board = { ...store.state.board, runs: { last: { ...run(true), started_at: 'nonsense' } } };
+  assert.deepEqual(store.newSinceLastCheck(), [], 'an unreadable run timestamp marks nothing');
+
+  // The done branch says what the check found — counted from the rule above,
+  // and only when there was a prior successful run to compare against.
+  const src = fs.readFileSync(path.join(UI, 'lib/store.js'), 'utf8');
+  const done = /\} else if \(event === 'done'\) \{[\s\S]*?(?=\} else if \(event === 'failed'\))/m.exec(src);
+  assert.ok(done, 'the done branch of watchSweeps is missing');
+  assert.match(done[0], /newSinceLastCheck\(\)/, 'the count must come from the one derivation');
+  assert.match(done[0], /nothing new/);
+  assert.match(done[0], /new thing/);
+  assert.ok(done[0].indexOf('runs?.last') < done[0].indexOf('refreshBoard('),
+    'whether a prior successful run exists must be read BEFORE the refresh replaces it');
+});
+
+test('About says "AI usage today" and means it: a stale counter reads as quiet, not as spend', async (t) => {
+  withPlainDom(t);
+  globalThis.fetch = plainFetch({ presets: await llmPresets() });
+  t.after(() => { delete globalThis.fetch; });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const settings = await import(fileUrl(UI, 'views/settings.js'));
+  store.state.config = { identity: {}, model: {}, mail: [], calendars: [], sources: [] };
+  store.state.health = { model: { configured: false }, home: '/tmp/zelos-home', backend: { name: 'encrypted-file' } };
+  store.state.configErrors = [];
+
+  const lifetime = { tokensIn: 84_000, tokensOut: 9_100, runs: 40, modelRuns: 17 };
+  const boardWith = (tokens) => {
+    store.state.board = { items: [], events: [], notes: [], counts: {}, runs: {}, tokens, now: '2026-08-28T10:00:00-04:00' };
+    store.state.boardAt = Date.now();
+  };
+  const aboutText = () => onScreen(settings.renderSettings({ sub: 'about', navigate() {}, rerender() {} }));
+
+  // Today's counter: the spend, how often the AI was asked to think, and the
+  // running total since the start — with the no-price stance intact.
+  boardWith({ day: '2026-08-28', tokensIn: 12_400, tokensOut: 1_120, runs: 9, modelRuns: 3, lifetime });
+  let seen = aboutText();
+  assert.match(seen, /AI usage today/);
+  assert.doesNotMatch(seen, /AI usage this session/, 'the label still claims a session');
+  assert.match(seen, /12k tokens in · 1\.1k out/);
+  assert.match(seen, /asked to think 3 times/);
+  assert.match(seen, /84k tokens in · 9\.1k out/);
+  assert.match(seen, /asked to think 17 times/);
+  assert.match(seen, /What that costs depends on your AI service’s prices; Zelos does not see them\./);
+  assert.doesNotMatch(seen, /[$€£]/, 'a price was invented');
+
+  // Yesterday's counter on an untouched machine: today is quiet and says so,
+  // while the lifetime totals — which no day can stale — stay.
+  boardWith({ day: '2026-08-27', tokensIn: 500, tokensOut: 20, runs: 2, modelRuns: 1, lifetime });
+  seen = aboutText();
+  assert.match(seen, /Nothing sent to the AI yet today\./);
+  assert.doesNotMatch(seen, /500 tokens in/, 'yesterday\'s spend renders as current');
+  assert.doesNotMatch(seen, /asked to think 1 time\b/, 'yesterday\'s checks render as today\'s');
+  assert.match(seen, /84k tokens in · 9\.1k out/);
+
+  // No counter at all — a database from before the counter existed.
+  boardWith(null);
+  seen = aboutText();
+  assert.match(seen, /Nothing sent to the AI yet today\./);
+  assert.doesNotMatch(seen, /asked to think/);
+});
+
+test('Now folds "Finished recently" at the very bottom, and the tick on a done row reopens it', async (t) => {
+  withPlainDom(t);
+  const calls = [];
+  globalThis.fetch = async (reqPath, init = {}) => {
+    calls.push({ method: init.method || 'GET', path: reqPath, body: init.body ? JSON.parse(init.body) : null });
+    if (reqPath.startsWith('/api/items/')) return { ok: true, status: 200, text: async () => '{}' };
+    if (reqPath === '/api/state') return { ok: true, status: 200, text: async () => JSON.stringify({ items: [], events: [], notes: [], counts: {}, runs: {} }) };
+    return { ok: false, status: 404, text: async () => '{"error":"not found"}' };
+  };
+  t.after(() => { delete globalThis.fetch; });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const now = await import(fileUrl(UI, 'views/now.js'));
+
+  store.state.config = { identity: {}, model: { label: 'Claude' }, mail: [{ id: 'm1' }], calendars: [], sources: [] };
+  store.state.health = { model: { configured: true, label: 'Claude' } };
+  store.state.sweep = { running: false, phase: '', message: '', done: 0, total: 0, error: null, lastResult: null };
+  store.state.board = {
+    ...store.state.board,
+    items: [{ id: 'a', bucket: 'now', state: 'open', headline: 'Pay the invoice' }],
+    counts: { now: 1, today: 0, soon: 0, waiting: 0, promised: 0, note: 0, money: 0 },
+    events: [],
+    drafts: [],
+    notes: [],
+    runs: { last: { id: 'run_1', kind: 'full', ok: true, started_at: '2026-08-28T09:00:00-04:00', ended_at: '2026-08-28T09:01:00-04:00', stats: {} } },
+    first: 'a',
+    now: '2026-08-28T10:00:00-04:00',
+    finished: [
+      { id: 'f1', bucket: 'now', state: 'done', headline: 'Sent the survey', state_at: '2026-08-28T09:30:00-04:00' },
+      { id: 'f2', bucket: 'today', state: 'dismissed', headline: 'The newsletter', state_at: '2026-08-28T08:00:00-04:00' },
+    ],
+  };
+  store.state.boardAt = Date.now();
+
+  const view = now.renderNow({ tz: 'America/New_York', navigate() {} });
+  const fold = plainWalk(view).find((n) => n.tag === 'section' && (n.attributes.class || '').includes('is-finished'));
+  assert.ok(fold, 'no Finished recently section');
+  const toggle = plainWalk(fold).find((n) => n.tag === 'button' && textOf(n).includes('Finished recently'));
+  assert.ok(toggle, 'the fold has no toggle');
+  assert.match(textOf(toggle), /2/, 'the fold does not say how many rows it holds');
+  const panel = plainWalk(fold).find((n) => (n.attributes.class || '').includes('worth-body'));
+  assert.ok(panel, 'the fold has no body');
+  assert.ok('hidden' in panel.attributes, 'the section must start folded');
+  assert.match(anywhere(panel), /Sent the survey/);
+  assert.match(anywhere(panel), /The newsletter/);
+  // ...and the last section on the page: what you finished sits below even the snoozed.
+  assert.equal(view.children[view.children.length - 1], fold, 'Finished recently is not the last thing on Now');
+
+  toggle.fire('click');
+  assert.equal(toggle.attributes['aria-expanded'], 'true');
+  assert.equal(panel.hidden, false, 'opening the fold did not reveal the rows');
+
+  // The way back: the done row's tick is already a reopen button.
+  const tick = plainWalk(fold).find((n) => n.tag === 'button' && n.attributes.role === 'checkbox' && n.attributes['aria-checked'] === 'true');
+  assert.ok(tick, 'the done row lost its tick');
+  tick.fire('click');
+  await settle();
+  const posted = calls.find((c) => c.method === 'POST' && c.path === '/api/items/f1/state');
+  assert.ok(posted, 'ticking a finished row never reached the server');
+  assert.deepEqual(posted.body, { state: 'open' }, 'the tick on a done row must reopen it');
+
+  // Search keeps treating items[] as the board; the finished live beside it.
+  const search = fs.readFileSync(path.join(UI, 'views/search.js'), 'utf8');
+  assert.ok(!/finished/.test(search), 'search must not learn about the finished array');
+  // Dimmed like the snoozed: off the board, still on the record.
+  const css = fs.readFileSync(path.join(UI, 'app.css'), 'utf8');
+  assert.match(css, /\.worth\.is-finished \.row \{[^}]*opacity/, 'the finished rows are not dimmed');
+});
+
+test('a board without the finished field folds nothing and breaks nothing', async (t) => {
+  stubBrowserGlobals();
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  globalThis.fetch = async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ items: [], events: [], notes: [], counts: {}, runs: {}, now: '2026-08-28T10:00:00-04:00' }) });
+  t.after(() => { delete globalThis.fetch; });
+  await store.loadBoard();
+  assert.deepEqual(store.state.board.finished, [], 'an older server\'s payload must default to an empty list');
+  assert.deepEqual(store.finishedItems(), []);
+  store.state.board = { ...store.state.board, finished: [{ id: 'f1', state: 'done' }] };
+  assert.deepEqual(store.finishedItems().map((i) => i.id), ['f1']);
+  store.state.board = { ...store.state.board, finished: 'nonsense' };
+  assert.deepEqual(store.finishedItems(), [], 'a malformed field is an empty list, not a crash');
+});
+
+test('Your data counts what Zelos is holding, and stands unchanged when the route is missing', async (t) => {
+  withPlainDom(t);
+  const data = {
+    dbBytes: 320_000_000,
+    walBytes: 7_000_000,
+    messageCount: 2143,
+    oldestMessageAt: '2026-03-04T09:12:00-05:00',
+    eventCount: 480,
+    itemCount: 57,
+    accounts: [
+      { id: 'm1', label: 'frank@gmail.com', messages: 1801 },
+      { id: 'm2', label: 'the shop', messages: 342 },
+    ],
+  };
+  globalThis.fetch = async (reqPath, init = {}) => {
+    if (reqPath === '/api/data') return { ok: true, status: 200, text: async () => JSON.stringify(data) };
+    return plainFetch({})(reqPath, init);
+  };
+  t.after(() => { delete globalThis.fetch; });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const settings = await import(fileUrl(UI, 'views/settings.js'));
+  store.state.config = { identity: {}, model: {}, mail: [], calendars: [], sources: [] };
+  store.state.health = { model: { configured: false }, home: '/Users/nemo/Library/Zelos', backend: { name: 'encrypted-file' } };
+  store.state.configErrors = [];
+
+  const view = settings.renderSettings({ sub: 'data', navigate() {}, rerender() {} });
+  await settle();
+  const seen = onScreen(view);
+  // The one line the panel exists for: exact counts, the oldest month, the size.
+  assert.match(seen, /2,143 emails back to March 2026 · 312 MB on disk/);
+  assert.match(seen, /480 appointments · 57 items/);
+  // Per-account counts, in the account's own name.
+  assert.match(seen, /frank@gmail\.com/);
+  assert.match(seen, /1,801 emails/);
+  assert.match(seen, /the shop/);
+  assert.match(seen, /342 emails/);
+  assert.doesNotMatch(seen, JARGON, `the stats block: ${seen.match(JARGON)?.[0]}`);
+
+  // A build without the route: the panel stands, claiming nothing it cannot count.
+  globalThis.fetch = async (reqPath, init = {}) => {
+    if (reqPath === '/api/data') return { ok: false, status: 404, text: async () => '{"error":"not found"}' };
+    return plainFetch({})(reqPath, init);
+  };
+  const bare = settings.renderSettings({ sub: 'data', navigate() {}, rerender() {} });
+  await settle();
+  assert.match(onScreen(bare), /Everything Zelos knows is in one folder on this computer\./);
+  assert.doesNotMatch(onScreen(bare), /on disk/, 'a panel with no answer must not claim a size');
 });

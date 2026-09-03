@@ -18,6 +18,9 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 const whatsappModule = await import('../core/connectors/whatsapp.mjs');
 const {
@@ -205,6 +208,54 @@ test('a row carries no uid at all, so re-importing does not re-insert the chat',
   // Same input, same id — the property that makes re-reading the file safe.
   const again = rowFor(parsed.messages[0], { chatKey: 'chat-1', chatName: 'Kit Alder', ownerName: 'Nemo Hale' });
   assert.equal(again.messageId, row.messageId, 'the id is not stable, so every sweep duplicates the chat');
+});
+
+/* ------------------------------------------------------------------ *
+ * The file on disk
+ * ------------------------------------------------------------------ */
+
+test('REGRESSION: collect reads a plain .txt export — the binary guard must not refuse every text file', async (t) => {
+  /* The guard in readExport tested `text.includes('')` — an EMPTY needle, which
+     String.prototype.includes answers true for on every string — so every .txt
+     export threw ExportError and collect reported the file as "not text (it
+     contains NUL bytes)" with zero rows. Android's "Export chat → Without
+     media" produces a .txt, so the connector's primary input path never worked
+     once; only the .zip branch, which returns before the guard, ever did — and
+     check() parses the same .txt head directly, so doctor said "pass" about a
+     file the sweep called unreadable. The intended needle is a real NUL byte,
+     as folder.mjs spells it. Driven through the real collect(), because every
+     other test here calls the parser directly and the parser was never the
+     problem. */
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zelos-whatsapp-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, 'WhatsApp Chat with Kit Alder.txt');
+  fs.writeFileSync(file, [
+    '[9/8/26, 9:14:02 AM] Kit Alder: Retainage schedule is posted',
+    '[9/8/26, 9:15:00 AM] Nemo Hale: On it',
+  ].join('\n'));
+
+  const collectFrom = (target) => whatsapp.collect({
+    source: { id: 's_wa', settings: { path: target, yourName: 'Nemo Hale' } },
+    label: 'WhatsApp',
+    cursor: null,
+    timezone: 'UTC',
+    identityEmail: '',
+    emit() {},
+    signal: null,
+    log: { debug() {}, info() {}, warn() {}, error() {} },
+  });
+
+  const [part] = (await collectFrom(file)).parts;
+  assert.equal(part.error, null, `a clean ASCII export was refused: ${part.error}`);
+  assert.equal(part.rows.length, 2, 'the export parses on its own and collect still delivered nothing');
+  assert.equal(part.rows[0].from.name, 'Kit Alder');
+
+  // The guard still exists for what it was written against: a renamed binary.
+  const binary = path.join(dir, 'not-really-a-chat.txt');
+  fs.writeFileSync(binary, Buffer.from([0x50, 0x4b, 0x00, 0x01, 0x02]));
+  const refused = (await collectFrom(binary)).parts[0];
+  assert.equal(refused.rows.length, 0);
+  assert.match(String(refused.error), /NUL bytes/, 'a real binary must still be refused by name');
 });
 
 test('the manifest says out loud that this is an archive, not a connection', () => {

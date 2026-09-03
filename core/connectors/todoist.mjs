@@ -106,6 +106,26 @@ const DEFAULT_FILTER = 'overdue | today';
 const SNIPPET_CHARS = 240;
 const BODY_CHARS = 4_000;
 
+/**
+ * Every string that leaves `rowFor` is bounded, on linear.mjs's rule and with
+ * linear.mjs's numbers. BODY_CHARS capped the description and nothing else, so
+ * the title reached `subject` whole and the labels and the address were
+ * concatenated into `text` AFTER the slice — measured, a 400,000-character
+ * content and one 200,000-character label produced a 400,000-char subject and
+ * a 200,099-char text, bounded by nothing but the transport's 8 MiB response
+ * cap. TEXT_CHARS is the backstop that does not bind today; it sits above
+ * BODY_CHARS because the address is the last line and the one part a reader
+ * acts on, so a full-length description must not be able to push it off the
+ * end — linear.mjs:139 says the rest.
+ */
+const SUBJECT_CHARS = 200;
+const NAME_CHARS = 120;
+const URL_CHARS = 500;
+const TEXT_CHARS = 6_000;
+
+/** Labels shown on a row. Decoration, not obligations — the first few are plenty. */
+const MAX_LABELS = 8;
+
 /** A stranger's error text goes into `runs.error` and into /api/state. Bound it. */
 const ERROR_CHARS = 300;
 
@@ -310,17 +330,18 @@ export function readPage(text, describe) {
 function rowFor(entry, { now, identityEmail }) {
   const task = entry.task;
   const id = str(task?.id);
-  const title = collapse(task?.content) || '(untitled task)';
+  const title = collapse(task?.content).slice(0, SUBJECT_CHARS) || '(untitled task)';
   const priority = priorityLabel(task?.priority);
-  const url = collapse(task?.url);
-  const labels = (Array.isArray(task?.labels) ? task.labels : []).map(collapse).filter(Boolean);
+  const url = collapse(task?.url).slice(0, URL_CHARS);
+  const labels = (Array.isArray(task?.labels) ? task.labels : [])
+    .map(collapse).filter(Boolean).slice(0, MAX_LABELS).map((l) => l.slice(0, NAME_CHARS));
   const recurring = task?.due?.is_recurring === true;
   /* Todoist's own phrasing of the due date — "every day", "tomorrow at 9am" — is
      the only place a recurrence rule is legible at all, and it is what the user
      typed. Kept beside the computed day key rather than instead of it: the key
      is what the model copies into `dueAt`, the phrase is what makes "every
      Friday" visible. */
-  const spoken = collapse(task?.due?.string);
+  const spoken = collapse(task?.due?.string).slice(0, NAME_CHARS);
 
   /* The one line that has to carry the weight — `renderMessage`
      (core/triage.mjs:540) prints the snippet under every message it shows the
@@ -369,7 +390,8 @@ function rowFor(entry, { now, identityEmail }) {
     subject: title,
     date: now,
     snippet: line.slice(0, SNIPPET_CHARS),
-    text: body.trim(),
+    /* The finished body, not just its longest input — see TEXT_CHARS. */
+    text: body.trim().slice(0, TEXT_CHARS),
     hasAttachments: false,
     /* The bluntest of the three ways an overdue task outweighs a due-today one:
        `\Flagged` is +10 in `scoreInbound` (core/triage.mjs:434) and prints as

@@ -67,7 +67,7 @@ The size, measured rather than remembered — run it yourself in the repo:
 npm pack --dry-run
 ```
 
-**49 files, about 430 kB packed, 1.3 MB unpacked** at the time of writing — run
+**69 files, about 740 kB packed, 2.3 MB unpacked** at the time of writing — run
 the command rather than trusting the number, since editing these very documents
 moves it. One thing is deliberately *excluded*: `assets/icon.png`, the
 1024px app icon, which is 290 kB and was briefly 40% of this download: it is

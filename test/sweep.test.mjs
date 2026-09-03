@@ -493,6 +493,39 @@ test('a light run holds the bar too, without asking the model anything', async (
   assert.equal(listBoard(db, { states: ['open'] }).length, 8, 'still nothing deleted');
 });
 
+test('the demo week yields the now bar to real severity-3 work', async () => {
+  const db = fresh();
+  seedSampleData(db);
+  // Three genuine now items, all due later than the demo's two — so the board's
+  // own order ranked the fiction first and demoted a real item to make room for
+  // items about people who do not exist.
+  const due = (h) => new Date(Date.now() + h * 3_600_000).toISOString();
+  const three = [0, 1, 2].map((i) => item({
+    key: `real-${i}`, bucket: 'now', severity: 3, dueAt: due(30 + i),
+    headline: `Deal with the real thing number ${i}`,
+  }));
+  const model = fakeModel(board(three));
+  const result = await runSweep({
+    db,
+    config: baseConfig({ mail: [mailAccount()] }),
+    mode: 'full',
+    deps: { getSecret: SECRETS, complete: model, fetchMail: async () => [fetched()] },
+  });
+
+  assert.equal(result.ok, true, result.error);
+  assert.equal(bucketCounts(db).now, 4, 'the bar still holds four');
+  for (const key of ['real-0', 'real-1', 'real-2']) {
+    assert.equal(getItemByKey(db, key).bucket, 'now',
+      `${key} must not lose its place to an item about people who do not exist`);
+  }
+  const sampleInNow = listBoard(db, { states: ['open'], buckets: ['now'] })
+    .filter((i) => i.payload?.sample === true);
+  assert.equal(sampleInNow.length, 1, 'the demo keeps only the slot the real work left over');
+  const demoted = getItemByKey(db, 'sample-marked-up-drawings');
+  assert.equal(demoted.bucket, 'today', 'the demo item that lost its place was demoted, not deleted');
+  assert.equal(demoted.state, 'open');
+});
+
 test('a finished item\'s key is named to the next run as already handled', async () => {
   const db = fresh();
   const model = fakeModel(board([item()]));
@@ -552,6 +585,31 @@ test('the most recently closed item survives the limit whatever offset it was cl
   assert.match(prompt, /ALREADY HANDLED/);
   assert.ok(prompt.includes(`key=${LATE}`),
     'the newest decision the user made was dropped by the limit');
+});
+
+/**
+ * The old ceiling of forty was priced for full lines; a busy three weeks can
+ * close more items than that, and everything past the ceiling never reached the
+ * prompt at all — the same silent gap the compact keys line exists to close.
+ * Now that a closed item past the full lines costs only its key, the ceiling
+ * matches the 120 the prior board itself may carry.
+ */
+test('a busy three weeks of finished work is fenced off whole, not just the last forty', async () => {
+  const db = fresh();
+  const keys = [...Array(60).keys()].map((i) => `finished-${String(i).padStart(2, '0')}`);
+  const first = fakeModel(board(keys.map((key) => item({ key, headline: `Finish ${key}` }))));
+  const config = baseConfig({ mail: [mailAccount()] });
+  const fetchMail = async () => [fetched()];
+  await runSweep({ db, config, mode: 'full', deps: { getSecret: SECRETS, complete: first, fetchMail } });
+  for (const key of keys) setItemState(db, itemRowId(key), 'done');
+
+  const second = fakeModel(board([]));
+  await runSweep({ db, config, mode: 'full', deps: { getSecret: SECRETS, complete: second, fetchMail } });
+
+  const prompt = second.calls[0].messages[0].content;
+  for (const key of keys) {
+    assert.ok(prompt.includes(key), `${key} never reached the prompt, so nothing stops it being re-raised`);
+  }
 });
 
 test('a model that is told what was handled does not resurrect it under a new key', async () => {
@@ -765,6 +823,29 @@ test('one dead source does not cost the run the others', async () => {
   assert.equal(listEvents(db).length, 1);
   assert.equal(listEvents(db)[0].title, 'Pre-con with Alder & Vance');
   assert.equal(model.calls.length, 1, 'the model still got to think about what did arrive');
+});
+
+test('a calendar whose kind names no reader is still read as a subscribed .ics', async () => {
+  /* enabledSources routes an unrecognised calendar kind — the hand-edited
+     `webcal`, a legacy value — to the ics connector on purpose, but
+     defaultFetchEvents used to re-derive the reader from `calendar.kind` and
+     throw `no calendar reader named webcal`, so the fallback the registry
+     promises died one layer down: an internal-error row in the Now banner on
+     every sweep, while `zelos doctor` read the same address as a subscribed
+     .ics and said the calendar was fine. */
+  const db = fresh();
+  const startsAt = Date.now() + 26 * 3_600_000;
+  const cal = await icsServer(icsDocument(startsAt));
+  const config = baseConfig({
+    calendars: [{ id: 'c_webcal', enabled: true, label: 'Hand-edited', kind: 'webcal', url: cal.url, user: '', keyRef: null }],
+  });
+
+  const result = await runSweep({ db, config, mode: 'light', deps: { getSecret: SECRETS } });
+
+  const source = result.stats.sources.find((s) => s.kind === 'calendar');
+  assert.equal(source.ok, true, `the unknown kind must fall back to the .ics reader: ${source.error}`);
+  assert.equal(source.count, 1);
+  assert.equal(listEvents(db).length, 1);
 });
 
 test('an account with no stored password is reported, not crashed on', async () => {
@@ -1228,6 +1309,26 @@ test('shouldRunFull: newly stored mail, an untriaged note, or four hours all for
   assert.equal(shouldRunFull(stale, config, later), true);
 });
 
+test('shouldRunFull: the demo week alone never forces a think', () => {
+  /* The demo capture is never triaged — gatherPromptInput filters it out of
+     the prompt — so nothing ever marks it processed except clearing the demo.
+     An unfiltered probe here therefore said "there is an untriaged note"
+     forever, and every scheduled sweep while the demo sat on the board was
+     upgraded to a full, model-billed run over nothing new: ~34 paid calls a
+     day on a quiet home, against this file's own promise that a quiet
+     afternoon costs nothing. */
+  const db = fresh();
+  seedSampleData(db);
+  const at = '2026-08-08T09:00:00+00:00';
+  const id = startRun(db, { kind: 'full', now: at });
+  finishRun(db, id, { ok: true, now: at });
+  assert.equal(shouldRunFull(db, baseConfig(), '2026-08-08T09:30:00+00:00'), false,
+    'the sample capture is not untriaged work, so a quiet home stays light');
+  // A real note still thinks, demo or no demo.
+  insertCapture(db, 'remember the bank call');
+  assert.equal(shouldRunFull(db, baseConfig(), '2026-08-08T09:30:00+00:00'), true);
+});
+
 test('shouldRunFull: a full run that failed does not count as having thought', () => {
   const db = fresh();
   const id = startRun(db, { kind: 'full', now: '2026-08-08T09:00:00+00:00' });
@@ -1575,6 +1676,39 @@ test('the scheduler does not drift, and skips slots it slept through', async (t)
   scheduler.stop();
 });
 
+test('a config save that does not touch the schedule does not move the next sweep', async (t) => {
+  const db = fresh();
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.UTC(2026, 7, 8, 10, 0, 0) });
+
+  let runs = 0;
+  const scheduler = new Scheduler({
+    db,
+    config: baseConfig(),
+    run: async () => { runs += 1; return { ok: true }; },
+  });
+  scheduler.start();
+  assert.equal(scheduler.status().nextRunAt, '2026-08-08T10:30:00+00:00');
+
+  // Ten minutes later the accent colour is saved. PUT /api/config hands every
+  // save to reconfigure(), and re-anchoring from "now" postponed the next
+  // sweep by a fresh interval per save — indefinitely, for a fidgety afternoon
+  // of Settings changes, and by most of a day at intervalMinutes 1440.
+  t.mock.timers.tick(10 * 60_000);
+  scheduler.reconfigure(baseConfig({ ui: { theme: 'ink' } }));
+  assert.equal(scheduler.status().nextRunAt, '2026-08-08T10:30:00+00:00',
+    'a save that leaves the schedule alone keeps the grid');
+
+  t.mock.timers.tick(21 * 60_000);
+  await flush();
+  assert.equal(runs, 1, 'and the slot still fires on time');
+
+  // A save that DOES change the schedule re-aims from now, as it always has.
+  scheduler.reconfigure(baseConfig({ sweep: { intervalMinutes: 60, activeHours: [6, 23], auto: true } }));
+  assert.equal(scheduler.status().nextRunAt, '2026-08-08T11:31:00+00:00');
+
+  scheduler.stop();
+});
+
 test('the scheduler honours sweep.auto and active hours without stopping the loop', async (t) => {
   const db = fresh();
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.UTC(2026, 7, 8, 10, 0, 0) });
@@ -1593,10 +1727,11 @@ test('the scheduler honours sweep.auto and active hours without stopping the loo
   assert.equal(runs, 0, 'auto:false means the timer keeps time but does not sweep');
   assert.equal(scheduler.status().nextRunAt, '2026-08-08T11:00:00+00:00');
 
-  // Turning it back on must not require a restart.
+  // Turning it back on must not require a restart — and flipping sweep.auto is
+  // not a schedule change, so the timer keeps its grid.
   scheduler.reconfigure(baseConfig());
   assert.equal(scheduler.status().auto, true);
-  assert.equal(scheduler.status().nextRunAt, '2026-08-08T11:01:00+00:00');
+  assert.equal(scheduler.status().nextRunAt, '2026-08-08T11:00:00+00:00');
   scheduler.stop();
 });
 
@@ -1679,9 +1814,10 @@ test('the same scheduler starts sweeping once reconfigure() hands it a ready mod
   assert.equal(scheduler.status().lastResult?.skipped, true);
 
   // Settings → Model saved a local runtime; the server hands the new config
-  // to the running scheduler exactly as it does for sweep.auto.
+  // to the running scheduler exactly as it does for sweep.auto. A model change
+  // is not a schedule change, so the timer keeps its grid.
   scheduler.reconfigure(baseConfig());
-  assert.equal(scheduler.status().nextRunAt, '2026-08-08T11:01:00+00:00');
+  assert.equal(scheduler.status().nextRunAt, '2026-08-08T11:00:00+00:00');
   t.mock.timers.tick(31 * 60_000);
   await flush();
   assert.equal(runs, 1, 'a keyless local model is ready, so the next slot sweeps');

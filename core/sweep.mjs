@@ -94,10 +94,15 @@ const NOW_BOARD_LIMIT = 4;
  * closed item comes back is for the model to read the mail that produced it and
  * write it up again, and no mail older than that window is in front of it. A
  * resolution older than the oldest message in the prompt cannot be re-raised from
- * that message, so paying context for it would buy nothing. Forty is a ceiling on
- * a busy fortnight, not a target; the prompt's budget trims further if it has to.
+ * that message, so paying context for it would buy nothing. The ceiling matches
+ * the 120 open items the prior board itself may carry, and is affordable for the
+ * same reason that number is: past the few that get full lines, a closed item
+ * costs the prompt only its key on the compact keys line, and the prompt's
+ * budget trims further if it has to. It was 40 when every named item cost a
+ * full line — and a busy three weeks can close more than 40, so everything past
+ * the ceiling was re-raised as if the user had never done it.
  */
-const RESOLVED_LIMIT = 40;
+const RESOLVED_LIMIT = 120;
 
 /**
  * How large a cursor may be, serialised.
@@ -205,7 +210,12 @@ export function shouldRunFull(db, config, now = nowISO()) {
   if (!last || !last.started_at) return true;
 
   if (Number(getKV(db, SWEEP_KV.pendingNew)) > 0) return true;
-  if (listCaptures(db, { includeProcessed: false, limit: 1 }).length > 0) return true;
+  // The same SAMPLE_MARK filter gatherPromptInput applies, and it has to be:
+  // the demo capture never reaches a prompt, so nothing ever marks it processed
+  // — counting it here made every scheduled sweep a full, model-billed run for
+  // as long as the demo sat on the board, on a home with nothing new in it.
+  if (listCaptures(db, { includeProcessed: false, limit: 50 })
+    .some((c) => !String(c.text || '').startsWith(SAMPLE_MARK))) return true;
 
   const lastMs = instant(last.started_at);
   const nowMs = instant(now) ?? Date.now();
@@ -255,7 +265,12 @@ function markTruncated(events) {
  * the fact that a truncated read comes back as an array wearing a property.
  */
 async function defaultFetchEvents({ calendar, pass, from, to, timezone, email, signal }) {
-  const connector = connectorFor(calendar.kind);
+  // The same fallback enabledSources applies: a kind that names no connector is
+  // read as a subscribed .ics. Re-deriving strictly here threw `no calendar
+  // reader named webcal` one layer under the registry that had just routed the
+  // calendar to the ics reader — an error row every sweep, while `zelos doctor`
+  // read the same address as a subscribed .ics and passed it.
+  const connector = connectorFor(calendar.kind) ?? connectorFor('ics');
   if (!connector || typeof connector.read !== 'function') {
     throw new Error(`no calendar reader named ${calendar.kind}`);
   }
@@ -1183,7 +1198,16 @@ export function capNowBucket(db, { now = nowISO() } = {}) {
   const inNow = listBoard(db, { states: ['open'], buckets: ['now'], limit: 500, now });
   if (inNow.length <= NOW_BOARD_LIMIT) return 0;
 
-  const overflow = inNow.slice(NOW_BOARD_LIMIT);
+  // Demo rows give way first. The seeded week parks two severity-3 items in
+  // `now`, and ranked as-is they held their slots while a person's real work
+  // was demoted to make room for people who do not exist. Real items keep the
+  // board's own order among themselves; the demo only ever fills what they
+  // leave over.
+  const ranked = [
+    ...inNow.filter((i) => i.payload?.sample !== true),
+    ...inNow.filter((i) => i.payload?.sample === true),
+  ];
+  const overflow = ranked.slice(NOW_BOARD_LIMIT);
   const stmt = db.prepare(DEMOTE_ITEM_BUCKET);
   withTransaction(db, () => {
     for (const item of overflow) stmt.run({ bucket: 'today', now, id: item.id });
@@ -1256,6 +1280,13 @@ async function modelNotReadyReason(config, getSecret) {
   }
   if (typeof key === 'string' && key.trim()) return null;
   return 'No key has been saved for the AI you chose — open Settings → AI and paste one';
+}
+
+/** Whether two configs would aim the timer identically — what reconfigure asks. */
+function sameSchedule(a, b) {
+  return intervalMinutesOf(a) === intervalMinutesOf(b)
+    && activeHoursOf(a).join() === activeHoursOf(b).join()
+    && timezoneOf(a) === timezoneOf(b);
 }
 
 /**
@@ -1341,10 +1372,17 @@ export class Scheduler {
     };
   }
 
-  /** Replace the configuration and re-aim the timer without losing the loop. */
+  /**
+   * Replace the configuration without losing the loop. The timer is re-aimed
+   * only when the save actually touched the schedule: PUT /api/config hands
+   * every save here, and re-anchoring from "now" on all of them meant any
+   * Settings change — the accent colour included — pushed the next sweep a
+   * whole interval out, which at intervalMinutes 1440 was most of a day.
+   */
   reconfigure(config) {
+    const before = this.config;
     this.config = config;
-    if (this.#running) {
+    if (this.#running && !sameSchedule(before, config)) {
       this.#targetMs = this.#firstTarget();
       this.#arm();
     }

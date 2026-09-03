@@ -278,6 +278,62 @@ test('an over-large input degrades and says in the prompt what it cut', () => {
   assert.match(content, /do not invent the missing part/);
 });
 
+/**
+ * The drop order under the truncation notice's own claim. `fitSection` cuts
+ * overflow from the tail on the documented premise that entries arrive ranked —
+ * but the mail sections used to re-sort into reading order BEFORE fitting, so
+ * once even the bare headers overflowed, the tail was the OLDEST mail, not the
+ * lowest-ranked: the one message the ranker scored highest was cut while
+ * fresher bulk survived, and the prompt then told the model "highest-ranked
+ * first" and "Anything omitted ranked below what is here" about it.
+ */
+test('the bare-overflow cut drops the lowest-ranked mail, not the oldest', () => {
+  // The top-ranked message in the set: flagged, unread, directly addressed,
+  // asking a question — and five days old, so a chronological tail-cut eats it.
+  const client = message({
+    id: 'client1', thread_key: 'tclient',
+    from_name: 'Rafe Ondrik', from_email: 'rafe@thistlebank.example',
+    subject: 'Are we still good for the 12th?',
+    snippet: 'the joiner is waiting to cut',
+    body: 'The joiner is waiting to cut — are we still good for the 12th?',
+    sent_at: '2026-08-03T09:00:00-04:00',
+    flags: ['\\Flagged'],
+  });
+  const noise = Array.from({ length: 60 }, (_, i) => message({
+    id: `nl${i}`, thread_key: `tnl${i}`,
+    from_name: 'The Daily', from_email: `newsletter@daily${i}.example`,
+    to: [{ name: 'List', email: 'list@daily.example' }],
+    cc: [{ name: 'Nemo', email: 'nemo@example.com' }],
+    subject: `Issue ${i}`, snippet: 'stories inside',
+    body: 'Lots of stories inside. Unsubscribe',
+    sent_at: `2026-08-07T${String(8 + (i % 12)).padStart(2, '0')}:${String(i % 60).padStart(2, '0')}:00-04:00`,
+  }));
+
+  const build = (budgetChars) => buildSweepPrompt({
+    identity: IDENTITY, now: NOW, messages: [client, ...noise], privacy: PRIVACY, budgetChars,
+  });
+
+  // Control: with room for everything, the client message is in.
+  assert.ok(build(200_000).messages[0].content.includes('[msg:client1]'));
+
+  // Squeezed until even bare headers overflow, the cut is by rank: the flagged
+  // direct question survives and newsletters are what give way.
+  const tight = build(8000);
+  const content = tight.messages[0].content;
+  assert.equal(tight.budget.levels.inbound, 'bare', 'the squeeze must reach the drop branch');
+  assert.ok(tight.budget.shown.inbound < 61, 'and actually cut');
+  assert.ok(content.includes('[msg:client1]'),
+    'the highest-ranked message must survive the bare-level cut');
+  assert.match(content, /highest-ranked first/,
+    'and the truncation notice goes on saying so, truthfully now');
+
+  // Ranking picked who; chronology is still the reading order of what was kept.
+  const kept = [...content.matchAll(/\[msg:(nl\d+|client1)\]/g)].map((m) => m[1]);
+  assert.ok(kept.length >= 2);
+  assert.equal(kept[kept.length - 1], 'client1',
+    'the kept set still reads newest first, so the old message renders last');
+});
+
 test('a section that could not fit says "unknown", never "none"', () => {
   const long = (n, ch) => ch.repeat(n);
   const fat = {
@@ -314,6 +370,37 @@ test('maxItemsPerSweep limits how much material leaves the machine', () => {
   assert.ok(budget.shown.inbound <= 10, `expected <=10, got ${budget.shown.inbound}`);
 });
 
+/**
+ * The cap is a promise, not an estimate. Scaling floors every populated section
+ * at one, so a cap smaller than the number of populated sections used to
+ * overrun it: "at most 1" sent 4 — one per section — from the privacy control
+ * whose whole meaning is "how much of my life leaves this machine per run".
+ */
+test('a cap smaller than the number of populated sections still holds', () => {
+  const build = (maxItemsPerSweep) => buildSweepPrompt({
+    identity: IDENTITY, now: NOW,
+    messages: [
+      message({ id: 'in1' }),
+      message({ id: 'out1', direction: 'out', from_email: 'nemo@example.com', from_name: 'Nemo',
+        to: [{ name: 'Dana', email: 'dana@example.com' }], subject: 'W-9', body: 'Tomorrow.' }),
+    ],
+    events: [{
+      id: 'ev1', uid: 'u1', title: 'Pre-con', description: '', location: '',
+      starts_at: '2026-08-09T14:00:00-04:00', ends_at: '2026-08-09T15:00:00-04:00',
+      all_day: 0, organizer: 'pm@aldervance.example', attendees: [], rsvp: '', status: '',
+    }],
+    captures: [{ id: 'c1', text: 'Call the bank', created_at: '2026-08-08T08:00:00-04:00' }],
+    privacy: { ...PRIVACY, maxItemsPerSweep },
+  });
+  for (const cap of [1, 2, 3]) {
+    const { shown } = build(cap).budget;
+    const left = shown.inbound + shown.sent + shown.events + shown.captures;
+    assert.ok(left <= cap, `maxItemsPerSweep ${cap} let ${left} items leave the machine`);
+  }
+  // Inbound is the last section to give way: squeezed to one, the one is mail.
+  assert.equal(build(1).budget.shown.inbound, 1);
+});
+
 test('sent mail gets its own section, and its absence is stated rather than faked', () => {
   const empty = buildSweepPrompt({ identity: IDENTITY, now: NOW, privacy: PRIVACY });
   assert.match(empty.messages[0].content, /do not guess at `promised` items/);
@@ -346,6 +433,43 @@ test('prior board goes in with its keys, so identity can be reused', () => {
   assert.match(content, /key=w9-dana-signed/);
   assert.match(content, /seen in 4 runs/);
   assert.match(content, /carried 6d/);
+});
+
+/**
+ * The other half of "reuse that exact key": a key the model was never shown
+ * cannot be reused. The prior-board share fits roughly fifteen full lines, so
+ * on a board of forty open items the tail used to be dropped silently — and
+ * every dropped key came back the next run as a fresh mint: the same live
+ * obligation, re-raised as brand new, at exactly the board size where the user
+ * most needs the memory to hold.
+ */
+test('a board of forty open items keeps every key in the prompt', () => {
+  const prior = Array.from({ length: 40 }, (_, i) => ({
+    id: `p${i}`, bucket: 'waiting', severity: 2, state: 'open', seen_runs: 3,
+    headline: `Chase person number ${i} for the signed agreement on the Redwood build`,
+    person: `Person ${i}`,
+    first_seen: '2026-08-02T09:00:00-04:00', due_at: '2026-08-12T09:00:00-04:00',
+    payload: { key: `redwood-agreement-person-${String(i).padStart(2, '0')}` },
+  }));
+  const { messages, budget } = buildSweepPrompt({
+    identity: IDENTITY, now: NOW, priorItems: prior, privacy: PRIVACY,
+  });
+  const content = messages[0].content;
+
+  assert.ok(budget.shown.prior < 40,
+    'the fixture must overflow the full-line share, or this test proves nothing');
+  for (const p of prior) {
+    assert.ok(content.includes(p.payload.key),
+      `${p.payload.key} never reached the prompt, and an unseen key cannot be reused`);
+  }
+  // The keys line is board memory derived from mail, so it lives inside the
+  // same fence as the full lines — data, never a second set of instructions.
+  const fenced = content.slice(content.indexOf('<<<ZELOS-UNTRUSTED'), content.indexOf('<<<END-ZELOS-UNTRUSTED'));
+  assert.ok(fenced.includes('Other live keys — reuse, never re-mint: '),
+    'the compact keys line must sit inside the prior-board fence');
+  // And the truncation notice tells the truth about the split.
+  assert.match(content, new RegExp(
+    `Prior board: ${budget.shown.prior} of 40 shown in full, highest-ranked first; \\d+ more by key alone`));
 });
 
 /** A finished item, in the shape core/sweep.mjs reads off the items table. */
@@ -432,6 +556,51 @@ test('the already-handled list is capped and costs the model no mail', () => {
     'and not one message was dropped to make room for the closed keys');
   assert.match(withHandled.messages[0].content,
     new RegExp(`Already handled: ${withHandled.budget.shown.resolved} of 200 shown`));
+});
+
+test('closed keys past the full-line ceiling still travel, as keys alone', () => {
+  const handled = Array.from({ length: 60 }, (_, i) =>
+    resolved({ key: `finished-${String(i).padStart(2, '0')}`, headline: `Something the user finished, number ${i}` }));
+  const { messages, budget } = buildSweepPrompt({
+    identity: IDENTITY, now: NOW, resolvedItems: handled, privacy: PRIVACY,
+  });
+  const content = messages[0].content;
+
+  assert.ok(budget.shown.resolved <= 24, 'the full-line ceiling holds');
+  for (const r of handled) {
+    assert.ok(content.includes(r.key), `${r.key} vanished, so nothing stops the model re-raising it`);
+  }
+  assert.match(content, /Other handled keys — closed, do not raise these again: /);
+});
+
+/**
+ * Context is zero-sum, and the keys line is not allowed to win it: on a small
+ * local model's budget it spends only the prior board's own share, shrinks
+ * with everything else, and the notice says how much of the tail it lost —
+ * while the inbound-mail share is untouched.
+ */
+test('on a tiny context the keys line degrades inside its own share and costs the mail nothing', () => {
+  const prior = Array.from({ length: 120 }, (_, i) => ({
+    id: `p${i}`, bucket: 'waiting', severity: 2, state: 'open', seen_runs: 2,
+    headline: `Chase person number ${i} for the signed agreement on the Redwood build`,
+    person: `Person ${i}`, first_seen: '2026-08-02T09:00:00-04:00', due_at: '',
+    payload: { key: `redwood-agreement-person-${String(i).padStart(3, '0')}` },
+  }));
+  const mail = Array.from({ length: 8 }, (_, i) =>
+    message({ id: `tiny${i}`, thread_key: `tiny-t${i}`, subject: `Question ${i}`, body: 'Short.' }));
+  const build = (priorItems) => buildSweepPrompt({
+    identity: IDENTITY, now: NOW, messages: mail, priorItems, privacy: PRIVACY, budgetChars: 8000,
+  });
+
+  const without = build([]);
+  const withPrior = build(prior);
+  assert.equal(withPrior.budget.shown.inbound, without.budget.shown.inbound,
+    'the keys line must never eat the inbound-mail share');
+  assert.ok(withPrior.messages[0].content.length <= 8000 + 4000,
+    'the assembled context stays near its budget');
+  assert.match(withPrior.messages[0].content, /Other live keys — reuse, never re-mint: /);
+  assert.match(withPrior.messages[0].content, /\d+ did not fit even as keys/,
+    'when even the keys overflow the share, the notice says so instead of pretending');
 });
 
 test('events carry the offset off the string, and the day is named', () => {

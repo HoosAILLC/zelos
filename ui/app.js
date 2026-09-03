@@ -20,7 +20,7 @@
 import { el, button, meander, replace, focusQuietly } from './lib/dom.js';
 import {
   state, subscribe, refresh, watchSweeps, watchBoard, startSweep, railCounts, timezone,
-  needsOnboarding, applyAccent, currentAccent, notify, nowMark,
+  needsOnboarding, applyAccent, currentAccent, notify, nowMark, checkAgainLine,
 } from './lib/store.js';
 import { api, hasToken } from './lib/api.js';
 import { BUCKET_LABEL, sweepSummary, sweepDetail, tokenLine } from './lib/format.js';
@@ -137,12 +137,22 @@ function buildSweepLine() {
 }
 
 /** "Last checked 20 minutes ago · 3 emails", or the state of the check under way. */
-export function sweepLineText(s, last) {
+export function sweepLineText(s, last, scheduler = null) {
   if (s.running) return s.message || 'Checking your mail…';
+  // One paint after a check ends: what it found, before the line settles back
+  // to "Last checked…". paintSweepLine clears it once it has been shown.
+  if (s.finished) return s.finished;
   if (s.error) return s.error;
-  if (!last) return 'Not checked yet';
+  const again = checkAgainLine(scheduler);
+  const withAgain = (line) => (again ? `${line} · ${again}` : line);
+  if (!last) return withAgain('Not checked yet');
+  // The STORED run, so a failure survives a reload: the in-memory error above
+  // dies with the tab, and "Last checked 2h ago" over a failed run is a lie.
+  if (last.ok === false) return withAgain('The last check failed — details on Now');
   const summary = sweepSummary(last);
-  return `Last checked ${humanDelta(last.ended_at || last.started_at)}${summary ? ` · ${summary}` : ''}`;
+  // A light run reads far less than a full one; say so, in plain words.
+  const quick = last.kind === 'light' ? ' · quick look' : '';
+  return withAgain(`Last checked ${humanDelta(last.ended_at || last.started_at)}${quick}${summary ? ` · ${summary}` : ''}`);
 }
 
 /** The hover title: duration and spend, the two numbers that left the line. */
@@ -153,11 +163,14 @@ export function sweepLineTitle(last, tokens, todayKeyStr) {
 function paintSweepLine(parts) {
   const s = state.sweep;
   const last = state.board.runs?.last;
-  const text = sweepLineText(s, last);
+  const text = sweepLineText(s, last, state.health?.scheduler);
 
   const pct = s.running && s.total > 0 ? Math.min(100, Math.round((s.done / s.total) * 100)) : null;
 
-  parts.node.className = `sweepline${s.running ? ' is-running' : ''}${s.error ? ' is-bad' : ''}`;
+  // Bad styling for a live error AND for a stored failure: the second is what
+  // a reload leaves behind, and it must not repaint as an ordinary line.
+  const bad = Boolean(s.error) || (!s.running && !s.finished && last?.ok === false);
+  parts.node.className = `sweepline${s.running ? ' is-running' : ''}${bad ? ' is-bad' : ''}`;
   parts.textNode.setAttribute('aria-busy', s.running ? 'true' : 'false');
   announce(parts.textNode, text);
   // The title is set on the node the pointer rests on, outside the live
@@ -167,6 +180,10 @@ function paintSweepLine(parts) {
   else parts.node.removeAttribute('title');
   parts.barNode.className = `sweepbar${pct === null && s.running ? ' is-indeterminate' : ''}`;
   parts.fillNode.style.width = s.running ? `${pct ?? 100}%` : '0%';
+  // The finished note lasts exactly one paint: it has been shown (and queued
+  // for the live region above), so the next repaint — the minute tick, a
+  // click, any store emit — settles back to "Last checked…".
+  if (!s.running && s.finished) state.sweep = { ...s, finished: null };
 }
 
 /** Quick capture. It is a reminder to yourself; the next check reads it. */
@@ -367,11 +384,18 @@ function fatalScreen() {
 }
 
 function noTokenScreen() {
+  // Plain words: this is a state a non-expert genuinely reaches — a
+  // bookmarked board after a restart, mostly — and the way back differs by
+  // shell. The desktop app has a menu and no terminal (window.zelos is the
+  // mark its preload leaves); a browser tab has the address the terminal
+  // printed, which is what carries the key a bookmark strips.
   return el('div', { class: 'screen' }, [
     el('p', { class: 'screen-mark', text: 'ΖΗΛΟΣ' }),
     meander(),
     el('h1', { class: 'screen-title', text: 'This page has no session key' }),
-    el('p', { class: 'screen-line', text: 'Zelos mints a token every launch and puts it in the URL it printed. Any page in your browser can reach 127.0.0.1, so without that token this one is refused — which is the point. Open the address from the terminal that started Zelos.' }),
+    el('p', { class: 'screen-line', text: window.zelos
+      ? 'Zelos gives each window a one-time key when it starts, and this page opened without one — so it is refused, which is the point: the key keeps anything else on this computer away from your board. Choose Board → Reload board and the app opens it again with a fresh key.'
+      : 'Zelos gives each window a one-time key when it starts, and this page opened without one — so it is refused, which is the point: the key keeps other pages in your browser away from your board. Open the address printed in the terminal that started Zelos; a bookmark of this page does not carry the key.' }),
   ]);
 }
 
@@ -416,7 +440,9 @@ let paintedToast = null;
  * rebuild the view under the user's hands: the Owed draft they are typing, a
  * settings field half-filled, every open disclosure snapped shut. So a render
  * caused by data (a background sweep finishing, mostly) is QUEUED while a text
- * field inside <main> has focus, and runs when that field blurs. A forced
+ * field inside <main> has focus — or while focus sits anywhere inside an open
+ * editor, because Tab rests it on "Save account" between two fields — and runs
+ * when focus settles outside both. A forced
  * render — the user's own navigation — is never deferred: they asked for it.
  */
 let renderQueued = false;
@@ -424,7 +450,15 @@ let renderQueued = false;
 function editingInMain() {
   const active = document.activeElement;
   if (!active || !main || !main.contains(active)) return false;
-  return active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.tagName === 'SELECT';
+  if (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.tagName === 'SELECT') return true;
+  // A button inside an open editor still counts. Tabbing from a text field to
+  // "Save account" lands focus on the button, and flushing in that moment
+  // rebuilds the view — the open form and everything typed into it gone
+  // before the button can be pressed, the result of "Test the connection"
+  // written into detached nodes. Focus anywhere else in the view — an item
+  // row's tick, a panel-level button — still flushes, because those hold no
+  // half-finished typing to protect.
+  return Boolean(active.closest('form, .account-form'));
 }
 
 /**
@@ -469,7 +503,9 @@ function render({ force = false } = {}) {
     paintChrome();
     return;
   }
-  if (!force && layout === 'chrome' && state.phase === 'ready' && editingInMain()) {
+  // Both skeletons: the bare one is onboarding, whose email step holds a
+  // half-typed address exactly as a settings form does.
+  if (!force && (layout === 'chrome' || layout === 'bare') && state.phase === 'ready' && editingInMain()) {
     renderQueued = true;
     paintChrome();
     return;

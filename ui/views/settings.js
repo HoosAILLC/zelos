@@ -27,8 +27,9 @@ import { el, button, meander, section, copyText, replace } from '../lib/dom.js';
    of /api/connectors, and a one-line wrapper in ui/lib/api.js would be a second
    place to look for a call that has exactly one call site. */
 import { api, request } from '../lib/api.js';
-import { state, saveConfig, loadConfig, setAccent, applyAccent, currentAccent, DEFAULT_ACCENT, markOnboarded } from '../lib/store.js';
+import { state, saveConfig, loadConfig, setAccent, applyAccent, currentAccent, DEFAULT_ACCENT, markOnboarded, nowMark } from '../lib/store.js';
 import { plural, tokenLine } from '../lib/format.js';
+import { monthName } from '../lib/time.js';
 import { aiAccessPanel } from './ai-access.js';
 
 /**
@@ -1294,8 +1295,12 @@ function microsoftSignIn({ keyRef, user, clientId = '', tenantId = 'common', cli
   const tenantInput = input({ value: tenantId || 'common', placeholder: 'common', autocomplete: 'off' });
   // `provider` travels with the account from here on, so a sweep can tell a
   // Microsoft grant from a Google one; an account saved before it existed has
-  // none, and the sweep reads that as Microsoft.
-  const oauth = () => ({ provider: 'microsoft', clientId: clientIdInput.value.trim(), tenantId: tenantInput.value.trim() || 'common' });
+  // none, and the sweep reads that as Microsoft. With the id field empty the
+  // server signs in with its own client and answers with the id it used —
+  // `grantedClientId` — so the saved account names the client its grant was
+  // actually minted for, instead of an empty string.
+  let grantedClientId = '';
+  const oauth = () => ({ provider: 'microsoft', clientId: clientIdInput.value.trim() || grantedClientId, tenantId: tenantInput.value.trim() || 'common' });
 
   const signInStatus = statusLine();
   const codeBox = el('div', { class: 'device-code' });
@@ -1312,6 +1317,7 @@ function microsoftSignIn({ keyRef, user, clientId = '', tenantId = 'common', cli
     flowId = null;
     codeBox.replaceChildren();
     if (flowStatus(flow) === 'connected') {
+      grantedClientId = flow.clientId || grantedClientId;
       signInStatus.good('Signed in. Zelos stays signed in on its own from here.');
       onConnected?.();
     } else if (flowStatus(flow) === 'cancelled') {
@@ -1461,7 +1467,12 @@ function microsoftSignIn({ keyRef, user, clientId = '', tenantId = 'common', cli
 function googleSignIn({ keyRef, email, clientReady = false, clientId = '', signedInAs = '', onStart = null, onConnected = null }) {
   const clientIdInput = input({ value: clientId, placeholder: '…apps.googleusercontent.com', autocomplete: 'off' });
   const secretInput = el('input', { class: 'input', type: 'password', autocomplete: 'off', placeholder: 'client secret' });
-  const oauth = () => ({ provider: 'google', clientId: clientIdInput.value.trim() });
+  // With the id field empty the server signs in with its own client and
+  // answers with the id it used — `grantedClientId` — so the saved account
+  // names the client its grant was actually minted for, instead of an empty
+  // string no refresh can spend.
+  let grantedClientId = '';
+  const oauth = () => ({ provider: 'google', clientId: clientIdInput.value.trim() || grantedClientId });
   const address = () => (typeof email === 'function' ? email() : String(email || '')).trim();
 
   const signInStatus = statusLine();
@@ -1477,6 +1488,7 @@ function googleSignIn({ keyRef, email, clientReady = false, clientId = '', signe
     flowBox.replaceChildren();
     const status = flowStatus(flow);
     if (status === 'connected') {
+      grantedClientId = flow.clientId || grantedClientId;
       signInStatus.good(flow.user
         ? `Signed in as ${flow.user}. Zelos stays signed in on its own from here.`
         : 'Signed in. Zelos stays signed in on its own from here.');
@@ -1691,14 +1703,39 @@ function mailForm(account, { onSaved, onCancel }) {
 
   // "Sign in with Microsoft" — the one device flow, shared with the simple
   // form; see microsoftSignIn above. What it learns lands on the draft.
-  const microsoft = microsoftSignIn({
+  // Built the way the Google block below is: whether Zelos has a Microsoft
+  // client to sign in with is the server's answer, asked once about a
+  // personal address for the same reason as Google's probe, and the one-time
+  // setup page is the server's too (GET /api/guides). Without both, this
+  // form refused a sign-in the configured client could run and its refusal
+  // named a file instead of showing the page.
+  let microsoft = null;
+  let microsoftReady = null;
+  const buildMicrosoft = () => microsoftSignIn({
     keyRef: draft.keyRef,
     user: () => draft.user,
     clientId: draft.oauth?.provider === 'google' ? '' : draft.oauth?.clientId || '',
     tenantId: draft.oauth?.tenantId || 'common',
+    clientReady: microsoftReady?.clientReady === true,
+    setupUrl: microsoftReady?.setupUrl || '',
     onStart: (oauth) => { draft.oauth = oauth; },
-    onConnected: () => { draft.auth = 'xoauth2'; },
+    onConnected: () => { draft.auth = 'xoauth2'; draft.oauth = microsoft.oauth(); },
   });
+  async function paintMicrosoft() {
+    if (microsoftReady === null) {
+      credentialSlot.replaceChildren(el('p', { class: 'quiet-note', text: 'Checking whether Zelos can sign in to Microsoft on this machine…' }));
+      try {
+        const [found, links] = await Promise.all([api.guessMail('you@outlook.com'), guideLinks()]);
+        microsoftReady = { clientReady: found.clientReady === true, setupUrl: links.microsoftSetup || '' };
+      } catch {
+        microsoftReady = { clientReady: false, setupUrl: '' };
+      }
+      // The picker moved on while the question was out.
+      if (authMethod() !== 'xoauth2' || provider() !== 'microsoft') return;
+    }
+    microsoft = microsoft || buildMicrosoft();
+    credentialSlot.replaceChildren(microsoft.node);
+  }
 
   // "Sign in with Google" — the same block the simple form shows, built when
   // the picker first lands on it. Whether Zelos has a Google client to sign
@@ -1720,7 +1757,7 @@ function mailForm(account, { onSaved, onCancel }) {
     onStart: (oauth) => { draft.oauth = oauth; },
     onConnected: (oauth) => { draft.auth = 'xoauth2'; draft.oauth = { provider: 'google', clientId: oauth.clientId }; },
   });
-  const activeOAuth = () => (provider() === 'google' ? google?.oauth() ?? draft.oauth : microsoft.oauth());
+  const activeOAuth = () => (provider() === 'google' ? google?.oauth() ?? draft.oauth : microsoft?.oauth() ?? draft.oauth);
   async function paintGoogle() {
     if (googleReady === null) {
       credentialSlot.replaceChildren(el('p', { class: 'quiet-note', text: 'Checking whether Zelos can sign in to Google on this machine…' }));
@@ -1747,9 +1784,10 @@ function mailForm(account, { onSaved, onCancel }) {
     const xo = authMethod() === 'xoauth2';
     const viaGoogle = xo && provider() === 'google';
     if (viaGoogle) paintGoogle();
-    else credentialSlot.replaceChildren(xo ? microsoft.node : passwordBlock);
+    else if (xo) paintMicrosoft();
+    else credentialSlot.replaceChildren(passwordBlock);
     tlsSelect.closest('.field')?.toggleAttribute('hidden', xo);
-    if (!xo || viaGoogle) microsoft.stop();
+    if (!xo || viaGoogle) microsoft?.stop();
     if (!viaGoogle) google?.stop();
   };
   authSelect.addEventListener('change', () => {
@@ -1757,7 +1795,7 @@ function mailForm(account, { onSaved, onCancel }) {
     paintCredential();
   });
 
-  return el('div', { class: 'account-form' }, [
+  const node = el('div', { class: 'account-form' }, [
     hostList,
     field('Name it', labelInput),
     field('IMAP host', hostInput),
@@ -1869,6 +1907,11 @@ function mailForm(account, { onSaved, onCancel }) {
     ]),
     status.node,
   ]);
+  // Paint the slot for the state the form OPENS in, or an existing account
+  // shows no password field and no sign-in until the picker above is touched.
+  // After the tree is built, so the TLS field's initial hide can find it.
+  paintCredential();
+  return node;
 }
 
 /* ---------------------------------------------------------- simple setup */
@@ -2692,6 +2735,8 @@ export function calendarPanel({ compact = false, onDone = null, rerender } = {})
           class: 'btn quiet',
           onClick: async () => {
             await saveConfig({ calendars: (state.config.calendars || []).filter((c) => c.id !== calendar.id) });
+            // The stored password goes with it, as a mail account's does.
+            if (calendar.keyRef) await api.deleteSecret(calendar.keyRef).catch(() => {});
             rerender?.();
           },
         }),
@@ -3041,6 +3086,56 @@ export function folderHint(platform = '') {
  */
 const canShowFolder = () => typeof window !== 'undefined' && typeof window.zelos?.showHome === 'function';
 
+/** "312 MB" — how big the folder's database really is, in the unit that fits. */
+function sizeOnDisk(bytes) {
+  const v = Math.max(0, Number(bytes) || 0);
+  if (v >= 1024 * 1024 * 1024) return `${(v / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+  if (v >= 1024 * 1024) return `${Math.round(v / (1024 * 1024))} MB`;
+  if (v >= 1024) return `${Math.round(v / 1024)} KB`;
+  return `${v} bytes`;
+}
+
+/** "2,143" — an exact count. The board's compact "2.1k" would be a guess here. */
+const exactCount = (n) => Math.max(0, Math.round(Number(n) || 0)).toLocaleString('en-US');
+
+/** "2,143 emails", with the exact count above rather than plural()'s bare number. */
+const counted = (n, word) => `${exactCount(n)} ${Number(n) === 1 ? word : `${word}s`}`;
+
+/** "March 2026" from a stored date, or '' when there is nothing that old. */
+function monthYear(iso) {
+  const m = /^(\d{4})-(\d{2})/.exec(String(iso || ''));
+  if (!m) return '';
+  const name = monthName(Number(m[2]));
+  return name ? `${name} ${m[1]}` : '';
+}
+
+/**
+ * The stats block for the Your data panel: what the folder actually holds,
+ * from GET /api/data's counts — filled in when the answer lands, and silent
+ * on a build without the route. Every check stores mail forever, and "how big
+ * has this gotten?" should not need Finder to answer.
+ */
+function dataStats() {
+  const slot = el('div', { class: 'data-stats' });
+  request('/api/data').then((d) => {
+    const since = monthYear(d?.oldestMessageAt);
+    const disk = sizeOnDisk((Number(d?.dbBytes) || 0) + (Number(d?.walBytes) || 0));
+    const accounts = Array.isArray(d?.accounts) ? d.accounts : [];
+    replace(slot, [
+      el('p', { class: 'quiet-note', text: `${counted(d?.messageCount, 'email')}${since ? ` back to ${since}` : ''} · ${disk} on disk` }),
+      el('p', { class: 'quiet-note', text: `${counted(d?.eventCount, 'appointment')} · ${counted(d?.itemCount, 'item')}` }),
+      accounts.length > 1 ? el('dl', { class: 'facts' }, accounts.flatMap((a) => [
+        el('dt', { text: String(a?.label || a?.id || 'account') }),
+        el('dd', { text: counted(a?.messages, 'email') }),
+      ])) : null,
+    ]);
+  }).catch(() => {
+    /* An older build without the route, or a hiccup: the panel stands on its
+       own, claiming nothing it cannot count. */
+  });
+  return slot;
+}
+
 function dataPanel() {
   const status = statusLine();
   const home = state.health?.home || '(unknown)';
@@ -3077,6 +3172,7 @@ function dataPanel() {
 
   return el('div', { class: 'panel' }, [
     el('p', { class: 'panel-lede', text: 'Everything Zelos knows is in one folder on this computer. Back it up by copying the folder; delete it and Zelos forgets everything.' }),
+    dataStats(),
     field('The Zelos folder', input({ value: home, readonly: true })),
     el('div', { class: 'row-inline' }, [
       canShowFolder()
@@ -3110,7 +3206,18 @@ function aboutPanel() {
   const backend = state.health?.backend || { name: 'unknown', writable: false, note: '' };
   // The day's AI usage, moved here from the header. A count of what went to
   // the AI, never a price: Zelos has no idea what anyone is paying per token.
-  const usage = tokenLine(state.board?.tokens, null);
+  // The day key is load-bearing: without it, a counter written yesterday reads
+  // as today's spend on a machine that has not checked yet today.
+  const tokens = state.board?.tokens;
+  const todayKey = nowMark().key;
+  const usage = tokenLine(tokens, todayKey);
+  // `modelRuns` counts the checks that actually asked the AI to think
+  // (core/sweep.mjs recordTokens). A question typed into Ask moves the token
+  // totals and deliberately not this count — it is not a check that happened.
+  const asked = usage && tokens?.day === todayKey ? Number(tokens.modelRuns) || 0 : 0;
+  const lifetime = tokens?.lifetime && typeof tokens.lifetime === 'object' ? tokens.lifetime : null;
+  const lifetimeUsage = tokenLine(lifetime);
+  const lifetimeAsked = lifetimeUsage ? Number(lifetime.modelRuns) || 0 : 0;
   return el('div', { class: 'panel panel-about' }, [
     el('dl', { class: 'facts' }, [
       el('dt', { text: 'Version' }), el('dd', { class: 'mono', text: state.health?.version || '—' }),
@@ -3122,8 +3229,13 @@ function aboutPanel() {
           ? `${state.health.model.label}${state.health.model.local ? ' · on this computer' : ''}`
           : 'none chosen yet',
       }),
-      el('dt', { text: 'AI usage this session' }),
-      el('dd', { text: usage ? `${usage}. What that costs depends on your AI service’s prices; Zelos does not see them.` : 'Nothing sent to the AI yet.' }),
+      el('dt', { text: 'AI usage today' }),
+      el('dd', { text: usage
+        ? `${usage}${asked ? ` · asked to think ${plural(asked, 'time')}` : ''}. What that costs depends on your AI service’s prices; Zelos does not see them.`
+        : 'Nothing sent to the AI yet today.' }),
+      // The running total is not the day's, so no day can stale it.
+      lifetimeUsage ? el('dt', { text: 'Since the start' }) : null,
+      lifetimeUsage ? el('dd', { text: `${lifetimeUsage}${lifetimeAsked ? ` · asked to think ${plural(lifetimeAsked, 'time')}` : ''}.` }) : null,
     ]),
     el('p', { class: 'panel-lede', text: plainSecretNotes(backend.name).about }),
     fold('Security details', [
@@ -3261,7 +3373,10 @@ const tabId = (id) => `settings-tab-${id}`;
 const panelId = (id) => `settings-panel-${id}`;
 
 export function renderSettings(ctx) {
-  const panel = ctx.sub || DEFAULT_PANEL;
+  // Only a sub-route that names a real panel, or the strip highlights
+  // nothing and the ids below point at elements that do not exist — the
+  // dangling-relationship failure the comment above is about.
+  const panel = PANELS.some((p) => p.id === ctx.sub) ? ctx.sub : DEFAULT_PANEL;
   const rerender = ctx.rerender;
 
   // Arrow keys move between tabs, the way a tablist is expected to. Activation

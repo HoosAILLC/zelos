@@ -1244,6 +1244,30 @@ test('docs/README.md counts the outbound calls with a recipe that still matches 
     assert.ok(fs.readFileSync(path.join(ROOT, file), 'utf8').includes(name),
       `docs/README.md says ${fn} in ${file} opens a connection, and no such name appears in that file`);
   }
+
+  /* The completeness check below the table is pinned the same way. An earlier
+     version of that list stopped at child_process and never named node:dns —
+     the fourth primitive actually in use: `discoverProvider` sends the typed
+     domain to the system resolver as MX and SRV questions during mail setup
+     (SECURITY.md § 5 counts it), real traffic the page said could not exist.
+     So the second command has to name node:dns, and running it has to turn up
+     the import in core/sources/imap.mjs at the count the prose states. */
+  const second = [...section.matchAll(/```\ngrep -rn "([^"\n]+)" core\/ zelos\.mjs\n```/g)][1];
+  assert.ok(second, 'the section should print a second `grep -rn "…" core/ zelos.mjs` command — the completeness check');
+  assert.ok(second[1].includes('node:dns'),
+    'the completeness-check grep never names node:dns, the primitive mail setup resolves MX and SRV records with');
+  const otherPattern = new RegExp(second[1].split('\\|').map((alt) => alt.replace(/\(/g, '\\(')).join('|'));
+  const others = [];
+  for (const full of files) {
+    const rel = path.relative(ROOT, full).split(path.sep).join('/');
+    fs.readFileSync(full, 'utf8').split('\n').forEach((text, i) => {
+      if (otherPattern.test(text)) others.push({ file: rel, line: i + 1, text });
+    });
+  }
+  assert.ok(others.some((h) => h.file === 'core/sources/imap.mjs' && h.text.includes('node:dns')),
+    'the completeness-check grep no longer turns up the node:dns import in core/sources/imap.mjs');
+  assert.equal(others.length, stated(/(\w+) lines come back/, 'how many lines the completeness check returns'),
+    `the completeness-check grep returns ${others.length} lines today, and the page says otherwise:\n  ${show(others)}`);
 });
 
 /* ================================================================== *
@@ -1414,14 +1438,21 @@ test('both READMEs send the stuck person to /help, and say what the message neve
 test('README.md says what a sign-in needs from the reader, and the code agrees', async () => {
   const { DEFAULT_OAUTH_CLIENTS } = await import('../core/sources/oauth.mjs');
   const shipped = Object.entries(DEFAULT_OAUTH_CLIENTS).filter(([, c]) => c.clientId).map(([id]) => id);
-  const readme = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8');
-  if (shipped.length === 0) {
-    assert.doesNotMatch(readme, /nothing to register/i,
-      'README.md promises a sign-in that registers nothing, and DEFAULT_OAUTH_CLIENTS ships no client id — the app asks the reader for one');
-    assert.match(readme, /registration of your own/,
-      'README.md should say a registration of the reader\'s own is what a sign-in needs today');
-  } else {
-    assert.doesNotMatch(readme, /not shipped yet/,
-      `DEFAULT_OAUTH_CLIENTS ships ${shipped.join(' and ')} now — README.md still says the clients are not shipped`);
+  // The long version and the sign-in page made the same promise in their own
+  // words — "Both sign-ins run against a client Zelos ships, so you register
+  // nothing" stood in docs/README.md while the app demanded a registration —
+  // so every page that states it is read against the constant. Whitespace is
+  // folded because markdown wraps the sentence across lines.
+  for (const rel of ['README.md', 'docs/README.md', 'docs/OAUTH.md']) {
+    const page = fs.readFileSync(path.join(ROOT, rel), 'utf8').replace(/\s+/g, ' ');
+    if (shipped.length === 0) {
+      assert.doesNotMatch(page, /nothing to register|registers? nothing/i,
+        `${rel} promises a sign-in that registers nothing, and DEFAULT_OAUTH_CLIENTS ships no client id — the app asks the reader for one`);
+      assert.match(page, /registration of your own/,
+        `${rel} should say a registration of the reader's own is what a sign-in needs today`);
+    } else {
+      assert.doesNotMatch(page, /not shipped yet/,
+        `DEFAULT_OAUTH_CLIENTS ships ${shipped.join(' and ')} now — ${rel} still says the clients are not shipped`);
+    }
   }
 });

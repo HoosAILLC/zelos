@@ -1722,6 +1722,52 @@ describe('the audit log names the scope that actually authorised the call', () =
     await call({ db, config: cfg({ board: true }) }, 'zelos_people', {});
     assert.equal(newest(db).scope, 'people');
   });
+
+  test('an item answered with a draft logs the mail scope the recipient rode in on', async () => {
+    /* zelos_drafts reports this exact disclosure as drafts+mail.metadata: the
+       recipient and subject are mail metadata that arrived by a different door
+       (see draftView). An item whose draft carries them has to say so too, even
+       when none of its own mail sources resolved — the address left the
+       machine either way, and this row is the only place that says it did. */
+    const db = freshDb();
+    const itemId = dbm.upsertItem(db, {
+      key: 'quarterly-numbers',
+      kind: 'money',
+      bucket: 'waiting',
+      headline: 'Answer the Q3 numbers question',
+      sourceRefs: [],
+    }, { runId: 'run_1' }).id;
+    dbm.upsertDraft(db, { itemId, to: 'boss@company.example', subject: 'Re: Q3 numbers', body: 'On it.' });
+
+    const res = await call({ db, config: cfg({ board: true, drafts: true, 'mail.metadata': true }) },
+      'zelos_item', { id: itemId });
+    assert.equal(res.result.structuredContent.drafts[0].to, 'boss@company.example',
+      'the fixture has to actually disclose a recipient');
+    assert.equal(newest(db).scope, 'board+drafts+mail.metadata');
+
+    // Without the mail grant nothing rode along, and the row must not claim it.
+    await call({ db, config: cfg({ board: true, drafts: true }) }, 'zelos_item', { id: itemId });
+    assert.equal(newest(db).scope, 'board+drafts');
+
+    // A resolved mail source already spends mail.metadata; the draft beside it
+    // must not make the row claim the same scope twice.
+    const withSource = seeded();
+    await call({ db: withSource.db, config: cfg(ALL_ON) }, 'zelos_item', { id: withSource.itemId });
+    assert.equal(newest(withSource.db).scope, 'board+mail.metadata+mail.bodies+drafts');
+  });
+
+  test('the row is stamped in the configured zone, not the machine\'s', async () => {
+    /* The same rule core/server.mjs's recordAskSpend spells out: `nowISO()`
+       with no argument reads the MACHINE zone, and for the hours when that
+       zone and the configured one sit on different dates, the panel files the
+       read under the wrong day. Kiritimati (+14:00) is a zone no machine
+       running this suite sits in, so this cannot pass by the two agreeing. */
+    const { db } = fourKinds();
+    const config = cfg({ board: true });
+    config.identity.timezone = 'Pacific/Kiritimati';
+    await call({ db, config }, 'zelos_board', {});
+    assert.match(newest(db).at, /\+14:00$/, 'the audit row was stamped off the machine clock');
+  });
 });
 
 /* ================================================================== *
