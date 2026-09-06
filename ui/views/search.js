@@ -69,6 +69,11 @@ export function hashForBucket(bucket) {
   return BUCKET_HASH[bucket] || '#/now';
 }
 
+// Snoozing preserves the item's bucket, but moves its visible row to Now.
+function hashForItem(item) {
+  return item.state === 'snoozed' ? '#/now/snoozed' : hashForBucket(item.bucket);
+}
+
 export function kindLabel(kind) {
   if (KIND_LABEL[kind]) return KIND_LABEL[kind];
   return typeof kind === 'string' && kind ? kind : 'result';
@@ -128,12 +133,12 @@ export function destinationFor(ref, { items = [], events = [] } = {}) {
   if (parts.prefix === 'item') {
     const item = items.find((i) => i && i.id === parts.id);
     if (!item) return null;
-    return { where: 'board', hash: hashForBucket(item.bucket), item, raised: false };
+    return { where: 'board', hash: hashForItem(item), item, raised: false };
   }
 
   const source = items.find((i) => Array.isArray(i?.sourceRefs) && i.sourceRefs.includes(ref));
   if (!source) return null;
-  return { where: 'board', hash: hashForBucket(source.bucket), item: source, raised: true };
+  return { where: 'board', hash: hashForItem(source), item: source, raised: true };
 }
 
 /* --------------------------------------------------------------- the view */

@@ -873,31 +873,16 @@ const TOOL_DEFS = [
         || toZonedISO(new Date((fromMs ?? Date.now()) + DEFAULT_CALENDAR_DAYS * 86_400_000), rt.tz);
       const toMs = instant(to);
 
-      // The stored range filter is lexical on strings that carry an offset, so
-      // it is only approximate at the edges: ask for a wider window, then
-      // filter on real instants.
-      //
-      // The padded upper bound is clamped below the year 10000 for a reason
-      // that only a lexical comparison could produce: at five digits the ISO
-      // string becomes "10000-01-01T…", which sorts BELOW "2026-…", so a query
-      // reaching far enough into the future silently matched nothing and came
-      // back as an empty calendar marked complete. An empty answer that claims
-      // to be the whole answer is the one shape this file must never produce.
-      const pad = 86_400_000;
-      const MAX_BOUND_MS = Date.UTC(9999, 0, 1);
-      const upperMs = Math.min((toMs ?? Date.now()) + pad, MAX_BOUND_MS);
+      // Filter and order by real instants before LIMIT. Fetching a padded
+      // prefix first let yesterday's events fill that prefix, then disappear
+      // in the filter, leaving an apparently empty day with appointments.
+      const MAX_BOUND_MS = Date.UTC(10000, 0, 1) - 1;
       const rows = listEvents(rt.db, {
-        from: toZonedISO(new Date((fromMs ?? Date.now()) - pad), rt.tz),
-        to: toZonedISO(new Date(upperMs), rt.tz),
-        limit: Math.min(1_000, limit * 4),
-      }).filter((ev) => {
-        const starts = instant(ev.starts_at);
-        const ends = instant(ev.ends_at) ?? starts;
-        if (starts === null) return true;
-        if (toMs !== null && starts > toMs) return false;
-        if (fromMs !== null && ends !== null && ends < fromMs) return false;
-        return true;
-      }).slice(0, limit);
+        from: new Date(fromMs ?? Date.now()).toISOString(),
+        to: new Date(Math.min(toMs ?? Date.now(), MAX_BOUND_MS)).toISOString(),
+        limit,
+        exact: true,
+      });
 
       return {
         payload: { from, to, events: rows.map(eventView), returned: rows.length, capped: rows.length >= limit },

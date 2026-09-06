@@ -606,6 +606,7 @@ test('one failing calendar does not cost the user the others', async (t) => {
 
   const texts = await fetchRange({ url: mock.origin, user: USER, pass: PASS });
   assert.equal(texts.length, 1);
+  assert.equal(texts.incomplete, true, 'partial collections cannot authorize cache deletion');
 });
 
 test('responses that are not calendar data are ignored', async (t) => {
@@ -1217,7 +1218,7 @@ test('an href pointing at another scheme is dropped rather than followed', async
   );
 });
 
-test('malformed XML degrades instead of throwing', async (t) => {
+test('malformed discovery XML reports a failure instead of an empty calendar', async (t) => {
   const mock = await startServer({
     'PROPFIND *': '<d:multistatus xmlns:d="DAV:"><d:response><d:href>/broken/',
   });
@@ -1225,7 +1226,7 @@ test('malformed XML degrades instead of throwing', async (t) => {
 
   const result = await testConnection({ url: mock.origin, user: USER, pass: PASS });
   assert.equal(result.ok, false);
-  assert.match(result.error, /found no calendars/);
+  assert.match(result.error, /incomplete calendar discovery/i);
 });
 
 test('an oversized response is refused before it is buffered', async (t) => {

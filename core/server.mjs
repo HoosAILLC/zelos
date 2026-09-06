@@ -2771,10 +2771,7 @@ async function handleMcp(ctx) {
 
   const presented = bearerToken(req.headers.authorization);
   const verdict = await verifyToken(presented, { config });
-  if (!verdict.ok) {
-    // The reason goes to the log, not to the caller: telling an unauthenticated
-    // client which half of its credential was wrong is telling it what to fix.
-    logger.warn('server: refused an MCP request', { reason: verdict.reason });
+  const refuseToken = () => {
     res.writeHead(401, {
       ...SECURITY_HEADERS,
       'Content-Type': 'application/json; charset=utf-8',
@@ -2782,6 +2779,12 @@ async function handleMcp(ctx) {
       'WWW-Authenticate': 'Bearer realm="zelos"',
     });
     res.end(`${JSON.stringify({ error: 'unauthorized', detail: 'send a Zelos AI token as Authorization: Bearer' })}\n`);
+  };
+  if (!verdict.ok) {
+    // The reason goes to the log, not to the caller: telling an unauthenticated
+    // client which half of its credential was wrong is telling it what to fix.
+    logger.warn('server: refused an MCP request', { reason: verdict.reason });
+    refuseToken();
     return;
   }
 
@@ -2803,6 +2806,14 @@ async function handleMcp(ctx) {
 
   let response;
   try {
+    // A client can hold its body open after the headers authenticated. Check
+    // current membership immediately before dispatch, with no await between
+    // this check and the tool call, so revocation also stops pending bodies.
+    const current = aiConfig(ctx.config());
+    if (!current.enabled || !current.tokens.some((token) => token.id === verdict.token.id)) {
+      refuseToken();
+      return;
+    }
     response = await ctx.mcp.handle(request, {
       db: ctx.db,
       // A function, not a snapshot: a scope the owner switches off in Settings

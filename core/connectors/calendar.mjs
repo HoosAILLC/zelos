@@ -58,7 +58,7 @@ export const TRUNCATED_NOTE = `This calendar filled Zelos's ceiling of ${ICS_MAX
 /** Every calendar reader takes and returns the same thing. */
 export function eventsFrom(text, window) {
   const events = parseICS_toEvents(text, window);
-  return { events, truncated: filledIcsBudget(events) };
+  return { events, truncated: filledIcsBudget(events), incomplete: events.incomplete === true };
 }
 
 /**
@@ -117,9 +117,13 @@ export function calendarConnector({ type, label, option, credential = null, read
       // Read BEFORE anything maps the array, which drops it along with every
       // other non-index property. See `markTruncated` in core/sweep.mjs.
       const truncated = events?.truncated === true;
+      const incomplete = !Array.isArray(events) || events.incomplete === true;
       const rows = events || [];
       emit(`${at}: ${rows.length} entries`, rows.length, rows.length);
-      return { parts: [{ label: '', rows, error: null, note: truncated ? TRUNCATED_NOTE : null }] };
+      const note = truncated ? TRUNCATED_NOTE : incomplete
+        ? 'This calendar could only be read in part. Previously saved appointments have been kept; try another check when the source is available.'
+        : null;
+      return { snapshotComplete: !truncated && !incomplete, parts: [{ label: '', rows, error: null, note }] };
     },
   };
 }

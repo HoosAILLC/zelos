@@ -30,7 +30,7 @@ import crypto from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 
 import { paths } from './config.mjs';
-import { nowISO } from './time.mjs';
+import { nowISO, instant, dayKey, toZonedISO } from './time.mjs';
 import { log } from './log.mjs';
 
 export const SCHEMA_VERSION = 2;
@@ -553,22 +553,64 @@ export function upsertEvents(db, list, opts = {}) {
   return { ids, inserted, updated: ids.length - inserted };
 }
 
+/**
+ * Remove events absent from a complete calendar snapshot. Only this source and
+ * events wholly inside its fetched window are eligible. Boundary-spanning or
+ * undated cache entries survive because the snapshot cannot prove their absence.
+ * The caller must never use this for a failed, partial or capped read.
+ */
+export function reconcileEvents(db, { calendarId, events, from, to, timezone } = {}) {
+  const source = str(calendarId);
+  const lower = instant(from);
+  const upper = instant(to);
+  if (!source || !Array.isArray(events) || lower === null || upper === null || lower >= upper) return 0;
+  const retained = new Set(events.map(ev => str(ev.id) || eventRowId(source, str(ev.uid), str(ev.recurrenceId ?? ev.recurrence_id))));
+  const firstDay = dayKey(toZonedISO(lower, timezone));
+  const lastDay = dayKey(toZonedISO(upper, timezone));
+  const candidates = prep(db, 'SELECT id, starts_at, ends_at, all_day FROM events WHERE calendar_id = ?').all(source);
+  let removed = 0;
+  withTransaction(db, () => {
+    for (const event of candidates) {
+      if (retained.has(event.id)) continue;
+      const start = instant(event.starts_at);
+      const end = instant(event.ends_at);
+      // All-day dates name the user's days, not UTC midnights. Keep both
+      // partially covered edge days rather than infer a timezone for a date.
+      const covered = event.all_day
+        ? firstDay && lastDay && dayKey(event.starts_at) > firstDay && dayKey(event.ends_at) <= lastDay
+        : start !== null && end !== null && start >= lower && start < upper && end >= start && end <= upper;
+      if (!covered) continue;
+      removed += Number(prep(db, 'DELETE FROM events WHERE id = ? AND calendar_id = ?').run(event.id, source).changes);
+      removeDoc(db, `evt:${event.id}`);
+    }
+  });
+  return removed;
+}
+
 export function getEvent(db, id) {
   return hydrateEvent(prep(db, 'SELECT * FROM events WHERE id = ?').get(id));
 }
 
 /**
  * Range filter on the ISO strings themselves. They carry an offset, so a
- * lexical comparison is only approximate at the boundaries — call it with a
- * range a little wider than you need and filter precisely upstream.
+ * lexical comparison is only approximate at the boundaries. `exact` compares
+ * and orders real instants before applying the limit, for callers whose limit
+ * must count only events in the requested window.
  */
-export function listEvents(db, { from = null, to = null, calendarId = null, limit = 1000 } = {}) {
+export function listEvents(db, { from = null, to = null, calendarId = null, limit = 1000, exact = false } = {}) {
   const where = [];
   const args = [];
-  if (from) { where.push('(ends_at IS NULL OR ends_at >= ?)'); args.push(from); }
-  if (to) { where.push('starts_at <= ?'); args.push(to); }
+  if (from) {
+    where.push(exact ? 'COALESCE(julianday(ends_at), julianday(starts_at)) >= julianday(?)' : '(ends_at IS NULL OR ends_at >= ?)');
+    args.push(from);
+  }
+  if (to) {
+    where.push(exact ? 'julianday(starts_at) <= julianday(?)' : 'starts_at <= ?');
+    args.push(to);
+  }
   if (calendarId) { where.push('calendar_id = ?'); args.push(calendarId); }
-  const sql = `SELECT * FROM events ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY starts_at ASC LIMIT ?`;
+  const order = exact ? 'julianday(starts_at) ASC, id ASC' : 'starts_at ASC';
+  const sql = `SELECT * FROM events ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY ${order} LIMIT ?`;
   return prep(db, sql).all(...args, Math.max(1, Number(limit) || 1000)).map(hydrateEvent);
 }
 

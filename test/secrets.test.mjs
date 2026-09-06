@@ -78,7 +78,7 @@ test('no command line can carry a secret — describeCommand never receives one'
         assert.equal(typeof a, 'string');
         assert.ok(!/hunter2/.test(a));
       }
-      assert.ok(desc.args.includes('mail.m_9f3a1c') || name === 'windows-dpapi');
+      assert.ok(desc.args.some((arg) => /^[0-9a-f]{32}\.mail\.m_9f3a1c$/.test(arg)) || name === 'windows-dpapi');
     }
   }
 });
@@ -86,14 +86,16 @@ test('no command line can carry a secret — describeCommand never receives one'
 test('macOS argv matches the spec, and the value is written to stdin twice', () => {
   const set = describeCommand({ name: 'macos-keychain', action: 'set', ref: 'model.default' });
   assert.equal(set.file, '/usr/bin/security');
-  assert.deepEqual(set.args, ['add-generic-password', '-U', '-s', SERVICE, '-a', 'model.default', '-w']);
+  const account = set.args[set.args.indexOf('-a') + 1];
+  assert.match(account, /^[0-9a-f]{32}\.model\.default$/);
+  assert.deepEqual(set.args, ['add-generic-password', '-U', '-s', SERVICE, '-a', account, '-w']);
   assert.equal(set.args.at(-1), '-w', 'nothing may follow -w');
   // security prompts "password data" AND "retype password"; one write leaves an
   // empty password stored with exit code 0.
   assert.equal(set.stdinWrites, 2);
 
   const get = describeCommand({ name: 'macos-keychain', action: 'get', ref: 'model.default' });
-  assert.deepEqual(get.args, ['find-generic-password', '-g', '-s', SERVICE, '-a', 'model.default']);
+  assert.deepEqual(get.args, ['find-generic-password', '-g', '-s', SERVICE, '-a', account]);
   assert.equal(get.stdinWrites, 0);
   assert.equal(get.stderrSafe, false, '-g prints the password on stderr; it must never be logged');
 
@@ -116,7 +118,7 @@ test('Windows DPAPI passes an encoded script and the path by env, never the valu
   assert.ok(!/\[Console\]::In\b/.test(script), 'Console.In would inherit the console code page');
   assert.match(script, /ConvertFrom-SecureString/);
   assert.ok(!/-Key\b/.test(script), 'CurrentUser DPAPI scope, not a hardcoded key');
-  assert.match(set.env.ZELOS_SECRET_FILE, /Zelos[\\/]secrets[\\/]mail\.m_1\.dpapi$/);
+  assert.match(set.env.ZELOS_SECRET_FILE, /Zelos[\\/]secrets[\\/][0-9a-f]{32}[\\/]mail\.m_1\.dpapi$/);
   assert.equal(set.stdinWrites, 1);
 
   const get = describeCommand({ name: 'windows-dpapi', action: 'get', ref: 'mail.m_1' });
@@ -130,12 +132,14 @@ test('Windows DPAPI passes an encoded script and the path by env, never the valu
 
 test('libsecret argv matches secret-tool, value on stdin', () => {
   const set = describeCommand({ name: 'libsecret', action: 'set', ref: 'mail.m_2' });
-  assert.deepEqual(set.args, ['store', '--label=Zelos', 'service', SERVICE, 'account', 'mail.m_2']);
+  const account = set.args.at(-1);
+  assert.match(account, /^[0-9a-f]{32}\.mail\.m_2$/);
+  assert.deepEqual(set.args, ['store', '--label=Zelos', 'service', SERVICE, 'account', account]);
   assert.equal(set.stdinWrites, 1);
   assert.deepEqual(describeCommand({ name: 'libsecret', action: 'get', ref: 'mail.m_2' }).args,
-    ['lookup', 'service', SERVICE, 'account', 'mail.m_2']);
+    ['lookup', 'service', SERVICE, 'account', account]);
   assert.deepEqual(describeCommand({ name: 'libsecret', action: 'delete', ref: 'mail.m_2' }).args,
-    ['clear', 'service', SERVICE, 'account', 'mail.m_2']);
+    ['clear', 'service', SERVICE, 'account', account]);
 });
 
 test('the module exposes no way to enumerate values', () => {

@@ -579,6 +579,37 @@ describe('config.ai.maxRows caps every result set', () => {
     assert.equal(res.result.structuredContent.items.length, 2);
   });
 
+  test('calendar limits apply to the requested window, not preceding events', async () => {
+    const db = freshDb();
+    for (let i = 0; i < 4; i += 1) {
+      dbm.upsertEvent(db, {
+        calendarId: 'c_work', uid: `yesterday-${i}`, title: 'Yesterday',
+        startsAt: '2026-09-06T18:00:00-04:00', endsAt: '2026-09-06T19:00:00-04:00',
+      });
+    }
+    dbm.upsertEvent(db, {
+      calendarId: 'c_work', uid: 'today', title: 'Actual appointment',
+      startsAt: '2026-09-07T09:00:00-04:00', endsAt: '2026-09-07T10:00:00-04:00',
+    });
+    const res = await call({ db, config: cfg(ALL_ON) }, 'zelos_calendar', {
+      from: '2026-09-07T00:00:00-04:00', to: '2026-09-07T23:59:59-04:00', limit: 1,
+    });
+    assert.deepEqual(res.result.structuredContent.events.map((event) => event.title), ['Actual appointment']);
+  });
+
+  test('calendar returns the earliest actual instant across offsets and keeps overlaps', async () => {
+    const db = freshDb();
+    for (const event of [
+      { uid: 'later', title: 'Later', startsAt: '2026-09-06T23:30:00-04:00', endsAt: '2026-09-07T00:30:00-04:00' },
+      { uid: 'overlap', title: 'Overlapping', startsAt: '2026-09-07T02:00:00Z', endsAt: '2026-09-07T03:00:00Z' },
+      { uid: 'old-no-end', title: 'Old without end', startsAt: '2026-09-06T12:00:00Z' },
+    ]) dbm.upsertEvent(db, { calendarId: 'c_work', ...event });
+    const res = await call({ db, config: cfg(ALL_ON) }, 'zelos_calendar', {
+      from: '2026-09-07T02:30:00Z', to: '2026-09-07T05:00:00Z', limit: 1,
+    });
+    assert.deepEqual(res.result.structuredContent.events.map((event) => event.title), ['Overlapping']);
+  });
+
   test('a nonsense limit is a clean invalid-params error', async () => {
     const db = busy();
     const res = await call({ db, config: cfg(ALL_ON) }, 'zelos_board', { limit: 'lots' });

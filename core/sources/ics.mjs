@@ -380,7 +380,7 @@ function parseRRule(raw) {
   for (const part of String(raw || '').split(';')) {
     if (!part) continue;
     const eq = part.indexOf('=');
-    if (eq === -1) continue;
+    if (eq === -1) { rule.incomplete = true; continue; }
     const key = part.slice(0, eq).trim().toUpperCase();
     const val = part.slice(eq + 1).trim();
     switch (key) {
@@ -389,47 +389,58 @@ function parseRRule(raw) {
         break;
       case 'INTERVAL': {
         const n = Number(val);
+        if (!Number.isInteger(n) || n < 1) rule.incomplete = true;
         rule.interval = Number.isFinite(n) && n >= 1 ? Math.floor(n) : 1;
         break;
       }
       case 'COUNT': {
         const n = Number(val);
+        if (!Number.isInteger(n) || n <= 0) rule.incomplete = true;
         rule.count = Number.isFinite(n) && n > 0 ? Math.floor(n) : null;
         break;
       }
       case 'UNTIL':
         rule.until = parseDateValue(val, {});
+        if (!rule.until) rule.incomplete = true;
         break;
       case 'BYDAY':
         for (const entry of val.toUpperCase().split(',')) {
           const m = BYDAY_RE.exec(entry.trim());
           if (m) rule.byday.push({ ordinal: m[1] ? Number(m[1]) : 0, weekday: WEEKDAYS.indexOf(m[2]) });
+          if (!m || (m[1] && (Number(m[1]) === 0 || Math.abs(Number(m[1])) > 53))) rule.incomplete = true;
         }
         break;
       case 'BYMONTHDAY':
         for (const entry of val.split(',')) {
           const n = Number(entry.trim());
           if (Number.isInteger(n) && n !== 0 && Math.abs(n) <= 31) rule.bymonthday.push(n);
+          else rule.incomplete = true;
         }
         break;
       case 'BYMONTH':
         for (const entry of val.split(',')) {
           const n = Number(entry.trim());
           if (Number.isInteger(n) && n >= 1 && n <= 12) rule.bymonth.push(n);
+          else rule.incomplete = true;
         }
         break;
       case 'BYSETPOS':
         for (const entry of val.split(',')) {
           const n = Number(entry.trim());
           if (Number.isInteger(n) && n !== 0) rule.bysetpos.push(n);
+          if (!Number.isInteger(n) || n === 0 || Math.abs(n) > 366) rule.incomplete = true;
         }
         break;
       case 'WKST': {
         const idx = WEEKDAYS.indexOf(val.toUpperCase());
         if (idx >= 0) rule.wkst = idx;
+        else rule.incomplete = true;
         break;
       }
       default:
+        // Unknown modifiers can change the set of occurrences. Keep the
+        // partial expansion readable, but never use it to remove cached rows.
+        rule.incomplete = true;
         break;
     }
   }
@@ -470,6 +481,8 @@ export function parseICS(text) {
   const vtimezones = new Map();
   const vevents = [];
   let calname = null;
+  let incomplete = false;
+  let calendarSeen = false;
 
   /** Stack of open components; each holds the props seen so far. */
   const stack = [];
@@ -483,6 +496,7 @@ export function parseICS(text) {
 
     if (name === 'BEGIN') {
       const comp = { type: value.trim().toUpperCase(), props: [], children: [] };
+      if (comp.type === 'VCALENDAR') calendarSeen = true;
       if (current) current.children.push(comp);
       stack.push(comp);
       current = comp;
@@ -491,10 +505,15 @@ export function parseICS(text) {
     if (name === 'END') {
       const closed = stack.pop();
       current = stack[stack.length - 1] || null;
-      if (!closed) continue;
+      if (!closed) { incomplete = true; continue; }
+      if (closed.type !== value.trim().toUpperCase()) incomplete = true;
       if (closed.type === 'VEVENT' && (!current || current.type === 'VCALENDAR')) {
         const ev = buildVEvent(closed, vtimezones);
         if (ev) vevents.push(ev);
+        else incomplete = true;
+        // Unsupported recurrence stays readable as one event, but is not a
+        // complete account of the series and cannot authorize cache deletion.
+        if (ev?.incomplete || (ev && firstProp(closed, 'RRULE') && (!ev.rrule || ev.rrule.incomplete))) incomplete = true;
       } else if (closed.type === 'VTIMEZONE') {
         const tz = buildVTimezone(closed);
         if (tz) vtimezones.set(tz.tzid, tz);
@@ -509,6 +528,7 @@ export function parseICS(text) {
   }
 
   for (const ev of vevents) ev.calendarName = calname;
+  if (incomplete || stack.length || !calendarSeen) Object.defineProperty(vevents, 'incomplete', { value: true });
   return { vevents, vtimezones, calname };
 }
 
@@ -537,9 +557,14 @@ function buildVEvent(comp, vtimezones) {
   const durationProp = firstProp(comp, 'DURATION');
   const recurProp = firstProp(comp, 'RECURRENCE-ID');
   const rruleProp = firstProp(comp, 'RRULE');
+  let incomplete = false;
 
   const exdates = [];
-  for (const p of allProps(comp, 'EXDATE')) exdates.push(...parseDateList(p.value, p.params));
+  for (const p of allProps(comp, 'EXDATE')) {
+    const parsed = parseDateList(p.value, p.params);
+    if (parsed.length !== String(p.value || '').split(',').length) incomplete = true;
+    exdates.push(...parsed);
+  }
 
   const rdates = [];
   for (const p of allProps(comp, 'RDATE')) {
@@ -548,25 +573,30 @@ function buildVEvent(comp, vtimezones) {
       if (isPeriod || piece.includes('/')) {
         const [startRaw, endRaw] = piece.split('/');
         const start = parseDateValue(startRaw, p.params);
-        if (!start) continue;
+        if (!start) { incomplete = true; continue; }
         let durationMs = null;
         if (endRaw && /^[+-]?P/i.test(endRaw)) durationMs = parseDuration(endRaw);
         else if (endRaw) {
           const end = parseDateValue(endRaw, p.params);
           if (end) durationMs = end.nominal - start.nominal;
         }
+        if (durationMs === null) incomplete = true;
         rdates.push({ start, durationMs });
       } else {
         const start = parseDateValue(piece, p.params);
         if (start) rdates.push({ start, durationMs: null });
+        else incomplete = true;
       }
     }
   }
 
   const attendees = allProps(comp, 'ATTENDEE').map(parseCalAddress).filter((a) => a && a.email);
   const statusRaw = textProp(comp, 'STATUS').trim().toUpperCase();
+  const recurrenceId = recurProp ? parseDateValue(recurProp.value, recurProp.params) : null;
+  if (recurProp && !recurrenceId) incomplete = true;
 
   return {
+    ...(incomplete ? { incomplete: true } : {}),
     uid: textProp(comp, 'UID').trim() || null,
     sequence: Number(textProp(comp, 'SEQUENCE')) || 0,
     summary: textProp(comp, 'SUMMARY'),
@@ -582,7 +612,7 @@ function buildVEvent(comp, vtimezones) {
     rrule: rruleProp ? parseRRule(rruleProp.value) : null,
     exdates,
     rdates,
-    recurrenceId: recurProp ? parseDateValue(recurProp.value, recurProp.params) : null,
+    recurrenceId,
     // RANGE is the only parameter that changes what a RECURRENCE-ID *means*:
     // THISANDFUTURE claims the named instance and every one after it, so an
     // override carrying it has to be applied to a range rather than to a single
@@ -735,6 +765,7 @@ function* recurrenceNominals(start, rule, { maxNominal = Infinity, minNominal = 
     scans.left -= 1;
     const days = candidateDays(rule, periodY, periodMo, periodD, base, bymonth, bydayWeekdays, scans);
     if (scans.left < 0 || scans.left < ruleFloor) {
+      scans.incomplete = true;
       if (scans.left < 0 && !scans.warned) {
         scans.warned = true;
         ics.warn(`recurrence scanning exhausted its budget; the series is cut short (FREQ=${rule.freq})`);
@@ -762,12 +793,16 @@ function* recurrenceNominals(start, rule, { maxNominal = Infinity, minNominal = 
       yield t;
       produced++;
       emitted++;
-      if (emitted >= maxCount) return;
+      if (emitted >= maxCount) {
+        if (rule.count === null || emitted < rule.count) scans.incomplete = true;
+        return;
+      }
       if (rule.count !== null && emitted >= rule.count) return;
     }
 
     if (produced === 0) {
       if (++emptyRun > MAX_EMPTY_PERIODS) {
+        scans.incomplete = true;
         ics.warn(`recurrence produced nothing for ${MAX_EMPTY_PERIODS} periods; giving up (FREQ=${rule.freq})`);
         return;
       }
@@ -798,6 +833,7 @@ function* recurrenceNominals(start, rule, { maxNominal = Infinity, minNominal = 
     }
   }
   ics.warn(`recurrence hit the ${MAX_PERIODS}-period cap (FREQ=${rule.freq})`);
+  scans.incomplete = true;
 }
 
 /** Days a rule selects inside one period, as {y, mo, d}. Spends `scans` as it looks. */
@@ -1056,7 +1092,9 @@ export function expand(vevents, { from, to, max = 1500, tzid, email = null, vtim
   if (sink.dropped > 0) {
     ics.warn(`more than max=${cap} instances in the window; dropped ${sink.dropped} from the far end of it`);
   }
-  return sink.items.map((c) => c.event);
+  const events = sink.items.map((c) => c.event);
+  if (list.incomplete || sink.dropped > 0 || sink.scans.incomplete) Object.defineProperty(events, 'incomplete', { value: true, configurable: true });
+  return events;
 }
 
 /**

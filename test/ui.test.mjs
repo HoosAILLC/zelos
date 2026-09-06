@@ -23,6 +23,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { spawnSync } from 'node:child_process';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const UI = path.join(ROOT, 'ui');
@@ -1254,6 +1255,26 @@ test('a window left open past midnight keeps its date, its now-line and its day'
   assert.deepEqual(store.eventsToday().map((e) => e.id), ['tomorrow']);
 });
 
+test('the Calendar count includes continuing appointments and respects exclusive end dates', async () => {
+  stubBrowserGlobals();
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  store.state.board = {
+    ...store.state.board,
+    now: '2026-08-12T09:00:00-04:00',
+    events: [
+      { id: 'trip', starts_at: '2026-08-11', ends_at: '2026-08-14', all_day: true },
+      { id: 'overnight', starts_at: '2026-08-11T23:00:00-04:00', ends_at: '2026-08-12T10:00:00-04:00' },
+      { id: 'today', starts_at: '2026-08-12T14:00:00-04:00', ends_at: '2026-08-12T15:00:00-04:00' },
+      { id: 'ended', starts_at: '2026-08-11', ends_at: '2026-08-12', all_day: true },
+      { id: 'midnight', starts_at: '2026-08-11T23:00:00-04:00', ends_at: '2026-08-12T00:00:00-04:00' },
+      { id: 'future', starts_at: '2026-08-13', ends_at: '2026-08-14', all_day: true },
+    ],
+  };
+  store.state.boardAt = Date.now();
+  assert.deepEqual(store.eventsToday().map((e) => e.id), ['trip', 'overnight', 'today']);
+  assert.equal(store.railCounts().events, 3);
+});
+
 test('an untouched window refetches the board on a timer, and stops while hidden', async (t) => {
   stubBrowserGlobals();
   const store = await import(fileUrl(UI, 'lib/store.js'));
@@ -1446,6 +1467,31 @@ test('a search hit knows where — and whether — it can be opened', async () =
   assert.equal(search.destinationFor('msg:gone', { items, events }), null);
   assert.equal(search.destinationFor('evt:gone', { items, events }), null);
   assert.equal(search.destinationFor('item:gone', { items, events }), null);
+});
+
+test('snoozed search hits open Now with the Snoozed section visible', async (t) => {
+  withPlainDom(t);
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const search = await import(fileUrl(UI, 'views/search.js'));
+  const { renderNow } = await import(fileUrl(UI, 'views/now.js'));
+  const item = {
+    id: 'asleep', state: 'snoozed', bucket: 'today', headline: 'The postponed invoice',
+    sourceRefs: ['msg:mail', 'cap:note'], snoozed_until: '2026-08-13T09:00:00-04:00',
+  };
+  store.state.config = { mail: [{ id: 'mail' }], calendars: [], sources: [] };
+  store.state.health = { model: { configured: true } };
+  store.state.board = { ...store.state.board, items: [item], finished: [], notes: [], counts: {}, runs: {} };
+  store.state.sweep.error = null;
+  for (const ref of ['item:asleep', 'msg:mail', 'cap:note']) {
+    const destination = search.destinationFor(ref, { items: [item] });
+    assert.equal(destination.hash, '#/now/snoozed', ref);
+    const view = renderNow({ tz: 'UTC', sub: destination.hash.split('/')[2], navigate() {} });
+    assert.match(onScreen(view), /The postponed invoice/);
+    const toggle = findButtons(view, /^Snoozed/)[0];
+    assert.equal(toggle.getAttribute('aria-expanded'), 'true');
+  }
+  const ordinary = renderNow({ tz: 'UTC', sub: null, navigate() {} });
+  assert.doesNotMatch(onScreen(ordinary), /The postponed invoice/, 'ordinary Now still starts folded');
 });
 
 test('the results summary counts in the words the app uses, board first', async () => {
@@ -3297,6 +3343,91 @@ const GUESSES = {
   'frank@hotmail.com': { label: 'Outlook / Microsoft', host: 'outlook.office365.com', port: 993, secure: true, auth: 'xoauth2', signIn: 'microsoft', clientReady: false, appPasswordUrl: null, note: 'Hotmail and Outlook.com need a one-time setup at Microsoft’s website first (about ten minutes) — the app shows you every step. There is no password to paste: Microsoft switched password sign-in off for personal Outlook, Hotmail, Live and MSN accounts on 16 September 2024.', known: true },
   'frank@icloud.com': { label: 'iCloud Mail', host: 'imap.mail.me.com', port: 993, secure: true, auth: 'password', signIn: null, clientReady: false, appPasswordUrl: 'https://account.apple.com/account/manage', note: 'iCloud Mail requires an app-specific password. This provider does not accept your normal password over IMAP.', known: true },
 };
+
+test('first-run setup stays on Email after saving the AI, and can finish even when storage refuses writes', () => {
+  // Run the actual shell in its own process: its subscriptions and timers live
+  // for the whole page, and must not leak into the renderer tests in this file.
+  for (const [initiallyConfigured, storageUnavailable] of [[false, false], [false, true], [true, false]]) {
+    const script = `
+      import assert from 'node:assert/strict';
+      const PlainNode = ${PlainNode.toString()};
+      const plainWalk = ${plainWalk.toString()};
+      const textOf = ${textOf.toString()};
+      const findButton = ${findButton.toString()};
+      const storage = () => {
+        const values = new Map();
+        return {
+          getItem: k => values.get(k) || null,
+          setItem: (k, v) => { if (${JSON.stringify(storageUnavailable)}) throw new Error('storage disabled'); values.set(k, String(v)); },
+          removeItem: k => values.delete(k),
+        };
+      };
+      globalThis.Node = PlainNode;
+      globalThis.localStorage = storage();
+      globalThis.sessionStorage = storage();
+      globalThis.window = {
+        location: { href: 'http://127.0.0.1/?t=test', host: '127.0.0.1', hash: '#/now' },
+        history: { replaceState() {} }, addEventListener() {}, scrollTo() {},
+        matchMedia: () => ({ matches: true }),
+      };
+      const root = new PlainNode('div');
+      PlainNode.prototype.contains = function(node) { return plainWalk(this).includes(node); };
+      PlainNode.prototype.getBoundingClientRect = () => ({ height: 100 });
+      PlainNode.prototype.querySelector = function(selector) {
+        return plainWalk(this).find(n => (n.attributes.class || '').split(' ').includes(selector.slice(1))) || null;
+      };
+      globalThis.document = {
+        documentElement: { style: { setProperty() {} } }, body: new PlainNode('body'), activeElement: null,
+        visibilityState: 'visible', addEventListener() {}, removeEventListener() {},
+        createElement: tag => new PlainNode(tag),
+        createTextNode: text => { const n = new PlainNode('#text'); n.textContent = String(text); return n; },
+        getElementById: id => id === 'app' ? root : null,
+      };
+      globalThis.requestAnimationFrame = fn => { fn(); return 0; };
+      globalThis.setInterval = () => 0;
+      globalThis.fetch = async path => {
+        if (path === '/api/sweep/stream') return new Promise(() => {});
+        assert.equal(path, '/api/sample-data');
+        return { ok: true, status: 200, text: async () => JSON.stringify({ installed: false }) };
+      };
+      let configured = ${JSON.stringify(initiallyConfigured)};
+      let config = {
+        identity: {}, ui: {}, mail: [], calendars: [], sources: [],
+        model: { protocol: 'openai', model: 'local-test', baseUrl: 'http://127.0.0.1:1234', keyRef: 'model.default' },
+      };
+      const { api } = await import(${JSON.stringify(fileUrl(UI, 'lib/api.js'))});
+      api.health = async () => ({ model: { configured }, backend: { name: 'memory' } });
+      api.config = async () => ({ config, errors: [], secretRefs: [] });
+      api.state = async () => ({ items: [], drafts: [], events: [], counts: {}, notes: [], runs: {}, now: '2026-08-12T09:00:00-04:00' });
+      api.saveConfig = async patch => { configured = true; config = { ...config, ...patch }; return { config, errors: [], secretRefs: [] }; };
+      api.presets = api.probeLocal = async () => [];
+      api.helpLinks = async () => ({});
+      const settle = async () => { await new Promise(setImmediate); await new Promise(setImmediate); };
+      await import(${JSON.stringify(fileUrl(UI, 'app.js'))});
+      await settle();
+      if (${JSON.stringify(initiallyConfigured)}) {
+        assert.ok(!findButton(root, 'Set up Zelos'), 'existing configured homes still open the board');
+      } else {
+        findButton(root, 'Set up Zelos').fire('click');
+        await settle();
+        assert.match(textOf(root), /Step 2 of 5/);
+        findButton(root, 'Save').fire('click');
+        await settle();
+        assert.match(textOf(root), /Step 3 of 5/, 'saving the AI must advance to Email');
+        assert.equal(localStorage.getItem('zelos.onboarded'), null);
+        findButton(root, 'Skip the rest').fire('click');
+        await settle();
+        assert.doesNotMatch(textOf(root), /Step 3 of 5/);
+        assert.match(textOf(root), /Nothing to read yet/, 'Skip must leave the entire setup flow');
+        const store = await import(${JSON.stringify(fileUrl(UI, 'lib/store.js'))});
+        assert.equal(store.onboardingDone(), true, 'completion survives unavailable storage for this session');
+        assert.equal(localStorage.getItem('zelos.onboarded'), ${JSON.stringify(storageUnavailable ? null : '1')});
+      }
+    `;
+    const run = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', timeout: 10_000 });
+    assert.equal(run.status, 0, run.stderr || run.error?.message || run.stdout);
+  }
+});
 
 test('no screen in onboarding, and no mail card, shows a first-timer a protocol word', async (t) => {
   withPlainDom(t);

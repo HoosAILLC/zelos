@@ -392,28 +392,29 @@ finally{ [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b) }
  * `find-generic-password -g` does), so that stream must never reach a log or an
  * error message.
  */
-export function describeCommand({ name, action, ref }) {
+export function describeCommand({ name, action, ref, legacy = false }) {
   if (!isValidRef(ref)) throw new TypeError(`secrets: invalid ref ${JSON.stringify(ref)}`);
   if (!BACKEND_NAMES.includes(name)) throw new TypeError(`secrets: unknown backend ${name}`);
+  const account = name === 'encrypted-file' || legacy ? ref : `${namespaceRecord().id}.${ref}`;
 
   if (name === 'macos-keychain') {
     switch (action) {
       case 'set':
-        return { file: '/usr/bin/security', args: ['add-generic-password', '-U', '-s', SERVICE, '-a', ref, '-w'], stdinWrites: 2, stderrSafe: true };
+        return { file: '/usr/bin/security', args: ['add-generic-password', '-U', '-s', SERVICE, '-a', account, '-w'], stdinWrites: 2, stderrSafe: true };
       case 'get':
         // -g prints "password: <value>" (or "password: 0x<hex>") on STDERR.
-        return { file: '/usr/bin/security', args: ['find-generic-password', '-g', '-s', SERVICE, '-a', ref], stdinWrites: 0, stderrSafe: false };
+        return { file: '/usr/bin/security', args: ['find-generic-password', '-g', '-s', SERVICE, '-a', account], stdinWrites: 0, stderrSafe: false };
       case 'has':
-        return { file: '/usr/bin/security', args: ['find-generic-password', '-s', SERVICE, '-a', ref], stdinWrites: 0, stderrSafe: true };
+        return { file: '/usr/bin/security', args: ['find-generic-password', '-s', SERVICE, '-a', account], stdinWrites: 0, stderrSafe: true };
       case 'delete':
-        return { file: '/usr/bin/security', args: ['delete-generic-password', '-s', SERVICE, '-a', ref], stdinWrites: 0, stderrSafe: true };
+        return { file: '/usr/bin/security', args: ['delete-generic-password', '-s', SERVICE, '-a', account], stdinWrites: 0, stderrSafe: true };
       default:
         throw new TypeError(`secrets: unknown action ${action}`);
     }
   }
 
   if (name === 'windows-dpapi') {
-    const env = { ZELOS_SECRET_FILE: dpapiFile(ref) };
+    const env = { ZELOS_SECRET_FILE: dpapiFile(ref, legacy) };
     const ps = (script) => ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', psEncoded(script)];
     switch (action) {
       case 'set':
@@ -431,12 +432,12 @@ export function describeCommand({ name, action, ref }) {
   if (name === 'libsecret') {
     switch (action) {
       case 'set':
-        return { file: 'secret-tool', args: ['store', '--label=Zelos', 'service', SERVICE, 'account', ref], stdinWrites: 1, stderrSafe: true };
+        return { file: 'secret-tool', args: ['store', '--label=Zelos', 'service', SERVICE, 'account', account], stdinWrites: 1, stderrSafe: true };
       case 'get':
       case 'has':
-        return { file: 'secret-tool', args: ['lookup', 'service', SERVICE, 'account', ref], stdinWrites: 0, stderrSafe: true };
+        return { file: 'secret-tool', args: ['lookup', 'service', SERVICE, 'account', account], stdinWrites: 0, stderrSafe: true };
       case 'delete':
-        return { file: 'secret-tool', args: ['clear', 'service', SERVICE, 'account', ref], stdinWrites: 0, stderrSafe: true };
+        return { file: 'secret-tool', args: ['clear', 'service', SERVICE, 'account', account], stdinWrites: 0, stderrSafe: true };
       default:
         throw new TypeError(`secrets: unknown action ${action}`);
     }
@@ -445,9 +446,9 @@ export function describeCommand({ name, action, ref }) {
   return null; // encrypted-file is pure JS
 }
 
-function dpapiFile(ref) {
+function dpapiFile(ref, legacy = false) {
   const base = process.env.LOCALAPPDATA || path.join(paths().home, 'dpapi');
-  return path.join(base, 'Zelos', 'secrets', `${ref}.dpapi`);
+  return path.join(base, 'Zelos', 'secrets', ...(legacy ? [] : [namespaceRecord().id]), `${ref}.dpapi`);
 }
 
 /* ------------------------------------------------------------- detection */
@@ -718,12 +719,18 @@ function indexFile() {
   return path.join(paths().home, 'secrets.index.json');
 }
 
-function readIndex() {
+function readIndex(strict = false) {
   try {
     const parsed = JSON.parse(fs.readFileSync(indexFile(), 'utf8'));
+    if (strict && (!Array.isArray(parsed?.refs) || !parsed.refs.every(isValidRef))) {
+      throw new Error('invalid credential index');
+    }
     const refs = Array.isArray(parsed?.refs) ? parsed.refs.filter(isValidRef) : [];
     return [...new Set(refs)].sort();
-  } catch {
+  } catch (err) {
+    if (strict && err.code !== 'ENOENT') {
+      throw new Error('secrets: credential index cannot be read; restore secrets.index.json before migrating this home');
+    }
     return [];
   }
 }
@@ -741,6 +748,61 @@ function rememberRef(ref) {
 function forgetRef(ref) {
   const refs = readIndex();
   if (refs.includes(ref)) writeIndex(refs.filter((r) => r !== ref));
+}
+
+// Keep the namespace in the home so moving an existing setup keeps its keys,
+// while independently created work/personal setups get different OS entries.
+// Only refs already indexed by an older installation may read its unscoped
+// entries until the next explicit save. Reads never write a migrated value:
+// a concurrent process may be replacing/deleting that key while the OS reads.
+// Never remove the shared legacy entry another older home may still need.
+function namespaceRecord() {
+  const file = path.join(paths().home, 'secrets.namespace.json');
+  let raw;
+  try {
+    raw = fs.readFileSync(file, 'utf8');
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
+    const fresh = { version: 1, id: crypto.randomBytes(16).toString('hex'), legacyRefs: readIndex(true) };
+    let fd;
+    try {
+      fd = fs.openSync(file, 'wx', 0o600);
+      fs.writeFileSync(fd, `${JSON.stringify(fresh, null, 2)}\n`);
+      fs.fsyncSync(fd);
+    } catch (writeError) {
+      if (writeError.code === 'EEXIST') return namespaceRecord();
+      throw writeError;
+    } finally {
+      if (fd !== undefined) fs.closeSync(fd);
+    }
+    return fresh;
+  }
+  let record;
+  try { record = JSON.parse(raw); } catch { /* fail without replacing the identity */ }
+  if (record?.version !== 1 || !/^[0-9a-f]{32}$/.test(record.id) || !Array.isArray(record.legacyRefs)
+      || !record.legacyRefs.every(isValidRef)) {
+    throw new Error('secrets: credential namespace is damaged; restore secrets.namespace.json from this home\'s backup');
+  }
+  return record;
+}
+
+function hasLegacyRef(ref) {
+  const record = namespaceRecord();
+  return record.legacyRefs.includes(ref) && !fs.existsSync(legacyMarker(record, ref));
+}
+
+function legacyMarker(record, ref) {
+  return path.join(paths().home, 'secrets.migrated', `${record.id}.${ref}`);
+}
+
+function forgetLegacyRef(ref) {
+  const record = namespaceRecord();
+  if (!record.legacyRefs.includes(ref)) return;
+  const file = legacyMarker(record, ref);
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  // Monotonic per-ref markers cannot lose another process's update to a shared
+  // array. In particular a removed scoped key must never revive a legacy one.
+  writeFileAtomic(file, '', 0o600);
 }
 
 /* ------------------------------------------------- encrypted-file backend */
@@ -937,8 +999,26 @@ function stdinFor(desc, value) {
   return `${value}\n`.repeat(desc.stdinWrites);
 }
 
+// Keep an application's reads and edits ordered. Legacy fallback reads are
+// read-only, so another process cannot turn one into a late migration write.
+const secretOperations = new Map();
+function withSecretLock(ref, operation) {
+  const key = `${paths().home}\0${ref}`;
+  const previous = secretOperations.get(key) ?? Promise.resolve();
+  const result = previous.then(operation);
+  const tail = result.then(() => {}, () => {});
+  secretOperations.set(key, tail);
+  return result.finally(() => {
+    if (secretOperations.get(key) === tail) secretOperations.delete(key);
+  });
+}
+
 export async function setSecret(ref, value) {
   assertRef(ref);
+  return withSecretLock(ref, () => writeSecret(ref, value));
+}
+
+async function writeSecret(ref, value) {
   const { name } = await backend();
   assertValue(name, value);
 
@@ -960,6 +1040,7 @@ export async function setSecret(ref, value) {
     if (code !== 0) throw new Error(`secrets: DPAPI write failed for ${ref} (exit ${code}) ${stderr.trim()}`);
     rememberRef(ref);
     recordBackend(name);
+    forgetLegacyRef(ref);
     return { ok: true, backend: name };
   }
 
@@ -973,6 +1054,7 @@ export async function setSecret(ref, value) {
   }
   rememberRef(ref);
   recordBackend(name);
+  forgetLegacyRef(ref);
   return { ok: true, backend: name };
 }
 
@@ -993,6 +1075,10 @@ function parseKeychainPassword(stderr) {
 
 export async function getSecret(ref) {
   assertRef(ref);
+  return withSecretLock(ref, () => readSecret(ref));
+}
+
+async function readSecret(ref) {
   const { name } = await backend();
 
   if (name === 'encrypted-file') {
@@ -1000,7 +1086,14 @@ export async function getSecret(ref) {
     return Object.hasOwn(store, ref) ? store[ref] : null;
   }
 
-  const desc = describeCommand({ name, action: 'get', ref });
+  const value = await readExternalSecret(name, ref);
+  if (value !== null || !hasLegacyRef(ref)) return value;
+  const previous = await readExternalSecret(name, ref, true);
+  return previous;
+}
+
+async function readExternalSecret(name, ref, legacy = false) {
+  const desc = describeCommand({ name, action: 'get', ref, legacy });
   const { code, stdout, stderr } = await runWithRetry(desc.file, desc.args,
     { env: desc.env, timeoutMs: budgets.access, label: `${name} get ${ref}` });
   if (code === NOT_FOUND_EXIT) return null;
@@ -1032,6 +1125,10 @@ export async function getSecret(ref) {
 
 export async function deleteSecret(ref) {
   assertRef(ref);
+  return withSecretLock(ref, () => removeSecret(ref));
+}
+
+async function removeSecret(ref) {
   const { name } = await backend();
 
   if (name === 'encrypted-file') {
@@ -1045,24 +1142,28 @@ export async function deleteSecret(ref) {
   }
 
   if (name === 'windows-dpapi') {
+    const legacy = hasLegacyRef(ref);
     let deleted = true;
     try {
       fs.unlinkSync(dpapiFile(ref));
     } catch (err) {
       if (err.code !== 'ENOENT') throw err;
-      deleted = false;
+      deleted = legacy;
     }
+    forgetLegacyRef(ref);
     forgetRef(ref);
     return { ok: true, deleted };
   }
 
+  const legacy = hasLegacyRef(ref);
   const desc = describeCommand({ name, action: 'delete', ref });
   const { code, stderr } = await runWithRetry(desc.file, desc.args,
     { timeoutMs: budgets.access, label: `${name} delete ${ref}` });
+  const missing = code === NOT_FOUND_EXIT || (name === 'libsecret' && code === 1 && !stderr.trim());
+  if (code !== 0 && !missing) throw new Error(`secrets: could not delete ${ref} from ${name} (exit ${code}) ${stderr.trim()}`);
+  forgetLegacyRef(ref);
   forgetRef(ref);
-  if (code === NOT_FOUND_EXIT || (name === 'libsecret' && code === 1)) return { ok: true, deleted: false };
-  if (code !== 0) throw new Error(`secrets: could not delete ${ref} from ${name} (exit ${code}) ${stderr.trim()}`);
-  return { ok: true, deleted: true };
+  return { ok: true, deleted: !missing || legacy };
 }
 
 /**
@@ -1077,10 +1178,11 @@ export async function deleteSecret(ref) {
  * mail kept syncing, while Ask started answering "no model is configured yet"
  * and Settings showed placeholders until every password was re-entered.
  */
-async function hasSecret(name, ref) {
+async function hasSecret(name, ref, legacy = false) {
   if (name === 'windows-dpapi') {
-    const blob = dpapiFile(ref);
+    const blob = dpapiFile(ref, legacy);
     if (fs.existsSync(blob)) return 'yes';
+    if (!legacy && hasLegacyRef(ref)) return hasSecret(name, ref, true);
     // The blob lives under %LOCALAPPDATA%, and dpapiFile() falls back to the
     // Zelos home when that variable is missing — so a relaunch without it looks
     // in a directory Zelos has never written to, where every ref reads as
@@ -1089,7 +1191,7 @@ async function hasSecret(name, ref) {
     return fs.existsSync(path.dirname(blob)) ? 'no' : 'unknown';
   }
 
-  const desc = describeCommand({ name, action: 'has', ref });
+  const desc = describeCommand({ name, action: 'has', ref, legacy });
   try {
     // The short budget, and see TIMEOUTS_MS for why: this question's "I could
     // not tell" is safe, and it is asked once per credential on a path a UI
@@ -1102,9 +1204,10 @@ async function hasSecret(name, ref) {
       // not answer" — probeSecretTool() above already knows this and reads
       // stderr to tell them apart. Not-found is exit 1 with nothing on stderr,
       // so anything printed there means we could not ask.
-      return stderr.trim() ? 'unknown' : 'no';
+      if (stderr.trim()) return 'unknown';
+      return !legacy && hasLegacyRef(ref) ? hasSecret(name, ref, true) : 'no';
     }
-    if (code === NOT_FOUND_EXIT) return 'no';
+    if (code === NOT_FOUND_EXIT) return !legacy && hasLegacyRef(ref) ? hasSecret(name, ref, true) : 'no';
     return 'unknown';
   } catch {
     // Spawn refused, or the tool was SIGKILLed at the access budget on both
@@ -1146,6 +1249,11 @@ export async function listRefs() {
   // but only prune when every probe actually answered. Pruning on a partial
   // answer is what made a transient failure permanent: the index is the only
   // record that a keychain item is ours, and there is no way to rebuild it.
-  if (answered && alive.length !== known.length) writeIndex(alive);
+  if (answered && alive.length !== known.length) {
+    // A credential may have been saved while the OS answered these probes.
+    // Remove only the refs this pass actually proved absent.
+    const removed = new Set(known.filter((ref) => !alive.includes(ref)));
+    writeIndex(readIndex().filter((ref) => !removed.has(ref)));
+  }
   return alive;
 }

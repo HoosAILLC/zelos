@@ -1123,10 +1123,14 @@ export async function* stream(opts = {}) {
   const usage = { input: 0, output: 0 };
   let model = req.model;
   let text = '';
+  let completed = false;
 
   try {
-    for await (const data of sseFrames(res.body, keepAlive)) {
-      if (data === '[DONE]') break;
+    frames: for await (const data of sseFrames(res.body, keepAlive)) {
+      if (req.protocol === 'openai' && data === '[DONE]') {
+        completed = true;
+        break;
+      }
       let event;
       try {
         event = JSON.parse(data);
@@ -1152,7 +1156,11 @@ export async function* stream(opts = {}) {
           case 'message_delta':
             if (event.usage?.input_tokens != null) usage.input = num(event.usage.input_tokens);
             if (event.usage?.output_tokens != null) usage.output = num(event.usage.output_tokens);
+            if (typeof event.delta?.stop_reason === 'string' && event.delta.stop_reason) completed = true;
             break;
+          case 'message_stop':
+            completed = true;
+            break frames;
           case 'error':
             throw new LLMError(
               `Model at ${req.address} failed mid-stream: ${midStreamDetail(req, event.error?.message)}`,
@@ -1172,6 +1180,7 @@ export async function* stream(opts = {}) {
       }
       if (typeof event?.model === 'string') model = event.model;
       const choice = Array.isArray(event?.choices) ? event.choices[0] : null;
+      if (typeof choice?.finish_reason === 'string' && choice.finish_reason) completed = true;
       const piece = textOf(choice?.delta?.content);
       if (piece) {
         text += piece;
@@ -1190,6 +1199,15 @@ export async function* stream(opts = {}) {
     release();
   }
 
+  // EOF alone does not mean the provider finished the answer. Accept either
+  // its final reason or its terminal frame: compatible runtimes may omit the
+  // latter, while OpenAI usage can arrive after the finish_reason frame.
+  if (!completed) {
+    throw new LLMError(`Model at ${req.address} ended before the answer was complete — try again`, {
+      address: req.address,
+      retriable: true,
+    });
+  }
   yield { type: 'done', usage, model, text };
 }
 

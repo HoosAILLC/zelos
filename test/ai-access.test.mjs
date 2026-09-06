@@ -28,6 +28,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import http from 'node:http';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -391,6 +392,41 @@ test('a revoked AI token is refused', async (t) => {
   assert.equal(after.status, 401);
   assert.equal(after.headers.get('www-authenticate'), 'Bearer realm="zelos"');
   assert.equal(ctx.mcp.calls.length, 1, 'a revoked token must not reach the tool layer');
+});
+
+test('revoking a token while its request body is pending prevents tool dispatch', async (t) => {
+  await resetAi();
+  const cfg = ai.setAiSettings({ enabled: true }, { config: loadConfig() });
+  const minted = await ai.mintToken({ label: 'Pending body', config: cfg });
+  const ctx = await startServer(t, { config: minted.config });
+  const body = JSON.stringify(RPC);
+  // readBody installs its data listener only after authenticating headers.
+  // Observe that boundary rather than guessing how long the key store takes.
+  const readingBody = new Promise((resolve) => {
+    ctx.server.prependOnceListener('request', (req) => {
+      const observe = (name) => {
+        if (name !== 'data') return;
+        req.off('newListener', observe);
+        resolve();
+      };
+      req.on('newListener', observe);
+    });
+  });
+  let req;
+  const response = new Promise((resolve, reject) => {
+    req = http.request(`${ctx.base}/api/mcp`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${minted.value}`, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+    }, (res) => { res.resume(); res.on('end', () => resolve(res.statusCode)); });
+    req.on('error', reject);
+    req.flushHeaders();
+  });
+  await readingBody;
+  const gone = await api(ctx, 'DELETE', `/api/ai/tokens/${minted.token.id}`);
+  assert.equal(gone.json.revoked, true);
+  req.end(body);
+  assert.equal(await response, 401);
+  assert.equal(ctx.mcp.calls.length, 0, 'a formerly valid request must not execute after revocation');
 });
 
 test('the session token does NOT authorise /api/mcp', async (t) => {

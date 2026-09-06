@@ -769,6 +769,45 @@ test('stream() reassembles events split across packets, including multibyte char
   assert.equal(events.at(-1).type, 'done');
 });
 
+test('stream() refuses EOF before a provider completion marker', async () => {
+  for (const [protocol, chunks] of [
+    ['openai', ['data: {"choices":[{"delta":{"content":"The appointment is on"}}]}\n\n']],
+    ['anthropic', ['data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"The appointment is on"}}\n\n']],
+    ['openai', [': ping\n\n']],
+  ]) {
+    mock.plan.push({ chunks });
+    const seen = [];
+    await assert.rejects(async () => {
+      for await (const event of stream({
+        protocol, baseUrl: mock.origin, model: 'test', apiKey: 'k',
+        messages: [{ role: 'user', content: 'hi' }], retries: 0,
+      })) seen.push(event);
+    }, /ended before.*complete/i);
+    assert.equal(seen.some((event) => event.type === 'done'), false, protocol);
+  }
+});
+
+test('stream() accepts provider completion variants and trailing usage', async () => {
+  for (const [protocol, chunks, expectedUsage] of [
+    ['openai', ['data: {"choices":[{"delta":{"content":"Ready"},"finish_reason":"stop"}]}\n\n',
+      'data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2}}\n\n'], { input: 5, output: 2 }],
+    ['openai', ['data: {"choices":[{"delta":{"content":"Ready"}}]}\n\n', 'data: [DONE]'], { input: 0, output: 0 }],
+    ['anthropic', ['data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Ready"}}\n\n',
+      'data: {"type":"message_stop"}\n\n'], { input: 0, output: 0 }],
+    ['anthropic', ['data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Ready"}}\n\n',
+      'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}\n\n'], { input: 0, output: 2 }],
+  ]) {
+    mock.plan.push({ chunks });
+    const events = await collect(stream({
+      protocol, baseUrl: mock.origin, model: 'test', apiKey: 'k',
+      messages: [{ role: 'user', content: 'hi' }], retries: 0,
+    }));
+    assert.equal(events.at(-1).type, 'done', protocol);
+    assert.equal(events.at(-1).text, 'Ready', protocol);
+    assert.deepEqual(events.at(-1).usage, expectedUsage, protocol);
+  }
+});
+
 test('stream() surfaces a mid-stream anthropic error event', async () => {
   mock.plan.push({
     chunks: [

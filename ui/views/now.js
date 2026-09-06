@@ -266,12 +266,13 @@ export function renderNow(ctx) {
   const snoozed = snoozedItems().sort((a, b) =>
     (instant(a.snoozed_until) ?? Infinity) - (instant(b.snoozed_until) ?? Infinity));
   if (snoozed.length) {
-    const panel = el('div', { class: 'worth-body', hidden: true },
+    const reveal = ctx.sub === 'snoozed';
+    const panel = el('div', { class: 'worth-body', hidden: !reveal },
       el('div', { class: 'stack' }, snoozed.map((item) => itemRow(item, { tz, showBucket: false }))));
     const toggle = el('button', {
       type: 'button',
       class: 'worth-toggle',
-      'aria-expanded': 'false',
+      'aria-expanded': reveal ? 'true' : 'false',
       onclick() {
         const open = this.getAttribute('aria-expanded') === 'true';
         this.setAttribute('aria-expanded', open ? 'false' : 'true');
