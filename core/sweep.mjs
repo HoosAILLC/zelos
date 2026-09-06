@@ -36,6 +36,7 @@ import { AuthError, RateLimitError, AUTH_BLOCK_MS, createHttp, createMeter, secr
 import {
   upsertMessages,
   upsertEvents,
+  reconcileEvents,
   listMessages,
   listEvents,
   listCaptures,
@@ -274,12 +275,13 @@ async function defaultFetchEvents({ calendar, pass, from, to, timezone, email, s
   if (!connector || typeof connector.read !== 'function') {
     throw new Error(`no calendar reader named ${calendar.kind}`);
   }
-  const { events, truncated } = await connector.read({
+  const { events, truncated, incomplete } = await connector.read({
     source: calendar,
     pass,
     signal,
     window: { from, to, tzid: timezone, email, max: ICS_MAX_INSTANCES },
   });
+  if (incomplete && Array.isArray(events)) Object.defineProperty(events, 'incomplete', { value: true, configurable: true });
   return truncated ? markTruncated(events) : events;
 }
 
@@ -727,10 +729,12 @@ export async function runSweep({
       });
 
       const rows = [];
+      let snapshotComplete = connector.sink === 'events' && result?.snapshotComplete === true;
       const maxRows = Number.isInteger(connector.limits.maxRows) ? connector.limits.maxRows : null;
       for (const part of result?.parts || []) {
         const at = part.label ? `${label} / ${part.label}` : label;
         if (part.error) {
+          snapshotComplete = false;
           slog.warn(`${connector.family} source failed: ${at}`, { error: storedError(part.error) });
           sources.push({ kind: connector.family, id: source.id, label: at, ok: false, count: 0, error: storedError(part.error) });
           continue;
@@ -744,6 +748,7 @@ export async function runSweep({
           note = note || `This source returned ${kept.length.toLocaleString('en-US')} entries and Zelos keeps ${maxRows.toLocaleString('en-US')}, so the rest were dropped.`;
           kept = kept.slice(0, maxRows);
         }
+        if (note || !Array.isArray(part.rows)) snapshotComplete = false;
         rows.push(...kept.map(stampFor(connector, source)));
         sources.push({
           kind: connector.family,
@@ -756,7 +761,7 @@ export async function runSweep({
       }
 
       record({ lastOkAt: startedMs, notBefore: 0, authBlockedUntil: 0, secretHash: null });
-      return { sink: connector.sink, rows, cursor: result?.cursor, sourceId: source.id };
+      return { sink: connector.sink, rows, cursor: result?.cursor, sourceId: source.id, snapshotComplete };
     } catch (err) {
       slog.warn(`${connector.family} source failed: ${label}`, { error: storedError(err) });
       sources.push({ kind: connector.family, id: source.id, label, ok: false, count: 0, error: storedError(err) });
@@ -796,6 +801,10 @@ export async function runSweep({
   try {
     const m = upsertMessages(db, fetchedMessages, { now });
     const e = upsertEvents(db, fetchedEvents, { now });
+    for (const result of results) {
+      if (!result.snapshotComplete) continue;
+      reconcileEvents(db, { calendarId: result.sourceId, events: result.rows, from, to, timezone: tz });
+    }
     stats.messages = m.ids.length;
     stats.events = e.ids.length;
     stats.newMessages = m.inserted;

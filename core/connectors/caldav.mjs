@@ -33,12 +33,14 @@ export default calendarConnector({
     // per-document: a collection of a hundred small VEVENT files cannot fill the
     // budget between them, and one enormous recurring series can.
     let truncated = false;
+    let incomplete = docs.incomplete === true;
     for (const doc of docs) {
       const part = eventsFrom(doc, window);
       if (part.truncated) truncated = true;
+      if (part.incomplete) incomplete = true;
       events.push(...part.events);
     }
-    return { events, truncated };
+    return { events, truncated, incomplete };
   },
 
   /**

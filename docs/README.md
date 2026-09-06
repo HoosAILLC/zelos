@@ -430,6 +430,7 @@ and is the only place it is stated.
 | `window.json` | Desktop app only: window size and position. |
 | `secrets.enc`, `.seed` | Present when this home is on the encrypted-file backend — see below. `.seed` holds the key that decrypts `secrets.enc`, in the same folder. |
 | `secrets.backend.json` | Which secret store this home committed to, the first time it stored one. Zelos keeps using that store afterwards even if a keychain later appears, because moving would orphan the secrets already written. |
+| `secrets.namespace.json`, `secrets.index.json`, `secrets.migrated/` | OS credential identity, known names, and upgrade markers; never key values. Keep them with a backup or a moved home. A new empty `--home` gets an independent identity; copying the entire folder copies its existing identity. |
 | `.seed.unreadable-<ts>`, `secrets.enc.unreadable-<ts>` | Only after damage: a seed or store Zelos could not read is renamed aside as a matched pair sharing one timestamp, rather than overwritten. To recover, put the 64 hex characters back in `.seed`, rename the store back to `secrets.enc`, and the secrets read again. |
 
 **Your passwords and API keys are not in that folder** — **unless this home is

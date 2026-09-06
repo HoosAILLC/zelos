@@ -20,7 +20,7 @@
 import { el, button, meander, replace, focusQuietly } from './lib/dom.js';
 import {
   state, subscribe, refresh, watchSweeps, watchBoard, startSweep, railCounts, timezone,
-  needsOnboarding, applyAccent, currentAccent, notify, nowMark, checkAgainLine,
+  needsOnboarding, onboardingDone, applyAccent, currentAccent, notify, nowMark, checkAgainLine,
 } from './lib/store.js';
 import { api, hasToken } from './lib/api.js';
 import { BUCKET_LABEL, sweepSummary, sweepDetail, tokenLine } from './lib/format.js';
@@ -65,6 +65,14 @@ const root = document.getElementById('app');
 
 let route = { view: 'now', sub: null };
 let lastRenderKey = '';
+let setupActive = false;
+
+// A model save changes whether setup is needed, but does not finish a setup
+// already on screen. Keep that flow until its own Finish/Skip action marks it
+// complete. This is set only after boot, so existing configured homes bypass it.
+function showOnboarding() {
+  return route.view === 'welcome' || (setupActive && !onboardingDone()) || needsOnboarding();
+}
 
 function parseHash() {
   const raw = (window.location.hash || '#/now').replace(/^#\/?/, '');
@@ -408,7 +416,7 @@ function renderKey() {
     state.phase,
     state.rev,
     state.fatal ? '1' : '0',
-    needsOnboarding() ? 'ob' : '-',
+    showOnboarding() ? 'ob' : '-',
     // Deliberately not the toast: it lives in the chrome, which repaints on
     // every event, so putting it here would rebuild the view — and a draft
     // someone is typing — every time a save failed.
@@ -422,7 +430,7 @@ function currentView() {
     sub: route.sub,
     rerender: () => render({ force: true }),
   };
-  if (route.view === 'welcome' || needsOnboarding()) return renderOnboarding(ctx);
+  if (showOnboarding()) return renderOnboarding(ctx);
   const view = VIEWS.find((v) => v.id === route.view) || VIEWS[0];
   return view.render(ctx);
 }
@@ -535,8 +543,9 @@ function render({ force = false } = {}) {
     return;
   }
 
-  const onboarding = route.view === 'welcome' || needsOnboarding();
+  const onboarding = showOnboarding();
   if (onboarding) {
+    setupActive = true;
     // The flow gets the whole window: no rail, no tab bar, nothing to click past.
     main = el('main', { class: 'main', id: 'main', tabindex: '-1' }, currentView());
     chromeWrap = null;
@@ -544,6 +553,7 @@ function render({ force = false } = {}) {
     replace(root, el('div', { class: 'shell shell-bare' }, main));
     return;
   }
+  setupActive = false;
 
   // The skeleton survives re-renders. Rebuilding it would re-parent the topbar
   // — and re-parenting a focused textarea blurs it, which is the note-wipe bug

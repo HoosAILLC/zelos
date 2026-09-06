@@ -15,7 +15,7 @@
 
 import { api, openStream, ApiError } from './api.js';
 import { minutesIntoDay, dayKey, addDaysToKey, localTimezone, instant, formatTime } from './time.js';
-import { plural, isNewSince } from './format.js';
+import { plural, isNewSince, eventSpanOnDay } from './format.js';
 
 const ACCENT_KEY = 'zelos.accent';
 const ONBOARDED_KEY = 'zelos.onboarded';
@@ -181,7 +181,10 @@ export async function setAccent(accent) {
  * on the next launch. The mark lives in localStorage rather than config.json
  * because it is a fact about this browser profile, not about the account.
  */
+let onboardingCompletedHere = null;
+
 export function onboardingDone() {
+  if (onboardingCompletedHere !== null) return onboardingCompletedHere;
   try {
     return localStorage.getItem(ONBOARDED_KEY) === '1';
   } catch {
@@ -190,6 +193,9 @@ export function onboardingDone() {
 }
 
 export function markOnboarded(done = true) {
+  // Keep the explicit choice for this page even when private browsing or a
+  // full storage quota refuses persistence. Finishing must still leave setup.
+  onboardingCompletedHere = Boolean(done);
   try {
     if (done) localStorage.setItem(ONBOARDED_KEY, '1');
     else localStorage.removeItem(ONBOARDED_KEY);
@@ -594,7 +600,9 @@ export function railCounts() {
 export function eventsToday() {
   const { key } = nowMark();
   if (!key) return [];
-  return state.board.events.filter((e) => dayKey(e.starts_at) === key);
+  // Count the same day overlap that the agenda and calendar display, including
+  // overnight and multi-day entries but excluding an end at today's midnight.
+  return state.board.events.filter((e) => eventSpanOnDay(e, key));
 }
 
 /**

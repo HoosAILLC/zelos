@@ -718,6 +718,23 @@ right for so long.)
 | Any, fallback | `secrets.enc` in the Zelos home, mode `0600`: AES-256-GCM, key derived by scrypt from a random 32-byte machine seed in `.seed` (mode `0600`, 64 hex characters). |
 | all of the above | Which one this home committed to is recorded in `secrets.backend.json` (mode `0600`) and is what later launches use — see below. |
 
+Independently created homes use separate OS credential names, even when both
+configurations use a ref such as `model.default`. `secrets.namespace.json` holds
+that home's random identifier and the refs recorded before upgrading; it holds
+no values. Keep it, `secrets.index.json`, and `secrets.migrated/` with the home
+when moving or restoring a backup. Copying an entire home also copies its
+credential identity; start with an empty `--home` directory for an independent
+setup. Windows stores new blobs in a namespace subdirectory of the path above.
+
+Older unscoped entries remain readable only by homes that already indexed
+them. The next explicit save writes the home's own entry. Reading an older key
+does not write anything back to the keychain, so it cannot undo an edit in
+another process. Saving or deleting records a per-ref marker that permanently
+disables the old fallback. Zelos leaves the shared old entry in the OS store
+because another installation may still use it; remove it with the OS keychain
+tool after all such installations have been updated. A damaged namespace or
+legacy index raises an error instead of silently generating a new identity.
+
 **The encrypted-file fallback is the weak one, and it is weak in a specific
 way.** The key that decrypts `secrets.enc` sits in `.seed` in the same
 directory, readable by the same user. That means:

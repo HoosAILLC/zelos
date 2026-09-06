@@ -128,32 +128,37 @@ function parseXml(source) {
 
     if (text.startsWith('<!--', lt)) {
       const end = text.indexOf('-->', lt + 4);
+      if (end === -1) root.incomplete = true;
       i = end === -1 ? text.length : end + 3;
       continue;
     }
     if (text.startsWith('<![CDATA[', lt)) {
       const end = text.indexOf(']]>', lt + 9);
+      if (end === -1) root.incomplete = true;
       stack[stack.length - 1].text += text.slice(lt + 9, end === -1 ? text.length : end);
       i = end === -1 ? text.length : end + 3;
       continue;
     }
     if (text.startsWith('<!', lt)) {
       i = skipDeclaration(text, lt);
+      if (text[i - 1] !== '>') root.incomplete = true;
       continue;
     }
     if (text.startsWith('<?', lt)) {
       const end = text.indexOf('?>', lt + 2);
+      if (end === -1) root.incomplete = true;
       i = end === -1 ? text.length : end + 2;
       continue;
     }
 
     const gt = findTagEnd(text, lt);
-    if (gt === -1) break;
+    if (gt === -1) { root.incomplete = true; break; }
     const inner = text.slice(lt + 1, gt);
     i = gt + 1;
 
     if (inner[0] === '/') {
       const closing = makeNode(inner.slice(1).trim());
+      if (stack.length === 1 || stack[stack.length - 1].name !== closing.name) root.incomplete = true;
       for (let d = stack.length - 1; d > 0; d--) {
         if (stack[d].local === closing.local) {
           stack.length = d;
@@ -172,13 +177,22 @@ function parseXml(source) {
     if (!selfClosing) {
       if (stack.length >= MAX_XML_DEPTH) {
         dav.warn('XML nesting cap reached; remainder of the document ignored');
+        root.incomplete = true;
         break;
       }
       stack.push(node);
     }
   }
 
+  if (stack.length !== 1 || root.children.length !== 1 || root.children[0]?.local !== 'multistatus' || root.text.trim()) root.incomplete = true;
   return root;
+}
+
+/** A partial discovery tree cannot establish which calendars exist. */
+function discoveryDocument(response) {
+  const doc = parseXml(response.text);
+  if (doc.incomplete) throw new CalDavError(`Incomplete calendar discovery response from ${hostOf(response.url)}`, { host: hostOf(response.url) });
+  return doc;
 }
 
 /** Every descendant with this local name, document order. */
@@ -550,9 +564,10 @@ function calendarsFrom(doc, base) {
   const out = [];
   for (const response of findAll(doc, 'response')) {
     const href = resolveHref(base, textOf(findOne(response, 'href')));
-    if (!href) continue;
+    if (!href) { Object.defineProperty(out, 'incomplete', { value: true, configurable: true }); continue; }
 
     let isCalendar = false;
+    let classified = false;
     let name = '';
     let color = null;
     let ctag = null;
@@ -562,6 +577,7 @@ function calendarsFrom(doc, base) {
       for (const child of prop.children) {
         switch (child.local) {
           case 'resourcetype':
+            classified = true;
             if (child.children.some((t) => t.local === 'calendar')) isCalendar = true;
             // Scheduling inboxes/outboxes are not something a person reads.
             if (child.children.some((t) => t.local === 'schedule-inbox' || t.local === 'schedule-outbox')) {
@@ -588,6 +604,9 @@ function calendarsFrom(doc, base) {
       }
     }
 
+    // Optional properties may return 404; only the resource type is needed
+    // to prove that an omitted collection is not another calendar.
+    if (!classified) Object.defineProperty(out, 'incomplete', { value: true, configurable: true });
     if (!isCalendar) continue;
     if (components && components.length && !components.includes('VEVENT')) continue;
     out.push({
@@ -870,7 +889,7 @@ export async function discover({ url, user, pass, timeoutMs = DEFAULT_TIMEOUT_MS
     try {
       const res = await request('PROPFIND', root, { ...opts, body: BODY_PRINCIPAL, depth: 0 });
       reached = res.url;
-      const doc = parseXml(res.text);
+      const doc = discoveryDocument(res);
       principal = hrefUnder(doc, res.url, 'current-user-principal') || hrefUnder(doc, res.url, 'principal-url');
       if (principal) break;
     } catch (err) {
@@ -886,7 +905,7 @@ export async function discover({ url, user, pass, timeoutMs = DEFAULT_TIMEOUT_MS
   if (principal) {
     try {
       const res = await request('PROPFIND', principal, { ...opts, body: BODY_HOME_SET, depth: 0 });
-      homeSet = hrefUnder(parseXml(res.text), res.url, 'calendar-home-set');
+      homeSet = hrefUnder(discoveryDocument(res), res.url, 'calendar-home-set');
     } catch (err) {
       note(err);
       dav.debug(`calendar-home-set lookup failed: ${err.message}`);
@@ -901,15 +920,20 @@ export async function discover({ url, user, pass, timeoutMs = DEFAULT_TIMEOUT_MS
   }
 
   let listed = false;
+  let incompleteListing = false;
   let listError = null;
   for (const root of searchRoots) {
     try {
       const res = await request('PROPFIND', root, { ...opts, body: BODY_COLLECTIONS, depth: 1 });
+      const calendars = calendarsFrom(discoveryDocument(res), res.url);
       listed = true;
-      const calendars = calendarsFrom(parseXml(res.text), res.url);
+      if (calendars.incomplete) incompleteListing = true;
       // `res.url`, not `root`: a redirect means the collections live at the
       // address the server pointed at, and that is the hop worth remembering.
-      if (calendars.length) return { principal, homeSet, listRoot: res.url, calendars };
+      if (calendars.length) {
+        if (incompleteListing || listError || (principal && !homeSet)) Object.defineProperty(calendars, 'incomplete', { value: true, configurable: true });
+        return { principal, homeSet, listRoot: res.url, calendars };
+      }
     } catch (err) {
       listError = err;
       if (isCredentialVerdict(err)) throw err;
@@ -931,7 +955,11 @@ export async function discover({ url, user, pass, timeoutMs = DEFAULT_TIMEOUT_MS
       || new CalDavError(`No DAV collections at ${hostOf(base)}`, { host: hostOf(base) });
   }
   if (declined) throw declined;
-  return { principal, homeSet, listRoot: null, calendars: [] };
+  const calendars = [];
+  // An empty fallback root does not prove that a home set which failed to
+  // answer has no calendars. Keep that uncertainty through to the sweep.
+  if (incompleteListing || listError || (principal && !homeSet)) Object.defineProperty(calendars, 'incomplete', { value: true });
+  return { principal, homeSet, listRoot: null, calendars };
 }
 
 /**
@@ -947,7 +975,7 @@ export async function discover({ url, user, pass, timeoutMs = DEFAULT_TIMEOUT_MS
 async function listCalendarsAt(root, opts) {
   try {
     const res = await request('PROPFIND', root, { ...opts, body: BODY_COLLECTIONS, depth: 1 });
-    const calendars = calendarsFrom(parseXml(res.text), res.url);
+    const calendars = calendarsFrom(discoveryDocument(res), res.url);
     if (calendars.length) return { listRoot: res.url, calendars };
     dav.debug(`the remembered listing at ${hostOf(root)} holds no calendars any more`);
   } catch (err) {
@@ -997,7 +1025,7 @@ async function targetsFor(base, key, opts) {
       let homeSet = null;
       try {
         const res = await request('PROPFIND', known.principal, { ...opts, body: BODY_HOME_SET, depth: 0 });
-        homeSet = hrefUnder(parseXml(res.text), res.url, 'calendar-home-set');
+        homeSet = hrefUnder(discoveryDocument(res), res.url, 'calendar-home-set');
       } catch (err) {
         if (isCredentialVerdict(err)) throw err;
         dav.debug(`the remembered principal at ${hostOf(known.principal)} failed: ${err.message}`);
@@ -1053,10 +1081,11 @@ export async function fetchRange({ url, user, pass, from, to, timeoutMs = DEFAUL
   const targets = await targetsFor(base, key, opts);
   if (!targets.length) {
     dav.warn(`no calendar collections found at ${hostOf(base)}`);
-    return [];
+    return targets;
   }
 
   const out = [];
+  if (targets.incomplete) Object.defineProperty(out, 'incomplete', { value: true, configurable: true });
   for (const calendar of targets) {
     // The ctag is the server's own answer to "has anything in this collection
     // changed?". When it has not moved and the window is the same one, the
@@ -1074,22 +1103,27 @@ export async function fetchRange({ url, user, pass, from, to, timeoutMs = DEFAUL
     } catch (err) {
       // One unreadable calendar must not cost the user the others.
       dav.warn(`calendar-query failed for ${calendar.name}: ${err.message}`);
+      Object.defineProperty(out, 'incomplete', { value: true, configurable: true });
       continue;
     }
     const docs = [];
     const doc = parseXml(res.text);
+    let incomplete = doc.incomplete === true;
     for (const response of findAll(doc, 'response')) {
+      let hasCalendarData = false;
       for (const prop of okProps(response)) {
         for (const child of prop.children) {
           if (child.local !== 'calendar-data') continue;
           const text = textOf(child).trim();
-          if (text.includes('BEGIN:VCALENDAR')) docs.push(text);
+          if (text.includes('BEGIN:VCALENDAR')) { docs.push(text); hasCalendarData = true; }
         }
       }
+      if (!hasCalendarData) incomplete = true;
     }
+    if (incomplete) Object.defineProperty(out, 'incomplete', { value: true, configurable: true });
     // Only a server that advertises a ctag can be skipped later: without one
     // there is no way to know the collection has not moved on.
-    if (calendar.ctag) remember(key, calendar.href, { ctag: calendar.ctag, start, end, docs });
+    if (calendar.ctag && !incomplete) remember(key, calendar.href, { ctag: calendar.ctag, start, end, docs });
     out.push(...docs);
   }
   return out;

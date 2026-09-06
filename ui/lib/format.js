@@ -154,6 +154,8 @@ export function isNewSince(item, run) {
 
 /** Minutes [start, end) of an event within one day-key, clamped to that day. */
 export function eventSpanOnDay(event, key) {
+  // A provider keeps cancelled occurrences as receipts; they occupy no time.
+  if (String(event.status || '').trim().toUpperCase() === 'CANCELLED') return null;
   const startKey = dayKey(event.starts_at);
   const endKey = dayKey(event.ends_at) || startKey;
   if (!startKey) return null;
