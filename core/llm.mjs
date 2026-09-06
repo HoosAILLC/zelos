@@ -953,7 +953,11 @@ export async function complete(opts = {}) {
   } finally {
     release();
   }
+  return completionOf(raw, req);
+}
 
+/** Decode either a requested completion or a server's non-streaming fallback. */
+function completionOf(raw, req) {
   // Not every failure comes with a failing status. OpenRouter answers a billing
   // problem with 200 and "402: insufficient credits" in the envelope; read as a
   // success that is an empty string, and an empty string is not obviously wrong
@@ -975,6 +979,20 @@ export async function complete(opts = {}) {
     );
   }
 
+  const object = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+  const choice = Array.isArray(raw?.choices) ? raw.choices[0] : null;
+  // Validate the protocol envelope, not the presence of prose: a refusal,
+  // tool call, or legitimate empty response can carry no text at all.
+  const valid = object(raw) && (req.protocol === 'anthropic'
+    ? Array.isArray(raw.content)
+    : object(choice?.message));
+  if (!valid) {
+    throw new LLMError(
+      `Model at ${req.address} returned an invalid ${req.protocol} response — check the base URL and protocol`,
+      { address: req.address, retriable: false },
+    );
+  }
+
   if (req.protocol === 'anthropic') {
     const blocks = Array.isArray(raw?.content) ? raw.content : [];
     const text = blocks
@@ -990,7 +1008,6 @@ export async function complete(opts = {}) {
     };
   }
 
-  const choice = Array.isArray(raw?.choices) ? raw.choices[0] : null;
   return {
     text: textOf(choice?.message?.content),
     usage: { input: num(raw?.usage?.prompt_tokens), output: num(raw?.usage?.completion_tokens) },
@@ -1077,7 +1094,7 @@ function midStreamDetail(req, raw) {
 
 /**
  * Token stream. Yields {type:'delta', text} then a final
- * {type:'done', usage, model, text}.
+ * {type:'done', usage, model, text, stopReason}.
  */
 export async function* stream(opts = {}) {
   const req = buildChatRequest(opts, { stream: true });
@@ -1105,18 +1122,11 @@ export async function* stream(opts = {}) {
     } finally {
       release();
     }
-    const bodyError = errorInBody(raw);
-    if (bodyError) {
-      const detail = withoutCredentials(bodyError, credentialsIn(req.headers));
-      throw new LLMError(
-        `Model at ${req.address} returned a success status with an error body: ${detail.slice(0, ERROR_DETAIL_CHARS)}`,
-        { address: req.address, retriable: false },
-      );
-    }
-    // Not an error envelope — the old silent shape, kept: a server that
-    // answered a stream request with an ordinary JSON body never streamed
-    // anything, and inventing deltas for it would be a lie of a third kind.
-    yield { type: 'done', usage: { input: 0, output: 0 }, model: req.model, text: '' };
+    const { text, usage, model, stopReason } = completionOf(raw, req);
+    // Some compatible servers ignore stream:true. Their complete answer is
+    // still usable, and its reported usage belongs in the same daily counter.
+    if (text) yield { type: 'delta', text };
+    yield { type: 'done', usage, model, text, stopReason };
     return;
   }
 
@@ -1124,6 +1134,7 @@ export async function* stream(opts = {}) {
   let model = req.model;
   let text = '';
   let completed = false;
+  let stopReason = null;
 
   try {
     frames: for await (const data of sseFrames(res.body, keepAlive)) {
@@ -1156,7 +1167,10 @@ export async function* stream(opts = {}) {
           case 'message_delta':
             if (event.usage?.input_tokens != null) usage.input = num(event.usage.input_tokens);
             if (event.usage?.output_tokens != null) usage.output = num(event.usage.output_tokens);
-            if (typeof event.delta?.stop_reason === 'string' && event.delta.stop_reason) completed = true;
+            if (typeof event.delta?.stop_reason === 'string' && event.delta.stop_reason) {
+              completed = true;
+              stopReason = normalizeStopReason('anthropic', event.delta.stop_reason);
+            }
             break;
           case 'message_stop':
             completed = true;
@@ -1180,7 +1194,10 @@ export async function* stream(opts = {}) {
       }
       if (typeof event?.model === 'string') model = event.model;
       const choice = Array.isArray(event?.choices) ? event.choices[0] : null;
-      if (typeof choice?.finish_reason === 'string' && choice.finish_reason) completed = true;
+      if (typeof choice?.finish_reason === 'string' && choice.finish_reason) {
+        completed = true;
+        stopReason = normalizeStopReason('openai', choice.finish_reason);
+      }
       const piece = textOf(choice?.delta?.content);
       if (piece) {
         text += piece;
@@ -1208,7 +1225,7 @@ export async function* stream(opts = {}) {
       retriable: true,
     });
   }
-  yield { type: 'done', usage, model, text };
+  yield { type: 'done', usage, model, text, stopReason };
 }
 
 /* ------------------------------------------------------------------ *

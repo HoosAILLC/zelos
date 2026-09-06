@@ -131,11 +131,10 @@ function morningISO(key, tz) {
 
 /**
  * The three snooze deadlines on offer, computed in the user's configured zone
- * at the moment the chooser opens — "later today" from a chooser opened at
- * lunch and one opened at dinner are different instants, and both mean four
- * hours from now. Each carries `when`, the clock it is promising, printed on
- * the button so "Tomorrow morning" is legibly 9 AM before the click rather
- * than after the surprise.
+ * at the moment the chooser opens. The first always means four hours from now,
+ * even when that lands tomorrow. Each carries `when`, the clock it is promising,
+ * printed on the button so "Tomorrow morning" is legibly 9 AM before the click
+ * rather than after the surprise.
  */
 export function snoozeChoices(tz, now = Date.now()) {
   const today = dayKey(toZonedISO(new Date(now), tz));
@@ -146,7 +145,7 @@ export function snoozeChoices(tz, now = Date.now()) {
   const tomorrow = morningISO(addDaysToKey(today, 1), tz);
   const nextWeek = morningISO(monday, tz);
   return [
-    { label: 'Later today', when: formatTime(later), until: later },
+    { label: 'In 4 hours', when: dayKey(later) === today ? formatTime(later) : `${formatDay(later)} ${formatTime(later)}`, until: later },
     { label: 'Tomorrow morning', when: formatTime(tomorrow), until: tomorrow },
     { label: 'Next week', when: `${formatDay(nextWeek)} ${formatTime(nextWeek)}`, until: nextWeek },
   ];

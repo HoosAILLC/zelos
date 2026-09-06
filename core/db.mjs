@@ -372,6 +372,26 @@ ON CONFLICT(id) DO UPDATE SET
   flags_json = excluded.flags_json,
   fetched_at = excluded.fetched_at`;
 
+const MESSAGE_CHANGE_IGNORED = new Set(['id', 'source_id', 'uid', 'message_id', 'sent_at', 'fetched_at']);
+const EVENT_CHANGE_IGNORED = new Set(['id', 'calendar_id', 'uid', 'recurrence_id', 'fetched_at']);
+
+function messageIdentity(msg) {
+  return str(msg.id) || messageRowId(str(msg.sourceId ?? msg.source_id),
+    Number.isFinite(Number(msg.uid)) ? Number(msg.uid) : null, str(msg.messageId ?? msg.message_id));
+}
+
+function eventIdentity(ev) {
+  return str(ev.id) || eventRowId(str(ev.calendarId ?? ev.calendar_id), str(ev.uid), str(ev.recurrenceId ?? ev.recurrence_id));
+}
+
+function sourceRowChanged(before, after, ignored, preserveEmptyBody = false) {
+  return !!before && Object.entries(after).some(([key, value]) => {
+    if (ignored.has(key)) return false;
+    if (preserveEmptyBody && (key === 'snippet' || key === 'body') && value === '') return false;
+    return before[key] !== value;
+  });
+}
+
 /**
  * Accepts a `fetchRecent()` row plus `sourceId`. A cheap header-only re-fetch
  * keeps the body and snippet a fuller fetch already stored — losing a body
@@ -382,12 +402,13 @@ export function upsertMessage(db, msg, { now = nowISO() } = {}) {
   const sourceId = str(msg.sourceId ?? msg.source_id);
   const messageId = str(msg.messageId ?? msg.message_id);
   const uid = Number.isFinite(Number(msg.uid)) ? Number(msg.uid) : null;
-  const id = str(msg.id) || messageRowId(sourceId, uid, messageId);
+  const id = messageIdentity(msg);
   const from = addr(msg.from);
   const direction = DIRECTIONS.includes(msg.direction) ? msg.direction : 'in';
-  const existed = !!prep(db, 'SELECT 1 FROM messages WHERE id = ?').get(id);
+  const before = prep(db, 'SELECT * FROM messages WHERE id = ?').get(id);
+  const existed = !!before;
 
-  prep(db, MESSAGE_UPSERT).run({
+  const record = {
     id,
     source_id: sourceId,
     uid,
@@ -406,7 +427,13 @@ export function upsertMessage(db, msg, { now = nowISO() } = {}) {
     has_attach: bit(msg.hasAttachments ?? msg.has_attach),
     flags_json: json(msg.flags || []),
     fetched_at: str(msg.fetchedAt ?? msg.fetched_at ?? now),
-  });
+  };
+  prep(db, MESSAGE_UPSERT).run(record);
+
+  // Task connectors use their read time as sent_at. Moving that timestamp or
+  // fetched_at alone is not new work, but a revised deadline/body/flag is.
+  // Compare effective values: a header-only fetch keeps the stored body.
+  const changed = sourceRowChanged(before, record, MESSAGE_CHANGE_IGNORED, true);
 
   // The index mirrors the ROW, not the fetch. The COALESCE above keeps a
   // stored snippet/body that a cheaper re-fetch arrived without — and indexing
@@ -424,20 +451,29 @@ export function upsertMessage(db, msg, { now = nowISO() } = {}) {
       : `${str(msg.snippet)}\n${str(msg.text ?? msg.body)}`.trim(),
   });
 
-  return { id, inserted: !existed };
+  return { id, inserted: !existed, changed };
 }
 
 export function upsertMessages(db, list, opts = {}) {
   const ids = [];
+  const before = new Map();
   let inserted = 0;
+  let changed = 0;
   withTransaction(db, () => {
     for (const msg of list || []) {
+      const id = messageIdentity(msg);
+      if (!before.has(id)) before.set(id, prep(db, 'SELECT * FROM messages WHERE id = ?').get(id));
       const r = upsertMessage(db, msg, opts);
       ids.push(r.id);
       if (r.inserted) inserted += 1;
     }
+    // A message may appear in more than one folder. Count the net change to
+    // each existing row, never intermediate writes or an insert again as an edit.
+    for (const [id, row] of before) {
+      if (row && sourceRowChanged(row, prep(db, 'SELECT * FROM messages WHERE id = ?').get(id), MESSAGE_CHANGE_IGNORED)) changed += 1;
+    }
   });
-  return { ids, inserted, updated: ids.length - inserted };
+  return { ids, inserted, updated: ids.length - inserted, changed };
 }
 
 export function getMessage(db, id) {
@@ -505,13 +541,14 @@ export function upsertEvent(db, ev, { now = nowISO() } = {}) {
   const calendarId = str(ev.calendarId ?? ev.calendar_id);
   const uid = str(ev.uid);
   const recurrenceId = str(ev.recurrenceId ?? ev.recurrence_id);
-  const id = str(ev.id) || eventRowId(calendarId, uid, recurrenceId);
-  const existed = !!prep(db, 'SELECT 1 FROM events WHERE id = ?').get(id);
+  const id = eventIdentity(ev);
+  const before = prep(db, 'SELECT * FROM events WHERE id = ?').get(id);
+  const existed = !!before;
   const organizer = ev.organizer && typeof ev.organizer === 'object'
     ? str(ev.organizer.email || ev.organizer.name)
     : str(ev.organizer);
 
-  prep(db, EVENT_UPSERT).run({
+  const record = {
     id,
     calendar_id: calendarId,
     uid,
@@ -528,7 +565,9 @@ export function upsertEvent(db, ev, { now = nowISO() } = {}) {
     status: str(ev.status),
     url: strOrNull(ev.url),
     fetched_at: str(ev.fetchedAt ?? ev.fetched_at ?? now),
-  });
+  };
+  prep(db, EVENT_UPSERT).run(record);
+  const changed = sourceRowChanged(before, record, EVENT_CHANGE_IGNORED);
 
   indexDoc(db, {
     ref: `evt:${id}`,
@@ -537,20 +576,27 @@ export function upsertEvent(db, ev, { now = nowISO() } = {}) {
     body: `${str(ev.description)}\n${str(ev.location)}\n${organizer}`.trim(),
   });
 
-  return { id, inserted: !existed };
+  return { id, inserted: !existed, changed };
 }
 
 export function upsertEvents(db, list, opts = {}) {
   const ids = [];
+  const before = new Map();
   let inserted = 0;
+  let changed = 0;
   withTransaction(db, () => {
     for (const ev of list || []) {
+      const id = eventIdentity(ev);
+      if (!before.has(id)) before.set(id, prep(db, 'SELECT * FROM events WHERE id = ?').get(id));
       const r = upsertEvent(db, ev, opts);
       ids.push(r.id);
       if (r.inserted) inserted += 1;
     }
+    for (const [id, row] of before) {
+      if (row && sourceRowChanged(row, prep(db, 'SELECT * FROM events WHERE id = ?').get(id), EVENT_CHANGE_IGNORED)) changed += 1;
+    }
   });
-  return { ids, inserted, updated: ids.length - inserted };
+  return { ids, inserted, updated: ids.length - inserted, changed };
 }
 
 /**

@@ -3141,7 +3141,7 @@ function dataPanel() {
   const home = state.health?.home || '(unknown)';
   const platform = typeof window !== 'undefined' ? (window.zelos?.platform || window.navigator?.platform || '') : '';
 
-  async function exportAll() {
+  async function exportSnapshot() {
     status.working('Gathering…');
     try {
       const [board, config] = await Promise.all([api.state(), api.config()]);
@@ -3153,12 +3153,12 @@ function dataPanel() {
       }, null, 2);
       const blob = new Blob([payload], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
-      const a = el('a', { href: url, download: `zelos-export-${Date.now()}.json` });
+      const a = el('a', { href: url, download: `zelos-board-${Date.now()}.json` });
       document.body.appendChild(a);
       a.click();
       a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 10_000);
-      status.good('Saved. The file holds no passwords.');
+      status.good('Board snapshot saved. It contains no passwords and is not a full backup.');
     } catch (err) {
       status.bad(err.message);
     }
@@ -3171,7 +3171,7 @@ function dataPanel() {
   };
 
   return el('div', { class: 'panel' }, [
-    el('p', { class: 'panel-lede', text: 'Everything Zelos knows is in one folder on this computer. Back it up by copying the folder; delete it and Zelos forgets everything.' }),
+    el('p', { class: 'panel-lede', text: 'Your board and saved history live in one folder on this computer. For a complete data backup, quit Zelos first, then copy the whole folder to a private location. Passwords kept in your computer’s password storage may need to be entered again on a different computer.' }),
     dataStats(),
     field('The Zelos folder', input({ value: home, readonly: true })),
     el('div', { class: 'row-inline' }, [
@@ -3184,8 +3184,9 @@ function dataPanel() {
           },
         })
         : button('Copy the folder path', { class: 'btn solid', onClick: copyPath }),
-      button('Save a copy as a file', { class: 'btn quiet', onClick: exportAll }),
+      button('Save board snapshot', { class: 'btn quiet', onClick: exportSnapshot }),
     ]),
+    el('p', { class: 'quiet-note', text: 'The snapshot includes the current board and settings, without passwords. It does not include your full mail archive, captures or complete item history. Keep the whole data folder for a backup you can restore.' }),
     canShowFolder() ? null : el('p', { class: 'quiet-note', text: folderHint(platform) }),
     section('Erasing everything', {}, [
       el('p', { class: 'quiet-note', text: 'To erase everything: quit Zelos, then drag this folder to the Trash and empty the Trash.' }),

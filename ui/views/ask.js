@@ -139,6 +139,11 @@ async function ask(question) {
         } else if (event === 'delta') {
           gotAnswer = true;
           write(String(data?.text ?? ''));
+        } else if (event === 'done' && data?.stopReason === 'length') {
+          noteSlot.appendChild(el('p', {
+            class: 'exchange-note mono',
+            text: 'The AI reached its answer limit, so this reply may be incomplete. Try a narrower question.',
+          }));
         } else if (event === 'error') {
           failed = true;
           write(`\n\n${String(data?.error || 'the AI stopped answering')}`);

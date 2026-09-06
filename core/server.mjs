@@ -2345,7 +2345,7 @@ async function handleAsk(ctx) {
       if (!sse.open) break; // the client left; stop pulling tokens
       if (event.type === 'delta') sse.send('delta', { text: event.text });
       else if (event.type === 'done') {
-        sse.send('done', { usage: event.usage, model: event.model, grounded: true });
+        sse.send('done', { usage: event.usage, model: event.model, grounded: true, stopReason: event.stopReason });
         // Reported to this one client, and now recorded for the counter every
         // client reads. Both, not either: the SSE frame is what the Ask panel
         // shows about this answer, and the counter is what the rail shows about

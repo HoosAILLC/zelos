@@ -563,7 +563,13 @@ function render({ force = false } = {}) {
     chromeWrap = el('div', { class: 'chrome' });
     layout = 'chrome';
     replace(root, el('div', { class: 'shell' }, [
-      el('a', { class: 'skip-link', href: '#main', text: 'Skip to content' }),
+      el('a', {
+        class: 'skip-link', href: '#main', text: 'Skip to content',
+        onclick(e) {
+          e.preventDefault();
+          main.focus();
+        },
+      }),
       chromeWrap,
       main,
     ]));

@@ -674,6 +674,60 @@ test('system-role messages are folded into the top-level system prompt', async (
  * Streaming
  * ------------------------------------------------------------------ */
 
+test('complete() refuses a JSON response that is not a completion envelope', async () => {
+  for (const [protocol, body] of [
+    ['openai', { status: 'ok' }], ['openai', { choices: [] }],
+    ['openai', { choices: [{ message: null }] }],
+    ['anthropic', { status: 'ok' }], ['anthropic', { content: 'ready' }],
+  ]) {
+    mock.plan.push({ body });
+    await assert.rejects(() => complete({
+      protocol, baseUrl: mock.origin, model: 'test', apiKey: 'k',
+      messages: [{ role: 'user', content: 'hi' }], retries: 0,
+    }), /invalid .*response/i, `${protocol}: ${JSON.stringify(body)}`);
+  }
+});
+
+test('completion validation accepts empty text, tool calls, and refusals', async () => {
+  for (const [protocol, body] of [
+    ['openai', { choices: [{ message: { content: '' }, finish_reason: 'stop' }] }],
+    ['openai', { choices: [{ message: { content: null, refusal: 'Cannot help.' }, finish_reason: 'stop' }] }],
+    ['openai', { choices: [{ message: { tool_calls: [{ type: 'function', function: { name: 'lookup', arguments: '{}' } }] }, finish_reason: 'tool_calls' }] }],
+    ['anthropic', { content: [], stop_reason: 'end_turn' }],
+    ['anthropic', { content: [{ type: 'tool_use', id: 'tool_1', name: 'lookup', input: {} }], stop_reason: 'tool_use' }],
+  ]) {
+    mock.plan.push({ body });
+    const answer = await complete({
+      protocol, baseUrl: mock.origin, model: 'test', apiKey: 'k',
+      messages: [{ role: 'user', content: 'hi' }], retries: 0,
+    });
+    assert.equal(answer.text, '');
+    assert.deepEqual(answer.raw, body);
+  }
+});
+
+test('stream() preserves an ordinary JSON completion and its usage', async () => {
+  for (const [protocol, body, usage] of [
+    ['openai', { model: 'fallback', choices: [{ message: { content: 'Whole answer' }, finish_reason: 'stop' }], usage: { prompt_tokens: 12, completion_tokens: 3 } }, { input: 12, output: 3 }],
+    ['anthropic', { model: 'fallback', content: [{ type: 'text', text: 'Whole answer' }], stop_reason: 'end_turn', usage: { input_tokens: 12, output_tokens: 3 } }, { input: 12, output: 3 }],
+  ]) {
+    mock.plan.push({ body });
+    const events = await collect(stream({
+      protocol, baseUrl: mock.origin, model: 'test', apiKey: 'k',
+      messages: [{ role: 'user', content: 'hi' }], retries: 0,
+    }));
+    assert.deepEqual(events.filter((event) => event.type === 'delta'), [{ type: 'delta', text: 'Whole answer' }]);
+    assert.equal(events.at(-1).text, 'Whole answer');
+    assert.equal(events.at(-1).model, 'fallback');
+    assert.deepEqual(events.at(-1).usage, usage);
+  }
+  mock.plan.push({ body: { status: 'ok' } });
+  await assert.rejects(() => collect(stream({
+    protocol: 'openai', baseUrl: mock.origin, model: 'test',
+    messages: [{ role: 'user', content: 'hi' }], retries: 0,
+  })), /invalid .*response/i);
+});
+
 test('stream() parses openai SSE and reports usage on done', async () => {
   const events = await collect(
     stream({
@@ -805,6 +859,30 @@ test('stream() accepts provider completion variants and trailing usage', async (
     assert.equal(events.at(-1).type, 'done', protocol);
     assert.equal(events.at(-1).text, 'Ready', protocol);
     assert.deepEqual(events.at(-1).usage, expectedUsage, protocol);
+  }
+});
+
+test('stream() reports token-limit stops without losing partial text or usage', async () => {
+  for (const [protocol, chunks] of [
+    ['openai', [
+      'data: {"choices":[{"delta":{"content":"The next step is"},"finish_reason":"length"}],"usage":{"prompt_tokens":12,"completion_tokens":32}}\n\n',
+      'data: [DONE]\n\n',
+    ]],
+    ['anthropic', [
+      'data: {"type":"message_start","message":{"usage":{"input_tokens":12}}}\n\n',
+      'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"The next step is"}}\n\n',
+      'data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":32}}\n\n',
+      'data: {"type":"message_stop"}\n\n',
+    ]],
+  ]) {
+    mock.plan.push({ chunks });
+    const events = await collect(stream({
+      protocol, baseUrl: mock.origin, model: 'test', apiKey: 'k',
+      messages: [{ role: 'user', content: 'hi' }], retries: 0,
+    }));
+    assert.equal(events.at(-1).stopReason, 'length', protocol);
+    assert.equal(events.at(-1).text, 'The next step is', protocol);
+    assert.deepEqual(events.at(-1).usage, { input: 12, output: 32 }, protocol);
   }
 });
 
