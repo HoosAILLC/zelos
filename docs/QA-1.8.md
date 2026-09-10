@@ -33,7 +33,7 @@ It does not connect to accounts or read the installed app's data.
 
 ## Recovery and interaction coverage
 
-The local release suite passed 1,811 checks with four platform-specific skips.
+The local release suite passed 1,812 checks with four platform-specific skips.
 The Mac packaged runtime (Electron 43.3.0, Node 24.18.1) also passed first-run
 HTTP checks and backup/restore round-trips through both the core and native
 background-worker paths.

@@ -66,7 +66,9 @@ function copyPrivate(from, to) {
   regular(from);
   fs.copyFileSync(from, to, fs.constants.COPYFILE_EXCL);
   fs.chmodSync(to, 0o600);
-  const fd = fs.openSync(to, 'r');
+  // Windows FlushFileBuffers requires write access. Reopen without truncating
+  // the bytes copyFileSync just wrote; a read-only handle fails with EPERM.
+  const fd = fs.openSync(to, 'r+');
   try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
 }
 function readJSON(file) {

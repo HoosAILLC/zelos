@@ -72,6 +72,39 @@ afterEach(() => {
 });
 
 describe('portable backup and restore', () => {
+  it('flushes copied files through writable handles without truncating backup or rollback data', (t) => {
+    const source = fixture('source', 'Original'); const target = fixture('target', 'Current');
+    const handles = new Map(); const copied = new Set(); const synced = new Set();
+    const { openSync, closeSync, copyFileSync, fsyncSync } = fs;
+    t.mock.method(fs, 'openSync', function (file, flags, ...args) {
+      const fd = openSync.call(fs, file, flags, ...args); handles.set(fd, { file, flags }); return fd;
+    });
+    t.mock.method(fs, 'closeSync', function (fd) { try { return closeSync.call(fs, fd); } finally { handles.delete(fd); } });
+    t.mock.method(fs, 'copyFileSync', function (from, to, ...args) { const result = copyFileSync.call(fs, from, to, ...args); copied.add(to); return result; });
+    t.mock.method(fs, 'fsyncSync', function (fd) {
+      const opened = handles.get(fd);
+      if (opened && fs.fstatSync(fd).isFile()) {
+        const writable = typeof opened.flags === 'number'
+          ? Boolean(opened.flags & (fs.constants.O_WRONLY | fs.constants.O_RDWR))
+          : /[wa+]/.test(opened.flags);
+        // Windows FlushFileBuffers rejects read-only regular-file handles.
+        // Model that OS contract on every host, but perform the real flush.
+        if (!writable) throw Object.assign(new Error('EPERM: read-only handle cannot be flushed'), { code: 'EPERM', syscall: 'fsync' });
+        synced.add(opened.file);
+      }
+      return fsyncSync.call(fs, fd);
+    });
+    const prepared = restorePreparation(target, save(source).file);
+    applyRestore(prepared);
+    assert.ok(copied.size > 0);
+    for (const file of copied) assert.ok(synced.has(file), 'every copied file must reach a real flush');
+    assert.equal(JSON.parse(fs.readFileSync(path.join(target.home, 'config.json'))).identity.name, 'Original');
+    const restored = open(path.join(target.home, 'zelos.db')); live.add(restored);
+    assert.equal(getKV(restored, 'private.history'), 'Original');
+    const old = stageBackup({ home: source.home, source: prepared.recoveryFile });
+    assert.equal(JSON.parse(fs.readFileSync(path.join(old.directory, 'new', 'config.json'))).identity.name, 'Current'); old.cleanup();
+  });
+
   it('round-trips all SQLite data, FTS, settings, and encrypted credentials with a private recovery copy', async () => {
     const source = fixture('source', 'Original');
     process.env.ZELOS_HOME = source.home;
