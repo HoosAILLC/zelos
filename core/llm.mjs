@@ -942,8 +942,21 @@ function errorInBody(raw) {
 
 /**
  * One round trip. -> {text, usage:{input,output}, model, stopReason, raw}
+ * `stream:true` collects a completed stream with an idle deadline instead of
+ * a total deadline. No partial result escapes; raw is null in this mode.
  */
 export async function complete(opts = {}) {
+  if (opts.stream === true) {
+    for await (const event of stream(opts)) {
+      if (event.type === 'done') {
+        const { text, usage, model, stopReason } = event;
+        return { text, usage, model, stopReason, raw: null };
+      }
+    }
+    throw new LLMError('The model stream ended without a completed response', {
+      address: normalizeBase(opts.baseUrl), retriable: true,
+    });
+  }
   const req = buildChatRequest(opts, { stream: false });
   llog.debug('complete', { address: req.address, protocol: req.protocol, model: req.model });
   const { res, release } = await requestWithRetry(req, opts);

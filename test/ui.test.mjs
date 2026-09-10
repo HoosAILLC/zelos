@@ -4504,7 +4504,7 @@ test('the guided AI card stores the key, tests, picks the model itself, saves an
   assert.equal(tested.model, 'claude-sonnet-5', 'the test did not carry the model the card picked');
   assert.equal(tested.baseUrl, anthropic.baseUrl);
   const saved = calls.find((c) => c.path === '/api/config').body.model;
-  assert.deepEqual(saved, { protocol: 'anthropic', label: 'Anthropic', baseUrl: anthropic.baseUrl, model: 'claude-sonnet-5', keyRef: 'model.default' });
+  assert.deepEqual(saved, { protocol: 'anthropic', label: 'Anthropic', baseUrl: anthropic.baseUrl, model: 'claude-sonnet-5', keyRef: 'model.default', maxTokens: 8192 });
   assert.equal(key.value, '', 'the key is still in the box after it was stored');
   assert.match(onScreen(panel), /Working\. Zelos will use Claude\./);
   assert.equal(done, 1, 'onDone did not fire, so onboarding would not advance');

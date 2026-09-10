@@ -1186,8 +1186,145 @@ test('a reply cut off at the token limit says so, and says what to raise', async
 
   assert.equal(result.ok, false);
   assert.match(result.error, /cut off/i, 'the error must say the reply was truncated');
-  assert.match(result.error, /maxTokens/, 'and point at the setting that fixes it');
+  assert.match(result.error, /Response limit \(tokens\) in Settings → AI → Advanced/, 'and point at the setting that fixes it');
   assert.ok(!/larger model/.test(result.error), 'a bigger model would be the wrong advice');
+});
+
+test('full Claude reviews stream while other protocols and injected completions keep working', async () => {
+  const requests = [];
+  const response = JSON.stringify(board([item()]));
+  let reportPrefix;
+  let releaseTerminal;
+  const prefix = new Promise((resolve) => { reportPrefix = resolve; });
+  const terminal = new Promise((resolve) => { releaseTerminal = resolve; });
+  const server = http.createServer(async (req, res) => {
+    const parts = [];
+    for await (const part of req) parts.push(part);
+    const body = JSON.parse(Buffer.concat(parts).toString());
+    requests.push(body);
+    if (body.stream) {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      const frame = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+      frame({ type: 'message_start', message: { model: body.model, usage: { input_tokens: 2000 } } });
+      frame({ type: 'content_block_delta', delta: { type: 'thinking_delta', thinking: 'synthetic private reasoning' } });
+      frame({ type: 'content_block_delta', delta: { type: 'text_delta', text: response } });
+      reportPrefix();
+      await terminal;
+      frame({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 10000 } });
+      frame({ type: 'message_stop' });
+      res.end();
+    } else {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        content: [{ type: 'text', text: response }], stop_reason: 'end_turn',
+        choices: [{ message: { content: response }, finish_reason: 'stop' }],
+        usage: { input_tokens: 2000, output_tokens: 10000, prompt_tokens: 2000, completion_tokens: 10000 },
+      }));
+    }
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  servers.push(server);
+  for (const protocol of ['anthropic', 'openai']) {
+    const db = fresh();
+    const config = baseConfig();
+    config.model = { ...config.model, protocol, baseUrl: `http://127.0.0.1:${server.address().port}`, maxTokens: 32768 };
+    const running = runSweep({ db, config, mode: 'full', deps: { getSecret: SECRETS } });
+    if (protocol === 'anthropic') {
+      await prefix;
+      try { assert.equal(listBoard(db).length, 0, 'even balanced JSON waits for provider completion'); }
+      finally { releaseTerminal(); }
+    }
+    const result = await running;
+    assert.equal(result.ok, true);
+    assert.equal(listBoard(db).length, 1);
+    assert.equal(requests.at(-1).stream, protocol === 'anthropic' ? true : undefined);
+    assert.equal(requests.at(-1).max_tokens, 32768);
+    assert.equal(result.stats.tokensIn, 2000);
+    assert.equal(result.stats.tokensOut, 10000);
+  }
+  assert.equal(requests.length, 2);
+
+  const injected = fakeModel(board([item()]));
+  const config = baseConfig();
+  config.model.protocol = 'anthropic';
+  const result = await runSweep({ db: fresh(), config, mode: 'full', deps: { getSecret: SECRETS, complete: injected } });
+  assert.equal(result.ok, true);
+  assert.equal(injected.calls.length, 1);
+  assert.equal(injected.calls[0].stream, true);
+});
+
+test('a failed Claude stream never merges its balanced board prefix', async (t) => {
+  for (const ending of ['EOF', 'error', 'length']) await t.test(ending, async () => {
+    let requests = 0;
+    const server = http.createServer(async (req, res) => {
+      for await (const _part of req) { /* consume the request */ }
+      requests += 1;
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      const frame = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+      frame({ type: 'message_start', message: { model: 'claude-sonnet-5', usage: { input_tokens: 2000 } } });
+      frame({ type: 'content_block_delta', delta: { type: 'text_delta', text: JSON.stringify(board([item()])) } });
+      if (ending === 'error') frame({ type: 'error', error: { message: 'synthetic interruption' } });
+      if (ending === 'length') {
+        frame({ type: 'message_delta', delta: { stop_reason: 'max_tokens' }, usage: { output_tokens: 32768 } });
+        frame({ type: 'message_stop' });
+      }
+      res.end();
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    servers.push(server);
+    const db = fresh();
+    insertCapture(db, 'Call the bank');
+    const config = baseConfig({ mail: [mailAccount()] });
+    config.model = { ...config.model, protocol: 'anthropic', baseUrl: `http://127.0.0.1:${server.address().port}`, maxTokens: 32768 };
+    const result = await runSweep({ db, config, mode: 'full', deps: { getSecret: SECRETS, fetchMail: async () => [fetched()] } });
+    assert.equal(result.ok, false);
+    assert.equal(requests, 1, 'do not repeat a generation after its stream started');
+    assert.match(result.error, ending === 'EOF' ? /before the answer was complete/ : ending === 'error' ? /synthetic interruption/ : /cut off/);
+    assert.equal(listBoard(db).length, 0);
+    assert.equal(listCaptures(db, { includeProcessed: false }).length, 1);
+    assert.equal(getKV(db, SWEEP_KV.pendingNew), '1');
+    if (ending === 'length') assert.equal(getRun(db, result.runId).tokens_out, 32768);
+  });
+});
+
+test('a token-limited balanced board is rejected before merge and retains pending work and usage', async () => {
+  const db = fresh();
+  insertCapture(db, 'Call the bank');
+  const result = await runSweep({
+    db, config: baseConfig({ mail: [mailAccount()] }), mode: 'full',
+    deps: {
+      getSecret: SECRETS, fetchMail: async () => [fetched()],
+      complete: async () => ({ text: JSON.stringify(board([item()])), usage: { input: 2000, output: 32768 }, stopReason: 'length' }),
+    },
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /Response limit \(tokens\)/);
+  assert.equal(listBoard(db).length, 0);
+  assert.equal(listCaptures(db, { includeProcessed: false }).length, 1);
+  assert.equal(getKV(db, SWEEP_KV.pendingNew), '1');
+  assert.equal(getRun(db, result.runId).tokens_out, 32768);
+});
+
+test('cancellation at model completion preserves the board and pending work', async () => {
+  const db = fresh();
+  insertCapture(db, 'Call the bank');
+  const controller = new AbortController();
+  const result = await runSweep({
+    db, config: baseConfig({ mail: [mailAccount()] }), mode: 'full', signal: controller.signal,
+    deps: {
+      getSecret: SECRETS, fetchMail: async () => [fetched()],
+      complete: async () => {
+        controller.abort();
+        return { text: JSON.stringify(board([item()])), usage: { input: 2000, output: 7000 }, stopReason: 'stop' };
+      },
+    },
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /cancelled/);
+  assert.equal(listBoard(db).length, 0);
+  assert.equal(listCaptures(db, { includeProcessed: false }).length, 1);
+  assert.equal(getKV(db, SWEEP_KV.pendingNew), '1');
+  assert.equal(getRun(db, result.runId).tokens_out, 7000);
 });
 
 test('the demo week never reaches the model once real sources exist', async () => {
