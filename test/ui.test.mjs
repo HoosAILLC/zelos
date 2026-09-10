@@ -3752,6 +3752,200 @@ test('a draft edit lands in the board copy before the save returns, so a repaint
     [{ body: 'The body as edited.', state: 'edited' }]);
 });
 
+test('native leave flushes a draft before its debounce and waits for the write', async (t) => {
+  withPlainDom(t);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const owed = await import(fileUrl(UI, 'views/owed.js'));
+  const { api } = await import(fileUrl(UI, 'lib/api.js'));
+  let release;
+  let saved = 'Original';
+  t.mock.method(api, 'updateDraft', async (_id, patch) => {
+    await new Promise(resolve => { release = resolve; });
+    saved = patch.body;
+  });
+  store.state.board = { ...store.state.board, items: [], drafts: [{ id: 'leave-before-debounce', state: 'pending', body: saved }] };
+  const area = findInput(owed.renderOwed({ tz: 'UTC' }), n => n.tag === 'textarea');
+  area.value = 'Typed immediately before quitting.';
+  area.fire('input');
+  assert.equal(saved, 'Original');
+  let left = false;
+  const leaving = owed.flushDrafts().then(() => { left = true; });
+  await settle();
+  assert.equal(left, false, 'native quit must wait for the pending server write');
+  release();
+  await leaving;
+  assert.equal(saved, area.value);
+  assert.equal(left, true);
+});
+
+test('native leave saves edits typed during an earlier draft write', async (t) => {
+  withPlainDom(t);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const owed = await import(fileUrl(UI, 'views/owed.js'));
+  const { api } = await import(fileUrl(UI, 'lib/api.js'));
+  const bodies = [];
+  let release;
+  t.mock.method(api, 'updateDraft', async (_id, patch) => {
+    bodies.push(patch.body);
+    if (bodies.length === 1) await new Promise(resolve => { release = resolve; });
+  });
+  store.state.board = { ...store.state.board, items: [], drafts: [{ id: 'leave-during-write', state: 'pending', body: 'Original' }] };
+  const area = findInput(owed.renderOwed({ tz: 'UTC' }), n => n.tag === 'textarea');
+  area.value = 'First edit';
+  area.fire('input');
+  area.fire('blur');
+  await settle();
+  area.value = 'Latest edit';
+  area.fire('input');
+  const leaving = owed.flushDrafts();
+  release();
+  await leaving;
+  assert.deepEqual(bodies, ['First edit', 'Latest edit']);
+});
+
+test('a failed native leave keeps draft text and retries saving on the next request', async (t) => {
+  withPlainDom(t);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const owed = await import(fileUrl(UI, 'views/owed.js'));
+  const { api } = await import(fileUrl(UI, 'lib/api.js'));
+  let fail = true;
+  let saved;
+  t.mock.method(api, 'updateDraft', async (_id, patch) => {
+    if (fail) throw new Error('Could not write the draft');
+    saved = patch.body;
+  });
+  store.state.board = { ...store.state.board, items: [], drafts: [{ id: 'leave-save-failure', state: 'pending', body: 'Original' }] };
+  const view = owed.renderOwed({ tz: 'UTC' });
+  const area = findInput(view, n => n.tag === 'textarea');
+  area.value = 'Keep this text after the failure';
+  area.fire('input');
+  await assert.rejects(owed.flushDrafts(), /save/i);
+  assert.equal(area.value, 'Keep this text after the failure');
+  assert.match(onScreen(view), /Could not write the draft/);
+  fail = false;
+  await owed.flushDrafts();
+  assert.equal(saved, area.value);
+});
+
+test('a board refresh after a failed leave keeps unsaved draft text visible for copying', async (t) => {
+  withPlainDom(t);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const owed = await import(fileUrl(UI, 'views/owed.js'));
+  const { api } = await import(fileUrl(UI, 'lib/api.js'));
+  let fail = true;
+  t.mock.method(api, 'updateDraft', async () => { if (fail) throw new Error('Save failed'); });
+  const serverDraft = { id: 'leave-refresh-failure', state: 'pending', body: 'Old saved text' };
+  store.state.board = { ...store.state.board, items: [], drafts: [serverDraft] };
+  const area = findInput(owed.renderOwed({ tz: 'UTC' }), n => n.tag === 'textarea');
+  area.value = 'Unsaved words to keep and copy';
+  area.fire('input');
+  await assert.rejects(owed.flushDrafts(), /save/i);
+  store.state.board = { ...store.state.board, drafts: [serverDraft] };
+  const rebuilt = owed.renderOwed({ tz: 'UTC' });
+  const restored = findInput(rebuilt, n => n.tag === 'textarea');
+  // Restore the write before assertions so this shared module leaves no
+  // failed draft behind for a following test, including on the red run.
+  fail = false;
+  await owed.flushDrafts();
+  assert.equal(restored.value, 'Unsaved words to keep and copy');
+});
+
+test('an older failed card cannot overwrite a newer saved edit when leaving', async (t) => {
+  withPlainDom(t);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const owed = await import(fileUrl(UI, 'views/owed.js'));
+  const { api } = await import(fileUrl(UI, 'lib/api.js'));
+  let fail = true;
+  let saved = 'Original';
+  const writes = [];
+  t.mock.method(api, 'updateDraft', async (_id, patch) => {
+    writes.push(patch.body);
+    if (fail) throw new Error('Save failed');
+    saved = patch.body;
+  });
+  store.state.board = { ...store.state.board, items: [], drafts: [{ id: 'leave-stale-failure', state: 'pending', body: saved }] };
+  const oldArea = findInput(owed.renderOwed({ tz: 'UTC' }), n => n.tag === 'textarea');
+  oldArea.value = 'Older failed edit';
+  oldArea.fire('input');
+  await assert.rejects(owed.flushDrafts(), /save/i);
+  const newArea = findInput(owed.renderOwed({ tz: 'UTC' }), n => n.tag === 'textarea');
+  newArea.value = 'Latest successfully saved edit';
+  newArea.fire('input');
+  fail = false;
+  newArea.fire('blur');
+  await settle();
+  assert.equal(saved, 'Latest successfully saved edit');
+  await owed.flushDrafts();
+  assert.equal(saved, 'Latest successfully saved edit');
+  assert.deepEqual(writes, ['Older failed edit', 'Latest successfully saved edit']);
+});
+
+test('a refresh during saving cannot repaint old text after the save succeeds', async (t) => {
+  withPlainDom(t);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const owed = await import(fileUrl(UI, 'views/owed.js'));
+  const { api } = await import(fileUrl(UI, 'lib/api.js'));
+  let release;
+  let saved;
+  t.mock.method(api, 'updateDraft', async (_id, patch) => {
+    await new Promise(resolve => { release = resolve; });
+    saved = patch.body;
+  });
+  const serverDraft = { id: 'leave-refresh-during-save', state: 'pending', body: 'Old server copy' };
+  store.state.board = { ...store.state.board, items: [], drafts: [serverDraft] };
+  const area = findInput(owed.renderOwed({ tz: 'UTC' }), n => n.tag === 'textarea');
+  area.value = 'Latest edited text';
+  area.fire('input');
+  const leaving = owed.flushDrafts();
+  await settle();
+  store.state.board = { ...store.state.board, drafts: [serverDraft] };
+  assert.equal(findInput(owed.renderOwed({ tz: 'UTC' }), n => n.tag === 'textarea').value, 'Latest edited text');
+  release();
+  await leaving;
+  assert.equal(saved, 'Latest edited text');
+  assert.equal(findInput(owed.renderOwed({ tz: 'UTC' }), n => n.tag === 'textarea').value, 'Latest edited text');
+});
+
+test('a stalled draft request is aborted so a later native leave can retry', async (t) => {
+  withPlainDom(t);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const owed = await import(fileUrl(UI, 'views/owed.js'));
+  let stalled = true;
+  let aborted = false;
+  let saved;
+  globalThis.fetch = async (_path, init) => {
+    if (stalled) return new Promise((_, reject) => init.signal.addEventListener('abort', () => {
+      aborted = true;
+      reject(new DOMException('Aborted', 'AbortError'));
+    }, { once: true }));
+    saved = JSON.parse(init.body).body;
+    return { ok: true, text: async () => '{}' };
+  };
+  t.after(() => { delete globalThis.fetch; });
+  store.state.board = { ...store.state.board, items: [], drafts: [{ id: 'leave-stalled-request', state: 'pending', body: 'Original' }] };
+  const view = owed.renderOwed({ tz: 'UTC' });
+  const area = findInput(view, n => n.tag === 'textarea');
+  area.value = 'Keep this while saving is stalled';
+  area.fire('input');
+  const rejected = assert.rejects(owed.flushDrafts(), /save/i);
+  await settle();
+  t.mock.timers.tick(8_001);
+  await rejected;
+  assert.equal(aborted, true);
+  assert.match(onScreen(view), /Saving took too long/);
+  assert.equal(area.value, 'Keep this while saving is stalled');
+  stalled = false;
+  await owed.flushDrafts();
+  assert.equal(saved, area.value);
+});
+
 test('discard waits for an older card save and prevents its delayed edit from resurrecting the draft', async (t) => {
   withPlainDom(t);
   t.mock.timers.enable({ apis: ['setTimeout'] });

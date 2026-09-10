@@ -98,7 +98,7 @@ export const CAST = Object.freeze({
 });
 
 export const SAMPLE_SUMMARY = 'A made-up week at Quillon Row, a six-person studio: eight messages, '
-  + 'seven meetings — two of them genuinely double-booked at 2pm today — a client waiting on drawings, '
+  + 'seven meetings — two of them overlap for half an hour this afternoon — a client waiting on drawings, '
   + 'an invoice three weeks out, and two drafts already written. Nobody in it is real.';
 
 /* ------------------------------------------------------------------ *
@@ -207,9 +207,9 @@ export function sampleWeek({ now = null, timezone = null } = {}) {
       'A referral she wants a yes or no on before she passes it along.',
       'I have a small clinic fit-out that is too small for us and about right for you. They are decent people and they pay. Tell me yes or no by the end of the week and I will pass it along either way.'),
 
-    msg(6, teodora, YOU, 'Two things at 2 today',
+    msg(6, teodora, YOU, 'A half-hour overlap this afternoon',
       'Teodora flagged the clash before anyone drove anywhere.',
-      'You have the shop-drawing review and the timber delivery both sitting at 2 this afternoon. One of them needs a person on site. Tell me which one you are doing and I will move the other.'),
+      'Your shop-drawing review runs from 2 to 3 this afternoon, but the timber delivery window is 2:30 to 3:30. They overlap for half an hour, and the delivery needs a person on site. Tell me which one you are doing and I will move the other.'),
 
     msg(5, YOU, nadia, 'Re: Invoice 2214 — 21 days out',
       'You said you would chase Thistlebank yourself.',
@@ -263,8 +263,8 @@ export function sampleWeek({ now = null, timezone = null } = {}) {
       key: 'sample-double-booked-two-pm',
       kind: 'conflict',
       bucket: 'now',
-      headline: `${SAMPLE_MARK}Two o'clock is booked twice — pick one and move the other`,
-      why: 'The shop-drawing review and the timber delivery both start at 2 today, and the delivery needs a person standing on site to sign for it.',
+      headline: `${SAMPLE_MARK}Your afternoon appointments overlap — pick one and move the other`,
+      why: 'The 2–3pm shop-drawing review overlaps the 2:30–3:30pm timber delivery by half an hour, and the delivery needs someone on site to sign for it.',
       person: teodora.name,
       personEmail: teodora.email,
       dueAt: clashAt,

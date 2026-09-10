@@ -194,8 +194,8 @@ export const api = {
   mailOAuthStatus: (id) => request(`/api/mail/oauth/${encodeURIComponent(id)}`),
   cancelMailOAuth: (id) =>
     request(`/api/mail/oauth/${encodeURIComponent(id)}`, { method: 'DELETE' }),
-  updateDraft: (id, patch) =>
-    request(`/api/drafts/${encodeURIComponent(id)}`, { method: 'PUT', body: patch }),
+  updateDraft: (id, patch, { signal } = {}) =>
+    request(`/api/drafts/${encodeURIComponent(id)}`, { method: 'PUT', body: patch, signal }),
   /**
    * The index, queried. The options are optional so the one-argument call
    * `api.search(q)` still means exactly what it always did — same URL, same

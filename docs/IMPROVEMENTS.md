@@ -1,5 +1,12 @@
 # Product improvements
 
+## Included in 1.7.1
+
+- Save draft edits before desktop reload and quit; preserve failed edits across card refreshes.
+- Complete desktop shutdown so Zelos can reopen after quitting.
+- Reliable repeated Command-F focus and useful external-link failure guidance.
+- Chronological month-view appointments and consistent sample clash descriptions.
+
 ## Included in 1.7.0
 
 - Task activity reconciliation after complete Todoist and Linear selections, with searchable history and clear historical labels.

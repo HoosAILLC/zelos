@@ -42,8 +42,8 @@ const DEFAULT_PORTS = { 'http:': 80, 'https:': 443 };
  * the shell fails closed.
  *
  * Returns `{action, url, reason}`. `url` is the parsed, normalised href for the
- * two allowed outcomes and the raw input for a block, so a log line shows what
- * was actually asked for.
+ * two allowed outcomes and the raw input for a block. These URLs can contain
+ * private message text or credentials, so they must not be logged verbatim.
  */
 export function classifyTarget(raw, { port } = {}) {
   if (typeof raw !== 'string' || raw === '') {
@@ -77,27 +77,51 @@ function portOf(url) {
   return DEFAULT_PORTS[url.protocol] ?? -1;
 }
 
+function safeTarget(raw) {
+  try {
+    const url = new URL(raw);
+    return { scheme: url.protocol, host: url.hostname || null };
+  } catch {
+    return { scheme: null, host: null };
+  }
+}
+
 /**
  * Wire the guard onto one webContents.
  *
- * `deps` carries the two effects this needs — opening the system browser and
- * logging — so the wiring itself stays testable. `getPort` is read at event
+ * Effects are injected so the wiring itself stays testable. The optional
+ * `onExternalOpenError({ scheme, host })` lets the shell show recovery advice;
+ * neither it nor the logger receives a full URL or platform error, which may
+ * contain the body of a draft. `getPort` is read at event
  * time rather than captured, because the window is created before the server
  * has finished binding on a first run.
  */
-export function guardWebContents(contents, { getPort, openExternal, logger }) {
+export function guardWebContents(contents, { getPort, openExternal, logger, onExternalOpenError }) {
   const decide = (raw) => classifyTarget(raw, { port: getPort() });
+  const openLink = async (url, message) => {
+    const target = safeTarget(url);
+    logger.info(message, target);
+    try {
+      await openExternal(url);
+    } catch {
+      logger.warn('desktop: could not open an external link', target);
+      try {
+        await onExternalOpenError?.(target);
+      } catch {
+        logger.warn('desktop: could not show external-link recovery advice', target);
+      }
+    }
+  };
 
   const handleNavigation = (event, raw) => {
     const verdict = decide(raw);
     if (verdict.action === 'internal') return;
     event.preventDefault();
     if (verdict.action === 'external') {
-      logger.info('desktop: opening a link in the system browser', { url: verdict.url });
-      openExternal(verdict.url);
+      void openLink(verdict.url, 'desktop: opening a link in the system browser');
       return;
     }
-    logger.warn('desktop: refused a navigation', { url: verdict.url, reason: verdict.reason });
+    logger.warn('desktop: refused a navigation', { ...safeTarget(verdict.url), reason: verdict.reason });
   };
 
   contents.on('will-navigate', handleNavigation);
@@ -107,8 +131,7 @@ export function guardWebContents(contents, { getPort, openExternal, logger }) {
   contents.setWindowOpenHandler(({ url: raw }) => {
     const verdict = decide(raw);
     if (verdict.action === 'external') {
-      logger.info('desktop: opening a new-window link in the system browser', { url: verdict.url });
-      openExternal(verdict.url);
+      void openLink(verdict.url, 'desktop: opening a new-window link in the system browser');
     } else {
       // The board itself is refused here too — not routed into the window that
       // is already open, which is what used to happen. The board has no popups
@@ -120,7 +143,7 @@ export function guardWebContents(contents, { getPort, openExternal, logger }) {
       // 401ed until "Reload board". Nothing is lost by denying it: the board's
       // own same-window navigations are hash routes, and those never get here.
       const reason = verdict.action === 'internal' ? 'the board opens no popups of its own' : verdict.reason;
-      logger.warn('desktop: refused a new window', { url: verdict.url, reason });
+      logger.warn('desktop: refused a new window', { ...safeTarget(verdict.url), reason });
     }
     return { action: 'deny' };
   });
