@@ -74,6 +74,7 @@ const ALLOWED_KEYS = new Set([
   'type', 'family', 'label', 'option', 'configKey', 'sink',
   'credential', 'origins', 'fields', 'limits', 'graphql',
   'collect', 'check', 'read', 'onConfigChanged',
+  'taskPrefix',
 ]);
 
 const isPlainObject = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
@@ -120,6 +121,9 @@ export function assertShape(c, seen = new Set()) {
   if (c.read !== undefined && typeof c.read !== 'function') bad('read must be a function');
   if (c.onConfigChanged !== undefined && typeof c.onConfigChanged !== 'function') bad('onConfigChanged must be a function');
   if (c.graphql !== undefined && typeof c.graphql !== 'boolean') bad('graphql must be a boolean');
+  if (c.taskPrefix !== undefined && (c.sink !== 'messages' || !nonEmpty(c.taskPrefix) || c.taskPrefix.length > 100)) {
+    bad('taskPrefix must be a bounded message-id namespace on a messages connector');
+  }
 
   if (!Array.isArray(c.origins)) {
     bad('needs an `origins` array. `ctx.http` refuses every host that is not on it, '

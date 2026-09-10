@@ -41,6 +41,7 @@ function sourceList(sources) {
     el('ul', { class: 'sources-list' }, sources.map((s) => el('li', { class: 'source' }, [
       el('span', { class: 'source-kind mono', text: KIND_LABEL[s.kind] || s.kind || 'source' }),
       el('span', { class: 'source-title', text: s.title || s.ref }),
+      s.sourceInactive ? el('span', { class: 'source-excerpt', text: 'No longer in task selection' }) : null,
       s.excerpt ? el('span', { class: 'source-excerpt', text: s.excerpt }) : null,
     ]))),
   ]);
@@ -139,6 +140,11 @@ async function ask(question) {
         } else if (event === 'delta') {
           gotAnswer = true;
           write(String(data?.text ?? ''));
+        } else if (event === 'done' && data?.stopReason === 'length') {
+          noteSlot.appendChild(el('p', {
+            class: 'exchange-note mono',
+            text: 'The AI reached its answer limit, so this reply may be incomplete. Try a narrower question.',
+          }));
         } else if (event === 'error') {
           failed = true;
           write(`\n\n${String(data?.error || 'the AI stopped answering')}`);

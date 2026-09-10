@@ -1,0 +1,28 @@
+<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Not here — Zelos</title><meta name="color-scheme" content="dark">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<!-- There is deliberately no <style> block and no style="" attribute in this
+     file, and this was the only page on the site that had either. _headers now
+     sends `style-src 'self'` with no 'unsafe-inline', so an inline rule here
+     would be dropped by the browser and this page would silently lose its
+     layout — the one failure mode a strict CSP has, and it would land on the
+     page nobody looks at until a link rots. The markup below is the same shape
+     as #problem and #ask on the front page (band → glass pane pane-tight), so
+     it borrows styles.css instead of carrying its own. If you need a rule that
+     styles.css does not have, put it in styles.css. -->
+<body>
+<!-- The same room, held still. No script on this page, so the veil stays at
+     the stylesheet's default and the still sits well back. -->
+<div class="backdrop backdrop-still" aria-hidden="true"></div>
+<main class="band">
+<div class="glass pane pane-tight">
+  <p class="eyebrow">404</p>
+  <h2>Nothing was carved here.</h2>
+  <p>That page doesn't exist.</p>
+  <p class="see-cta"><a class="btn btn-ghost" href="/">Go back to the front</a></p>
+</div>
+</main></body></html>

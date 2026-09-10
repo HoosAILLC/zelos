@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Privacy — Zelos</title>
+<meta name="description" content="Zelos has no server and collects nothing. What the app reads, where it keeps it, what it sends to the providers and the model you chose, and how to delete all of it.">
+<link rel="canonical" href="https://zelos-app.netlify.app/privacy">
+<meta name="theme-color" content="#060A07">
+<meta name="color-scheme" content="dark">
+<meta name="robots" content="index,follow">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="preload" href="/fonts/cinzel.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/fonts/hankengrotesk.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<!-- No <style> block and no style="" attribute anywhere in this file, for the
+     same reason 404.html has none: _headers sends style-src 'self' with no
+     'unsafe-inline', so an inline rule would be dropped and the page would lose
+     its layout on the one page a Google reviewer is sent to. Every class below
+     already exists in styles.css — band, glass pane, privacy-grid, boundary,
+     limits, zero-deps, foot — so the page borrows the front page's look rather
+     than carrying its own.
+
+     This page is also a verification artefact, not only a courtesy. Google's
+     restricted-scope review requires a privacy policy on the app's own domain,
+     linked from the homepage and from the consent screen, that discloses how
+     the app accesses, uses, stores and shares Google user data and carries the
+     Limited Use statement. docs/VERIFICATION.md in the repo says which
+     sentences here are load-bearing for that. Keep the Limited Use paragraph
+     verbatim. -->
+<body>
+
+<!-- The same room, held still. No <video> here — this page is prose from its
+     first line, so it takes the poster frame and keeps the veil closed. -->
+<div class="backdrop backdrop-still" aria-hidden="true"></div>
+<canvas class="motes" aria-hidden="true"></canvas>
+<a class="skip" href="#main">Skip to content</a>
+
+<nav class="nav" aria-label="Primary">
+  <a class="wordmark" href="/" aria-label="Zelos, home">Zelos</a>
+  <ul class="nav-links">
+    <li><a href="/#does">What it does</a></li>
+    <li><a href="/#models">Any AI</a></li>
+    <li><a href="/#privacy">Privacy</a></li>
+    <li><a href="/#ai">AI access</a></li>
+    <li><a href="/help">Help</a></li>
+    <li><a href="/#download" class="nav-cta">Download</a></li>
+  </ul>
+</nav>
+
+<main id="main">
+
+<section class="band" aria-labelledby="privacy-title">
+  <div class="band-head">
+    <p class="eyebrow">Privacy policy · effective 22 August 2026</p>
+    <h2 id="privacy-title">There is no Zelos server. This page is short because of it.</h2>
+    <p class="band-note">Zelos is a program you download and run on your own computer. It has no
+      account to create, no backend to talk to, and no way to see what you do with it. What follows
+      is everything it reads, where it keeps it, the handful of places it sends anything, and how
+      to delete all of it.</p>
+  </div>
+
+  <div class="privacy-grid">
+
+    <div class="glass pane">
+      <h2>What Zelos collects about you</h2>
+      <p><strong>Nothing.</strong> The people who make Zelos do not receive your mail, your
+        calendar, your address, your name, a device identifier, usage statistics, crash reports,
+        or a record that you installed it. There is no telemetry, no analytics, no update check,
+        no remote font, no remote image. The source is public, the program has zero third-party
+        dependencies, and the only outbound connections it can make are the ones listed on this
+        page — you can watch it with <code>lsof -i</code> and count them against your own
+        settings.</p>
+      <p>This website is a static page on Netlify. It sets no cookies of its own and runs no
+        analytics. Netlify keeps ordinary server logs for the requests that fetch it, under its own
+        privacy policy, which we do not see.</p>
+    </div>
+
+    <div class="glass pane boundary">
+      <p class="boundary-head">Where the app sends anything</p>
+      <ul>
+        <li><span class="dot"></span>Your mail provider <em>you chose it</em></li>
+        <li><span class="dot"></span>Your calendar address <em>you chose it</em></li>
+        <li><span class="dot"></span>Your model endpoint <em>you chose it — or localhost</em></li>
+        <li><span class="dot"></span>Each source you add <em>you chose it — one host apiece</em></li>
+        <li><span class="dot"></span>Google or Microsoft sign-in <em>only while signing in and refreshing</em></li>
+      </ul>
+      <p class="boundary-foot">Never a server of ours. There isn't one.</p>
+    </div>
+
+    <div class="glass pane">
+      <h2>What it reads, and where it keeps it</h2>
+      <p>Zelos connects to your mail server over IMAP and <strong>only reads</strong> — recent
+        messages from your inbox and from your sent folder. The sent folder is read by default,
+        because what you promised is mined from what you yourself wrote; clear the sent folder's
+        name under Settings → Email and it is left alone. It fetches them with
+        <code>BODY.PEEK</code>, so nothing is marked read; it never sends, moves, labels or deletes
+        a message. It reads your calendar the same way, from an address you give it. Each source
+        you add in Settings is read from the one host its connector names.</p>
+      <p>Everything it reads, and everything it concludes, is stored in one folder on your own disk
+        — <code>~/.zelos</code> on macOS and Linux, your user profile on Windows — in a plain SQLite
+        file with permissions limited to your account. Passwords, API keys and sign-in tokens go in
+        your operating system's keychain (macOS Keychain, Windows DPAPI, Linux libsecret), never in
+        a settings file; on a machine with no keychain they go in an encrypted file in that same
+        folder, and the app tells you so.</p>
+    </div>
+
+    <div class="glass pane">
+      <h2>The model you choose</h2>
+      <p>To work out what needs you, Zelos sends what it read to a language model — and the model is
+        the one thing here that is a third party. You pick it: a hosted provider you hold your own
+        key for, or a model running on your own machine. What travels to a hosted model is message
+        subjects, sender and recipient addresses, dates, and message bodies cut at 4,000
+        characters; calendar events — titles, times, places, who is invited, and their notes;
+        your reminders; and the board it built last time, so it does not tell you the same thing
+        twice. Turning <strong>Send message bodies</strong> off in Settings drops the bodies to a
+        short stored snippet and drops event notes entirely — subjects, titles, dates and
+        addresses still travel, because without them there is nothing to reason about. That
+        request is inference only. Zelos trains nothing, operates
+        no model, and keeps no copy of what it sent; how the provider treats it is governed by the
+        provider's terms and the key you gave it.</p>
+      <p>Point Zelos at a local model — Ollama, LM Studio, llama.cpp, vLLM — and nothing it read
+        leaves your computer at all.</p>
+    </div>
+
+    <div class="glass pane">
+      <h2>Google user data</h2>
+      <p>If you connect a Gmail or Google Workspace mailbox with <strong>Sign in with
+        Google</strong>, Zelos asks Google for the <code>https://mail.google.com/</code> scope,
+        because it is the only scope Google offers for IMAP. Of what that scope permits, Zelos uses
+        one part: reading. It does not send, compose, label, move, or delete mail, and it does not
+        call the Gmail API.</p>
+      <p><strong>Accessed:</strong> your mailbox, over IMAP, read-only, as described above.
+        <strong>Used:</strong> to build the page Zelos shows you, to draft replies you send
+        yourself, and to answer questions you ask about your own archive — all on your machine.
+        <strong>Stored:</strong> on your own disk only; the sign-in token in your keychain.
+        <strong>Shared:</strong> with nobody, except the model endpoint you configured, for the
+        purpose above, at your direction. Never sold, never used for advertising, never read by a
+        person at Zelos, never used to train or improve any machine-learning or AI model.</p>
+      <p class="zero-deps">Zelos's use of information received from Google APIs will adhere to the
+        <a href="https://developers.google.com/terms/api-services-user-data-policy">Google API
+        Services User Data Policy</a>, including the Limited Use requirements.</p>
+      <p>During sign-in your browser talks to <code>accounts.google.com</code>, and Zelos exchanges
+        the result at <code>oauth2.googleapis.com</code>; the same host refreshes the token while
+        the app is sweeping. Mail itself comes from <code>imap.gmail.com</code>. You can revoke
+        Zelos's access at any time at
+        <a href="https://myaccount.google.com/permissions">myaccount.google.com/permissions</a>,
+        and removing the mailbox in Settings deletes the token from your keychain. An app password
+        works instead of sign-in if you prefer one.</p>
+    </div>
+
+    <div class="glass pane">
+      <h2>Microsoft accounts</h2>
+      <p>If you connect an Outlook.com, Hotmail, Live, MSN or Microsoft 365 mailbox with
+        <strong>Sign in with Microsoft</strong>, Zelos asks for two permissions:
+        <code>IMAP.AccessAsUser.All</code>, which opens the mailbox over IMAP, and
+        <code>offline_access</code>, which lets it stay signed in. The same read-only rules apply;
+        Zelos does not use the Microsoft Graph API and does not read anything but mail.</p>
+      <p>The sign-in is a code you type at <code>microsoft.com/devicelogin</code>; Zelos talks to
+        <code>login.microsoftonline.com</code> to get and refresh the token, and to
+        <code>outlook.office365.com</code> for mail. Revoke it under your Microsoft account's
+        <a href="https://account.microsoft.com/privacy/app-access">apps and services</a>, or by
+        removing the mailbox in Settings, which deletes the token from your keychain.</p>
+    </div>
+
+    <div class="glass pane">
+      <h2>Other providers</h2>
+      <p>iCloud, Yahoo, AOL, Fastmail, Zoho and self-hosted mail connect with an app password you
+        create on the provider's site; Proton connects through Proton Bridge on your own machine.
+        The password goes in your keychain and is sent only to the mail server you typed, over TLS
+        — Zelos refuses to send it in the clear to any host that is not your own computer. When you
+        type an address on a custom domain, Zelos asks your system's DNS resolver who handles that
+        domain's mail; the domain goes to the resolver, your address does not.</p>
+    </div>
+
+    <div class="glass pane">
+      <h2>AI access</h2>
+      <p>If you turn on AI access in Settings, another AI client on your machine can read your
+        board over MCP, using a separate token you mint and scopes you choose. That is a local
+        connection you opened; nothing about it involves us. Every call it makes is logged in the
+        app. Six of the seven tools it can be given only look; the seventh — the board — does the
+        one thing opening Zelos does: a reminder you put off wakes up when its time comes, and
+        <em>Now</em> is held to four items. Nothing sends, nothing deletes, nothing changes a
+        setting.</p>
+    </div>
+
+    <div class="glass pane">
+      <h2>Deleting everything</h2>
+      <dl class="limits">
+        <dt>One mailbox</dt>
+        <dd>Settings → Email → remove the account. Its password or sign-in token is deleted from
+          your keychain at the same moment; nothing else holds it. Then revoke Zelos at the
+          provider if you signed in with Google or Microsoft.</dd>
+        <dt>All of it</dt>
+        <dd>Quit Zelos, then drag the Zelos folder to the Trash. Settings → Your data shows you
+          where it is. That is every message,
+          every conclusion, every setting. Keychain entries live under the service name
+          <code>com.zelos.app</code> — remove the account first and they go with it, or delete them
+          in Keychain Access, Credential Manager or your desktop's keyring.</dd>
+        <dt>Nothing remains with us</dt>
+        <dd>There is no copy anywhere else to ask us to delete. If you want to be certain of that,
+          read the source: it is the whole program.</dd>
+      </dl>
+    </div>
+
+    <div class="glass pane">
+      <h2>Children, changes, contact</h2>
+      <p>Zelos is not directed at children under 13, and we have no way to know the age of anyone
+        who runs it — we have no way to know that anyone runs it. If this policy changes, the
+        change appears here with a new effective date; the app will not gain a new destination
+        without this page saying so first.</p>
+      <!-- OPERATOR: replace the placeholder below with a real, monitored address
+           before submitting the Google consent screen — Google's reviewers check
+           that the contact works. -->
+      <p>Questions about this policy: open an issue at <a href="https://github.com/HoosAILLC/zelos/issues">github.com/HoosAILLC/zelos</a>. The source,
+        the security document and the tests are at
+        <a href="https://github.com/HoosAILLC/zelos">github.com/HoosAILLC/zelos</a>.</p>
+    </div>
+
+  </div>
+</section>
+
+</main>
+
+<footer class="foot">
+  <div class="foot-inner">
+    <p class="foot-mark">Zelos</p>
+    <p class="foot-line">A local-first second brain. MIT licensed —
+      <a href="https://github.com/HoosAILLC/zelos">the source is on GitHub</a>, all of it, including the tests.
+      · <a href="/help">Help</a> · <a href="/privacy">Privacy</a></p>
+    <p class="foot-greek">Named for <span lang="grc" title="Zelos, in Greek">Ζῆλος</span> — Zelos — who in Greek myth stood
+      beside Zeus as the spirit of devotion: the one who did the work so the god could rule.</p>
+  </div>
+</footer>
+
+<script type="module" src="/main.js"></script>
+</body>
+</html>

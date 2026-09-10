@@ -317,14 +317,18 @@ export function readPage(text, describe) {
      working credential into "Todoist returned nothing" with no way to tell the
      difference from an empty list. */
   const tasks = Array.isArray(body) ? body : Array.isArray(body?.results) ? body.results : null;
+  // A task list beside an error is a partial answer, never a complete snapshot.
+  // Classify it even when some rows arrived; the page walker preserves earlier
+  // successful pages while a first-page refusal keeps the existing cache.
+  const stated = todoistError(body, describe);
+  if (stated) throw stated;
   if (tasks === null) {
-    /* Ask the body why before guessing. This only runs when there is no task
-       list, so a healthy answer never reaches it. */
-    const stated = todoistError(body, describe);
-    if (stated) throw stated;
     throw new Error(`${describe} answered with JSON that holds no task list — the endpoint or its version has changed`);
   }
-  return { tasks, nextCursor: Array.isArray(body) ? '' : collapse(body?.next_cursor) };
+  const paginationIncomplete = !Array.isArray(body) &&
+    (!Object.hasOwn(body, 'next_cursor') || (body.next_cursor !== null && typeof body.next_cursor !== 'string'));
+  return { tasks, nextCursor: Array.isArray(body) ? '' : collapse(body?.next_cursor),
+    ...(paginationIncomplete ? { paginationIncomplete: true } : {}) };
 }
 
 function rowFor(entry, { now, identityEmail }) {
@@ -409,6 +413,7 @@ export default {
   option: 'Todoist tasks due today or overdue',
   configKey: 'sources',
   sink: 'messages',
+  taskPrefix: 'todoist:task:',
 
   credential: {
     label: 'API token',
@@ -492,6 +497,7 @@ export default {
     let truncated = false;
     /* The vendor's sentence, when a later page failed and earlier pages did not. */
     let cutShort = null;
+    let paginationIncomplete = false;
     let pagesRead = 0;
     let cursor = '';
     for (let page = 0; page < MAX_PAGES; page += 1) {
@@ -538,10 +544,11 @@ export default {
         break;
       }
       pagesRead += 1;
+      if (read.paginationIncomplete) paginationIncomplete = true;
       for (const task of read.tasks) {
-        if (!task || typeof task !== 'object') continue;
-        const id = str(task.id);
-        if (!id) { unidentified += 1; continue; }
+        if (!task || typeof task !== 'object') { unidentified += 1; continue; }
+        const id = typeof task.id === 'string' || (typeof task.id === 'number' && Number.isFinite(task.id)) ? str(task.id) : '';
+        if (!id.trim()) { unidentified += 1; continue; }
         if (!byId.has(id)) byId.set(id, task);
       }
       if (!read.nextCursor) break;
@@ -592,6 +599,7 @@ export default {
     if (unidentified > 0) {
       notes.push(`${unidentified} task${unidentified === 1 ? '' : 's'} arrived with no id and ${unidentified === 1 ? 'was' : 'were'} dropped — a task with no id cannot be stored without overwriting another one.`);
     }
+    if (paginationIncomplete) notes.push('Todoist did not confirm whether more task pages remain, so previous tasks are kept until a complete read succeeds.');
     const note = notes.length ? notes.join(' ') : null;
 
     /* NO `cursor` KEY. The Todoist cursor paginates ONE answer and is spent when
@@ -599,7 +607,10 @@ export default {
        ask for page two of a list that no longer exists. And even a real sync
        token would be wrong here for the reason linear.mjs gives: what changes
        about these rows between sweeps is that the clock moved. */
-    return { parts: [{ label: '', rows, error: null, note }] };
+    return {
+      parts: [{ label: '', rows, error: null, note }],
+      taskSnapshot: { selection: JSON.stringify({ filter, timezone }), complete: !note && ctx.signal?.aborted !== true },
+    };
   },
 
   /**

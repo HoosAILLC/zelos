@@ -37,6 +37,7 @@ import {
   upsertMessages,
   upsertEvents,
   reconcileEvents,
+  reconcileTaskActivity,
   listMessages,
   listEvents,
   listCaptures,
@@ -64,6 +65,7 @@ import {
   localTimezone,
 } from './time.mjs';
 import { log } from './log.mjs';
+import { recordSourceResults } from './source-status.mjs';
 
 const slog = log.child('[sweep]');
 
@@ -197,11 +199,11 @@ export function isActiveHour(config, now = nowISO()) {
  * Light or full?
  *
  * Full when the model has something new to think about — mail or events that
- * were *inserted* since the last successful full run, or a note the user typed
- * that has not been triaged — or when the last full run is old enough that the
- * world has moved on regardless.
+ * were inserted or materially changed since the last successful full run, or a
+ * note the user typed that has not been triaged — or when the last full run is
+ * old enough that the world has moved on regardless.
  *
- * "New" deliberately means newly inserted rows, counted as they are stored, not
+ * "New" means source information changed, counted as it is stored, not
  * `fetched_at > lastRun`: every sweep re-touches `fetched_at` on every message
  * it re-reads, so a timestamp comparison would make every run a full run and the
  * light/full distinction would quietly stop existing.
@@ -578,6 +580,10 @@ export async function runSweep({
     kind: wantFull ? 'full' : 'light',
     newMessages: 0,
     newEvents: 0,
+    changedMessages: 0,
+    changedEvents: 0,
+    removedEvents: 0,
+    taskActivityChanges: 0,
     sourcesOk: 0,
     sourcesFailed: 0,
   };
@@ -586,6 +592,7 @@ export async function runSweep({
   const finish = (ok, error, extra = {}) => {
     stats.ms = Date.now() - startedMs;
     const endedAt = nowISO(tz);
+    recordSourceResults(db, sources, now);
     finishRun(db, runId, {
       ok,
       error,
@@ -682,7 +689,8 @@ export async function runSweep({
          `authResting` already writes to the debug log, so the user reads what
          the log reads: not until when, and that a new credential lifts it. */
       slog.debug(`source resting: ${label}`, { id: source.id, why: stillRefused });
-      sources.push({ kind: connector.family, id: source.id, label, ok: false, count: 0, error: storedError(stillRefused) });
+      sources.push({ kind: connector.family, id: source.id, label, ok: false, count: 0, error: storedError(stillRefused),
+        attempted: false, retryAt: new Date(state.authBlockedUntil).toISOString() });
       return nothing;
     }
 
@@ -730,11 +738,18 @@ export async function runSweep({
 
       const rows = [];
       let snapshotComplete = connector.sink === 'events' && result?.snapshotComplete === true;
+      // Only an opted-in task connector may describe a complete selection.
+      // The selection key records filter changes without storing their text.
+      const taskSnapshot = connector.taskPrefix && typeof result?.taskSnapshot?.selection === 'string' && result.taskSnapshot.selection
+        ? { prefix: connector.taskPrefix, selection: secretHash(result.taskSnapshot.selection),
+          complete: result.taskSnapshot.complete === true && Array.isArray(result.parts) && result.parts.length > 0 }
+        : null;
       const maxRows = Number.isInteger(connector.limits.maxRows) ? connector.limits.maxRows : null;
       for (const part of result?.parts || []) {
         const at = part.label ? `${label} / ${part.label}` : label;
         if (part.error) {
           snapshotComplete = false;
+          if (taskSnapshot) taskSnapshot.complete = false;
           slog.warn(`${connector.family} source failed: ${at}`, { error: storedError(part.error) });
           sources.push({ kind: connector.family, id: source.id, label: at, ok: false, count: 0, error: storedError(part.error) });
           continue;
@@ -749,6 +764,7 @@ export async function runSweep({
           kept = kept.slice(0, maxRows);
         }
         if (note || !Array.isArray(part.rows)) snapshotComplete = false;
+        if (taskSnapshot && (note || !Array.isArray(part.rows))) taskSnapshot.complete = false;
         rows.push(...kept.map(stampFor(connector, source)));
         sources.push({
           kind: connector.family,
@@ -761,7 +777,7 @@ export async function runSweep({
       }
 
       record({ lastOkAt: startedMs, notBefore: 0, authBlockedUntil: 0, secretHash: null });
-      return { sink: connector.sink, rows, cursor: result?.cursor, sourceId: source.id, snapshotComplete };
+      return { sink: connector.sink, rows, cursor: result?.cursor, sourceId: source.id, snapshotComplete, taskSnapshot };
     } catch (err) {
       slog.warn(`${connector.family} source failed: ${label}`, { error: storedError(err) });
       sources.push({ kind: connector.family, id: source.id, label, ok: false, count: 0, error: storedError(err) });
@@ -800,16 +816,29 @@ export async function runSweep({
     0, fetchedMessages.length + fetchedEvents.length);
   try {
     const m = upsertMessages(db, fetchedMessages, { now });
+    stats.messages = m.ids.length;
+    stats.newMessages = m.inserted;
+    stats.changedMessages = m.changed;
+    // Each sink commits separately. Preserve work from this successful write
+    // before a later sink can fail, or its retry sees only unchanged rows.
+    bumpPendingNew(db, m.inserted + m.changed);
+    for (const result of results) {
+      if (!result.taskSnapshot) continue;
+      const changed = reconcileTaskActivity(db, { sourceId: result.sourceId, ...result.taskSnapshot, rows: result.rows, now });
+      stats.taskActivityChanges += changed;
+      bumpPendingNew(db, changed);
+    }
     const e = upsertEvents(db, fetchedEvents, { now });
+    stats.events = e.ids.length;
+    stats.newEvents = e.inserted;
+    stats.changedEvents = e.changed;
+    bumpPendingNew(db, e.inserted + e.changed);
     for (const result of results) {
       if (!result.snapshotComplete) continue;
-      reconcileEvents(db, { calendarId: result.sourceId, events: result.rows, from, to, timezone: tz });
+      const removed = reconcileEvents(db, { calendarId: result.sourceId, events: result.rows, from, to, timezone: tz });
+      stats.removedEvents += removed;
+      bumpPendingNew(db, removed);
     }
-    stats.messages = m.ids.length;
-    stats.events = e.ids.length;
-    stats.newMessages = m.inserted;
-    stats.newEvents = e.inserted;
-    bumpPendingNew(db, m.inserted + e.inserted);
   } catch (err) {
     slog.error('could not store fetched sources', { error: storedError(err) });
     return finish(false, storedMessage(`Could not store what was fetched: ${errorText(err)}`));
@@ -839,14 +868,15 @@ export async function runSweep({
   /* ---- 3. light or full ------------------------------------------- */
 
   let full = wantFull;
-  if (!full && mode === 'auto' && stats.newMessages + stats.newEvents > 0) {
-    // This fetch itself brought in something the model has never seen. Waiting a
+  const sourceChanges = stats.newMessages + stats.newEvents + stats.changedMessages + stats.changedEvents + stats.removedEvents + stats.taskActivityChanges;
+  if (!full && mode === 'auto' && sourceChanges > 0) {
+    // This fetch itself brought in information the model has never seen. Waiting a
     // whole interval to think about it is exactly the delay the product exists
     // to remove.
     full = true;
     stats.kind = 'full';
     setRunKind(db, runId, 'full');
-    slog.debug('upgraded a light run to full', { runId, new: stats.newMessages + stats.newEvents });
+    slog.debug('upgraded a light run to full', { runId, sourceChanges });
   }
 
   if (!full) {
@@ -1244,7 +1274,7 @@ function recomputeDerived(db, { now = nowISO() } = {}) {
 
   const firstId = getKV(db, SWEEP_KV.first);
   const current = firstId ? getItem(db, firstId) : null;
-  if (!current || current.state !== 'open') {
+  if (!current || current.state !== 'open' || current.sourceInactive) {
     const board = listBoard(db, { states: ['open'], limit: 1 });
     setKV(db, SWEEP_KV.first, board.length ? board[0].id : '');
   }

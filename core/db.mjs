@@ -33,7 +33,7 @@ import { paths } from './config.mjs';
 import { nowISO, instant, dayKey, toZonedISO } from './time.mjs';
 import { log } from './log.mjs';
 
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 /** Closed set, in board order: the rail reads top to bottom. */
 export const BUCKETS = Object.freeze(['now', 'today', 'soon', 'waiting', 'promised', 'note', 'money']);
@@ -206,6 +206,22 @@ const MIGRATIONS = [
       db.exec('ALTER TABLE items ADD COLUMN snoozed_until TEXT');
     },
   },
+  {
+    // Activity describes membership in a connector's selected open-task list.
+    // It never rewrites the source history or the user's board decisions.
+    version: 3,
+    up(db) {
+      db.exec(`CREATE TABLE task_activity (
+        message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+        source_id TEXT NOT NULL,
+        activity TEXT NOT NULL CHECK(activity IN ('active', 'inactive')),
+        selection_key TEXT,
+        observed_at TEXT,
+        inactive_reason TEXT
+      );
+      CREATE INDEX task_activity_source ON task_activity(source_id, activity);`);
+    },
+  },
 ];
 
 /** Idempotent. Running it twice is a no-op; running it on an old file upgrades. */
@@ -337,8 +353,8 @@ function hydrateEvent(row) {
 
 function hydrateItem(row) {
   if (!row) return null;
-  const { source_refs_json, payload_json, ...rest } = row;
-  return { ...rest, sourceRefs: parseJson(source_refs_json, []), payload: parseJson(payload_json, {}) };
+  const { source_refs_json, payload_json, source_inactive, ...rest } = row;
+  return { ...rest, sourceInactive: !!source_inactive, sourceRefs: parseJson(source_refs_json, []), payload: parseJson(payload_json, {}) };
 }
 
 function hydrateRun(row) {
@@ -372,6 +388,26 @@ ON CONFLICT(id) DO UPDATE SET
   flags_json = excluded.flags_json,
   fetched_at = excluded.fetched_at`;
 
+const MESSAGE_CHANGE_IGNORED = new Set(['id', 'source_id', 'uid', 'message_id', 'sent_at', 'fetched_at']);
+const EVENT_CHANGE_IGNORED = new Set(['id', 'calendar_id', 'uid', 'recurrence_id', 'fetched_at']);
+
+function messageIdentity(msg) {
+  return str(msg.id) || messageRowId(str(msg.sourceId ?? msg.source_id),
+    Number.isFinite(Number(msg.uid)) ? Number(msg.uid) : null, str(msg.messageId ?? msg.message_id));
+}
+
+function eventIdentity(ev) {
+  return str(ev.id) || eventRowId(str(ev.calendarId ?? ev.calendar_id), str(ev.uid), str(ev.recurrenceId ?? ev.recurrence_id));
+}
+
+function sourceRowChanged(before, after, ignored, preserveEmptyBody = false) {
+  return !!before && Object.entries(after).some(([key, value]) => {
+    if (ignored.has(key)) return false;
+    if (preserveEmptyBody && (key === 'snippet' || key === 'body') && value === '') return false;
+    return before[key] !== value;
+  });
+}
+
 /**
  * Accepts a `fetchRecent()` row plus `sourceId`. A cheap header-only re-fetch
  * keeps the body and snippet a fuller fetch already stored — losing a body
@@ -382,12 +418,13 @@ export function upsertMessage(db, msg, { now = nowISO() } = {}) {
   const sourceId = str(msg.sourceId ?? msg.source_id);
   const messageId = str(msg.messageId ?? msg.message_id);
   const uid = Number.isFinite(Number(msg.uid)) ? Number(msg.uid) : null;
-  const id = str(msg.id) || messageRowId(sourceId, uid, messageId);
+  const id = messageIdentity(msg);
   const from = addr(msg.from);
   const direction = DIRECTIONS.includes(msg.direction) ? msg.direction : 'in';
-  const existed = !!prep(db, 'SELECT 1 FROM messages WHERE id = ?').get(id);
+  const before = prep(db, 'SELECT * FROM messages WHERE id = ?').get(id);
+  const existed = !!before;
 
-  prep(db, MESSAGE_UPSERT).run({
+  const record = {
     id,
     source_id: sourceId,
     uid,
@@ -406,7 +443,13 @@ export function upsertMessage(db, msg, { now = nowISO() } = {}) {
     has_attach: bit(msg.hasAttachments ?? msg.has_attach),
     flags_json: json(msg.flags || []),
     fetched_at: str(msg.fetchedAt ?? msg.fetched_at ?? now),
-  });
+  };
+  prep(db, MESSAGE_UPSERT).run(record);
+
+  // Task connectors use their read time as sent_at. Moving that timestamp or
+  // fetched_at alone is not new work, but a revised deadline/body/flag is.
+  // Compare effective values: a header-only fetch keeps the stored body.
+  const changed = sourceRowChanged(before, record, MESSAGE_CHANGE_IGNORED, true);
 
   // The index mirrors the ROW, not the fetch. The COALESCE above keeps a
   // stored snippet/body that a cheaper re-fetch arrived without — and indexing
@@ -424,27 +467,40 @@ export function upsertMessage(db, msg, { now = nowISO() } = {}) {
       : `${str(msg.snippet)}\n${str(msg.text ?? msg.body)}`.trim(),
   });
 
-  return { id, inserted: !existed };
+  return { id, inserted: !existed, changed };
 }
 
 export function upsertMessages(db, list, opts = {}) {
   const ids = [];
+  const before = new Map();
   let inserted = 0;
+  let changed = 0;
   withTransaction(db, () => {
     for (const msg of list || []) {
+      const id = messageIdentity(msg);
+      if (!before.has(id)) before.set(id, prep(db, 'SELECT * FROM messages WHERE id = ?').get(id));
       const r = upsertMessage(db, msg, opts);
       ids.push(r.id);
       if (r.inserted) inserted += 1;
     }
+    // A message may appear in more than one folder. Count the net change to
+    // each existing row, never intermediate writes or an insert again as an edit.
+    for (const [id, row] of before) {
+      if (row && sourceRowChanged(row, prep(db, 'SELECT * FROM messages WHERE id = ?').get(id), MESSAGE_CHANGE_IGNORED)) changed += 1;
+    }
   });
-  return { ids, inserted, updated: ids.length - inserted };
+  return { ids, inserted, updated: ids.length - inserted, changed };
 }
 
 export function getMessage(db, id) {
-  return hydrateMessage(prep(db, 'SELECT * FROM messages WHERE id = ?').get(id));
+  return hydrateMessage(prep(db, `SELECT messages.*, ${TASK_METADATA_SQL} FROM messages
+    LEFT JOIN task_activity ON task_activity.message_id = messages.id WHERE messages.id = ?`).get(id));
 }
 
-export function listMessages(db, { sinceISO = null, sourceId = null, direction = null, limit = 500 } = {}) {
+const TASK_METADATA_SQL = `task_activity.activity AS task_activity,
+  task_activity.observed_at AS task_observed_at, task_activity.inactive_reason AS task_inactive_reason`;
+
+export function listMessages(db, { sinceISO = null, sourceId = null, direction = null, limit = 500, includeInactive = false } = {}) {
   const where = [];
   const args = [];
   /* Both sides through datetime(), for the reason core/sweep.mjs gives at
@@ -459,18 +515,62 @@ export function listMessages(db, { sinceISO = null, sourceId = null, direction =
      6.7 ms against 0.2 ms, which at one person's mailbox is nothing and not
      worth a third schema version for an expression index. */
   if (sinceISO) { where.push('datetime(sent_at) >= datetime(?)'); args.push(sinceISO); }
-  if (sourceId) { where.push('source_id = ?'); args.push(sourceId); }
+  if (sourceId) { where.push('messages.source_id = ?'); args.push(sourceId); }
   if (direction) { where.push('direction = ?'); args.push(direction); }
-  const sql = `SELECT * FROM messages ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY datetime(sent_at) DESC LIMIT ?`;
+  if (!includeInactive) where.push("COALESCE(task_activity.activity, 'active') <> 'inactive'");
+  const sql = `SELECT messages.*, ${TASK_METADATA_SQL} FROM messages
+    LEFT JOIN task_activity ON task_activity.message_id = messages.id
+    ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY datetime(sent_at) DESC LIMIT ?`;
   return prep(db, sql).all(...args, Math.max(1, Number(limit) || 500)).map(hydrateMessage);
 }
 
-export function messagesInThread(db, threadKey, { limit = 50 } = {}) {
+export function messagesInThread(db, threadKey, { limit = 50, includeInactive = false } = {}) {
   // Instants, not characters, for the same reason as listMessages: a reply
   // from a -04:00 sender and one from a Z sender would otherwise interleave
   // by their digits, and a thread is read in the order it happened.
-  return prep(db, 'SELECT * FROM messages WHERE thread_key = ? ORDER BY datetime(sent_at) ASC LIMIT ?')
+  return prep(db, `SELECT messages.*, ${TASK_METADATA_SQL} FROM messages
+    LEFT JOIN task_activity ON task_activity.message_id = messages.id
+    WHERE thread_key = ? ${includeInactive ? '' : "AND COALESCE(task_activity.activity, 'active') <> 'inactive'"}
+    ORDER BY datetime(sent_at) ASC LIMIT ?`)
     .all(str(threadKey), Math.max(1, Number(limit) || 50)).map(hydrateMessage);
+}
+
+/** Apply a task selection observation after its messages have been stored.
+ * Incomplete reads can confirm presence, never absence. A complete replacement
+ * selection may retire old membership, but cannot prove completion/deletion.
+ * Existing caches are adopted by the connector's declared message-id namespace.
+ */
+export function reconcileTaskActivity(db, { sourceId, prefix, selection, complete = false, rows = [], now = nowISO() } = {}) {
+  if (!str(sourceId) || !str(prefix) || !str(selection) || !Array.isArray(rows)) return 0;
+  const observed = new Set();
+  let valid = true;
+  for (const row of rows) {
+    if (!row || str(row.sourceId ?? row.source_id) !== sourceId || !str(row.messageId ?? row.message_id).startsWith(prefix)) {
+      valid = false;
+      continue;
+    }
+    observed.add(messageIdentity(row));
+  }
+  let changed = 0;
+  withTransaction(db, () => {
+    // Adoption is neutral: these rows were already active before migration.
+    prep(db, `INSERT OR IGNORE INTO task_activity (message_id, source_id, activity)
+      SELECT id, source_id, 'active' FROM messages
+      WHERE source_id = ? AND substr(message_id, 1, length(?)) = ?`).run(sourceId, prefix, prefix);
+    const entries = prep(db, 'SELECT * FROM task_activity WHERE source_id = ?').all(sourceId);
+    const active = prep(db, `UPDATE task_activity SET activity = 'active', selection_key = ?, observed_at = ?, inactive_reason = NULL WHERE message_id = ?`);
+    const inactive = prep(db, `UPDATE task_activity SET activity = 'inactive', observed_at = ?, inactive_reason = 'not_in_current_selection' WHERE message_id = ?`);
+    for (const entry of entries) {
+      if (observed.has(entry.message_id)) {
+        active.run(selection, now, entry.message_id);
+        if (entry.activity === 'inactive') changed++;
+      } else if (complete && valid && entry.activity === 'active') {
+        inactive.run(now, entry.message_id);
+        changed++;
+      }
+    }
+  });
+  return changed;
 }
 
 /** How much arrived since a moment — what `shouldRunFull` needs. */
@@ -505,13 +605,14 @@ export function upsertEvent(db, ev, { now = nowISO() } = {}) {
   const calendarId = str(ev.calendarId ?? ev.calendar_id);
   const uid = str(ev.uid);
   const recurrenceId = str(ev.recurrenceId ?? ev.recurrence_id);
-  const id = str(ev.id) || eventRowId(calendarId, uid, recurrenceId);
-  const existed = !!prep(db, 'SELECT 1 FROM events WHERE id = ?').get(id);
+  const id = eventIdentity(ev);
+  const before = prep(db, 'SELECT * FROM events WHERE id = ?').get(id);
+  const existed = !!before;
   const organizer = ev.organizer && typeof ev.organizer === 'object'
     ? str(ev.organizer.email || ev.organizer.name)
     : str(ev.organizer);
 
-  prep(db, EVENT_UPSERT).run({
+  const record = {
     id,
     calendar_id: calendarId,
     uid,
@@ -528,7 +629,9 @@ export function upsertEvent(db, ev, { now = nowISO() } = {}) {
     status: str(ev.status),
     url: strOrNull(ev.url),
     fetched_at: str(ev.fetchedAt ?? ev.fetched_at ?? now),
-  });
+  };
+  prep(db, EVENT_UPSERT).run(record);
+  const changed = sourceRowChanged(before, record, EVENT_CHANGE_IGNORED);
 
   indexDoc(db, {
     ref: `evt:${id}`,
@@ -537,20 +640,27 @@ export function upsertEvent(db, ev, { now = nowISO() } = {}) {
     body: `${str(ev.description)}\n${str(ev.location)}\n${organizer}`.trim(),
   });
 
-  return { id, inserted: !existed };
+  return { id, inserted: !existed, changed };
 }
 
 export function upsertEvents(db, list, opts = {}) {
   const ids = [];
+  const before = new Map();
   let inserted = 0;
+  let changed = 0;
   withTransaction(db, () => {
     for (const ev of list || []) {
+      const id = eventIdentity(ev);
+      if (!before.has(id)) before.set(id, prep(db, 'SELECT * FROM events WHERE id = ?').get(id));
       const r = upsertEvent(db, ev, opts);
       ids.push(r.id);
       if (r.inserted) inserted += 1;
     }
+    for (const [id, row] of before) {
+      if (row && sourceRowChanged(row, prep(db, 'SELECT * FROM events WHERE id = ?').get(id), EVENT_CHANGE_IGNORED)) changed += 1;
+    }
   });
-  return { ids, inserted, updated: ids.length - inserted };
+  return { ids, inserted, updated: ids.length - inserted, changed };
 }
 
 /**
@@ -679,8 +789,16 @@ export function upsertItem(db, item, { runId = null, now = nowISO() } = {}) {
   return { id, inserted: !before, firstSeen: before ? before.first_seen : now };
 }
 
+// Missing/mixed/non-task evidence is never enough to hide an obligation. Only
+// a nonempty list whose every reference is a proven inactive task qualifies.
+const ITEM_REFS_SQL = "CASE WHEN json_valid(items.source_refs_json) THEN items.source_refs_json ELSE '[]' END";
+const INACTIVE_ITEM_SQL = `(json_type(${ITEM_REFS_SQL}) = 'array' AND json_array_length(${ITEM_REFS_SQL}) > 0
+  AND NOT EXISTS (SELECT 1 FROM json_each(${ITEM_REFS_SQL}) AS refs
+    WHERE NOT EXISTS (SELECT 1 FROM task_activity AS task
+      WHERE substr(refs.value, 1, 4) = 'msg:' AND task.message_id = substr(refs.value, 5) AND task.activity = 'inactive')))`;
+
 export function getItem(db, id) {
-  return hydrateItem(prep(db, 'SELECT * FROM items WHERE id = ?').get(str(id)));
+  return hydrateItem(prep(db, `SELECT items.*, ${INACTIVE_ITEM_SQL} AS source_inactive FROM items WHERE id = ?`).get(str(id)));
 }
 
 export function getItemByKey(db, key) {
@@ -732,10 +850,11 @@ WHERE state = 'snoozed' AND snoozed_until IS NOT NULL
  * be off by the offset difference. A string datetime() cannot read becomes
  * NULL, and NULL never satisfies the comparison: garbage sleeps, safely.
  */
-export function listBoard(db, { states = ['open'], buckets = null, limit = 500, now = nowISO() } = {}) {
+export function listBoard(db, { states = ['open'], buckets = null, limit = 500, now = nowISO(), includeInactive = false } = {}) {
   prep(db, WAKE_DUE_SNOOZES).run({ now });
   const args = [];
   const where = [];
+  if (!includeInactive) where.push(`NOT ${INACTIVE_ITEM_SQL}`);
   const stateList = (states || []).filter((s) => ITEM_STATES.includes(s));
   if (stateList.length) {
     where.push(`state IN (${stateList.map(() => '?').join(',')})`);
@@ -753,7 +872,7 @@ export function listBoard(db, { states = ['open'], buckets = null, limit = 500, 
      demotes from, so getting the tie wrong picked the wrong item to push off
      the four-slot bar. The NULL branch stays first: undated rows sort last. */
   const sql = `
-    SELECT * FROM items
+    SELECT items.*, ${INACTIVE_ITEM_SQL} AS source_inactive FROM items
     ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
     ORDER BY ${BUCKET_RANK_SQL} ASC, severity DESC, (due_at IS NULL) ASC, datetime(due_at) ASC, first_seen ASC
     LIMIT ?`;
@@ -761,10 +880,13 @@ export function listBoard(db, { states = ['open'], buckets = null, limit = 500, 
 }
 
 /** `{now: 2, today: 5, …}` — every bucket present, zeros included. */
-export function bucketCounts(db, { states = ['open'] } = {}) {
+export function bucketCounts(db, { states = ['open'], includeInactive = false } = {}) {
   const stateList = (states || []).filter((s) => ITEM_STATES.includes(s));
   const counts = Object.fromEntries(BUCKETS.map((b) => [b, 0]));
-  const sql = `SELECT bucket, COUNT(*) AS n FROM items ${stateList.length ? `WHERE state IN (${stateList.map(() => '?').join(',')})` : ''} GROUP BY bucket`;
+  const where = [];
+  if (stateList.length) where.push(`state IN (${stateList.map(() => '?').join(',')})`);
+  if (!includeInactive) where.push(`NOT ${INACTIVE_ITEM_SQL}`);
+  const sql = `SELECT bucket, COUNT(*) AS n FROM items ${where.length ? `WHERE ${where.join(' AND ')}` : ''} GROUP BY bucket`;
   for (const row of prep(db, sql).all(...stateList)) {
     if (Object.hasOwn(counts, row.bucket)) counts[row.bucket] = Number(row.n);
   }
@@ -781,7 +903,7 @@ export function bucketCounts(db, { states = ['open'] } = {}) {
  */
 export function listFinished(db, { limit = 20 } = {}) {
   const sql = `
-    SELECT * FROM items
+    SELECT items.*, ${INACTIVE_ITEM_SQL} AS source_inactive FROM items
     WHERE state IN ('done', 'dismissed') AND state_at IS NOT NULL
     ORDER BY datetime(state_at) DESC
     LIMIT ?`;
@@ -819,7 +941,7 @@ export function getDraft(db, id) {
   return prep(db, 'SELECT * FROM drafts WHERE id = ?').get(str(id)) ?? null;
 }
 
-export function listDrafts(db, { states = null, itemId = null, limit = 200 } = {}) {
+export function listDrafts(db, { states = null, itemId = null, limit = 200, includeInactive = false } = {}) {
   const where = [];
   const args = [];
   const stateList = (states || []).filter((s) => DRAFT_STATES.includes(s));
@@ -828,6 +950,7 @@ export function listDrafts(db, { states = null, itemId = null, limit = 200 } = {
     args.push(...stateList);
   }
   if (itemId) { where.push('item_id = ?'); args.push(str(itemId)); }
+  if (!includeInactive && !itemId) where.push(`NOT EXISTS (SELECT 1 FROM items WHERE items.id = drafts.item_id AND ${INACTIVE_ITEM_SQL})`);
   const sql = `SELECT * FROM drafts ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY updated_at DESC LIMIT ?`;
   return prep(db, sql).all(...args, Math.max(1, Number(limit) || 200));
 }
@@ -1018,7 +1141,7 @@ export function ftsQuery(raw) {
  * not match, so "you may see who wrote and about what, but not what it said"
  * is true of querying as well as of reading.
  */
-export function search(db, query, { limit = 20, kinds = null, columns = null } = {}) {
+export function search(db, query, { limit = 20, kinds = null, columns = null, includeInactive = false } = {}) {
   let match = ftsQuery(query);
   if (!match) return [];
   if (Array.isArray(columns) && columns.length) {
@@ -1028,17 +1151,21 @@ export function search(db, query, { limit = 20, kinds = null, columns = null } =
     match = `{${allowed.join(' ')}} : (${match})`;
   }
   const kindList = (kinds || []).filter((k) => typeof k === 'string' && k);
+  const inactive = `(EXISTS (SELECT 1 FROM task_activity WHERE substr(search.ref, 1, 4) = 'msg:' AND task_activity.message_id = substr(search.ref, 5) AND task_activity.activity = 'inactive')
+    OR EXISTS (SELECT 1 FROM items WHERE substr(search.ref, 1, 5) = 'item:' AND items.id = substr(search.ref, 6) AND ${INACTIVE_ITEM_SQL}))`;
   const sql = `
     SELECT ref, kind, title,
            snippet(search, 1, '', '', '…', 12) AS excerpt,
-           -bm25(search) AS score
+           -bm25(search) AS score, ${inactive} AS source_inactive
     FROM search
     WHERE search MATCH ?
       ${kindList.length ? `AND kind IN (${kindList.map(() => '?').join(',')})` : ''}
+      ${includeInactive ? '' : `AND NOT ${inactive}`}
     ORDER BY bm25(search) ASC
     LIMIT ?`;
   try {
-    return prep(db, sql).all(match, ...kindList, Math.max(1, Number(limit) || 20));
+    return prep(db, sql).all(match, ...kindList, Math.max(1, Number(limit) || 20))
+      .map(({ source_inactive, ...hit }) => ({ ...hit, sourceInactive: !!source_inactive }));
   } catch (err) {
     // A malformed MATCH should return nothing, not take down the request.
     log.warn('db: search failed', { error: err.message });

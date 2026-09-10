@@ -191,7 +191,7 @@ const ICS_BODY = [
 ].join('\r\n');
 
 /** Speaks just enough of the openai wire protocol, and serves an .ics too. */
-async function startMockUpstream(t) {
+async function startMockUpstream(t, { jsonReply, finishReason } = {}) {
   const received = [];
   const server = http.createServer(async (req, res) => {
     const chunks = [];
@@ -212,10 +212,15 @@ async function startMockUpstream(t) {
       return;
     }
     if (req.url.startsWith('/chat/completions')) {
+      if (jsonReply !== undefined) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(jsonReply));
+        return;
+      }
       if (body?.stream) {
         res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store' });
         res.write(`data: ${JSON.stringify({ model: 'mock-model', choices: [{ delta: { content: 'Budget review ' } }] })}\n\n`);
-        res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: 'is on Tuesday.' } }], usage: { prompt_tokens: 41, completion_tokens: 6 } })}\n\n`);
+        res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: 'is on Tuesday.' }, ...(finishReason ? { finish_reason: finishReason } : {}) }], usage: { prompt_tokens: 41, completion_tokens: 6 } })}\n\n`);
         res.write('data: [DONE]\n\n');
         res.end();
         return;
@@ -931,6 +936,96 @@ test('/api/ask says so plainly when nothing is indexed', async (t) => {
   assert.equal(frames.at(-1).data.grounded, false);
   // Nothing was asked of the model, because there was nothing to ground on.
   assert.equal(upstream.received.length, 0);
+});
+
+test('inactive task history is opt-in for Search and explicitly historical in Ask', async (t) => {
+  const upstream = await startMockUpstream(t);
+  const ctx = await startServer(t, { config: baseConfig({
+    model: { protocol: 'openai', baseUrl: upstream.baseUrl, model: 'mock-model' },
+  }) });
+  const task = db.upsertMessage(ctx.db, {
+    sourceId: 'todoist', messageId: 'todoist:task:budget',
+    subject: 'Budget review obligation', text: 'Still open; budget review due tomorrow.',
+    date: '2026-09-01T12:00:00Z',
+  });
+  db.reconcileTaskActivity(ctx.db, { sourceId: 'todoist', prefix: 'todoist:task:', selection: 'all', complete: true, rows: [] });
+  const active = await call(ctx, 'GET', '/api/search?q=Budget');
+  assert.equal(active.status, 200);
+  assert.equal(active.json.results.length, 0);
+  const historical = await call(ctx, 'GET', '/api/search?q=Budget&includeHistory=1');
+  assert.equal(historical.json.results[0].ref, `msg:${task.id}`);
+  assert.equal(historical.json.results[0].sourceInactive, true);
+
+  const response = await fetch(`${ctx.base}/api/ask`, {
+    method: 'POST', headers: { 'X-Zelos-Token': ctx.token, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ question: 'What was the budget review obligation?' }),
+  });
+  assert.equal(response.status, 200);
+  const frames = (await readStream(response, null, { until: (f) => f.startsWith('event: done') })).map(parseFrame);
+  assert.equal(frames.find((f) => f.event === 'sources').data[0].sourceInactive, true);
+  const prompt = upstream.received.find((r) => r.url.startsWith('/chat/completions')).body.messages.map((m) => m.content).join('\n');
+  assert.match(prompt, /Historical task evidence/);
+  assert.match(prompt, /Absence does not prove completion/);
+});
+
+test('/api/state exposes durable source health without losing the last successful read', async (t) => {
+  const { recordSourceResults } = await import('../core/source-status.mjs');
+  const ctx = await startServer(t, { config: baseConfig({
+    sources: [{ id: 'tasks', type: 'todoist', enabled: true, keyRef: 'tasks.key', settings: {} }],
+  }) });
+  recordSourceResults(ctx.db, [{ id: 'tasks', kind: 'task', ok: true }], '2026-09-01T12:00:00Z');
+  recordSourceResults(ctx.db, [{ id: 'tasks', kind: 'task', ok: false, error: 'Could not connect' }], '2026-09-02T12:00:00Z');
+  const response = await call(ctx, 'GET', '/api/state');
+  assert.equal(response.status, 200);
+  const status = response.json.sourceStatus.find((s) => s.id === 'tasks');
+  assert.equal(status.ok, false);
+  assert.equal(status.lastSuccessAt, '2026-09-01T12:00:00.000Z');
+  assert.equal(status.lastAttemptAt, '2026-09-02T12:00:00.000Z');
+  assert.match(status.error, /Could not connect/);
+  assert.equal(status.keyRef, undefined);
+});
+
+test('/api/ask preserves non-streamed answers and records their usage', async (t) => {
+  const upstream = await startMockUpstream(t, { jsonReply: {
+    model: 'fallback-model', choices: [{ message: { content: 'Budget review is on Tuesday.' }, finish_reason: 'stop' }],
+    usage: { prompt_tokens: 41, completion_tokens: 6 },
+  } });
+  const ctx = await startServer(t, { config: baseConfig({
+    model: { protocol: 'openai', baseUrl: upstream.baseUrl, model: 'mock-model', keyRef: '' },
+  }) });
+  db.insertCapture(ctx.db, 'Budget review is on Tuesday.');
+  const response = await fetch(`${ctx.base}/api/ask`, {
+    method: 'POST', headers: { 'X-Zelos-Token': ctx.token, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ question: 'When is the budget review?' }),
+  });
+  const frames = (await readStream(response)).map(parseFrame).filter((frame) => frame.event);
+  assert.equal(frames.filter((frame) => frame.event === 'delta').map((frame) => frame.data.text).join(''), 'Budget review is on Tuesday.');
+  assert.equal(frames.at(-1).event, 'done');
+  assert.deepEqual(frames.at(-1).data.usage, { input: 41, output: 6 });
+  assert.equal(frames.at(-1).data.model, 'fallback-model');
+  const usage = JSON.parse(db.getKV(ctx.db, 'sweep.tokens'));
+  assert.equal(usage.tokensIn, 41);
+  assert.equal(usage.tokensOut, 6);
+});
+
+test('/api/ask exposes a token-limit stop and still records the partial answer usage', async (t) => {
+  const upstream = await startMockUpstream(t, { finishReason: 'length' });
+  const ctx = await startServer(t, { config: baseConfig({
+    model: { protocol: 'openai', baseUrl: upstream.baseUrl, model: 'mock-model', keyRef: '' },
+  }) });
+  db.insertCapture(ctx.db, 'Budget review is on Tuesday.');
+  const response = await fetch(`${ctx.base}/api/ask`, {
+    method: 'POST', headers: { 'X-Zelos-Token': ctx.token, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ question: 'When is the budget review?' }),
+  });
+  const frames = (await readStream(response)).map(parseFrame).filter((frame) => frame.event);
+  assert.ok(frames.some((frame) => frame.event === 'delta' && frame.data.text));
+  assert.equal(frames.at(-1).event, 'done');
+  assert.equal(frames.at(-1).data.stopReason, 'length');
+  assert.deepEqual(frames.at(-1).data.usage, { input: 41, output: 6 });
+  const usage = JSON.parse(db.getKV(ctx.db, 'sweep.tokens'));
+  assert.equal(usage.tokensIn, 41);
+  assert.equal(usage.tokensOut, 6);
 });
 
 test('/api/ask refuses before streaming when no model is configured', async (t) => {
@@ -1844,6 +1939,17 @@ test('a model that is not answering produces a readable failure, not a 500', asy
   assert.equal(res.status, 200);
   assert.equal(res.json.ok, false);
   assert.match(res.json.error, new RegExp(String(dead)), 'the error must name the address that failed');
+});
+
+test('/api/model/test refuses a success status with a non-completion body', async (t) => {
+  const upstream = await startMockUpstream(t, { jsonReply: { status: 'ok' } });
+  const ctx = await startServer(t, { config: baseConfig({
+    model: { protocol: 'openai', baseUrl: upstream.baseUrl, model: 'mock-model', keyRef: '' },
+  }) });
+  const result = await call(ctx, 'POST', '/api/model/test', { body: {} });
+  assert.equal(result.status, 200);
+  assert.equal(result.json.ok, false);
+  assert.match(result.json.error, /invalid openai response/i);
 });
 
 test('/api/model/presets covers the providers a user might pick', async (t) => {

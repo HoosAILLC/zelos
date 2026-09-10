@@ -830,7 +830,7 @@ test('the snooze chooser offers three future deadlines in the configured zone', 
   const noon = Date.parse('2026-08-11T16:00:00Z'); // Tuesday, noon in New York
 
   const [later, tomorrow, nextWeek] = items.snoozeChoices(tz, noon);
-  assert.equal(later.label, 'Later today');
+  assert.equal(later.label, 'In 4 hours');
   assert.equal(later.until, ui.toZonedISO(new Date(noon + 4 * 3_600_000), tz));
   assert.equal(tomorrow.until, '2026-08-12T09:00:00-04:00');
   assert.equal(nextWeek.until, '2026-08-17T09:00:00-04:00');
@@ -847,6 +847,15 @@ test('the snooze chooser offers three future deadlines in the configured zone', 
   const monday = Date.parse('2026-08-10T16:00:00Z');
   const [, , fromMonday] = items.snoozeChoices(tz, monday);
   assert.equal(fromMonday.until, '2026-08-17T09:00:00-04:00');
+});
+
+test('a four-hour snooze names the next day when its deadline crosses midnight', async () => {
+  stubBrowserGlobals();
+  const items = await import(fileUrl(UI, 'lib/items.js'));
+  const [later] = items.snoozeChoices('America/New_York', Date.parse('2026-08-12T02:00:00Z'));
+  assert.equal(later.until, '2026-08-12T02:00:00-04:00');
+  assert.equal(later.label, 'In 4 hours');
+  assert.equal(later.when, 'Wed, Aug 12 2 AM');
 });
 
 test('a toast dismisses itself, and an action toast is given longer', async (t) => {
@@ -3143,6 +3152,10 @@ class PlainNode {
 
   get isConnected() { return true; }
 
+  get hidden() { return 'hidden' in this.attributes; }
+
+  set hidden(value) { if (value) this.attributes.hidden = ''; else delete this.attributes.hidden; }
+
   /** A `value` attribute is an input's default value, which a browser reflects as `.value` until someone types. */
   setAttribute(key, value) {
     this.attributes[key] = String(value);
@@ -3167,6 +3180,8 @@ class PlainNode {
   removeEventListener() {}
 
   appendChild(child) { child.parentNode = this; this.children.push(child); return child; }
+
+  prepend(child) { child.parentNode = this; this.children.unshift(child); }
 
   replaceChildren(...kids) {
     for (const kid of kids) kid.parentNode = this;
@@ -3344,10 +3359,9 @@ const GUESSES = {
   'frank@icloud.com': { label: 'iCloud Mail', host: 'imap.mail.me.com', port: 993, secure: true, auth: 'password', signIn: null, clientReady: false, appPasswordUrl: 'https://account.apple.com/account/manage', note: 'iCloud Mail requires an app-specific password. This provider does not accept your normal password over IMAP.', known: true },
 };
 
-test('first-run setup stays on Email after saving the AI, and can finish even when storage refuses writes', () => {
+function runAppScenario({ initiallyConfigured = true, storageUnavailable = false, beforeBoot = '', scenario }) {
   // Run the actual shell in its own process: its subscriptions and timers live
   // for the whole page, and must not leak into the renderer tests in this file.
-  for (const [initiallyConfigured, storageUnavailable] of [[false, false], [false, true], [true, false]]) {
     const script = `
       import assert from 'node:assert/strict';
       const PlainNode = ${PlainNode.toString()};
@@ -3365,13 +3379,15 @@ test('first-run setup stays on Email after saving the AI, and can finish even wh
       globalThis.Node = PlainNode;
       globalThis.localStorage = storage();
       globalThis.sessionStorage = storage();
+      const windowEvents = {};
       globalThis.window = {
         location: { href: 'http://127.0.0.1/?t=test', host: '127.0.0.1', hash: '#/now' },
-        history: { replaceState() {} }, addEventListener() {}, scrollTo() {},
+        history: { replaceState() {} }, addEventListener: (name, fn) => { windowEvents[name] = fn; }, scrollTo() {},
         matchMedia: () => ({ matches: true }),
       };
       const root = new PlainNode('div');
       PlainNode.prototype.contains = function(node) { return plainWalk(this).includes(node); };
+      PlainNode.prototype.focus = function() { document.activeElement = this; };
       PlainNode.prototype.getBoundingClientRect = () => ({ height: 100 });
       PlainNode.prototype.querySelector = function(selector) {
         return plainWalk(this).find(n => (n.attributes.class || '').split(' ').includes(selector.slice(1))) || null;
@@ -3403,8 +3419,42 @@ test('first-run setup stays on Email after saving the AI, and can finish even wh
       api.presets = api.probeLocal = async () => [];
       api.helpLinks = async () => ({});
       const settle = async () => { await new Promise(setImmediate); await new Promise(setImmediate); };
+      ${beforeBoot}
       await import(${JSON.stringify(fileUrl(UI, 'app.js'))});
       await settle();
+      ${scenario}
+    `;
+    const run = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', timeout: 10_000 });
+    assert.equal(run.status, 0, run.stderr || run.error?.message || run.stdout);
+}
+
+test('the skip link focuses the current view without changing its route', () => {
+  runAppScenario({ scenario: `
+    window.location.hash = '#/today';
+    windowEvents.hashchange();
+    const main = plainWalk(root).find(n => n.attributes.id === 'main');
+    const content = main.firstChild;
+    const skip = plainWalk(root).find(n => n.attributes.class === 'skip-link');
+    assert.ok(skip);
+    document.activeElement = skip;
+    let prevented = false;
+    for (const listener of skip.listeners.get('click') || []) {
+      listener.call(skip, { target: skip, currentTarget: skip, preventDefault() { prevented = true; } });
+    }
+    // Emulate the anchor's browser default, including the real hash router.
+    if (!prevented) {
+      window.location.hash = skip.getAttribute('href');
+      windowEvents.hashchange();
+    }
+    assert.equal(window.location.hash, '#/today');
+    assert.equal(main.firstChild, content, 'the current calendar must stay in place');
+    assert.equal(document.activeElement, main);
+  ` });
+});
+
+test('first-run setup stays on Email after saving the AI, and can finish even when storage refuses writes', () => {
+  for (const [initiallyConfigured, storageUnavailable] of [[false, false], [false, true], [true, false]]) {
+    runAppScenario({ initiallyConfigured, storageUnavailable, scenario: `
       if (${JSON.stringify(initiallyConfigured)}) {
         assert.ok(!findButton(root, 'Set up Zelos'), 'existing configured homes still open the board');
       } else {
@@ -3423,10 +3473,46 @@ test('first-run setup stays on Email after saving the AI, and can finish even wh
         assert.equal(store.onboardingDone(), true, 'completion survives unavailable storage for this session');
         assert.equal(localStorage.getItem('zelos.onboarded'), ${JSON.stringify(storageUnavailable ? null : '1')});
       }
-    `;
-    const run = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', timeout: 10_000 });
-    assert.equal(run.status, 0, run.stderr || run.error?.message || run.stdout);
+    ` });
   }
+});
+
+test('first-run sample data recovers from availability and loading failures without losing the way to the board', () => {
+  runAppScenario({ initiallyConfigured: false, beforeBoot: `
+    let reads = 0;
+    let loads = 0;
+    let loaded = false;
+    globalThis.fetch = async (path, init = {}) => {
+      if (path === '/api/sweep/stream') return new Promise(() => {});
+      assert.equal(path, '/api/sample-data');
+      if (init.method === 'POST') {
+        loads += 1;
+        if (loads === 1) return { ok: false, status: 503, text: async () => JSON.stringify({ error: 'Please try loading again' }) };
+        loaded = true;
+      } else if (++reads === 1) {
+        return { ok: false, status: 503, text: async () => JSON.stringify({ error: 'Temporarily unavailable' }) };
+      }
+      return { ok: true, status: 200, text: async () => JSON.stringify({ installed: loaded }) };
+    };
+    api.state = async () => ({ items: loaded ? [{ id: 'sample-item', state: 'open', bucket: 'now', headline: 'Sample · Review the studio plan' }] : [], events: [], drafts: [], notes: [], counts: {}, runs: {} });
+  `, scenario: `
+    assert.match(textOf(root), /Temporarily unavailable/);
+    const retry = findButton(root, 'Retry sample data');
+    assert.ok(retry, 'a temporary sample probe failure needs a retry without reloading setup');
+    retry.fire('click');
+    await settle();
+    findButton(root, 'Look around with made-up data first').fire('click');
+    await settle();
+    assert.match(textOf(root), /Please try loading again/);
+    assert.equal(localStorage.getItem('zelos.onboarded'), null, 'failed loading must stay in setup');
+    findButton(root, 'Look around with made-up data first').fire('click');
+    await settle();
+    assert.match(textOf(root), /Sample · Review the studio plan/);
+    assert.equal(localStorage.getItem('zelos.onboarded'), '1');
+    assert.equal(loads, 2);
+    const store = await import(${JSON.stringify(fileUrl(UI, 'lib/store.js'))});
+    store.notify(null);
+  ` });
 });
 
 test('no screen in onboarding, and no mail card, shows a first-timer a protocol word', async (t) => {
@@ -3666,6 +3752,160 @@ test('a draft edit lands in the board copy before the save returns, so a repaint
     [{ body: 'The body as edited.', state: 'edited' }]);
 });
 
+test('discard waits for an older card save and prevents its delayed edit from resurrecting the draft', async (t) => {
+  withPlainDom(t);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const owed = await import(fileUrl(UI, 'views/owed.js'));
+  let serverDraft = { id: 'discard-race', state: 'pending', to_email: 'sam@example.com', subject: 'Reply', body: 'Original.' };
+  const puts = [];
+  let releaseSave;
+  globalThis.fetch = async (reqPath, init = {}) => {
+    if (reqPath === '/api/state') {
+      return { ok: true, status: 200, text: async () => JSON.stringify({ items: [], events: [], notes: [], counts: {}, runs: {}, drafts: serverDraft.state === 'discarded' ? [] : [serverDraft] }) };
+    }
+    assert.equal(reqPath, '/api/drafts/discard-race');
+    const patch = JSON.parse(init.body);
+    puts.push(patch);
+    if (puts.length === 1) await new Promise(resolve => { releaseSave = resolve; });
+    serverDraft = { ...serverDraft, ...patch };
+    return { ok: true, status: 200, text: async () => '{}' };
+  };
+  t.after(() => { releaseSave?.(); delete globalThis.fetch; store.notify(null); });
+  store.state.board = { ...store.state.board, items: [], drafts: [serverDraft] };
+  const ctx = { tz: 'UTC', navigate() {}, rerender() {} };
+  const first = owed.renderOwed(ctx);
+  const area = findInput(first, n => n.tag === 'textarea');
+  area.value = 'First edit.';
+  area.fire('input');
+  area.fire('blur');
+  await settle();
+  assert.equal(puts.length, 1);
+  area.value = 'One more edit before leaving.';
+  area.fire('input');
+
+  // Navigation rebuilds the card while its previous instance still has work.
+  const rebuilt = owed.renderOwed(ctx);
+  findButton(rebuilt, 'Discard').fire('click');
+  t.mock.timers.tick(1_000);
+  await settle();
+  const sentBeforeSaveFinished = puts.length;
+  releaseSave();
+  await settle();
+  await settle();
+
+  assert.equal(sentBeforeSaveFinished, 1, 'Discard must wait for the already-running save');
+  assert.equal(puts.at(-1).state, 'discarded', 'an old debounce must never send an edit after Discard');
+  assert.equal(serverDraft.state, 'discarded');
+  assert.deepEqual(store.state.board.drafts, []);
+});
+
+test('a successful discard stays final when refreshing the board fails', async (t) => {
+  withPlainDom(t);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const owed = await import(fileUrl(UI, 'views/owed.js'));
+  const puts = [];
+  globalThis.fetch = async (reqPath, init = {}) => {
+    if (reqPath === '/api/state') {
+      return { ok: false, status: 503, text: async () => JSON.stringify({ error: 'Board temporarily unavailable' }) };
+    }
+    puts.push(JSON.parse(init.body));
+    return { ok: true, status: 200, text: async () => '{}' };
+  };
+  t.after(() => { delete globalThis.fetch; store.notify(null); });
+  store.state.board = { ...store.state.board, items: [], drafts: [{ id: 'discard-refresh-failure', state: 'pending', body: 'Original.' }] };
+  const view = owed.renderOwed({ tz: 'UTC', navigate() {}, rerender() {} });
+  const area = findInput(view, n => n.tag === 'textarea');
+  const discard = findButton(view, 'Discard');
+  area.value = 'Unsaved text that I chose to discard.';
+  area.fire('input');
+  discard.fire('click');
+  await settle();
+  // Neither the old debounce nor a later blur may reopen a successful discard.
+  t.mock.timers.tick(1_000);
+  area.fire('blur');
+  await settle();
+  assert.deepEqual(puts, [{ state: 'discarded' }]);
+  assert.deepEqual(store.state.board.drafts, []);
+  assert.equal(area.disabled, true);
+  assert.equal(discard.disabled, true);
+  assert.equal(store.state.toast.message, 'Could not refresh the board: Board temporarily unavailable');
+});
+
+test('a failed discard preserves the edited text and allows saving and retrying', async (t) => {
+  withPlainDom(t);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const owed = await import(fileUrl(UI, 'views/owed.js'));
+  let failDiscard = true;
+  const puts = [];
+  globalThis.fetch = async (reqPath, init = {}) => {
+    if (reqPath === '/api/state') return { ok: true, status: 200, text: async () => JSON.stringify({ items: [], events: [], drafts: [], notes: [], counts: {}, runs: {} }) };
+    const patch = JSON.parse(init.body);
+    puts.push(patch);
+    if (patch.state === 'discarded' && failDiscard) return { ok: false, status: 503, text: async () => JSON.stringify({ error: 'Try again later' }) };
+    return { ok: true, status: 200, text: async () => '{}' };
+  };
+  t.after(() => { delete globalThis.fetch; store.notify(null); });
+  store.state.board = { ...store.state.board, items: [], drafts: [{ id: 'discard-failure', state: 'pending', to_email: 'sam@example.com', subject: 'Reply', body: 'Original.' }] };
+  const view = owed.renderOwed({ tz: 'UTC', navigate() {}, rerender() {} });
+  const area = findInput(view, n => n.tag === 'textarea');
+  const discard = findButton(view, 'Discard');
+  area.value = 'Keep these words if discard fails.';
+  area.fire('input');
+  discard.fire('click');
+  await settle();
+  assert.equal(area.value, 'Keep these words if discard fails.');
+  assert.equal(area.disabled, false);
+  assert.equal(discard.disabled, false);
+  assert.match(store.state.toast.message, /Could not discard that draft: Try again later/);
+  area.value += ' Updated.';
+  area.fire('input');
+  area.fire('blur');
+  await settle();
+  assert.deepEqual(puts.at(-1), { body: area.value, state: 'edited' });
+  failDiscard = false;
+  discard.fire('click');
+  await settle();
+  assert.equal(puts.at(-1).state, 'discarded');
+  assert.deepEqual(store.state.board.drafts, []);
+});
+
+test('a failed discard resumes an unsaved edit held by the previous card', async (t) => {
+  withPlainDom(t);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const owed = await import(fileUrl(UI, 'views/owed.js'));
+  const { api } = await import(fileUrl(UI, 'lib/api.js'));
+  const puts = [];
+  let releaseSave;
+  t.mock.method(api, 'updateDraft', async (_id, patch) => {
+    puts.push(patch);
+    if (puts.length === 1) await new Promise(resolve => { releaseSave = resolve; });
+    if (patch.state === 'discarded') throw new Error('Try again later');
+  });
+  t.after(() => { releaseSave?.(); store.notify(null); });
+  store.state.board = { ...store.state.board, items: [], drafts: [{ id: 'discard-old-failure', state: 'pending', body: 'Original.' }] };
+  const ctx = { tz: 'UTC', navigate() {}, rerender() {} };
+  const area = findInput(owed.renderOwed(ctx), n => n.tag === 'textarea');
+  area.value = 'First edit.';
+  area.fire('input');
+  area.fire('blur');
+  await settle();
+  area.value = 'The most recent words must survive.';
+  area.fire('input');
+  const rebuilt = owed.renderOwed(ctx);
+  findButton(rebuilt, 'Discard').fire('click');
+  t.mock.timers.tick(1_000);
+  releaseSave();
+  await settle();
+  await settle();
+  assert.match(store.state.toast.message, /Could not discard/);
+  assert.deepEqual(puts.at(-1), { body: 'The most recent words must survive.', state: 'edited' });
+  assert.equal(store.state.board.drafts[0].body, 'The most recent words must survive.');
+});
+
 /** A fetch for the board-row tests below: records every call, answers /api/state with an empty board. */
 const rowFetch = (calls) => async (reqPath, init = {}) => {
   calls.push({ method: init.method || 'GET', path: reqPath, body: init.body ? JSON.parse(init.body) : null });
@@ -3796,7 +4036,7 @@ test('the snooze menu prints each promise and can be told a day of your own', as
   findButton(row, 'Snooze').fire('click');
 
   // The three fixed choices say when, before the click.
-  assert.equal(findButtons(row, /^Later today · \d{1,2}(:\d{2})? [AP]M$/).length, 1, 'Later today does not print its clock');
+  assert.equal(findButtons(row, /^In 4 hours · (?:\w{3}, \w{3} \d{1,2} )?\d{1,2}(:\d{2})? [AP]M$/).length, 1, 'the four-hour choice does not print its deadline');
   assert.equal(findButtons(row, /^Tomorrow morning · 9 AM$/).length, 1);
   assert.equal(findButtons(row, /^Next week · \w{3}, \w{3} \d{1,2} 9 AM$/).length, 1);
 
@@ -3820,6 +4060,128 @@ test('the snooze menu prints each promise and can be told a day of your own', as
   assert.match(post.body.until, new RegExp(`^${picked}T09:00:00[-+]\\d{2}:\\d{2}$`),
     'the promise is 9:00 that morning, carrying the configured zone');
   assert.equal(ui.dayKey(post.body.until), picked);
+});
+
+test('connection status keeps successful read times separate from failures, paused and never-checked sources', async (t) => {
+  withPlainDom(t);
+  globalThis.fetch = plainFetch({});
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const settings = await import(fileUrl(UI, 'views/settings.js'));
+  const now = await import(fileUrl(UI, 'views/now.js'));
+  t.after(() => { delete globalThis.fetch; });
+  store.state.config = { identity: { timezone: 'UTC' }, model: {}, mail: [{ id: 'm1', label: 'Studio mail', user: 'sam@example.com' }], calendars: [{ id: 'c1', label: 'Team calendar', kind: 'ics' }], sources: [{ id: 's1', label: 'Paused tasks', type: 'todoist', enabled: false }, { id: 's2', label: 'New tasks', type: 'linear' }] };
+  store.state.health = { model: { configured: true } };
+  store.state.sweep = { running: false, error: null };
+  store.state.board = { ...store.state.board, items: [], notes: [], events: [], counts: {}, finished: [], runs: {}, sourceStatus: [
+    { id: 'm1', kind: 'mail', configKey: 'mail', label: 'Studio mail', enabled: true, ok: false, lastAttemptAt: '2026-09-09T18:00:00Z', lastSuccessAt: '2026-09-08T15:00:00Z', error: 'Sign in again', retryAt: '2026-09-10T18:00:00Z' },
+    { id: 'c1', kind: 'calendar', configKey: 'calendars', label: 'Team calendar', enabled: true, ok: true, lastAttemptAt: '2026-09-09T18:00:00Z', lastSuccessAt: '2026-09-09T18:00:00Z', error: null },
+    { id: 's1', kind: 'todoist', configKey: 'sources', label: 'Paused tasks', enabled: false, ok: false, lastAttemptAt: null, lastSuccessAt: null, error: 'Old problem' },
+    { id: 's2', kind: 'linear', configKey: 'sources', label: 'New tasks', enabled: true, ok: null, lastAttemptAt: null, lastSuccessAt: null, error: null },
+  ] };
+  const mail = settings.mailPanel();
+  assert.match(onScreen(mail), /Needs attention/);
+  assert.match(onScreen(mail), /Last successful read: Tue, Sep 8, 2026 · 3 PM/);
+  assert.match(onScreen(mail), /Last tried: Wed, Sep 9, 2026 · 6 PM/);
+  assert.match(onScreen(mail), /Sign in again/);
+  assert.match(onScreen(mail), /Can retry after: Thu, Sep 10, 2026 · 6 PM/);
+  assert.match(onScreen(settings.calendarPanel()), /Read successfully.*Last successful read: Wed, Sep 9, 2026 · 6 PM/);
+  const sources = onScreen(settings.sourcesPanel());
+  assert.match(sources, /Paused tasks.*Paused/);
+  assert.match(sources, /New tasks.*Not checked yet/);
+  assert.doesNotMatch(sources, /Old problem/);
+  const paths = [];
+  const board = now.renderNow({ tz: 'UTC', navigate: path => paths.push(path) });
+  assert.match(onScreen(board), /Reading status/);
+  assert.match(onScreen(board), /Studio mail.*Sign in again/);
+  findButton(board, 'Review connection').fire('click');
+  assert.deepEqual(paths, ['#/settings/mail']);
+});
+
+test('an older server never invents a successful read time for missing or failed source reports', async (t) => {
+  withPlainDom(t);
+  globalThis.fetch = plainFetch({});
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const settings = await import(fileUrl(UI, 'views/settings.js'));
+  t.after(() => { delete globalThis.fetch; });
+  store.state.config = { identity: { timezone: 'UTC' }, mail: [{ id: 'legacy', label: 'Older mail', user: 'sam@example.com' }], calendars: [], sources: [] };
+  store.state.board = { ...store.state.board, sourceStatus: undefined, runs: { last: { ok: true, ended_at: '2026-09-09T18:00:00Z', stats: { sources: [{ id: 'legacy', kind: 'mail', ok: false, error: 'Password refused' }] } } } };
+  const failed = onScreen(settings.mailPanel());
+  assert.match(failed, /Needs attention.*No successful read time recorded.*Last tried: Wed, Sep 9, 2026 · 6 PM/);
+  store.state.board.runs.last.stats.sources = [];
+  const missing = onScreen(settings.mailPanel());
+  assert.match(missing, /No reading result available/);
+  assert.doesNotMatch(missing, /Read successfully|Last successful read:|Last tried:/);
+});
+
+test('custom snooze dates reject past and impossible days with recoverable feedback', async (t) => {
+  withPlainDom(t);
+  const calls = [];
+  globalThis.fetch = rowFetch(calls);
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const items = await import(fileUrl(UI, 'lib/items.js'));
+  const priorConfig = store.state.config;
+  store.state.config = { identity: { timezone: 'UTC' } };
+  t.after(() => { store.state.config = priorConfig; delete globalThis.fetch; store.notify(null); });
+  const row = items.itemRow({ id: 'invalid-snooze', bucket: 'now', state: 'open', headline: 'Call Sam' }, { tz: 'UTC' });
+  plainWalk(row).find(n => n.attributes.class === 'disclosure').fire('click');
+  findButton(row, 'Snooze').fire('click');
+  findButton(row, 'Pick a day…').fire('click');
+  const day = findInput(row, n => n.attributes.type === 'date');
+  const confirm = findButton(row, 'Back that morning · 9 AM');
+  for (const invalid of [ui.todayKey('UTC'), '2099-02-31', 'not a date']) {
+    day.value = invalid;
+    day.fire('input');
+    assert.equal(confirm.disabled, true, `${invalid} must not enable snoozing`);
+    assert.equal(day.attributes['aria-invalid'], 'true');
+    assert.match(onScreen(row), /Choose a valid date from tomorrow onward/);
+    confirm.fire('click');
+    await settle();
+  }
+  assert.equal(calls.length, 0, 'an invalid date must not reach the server');
+  day.value = ui.addDaysToKey(ui.todayKey('UTC'), 2);
+  day.fire('input');
+  assert.equal(confirm.disabled, false);
+  assert.equal(day.attributes['aria-invalid'], 'false');
+  assert.doesNotMatch(onScreen(row), /Choose a valid date/);
+  confirm.fire('click');
+  await settle();
+  assert.equal(calls.filter(c => c.method === 'POST').length, 1);
+});
+
+test('finished items offer clear Restore and Reopen actions, and reopening has an accurate accessible name', async (t) => {
+  withPlainDom(t);
+  const calls = [];
+  globalThis.fetch = rowFetch(calls);
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const items = await import(fileUrl(UI, 'lib/items.js'));
+  t.after(() => { delete globalThis.fetch; store.notify(null); });
+  const done = items.itemRow({ id: 'restore-done', bucket: 'now', state: 'done', headline: 'Sent the survey' }, { tz: 'UTC' });
+  const dismissed = items.itemRow({ id: 'restore-dismissed', bucket: 'now', state: 'dismissed', headline: 'A real request' }, { tz: 'UTC' });
+  const tick = plainWalk(done).find(n => n.attributes.role === 'checkbox');
+  assert.equal(tick.attributes['aria-label'], 'Reopen: Sent the survey');
+  for (const [row, label] of [[done, 'Reopen'], [dismissed, 'Restore']]) {
+    const restore = findButton(row, label);
+    assert.ok(restore, `${label} should be visible without opening More`);
+    assert.equal(plainHidden(restore), false);
+    restore.fire('click');
+    await settle();
+  }
+  assert.deepEqual(calls.filter(c => c.method === 'POST').map(c => [c.path, c.body]), [
+    ['/api/items/restore-done/state', { state: 'open' }],
+    ['/api/items/restore-dismissed/state', { state: 'open' }],
+  ]);
+});
+
+test('inactive finished tasks explain why they cannot be restored onto the current board', async (t) => {
+  withPlainDom(t);
+  const items = await import(fileUrl(UI, 'lib/items.js'));
+  const row = items.itemRow({ id: 'old-finished-task', state: 'done', bucket: 'now', headline: 'An old task', sourceInactive: true }, { tz: 'UTC' });
+  const tick = plainWalk(row).find(n => n.attributes.role === 'checkbox');
+  assert.equal(tick.attributes.disabled, '');
+  assert.equal(findButton(row, 'Restore'), undefined);
+  assert.equal(findButton(row, 'Reopen'), undefined);
+  assert.equal(plainWalk(row).some(n => n.attributes.class === 'disclosure'), false);
+  assert.match(onScreen(row), /No longer in task selection.*include this task in your source selection again/);
 });
 
 test('a row and the hero wear "new" and their source at the end of the line', async (t) => {
@@ -3995,6 +4357,81 @@ test('the guided AI card stores the key, tests, picks the model itself, saves an
  * answered begin/status with the resolved `clientId`; these tests pin that
  * the blocks pick it up and that the saved account is self-describing.
  */
+test('the guided AI setup keeps a refused key recoverable and advances only after a successful retry', async (t) => {
+  withPlainDom(t);
+  const calls = [];
+  const base = plainFetch({ presets: await llmPresets(), calls });
+  let refused = true;
+  globalThis.fetch = async (reqPath, init = {}) => {
+    if (reqPath === '/api/model/test' && refused) return { ok: true, status: 200, text: async () => JSON.stringify({ ok: false, error: 'That key was refused. Try a new key.' }) };
+    return base(reqPath, init);
+  };
+  t.after(() => { delete globalThis.fetch; });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const settings = await import(fileUrl(UI, 'views/settings.js'));
+  store.state.config = { identity: {}, model: {}, mail: [], calendars: [], sources: [] };
+  store.state.health = { model: { configured: false } };
+  store.state.secretRefs = [];
+  let advances = 0;
+  const panel = settings.modelPanel({ compact: true, onDone: () => { advances += 1; } });
+  await settle();
+  findButtons(panel, /^Claude, by Anthropic/)[0].fire('click');
+  const key = findInput(panel, n => n.attributes.type === 'password');
+  key.value = 'refused-test-key';
+  findButton(panel, 'Check it works').fire('click');
+  await settle();
+  assert.match(onScreen(panel), /That key was refused/);
+  assert.equal(advances, 0);
+  assert.equal(calls.some(c => c.method === 'PUT'), false);
+  refused = false;
+  key.value = 'replacement-test-key';
+  findButton(panel, 'Check it works').fire('click');
+  await settle();
+  assert.match(onScreen(panel), /Working\. Zelos will use Claude/);
+  assert.equal(advances, 1);
+  assert.deepEqual(calls.filter(c => c.path === '/api/secrets').map(c => c.body.value), ['refused-test-key', 'replacement-test-key']);
+});
+
+test('email setup can retry a refused connection with a replacement password and the same address', async (t) => {
+  withPlainDom(t);
+  const calls = [];
+  const base = plainFetch({ guesses: GUESSES, calls });
+  let refused = true;
+  globalThis.fetch = async (reqPath, init = {}) => {
+    if (reqPath === '/api/mail/test') return { ok: true, status: 200, text: async () => JSON.stringify(refused
+      ? { ok: false, error: 'That password was refused. Try a new password.' }
+      : { ok: true, mailboxes: [{ name: 'INBOX' }, { name: 'Sent', specialUse: 'sent' }] }) };
+    return base(reqPath, init);
+  };
+  t.after(() => { delete globalThis.fetch; });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const settings = await import(fileUrl(UI, 'views/settings.js'));
+  store.state.config = { identity: {}, model: {}, mail: [], calendars: [], sources: [] };
+  store.state.secretRefs = [];
+  let advances = 0;
+  const form = settings.simpleMailForm({ onSaved: () => { advances += 1; }, onCancel() {} });
+  const email = findInput(form, n => n.attributes.type === 'email');
+  email.value = 'frank@icloud.com';
+  email.fire('change');
+  await settle();
+  const password = findInput(form, n => n.attributes.type === 'password');
+  password.value = 'refused-test-password';
+  findButton(form, 'Connect').fire('click');
+  await settle();
+  assert.match(onScreen(form), /That password was refused/);
+  assert.equal(advances, 0);
+  assert.equal(email.value, 'frank@icloud.com');
+  assert.equal(calls.some(c => c.method === 'PUT'), false);
+  refused = false;
+  password.value = 'replacement-test-password';
+  findButton(form, 'Connect').fire('click');
+  await settle();
+  assert.match(onScreen(form), /Connected · 2 mailboxes/);
+  assert.equal(advances, 1);
+  assert.equal(store.state.config.mail[0].user, 'frank@icloud.com');
+  assert.deepEqual(calls.filter(c => c.path === '/api/secrets').map(c => c.body.value), ['refused-test-password', 'replacement-test-password']);
+});
+
 test('the simple card saves the client a Google sign-in ran against, not the empty field it never showed', async (t) => {
   withPlainDom(t);
   const RESOLVED = '4242-zelos.apps.googleusercontent.com';
@@ -4427,6 +4864,90 @@ test('no user-facing failure names an address the person did not type, and the b
  * does not see as text. The expert's words are still there: the sharing panel
  * keeps both settings-file blocks under "For experts: connecting it".
  */
+test('Search explicitly includes task history and never links inactive hits to missing board rows', async (t) => {
+  withPlainDom(t);
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const search = await import(`${fileUrl(UI, 'views/search.js')}?task-history-test`);
+  const calls = [];
+  globalThis.fetch = async reqPath => {
+    const url = new URL(reqPath, 'http://127.0.0.1');
+    calls.push(url);
+    return { ok: true, status: 200, text: async () => JSON.stringify({ results: url.searchParams.get('includeHistory') === '1'
+      ? [{ ref: 'item:old-task', kind: 'item', title: 'Old task', excerpt: 'The retained task history.', sourceInactive: true }]
+      : [] }) };
+  };
+  t.after(() => { delete globalThis.fetch; });
+  // Even a stale board payload must not lend a historical hit a dead link.
+  store.state.board = { ...store.state.board, items: [{ id: 'old-task', state: 'open', bucket: 'now' }], events: [] };
+  const view = search.renderSearch({ navigate() {} });
+  const field = findInput(view, n => n.attributes.type === 'search');
+  const form = plainWalk(view).find(n => n.tag === 'form');
+  field.value = 'task';
+  form.fire('submit');
+  await settle();
+  assert.equal(calls[0].searchParams.has('includeHistory'), false);
+  const history = findInput(view, n => n.attributes.type === 'checkbox');
+  assert.ok(history, 'the retained task history must be reachable');
+  history.checked = true;
+  history.fire('change');
+  await settle();
+  assert.equal(calls.at(-1).searchParams.get('includeHistory'), '1');
+  assert.match(onScreen(view), /Old task.*retained task history.*No longer in task selection/);
+  assert.equal(findButton(view, 'Open on the board'), undefined);
+  history.checked = false;
+  history.fire('change');
+  await settle();
+  assert.equal(calls.at(-1).searchParams.has('includeHistory'), false);
+  assert.doesNotMatch(onScreen(view), /Old task/);
+});
+
+test('Ask labels a response cut short by its answer limit and keeps that notice out of Copy', async (t) => {
+  withPlainDom(t);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const ask = await import(`${fileUrl(UI, 'views/ask.js')}?answer-limit-test`);
+  const realNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  let copied;
+  Object.defineProperty(globalThis, 'navigator', { value: { clipboard: { writeText: async text => { copied = text; } } }, configurable: true });
+  t.after(() => {
+    delete globalThis.fetch;
+    if (realNavigator) Object.defineProperty(globalThis, 'navigator', realNavigator); else delete globalThis.navigator;
+  });
+  let stopReason = 'length';
+  globalThis.fetch = async reqPath => {
+    assert.equal(reqPath, '/api/ask');
+    return new Response(`event: sources\ndata: ${JSON.stringify([{ ref: 'msg:old-task', kind: 'message', title: 'Old task', sourceInactive: true }, { ref: 'msg:current', kind: 'message', title: 'Current mail', sourceInactive: false }])}\n\nevent: delta\ndata: ${JSON.stringify({ text: 'The reply so far' })}\n\nevent: done\ndata: ${JSON.stringify({ stopReason })}\n\n`);
+  };
+  store.state.health = { model: { configured: true } };
+  const view = ask.renderAsk({ navigate() {} });
+  const field = findInput(view, n => n.attributes['aria-label'] === 'Your question');
+  const form = plainWalk(view).find(n => n.tag === 'form');
+  field.value = 'What happened?';
+  form.fire('submit');
+  await settle();
+  const exchange = plainWalk(view).find(n => n.attributes.class === 'exchange');
+  const answer = plainWalk(exchange).find(n => n.attributes.class === 'answer');
+  const note = plainWalk(exchange).find(n => n.attributes.class === 'exchange-note-slot');
+  const sources = plainWalk(exchange).find(n => n.attributes.class === 'sources-slot');
+  assert.equal((textOf(sources).match(/No longer in task selection/g) || []).length, 1, 'historical task evidence must be visibly labelled separately from current mail');
+  assert.equal(textOf(answer), 'The reply so far');
+  assert.match(textOf(note), /answer limit.*may be incomplete/);
+  assert.equal(answer.attributes['aria-busy'], 'false');
+  // Reflect the real DOM's descendant textContent for the clipboard read.
+  Object.defineProperty(answer, 'textContent', { get: () => answer.children.map(textOf).join('') });
+  findButton(exchange, 'Copy').fire('click');
+  await settle();
+  assert.equal(copied, 'The reply so far');
+  assert.equal(findButton(view, 'Ask').disabled, false);
+
+  stopReason = 'stop';
+  field.value = 'And next?';
+  form.fire('submit');
+  await settle();
+  const next = plainWalk(view).find(n => n.attributes.class === 'exchange');
+  assert.equal(textOf(plainWalk(next).find(n => n.attributes.class === 'exchange-note-slot')), '', 'a normal answer must not get the warning');
+});
+
 test('Ask, Search, the Calendar and the sharing panel meet a first-timer without a word from the engine', async (t) => {
   withPlainDom(t);
   const STRAGGLERS = /IMAP|CalDAV|endpoint|keychain|config\.json|MCP|token|model\b|sweep/i;
@@ -4983,6 +5504,6 @@ test('Your data counts what Zelos is holding, and stands unchanged when the rout
   };
   const bare = settings.renderSettings({ sub: 'data', navigate() {}, rerender() {} });
   await settle();
-  assert.match(onScreen(bare), /Everything Zelos knows is in one folder on this computer\./);
+  assert.match(onScreen(bare), /Your board and saved history live in one folder on this computer\./);
   assert.doesNotMatch(onScreen(bare), /on disk/, 'a panel with no answer must not claim a size');
 });

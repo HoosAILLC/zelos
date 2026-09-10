@@ -11,3 +11,8 @@ undefined/
 # Build output and dependencies (desktop shell only; the app itself has none)
 node_modules/
 desktop/dist/
+
+# Generated website and release assets
+.site-dist/
+release-assets/
+.netlify/

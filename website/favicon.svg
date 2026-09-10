@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="32" height="32" role="img" aria-label="Zelos">
+<title>Zelos</title>
+
+<defs>
+  <linearGradient id="gold" x1="300" y1="120" x2="740" y2="880" gradientUnits="userSpaceOnUse">
+    <stop offset="0" stop-color="#F0D9A0"/>
+    <stop offset=".45" stop-color="#C9A24D"/>
+    <stop offset="1" stop-color="#8A671F"/>
+  </linearGradient>
+  <linearGradient id="goldDeep" x1="340" y1="180" x2="660" y2="560" gradientUnits="userSpaceOnUse">
+    <stop offset="0" stop-color="#C9A24D"/>
+    <stop offset="1" stop-color="#8A671F"/>
+  </linearGradient>
+  <!-- The foliage sits between the ring and the shadow. Sharing the main gold
+       bleached the left branch to near-white, because that gradient's light
+       stop is in the top-left corner, and the wreath then outshouted the ring
+       it is supposed to sit inside. -->
+  <linearGradient id="goldLeaf" x1="240" y1="240" x2="800" y2="820" gradientUnits="userSpaceOnUse">
+    <stop offset="0" stop-color="#D9B86A"/>
+    <stop offset=".5" stop-color="#BE9440"/>
+    <stop offset="1" stop-color="#8A671F"/>
+  </linearGradient>
+  <clipPath id="disc"><circle cx="512" cy="470" r="286"/></clipPath>
+</defs>
+<rect width="1024" height="1024" fill="#000000"/>
+<circle cx="512" cy="470" r="392" fill="none" stroke="url(#gold)" stroke-width="34"/>
+<g clip-path="url(#disc)" transform="translate(512 470) scale(1.24) translate(-512 -470)">
+  <path d="
+M 404 664 C 424 636 452 618 486 610
+C 520 602 556 610 584 630
+C 626 660 668 700 712 738
+C 744 766 780 788 812 800
+L 240 800 L 240 742
+C 288 716 348 690 404 664 Z" fill="url(#goldDeep)"/>
+  <path d="
+M 508 528 C 512 566 508 592 496 608
+C 470 616 442 626 418 642 L 636 642
+C 612 622 592 596 586 566 C 584 552 584 540 586 530
+C 562 552 530 550 508 528 Z" fill="url(#gold)"/>
+  <path d="
+M 598 286
+C 618 308 630 338 633 366
+C 634 375 629 378 631 387
+C 639 406 652 425 657 439
+C 660 448 651 452 641 452
+C 634 452 631 454 631 460
+C 631 468 623 471 616 473
+C 625 478 631 483 631 491
+C 631 501 622 503 618 509
+C 616 521 603 535 585 543
+C 559 553 527 553 503 545
+C 471 533 452 507 444 475
+C 436 441 438 403 448 369
+C 463 323 508 288 556 282
+C 572 280 587 281 598 286 Z" fill="url(#gold)"/>
+  <g fill="url(#goldDeep)"><circle cx="566" cy="268" r="46"/><circle cx="512" cy="276" r="44"/><circle cx="470" cy="300" r="40"/><circle cx="444" cy="336" r="38"/><circle cx="434" cy="378" r="36"/><circle cx="436" cy="418" r="34"/><circle cx="446" cy="452" r="32"/><circle cx="604" cy="292" r="38"/><circle cx="618" cy="322" r="30"/><circle cx="540" cy="258" r="38"/><circle cx="488" cy="262" r="34"/><circle cx="462" cy="428" r="28"/><circle cx="458" cy="468" r="26"/><circle cx="478" cy="496" r="24"/></g>
+</g>
+</svg>

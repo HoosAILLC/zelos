@@ -150,6 +150,7 @@ let resultsSlot = null;
 let navigateTo = null;
 let timer = null;
 let inFlight = null;
+let includeHistory = false;
 
 /**
  * What the results region is currently showing. `query` is the query the
@@ -188,7 +189,7 @@ function openControl(dest) {
 }
 
 function hitRow(result, board) {
-  const dest = destinationFor(result.ref, board);
+  const dest = result.sourceInactive ? null : destinationFor(result.ref, board);
   const title = String(result.title || '').trim();
   return el('article', { class: 'hit' }, [
     el('div', { class: 'hit-head' }, [
@@ -196,6 +197,7 @@ function hitRow(result, board) {
       el('h3', { class: 'hit-title', text: title || '(no title)' }),
     ]),
     result.excerpt ? el('p', { class: 'hit-excerpt', text: String(result.excerpt) }) : null,
+    result.sourceInactive ? el('p', { class: 'hit-meta mono', text: 'No longer in task selection' }) : null,
     metaLine(dest),
     dest ? el('div', { class: 'hit-tools' }, openControl(dest)) : null,
   ]);
@@ -304,7 +306,7 @@ async function run(text) {
   paint();
 
   try {
-    const res = await api.search(q, { limit: LIMIT, signal: mine.signal });
+    const res = await api.search(q, { limit: LIMIT, signal: mine.signal, includeHistory });
     if (inFlight !== mine) return;
     found = {
       status: 'done',
@@ -364,6 +366,13 @@ function build() {
 
   const form = el('form', { class: 'search-form', role: 'search' }, [
     field,
+    el('label', { class: 'check-row' }, [
+      el('input', {
+        class: 'checkbox', type: 'checkbox',
+        onchange() { includeHistory = this.checked; run(field.value); },
+      }),
+      el('span', { class: 'check-label', text: 'Include task history' }),
+    ]),
     el('div', { class: 'search-actions' }, [
       el('button', { type: 'submit', class: 'btn solid', text: 'Search' }),
       el('span', { class: 'search-hint mono', text: 'esc clears' }),

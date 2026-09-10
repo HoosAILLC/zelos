@@ -50,6 +50,7 @@ let step = 'start';
  * somebody clicks.
  */
 let sampleState = null;     // null = not asked yet | {supported:false} | {supported:true, ...status}
+let sampleError = '';
 
 function go(stepId, rerender) {
   step = stepId;
@@ -160,6 +161,7 @@ async function readSampleState() {
 }
 
 async function loadSample(rerender, navigate) {
+  sampleError = '';
   try {
     await sampleApi.load();
     sampleState = null;
@@ -167,19 +169,20 @@ async function loadSample(rerender, navigate) {
     notify('The made-up week is loaded. Every row is marked, and one click removes it.', { tone: 'info' });
     finish(navigate);
   } catch (err) {
-    notify(`Could not load the made-up data: ${err.message}`, { tone: 'warn' });
+    sampleError = `Could not load the made-up data: ${err.message}`;
     rerender();
   }
 }
 
 async function clearSample(rerender) {
+  sampleError = '';
   try {
     await sampleApi.clear();
     sampleState = null;
     await refresh({ silent: true });
     notify('The made-up data is gone. Nothing else was touched.', { tone: 'info' });
   } catch (err) {
-    notify(`Could not clear the made-up data: ${err.message}`, { tone: 'warn' });
+    sampleError = `Could not clear the made-up data: ${err.message}`;
   }
   rerender();
 }
@@ -215,12 +218,26 @@ function startScreen(rerender, navigate) {
     // build ships one, and bare when it does not.
     const row = [button('Set up Zelos', { class: 'btn solid', onClick: () => go('model', rerender) })];
     if (sample && !sample.installed) {
-      row.push(button('Look around with made-up data first', { class: 'btn quiet', onClick: () => loadSample(rerender, navigate) }));
+      row.push(button('Look around with made-up data first', {
+        class: 'btn quiet',
+        onClick: async (e) => { e.currentTarget.disabled = true; await loadSample(rerender, navigate); },
+      }));
     } else if (sample && sample.installed) {
       row.push(button('Look around', { class: 'btn quiet', onClick: () => finish(navigate) }));
       row.push(button('Clear the made-up data', { class: 'link', onClick: () => clearSample(rerender) }));
     } else {
       row.push(button('Look around first', { class: 'btn quiet', onClick: () => finish(navigate) }));
+      if (sampleState?.error) {
+        row.push(button('Retry sample data', {
+          class: 'btn quiet',
+          onClick: async (e) => {
+            e.currentTarget.disabled = true;
+            sampleState = null;
+            await readSampleState();
+            paintActions();
+          },
+        }));
+      }
     }
     actions.replaceChildren(...row);
 
@@ -233,7 +250,10 @@ function startScreen(rerender, navigate) {
       }));
     } else if (sampleState && sampleState.error) {
       sampleNote.replaceChildren(el('p', { class: 'quiet-note', text: `The made-up data is not available: ${sampleState.error}` }));
+    } else {
+      sampleNote.replaceChildren();
     }
+    if (sampleError) sampleNote.appendChild(el('p', { class: 'quiet-note is-bad', role: 'alert', text: sampleError }));
   };
 
   paintActions();

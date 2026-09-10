@@ -63,6 +63,13 @@ export function createLogger({ dir = null, level = 'info', stream = process.stde
     try {
       fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
       file = fs.createWriteStream(path.join(dir, `${name}.log`), { flags: 'a', mode: 0o600 });
+      // Opening and writing a stream can fail after createWriteStream returns.
+      // A missing log destination must not become an unhandled error that
+      // brings down the board. Keep the terminal sink available for diagnosis.
+      file.on('error', (err) => {
+        file = null;
+        emit('warn', 'File logging is unavailable; continuing with terminal diagnostics', { error: err.message });
+      });
     } catch {
       file = null; // logging must never be the reason the app fails to start
     }
@@ -94,7 +101,11 @@ export function createLogger({ dir = null, level = 'info', stream = process.stde
         child(p2) { return this; },
       };
     },
-    close() { try { file?.end(); } catch { /* ignore */ } },
+    close() {
+      const closing = file;
+      file = null;
+      try { closing?.end(); } catch { /* ignore */ }
+    },
   };
 }
 

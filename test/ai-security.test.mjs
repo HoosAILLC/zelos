@@ -91,15 +91,15 @@ const C = Object.freeze({
 });
 
 let seq = 0;
-function freshDb() {
-  const db = dbm.open(path.join(SANDBOX, `t${seq++}.db`));
+function freshDb({ memory = false } = {}) {
+  const db = dbm.open(memory ? ':memory:' : path.join(SANDBOX, `t${seq++}.db`));
   dbm.migrate(db);
   OPEN_DBS.push(db);
   return db;
 }
 
-function seeded() {
-  const db = freshDb();
+function seeded(options) {
+  const db = freshDb(options);
   const msgId = dbm.upsertMessage(db, {
     sourceId: 'm_work',
     uid: 4471,
@@ -253,7 +253,14 @@ describe('scope escape: with mail.bodies off, nothing gets a body out', () => {
   ];
 
   test('every scope combination, every tool, every hostile argument', async () => {
-    const { db, itemId, msgId } = seeded();
+    // This matrix tests grants and response filtering, not disk durability.
+    // Keep SQLite, FTS, and every real audit INSERT, but avoid thousands of
+    // WAL flushes that used up the file's timeout on Windows CI. All other
+    // fixtures still use temporary files, including the reopen test below.
+    const { db, itemId, msgId } = seeded({ memory: true });
+    assert.equal(db.prepare('PRAGMA database_list').all().find((row) => row.name === 'main').file, '');
+    assert.ok(dbm.getMessage(db, msgId).body.includes(C.body));
+    assert.ok(dbm.search(db, 'canarymessagebody', { limit: 5 }).length > 0);
     /* Everything except mail.bodies, which is the scope under test. */
     const OTHERS = ['board', 'calendar', 'mail.metadata', 'drafts', 'people'];
     const tools = mcp.TOOLS.map((t) => t.name);
@@ -292,7 +299,9 @@ describe('scope escape: with mail.bodies off, nothing gets a body out', () => {
         }
       }
     }
-    assert.ok(calls > 3_000, `the sweep only made ${calls} calls — it is not covering what it claims`);
+    assert.equal(calls, 4_256, 'all 32 scope combinations × 7 tools × 19 argument shapes must run');
+    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM ai_access_log').get().n, calls,
+      'each permitted or refused call must still execute its real audit write');
   });
 
   test('the body IS there, so the sweep above is not looking at an empty database', async () => {
@@ -313,6 +322,26 @@ describe('scope escape: with mail.bodies off, nothing gets a body out', () => {
     assert.ok(JSON.stringify(res).includes(C.itemWhy));
     assert.equal(JSON.stringify(res).includes(C.itemPayload), false);
   });
+});
+
+test('disk fixtures preserve audited reads across a database reopen', async () => {
+  const { db, msgId } = seeded();
+  const file = db.prepare('PRAGMA database_list').all().find((row) => row.name === 'main').file;
+  assert.ok(file, 'integration fixtures must still use real temporary databases');
+  assert.equal(fs.realpathSync(path.dirname(file)), fs.realpathSync(SANDBOX));
+  assert.equal(db.prepare('PRAGMA journal_mode').get().journal_mode, 'wal');
+  const response = await mcp.handle(callRpc('zelos_thread', { messageId: msgId }), {
+    db, config: cfg(['mail.metadata', 'mail.bodies']),
+  });
+  assert.ok(JSON.stringify(response).includes(C.body));
+  const before = mcp.listAccessLog(db);
+  assert.equal(before.length, 1);
+  dbm.close(db);
+
+  const reopened = dbm.open(file);
+  OPEN_DBS.push(reopened);
+  assert.deepEqual(mcp.listAccessLog(reopened), before);
+  assert.equal(JSON.stringify(before).includes(C.body), false);
 });
 
 /* ================================================================== *

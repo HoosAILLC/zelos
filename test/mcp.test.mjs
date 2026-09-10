@@ -172,6 +172,29 @@ function cfg(scopes = ALL_ON, over = {}) {
   };
 }
 
+test('direct historical item reads label inactive task evidence without widening body access', async () => {
+  const db = freshDb();
+  const raw = message({ sourceId: 'tasks', uid: undefined, messageId: 'todoist:task:one', subject: 'Historical obligation' });
+  const task = dbm.upsertMessage(db, raw);
+  const item = dbm.upsertItem(db, { key: 'historical-task', bucket: 'today', headline: 'Historical obligation', sourceRefs: [`msg:${task.id}`] });
+  dbm.reconcileTaskActivity(db, { sourceId: 'tasks', prefix: 'todoist:task:', selection: 'current', rows: [], complete: true, now: '2026-09-09T14:00:00Z' });
+  const ctx = { db, config: cfg(ALL_ON_NO_BODIES) };
+  const board = await call(ctx, 'zelos_board');
+  assert.equal(board.result.structuredContent.items.length, 0);
+  const result = await call(ctx, 'zelos_item', { id: item.id });
+  const content = result.result.structuredContent;
+  assert.equal(content.item.state, 'open', 'the original user state is retained');
+  assert.equal(content.item.sourceInactive, true);
+  assert.equal(content.sources[0].message.taskActivity, 'inactive');
+  assert.equal(content.sources[0].message.taskObservedAt, '2026-09-09T14:00:00Z');
+  assert.equal(content.sources[0].message.taskInactiveReason, 'not_in_current_selection');
+  assert.ok(!JSON.stringify(result).includes(BODY_CANARY));
+  dbm.reconcileTaskActivity(db, { sourceId: 'tasks', prefix: 'todoist:task:', selection: 'current', rows: [raw], complete: true });
+  const reopened = await call(ctx, 'zelos_item', { id: item.id });
+  assert.equal(reopened.result.structuredContent.item.sourceInactive, false);
+  assert.equal(reopened.result.structuredContent.sources[0].message.taskActivity, 'active');
+});
+
 const rpc = (method, params, id = 1) => ({ jsonrpc: '2.0', id, method, ...(params ? { params } : {}) });
 
 async function call(ctx, name, args = {}, id = 1) {

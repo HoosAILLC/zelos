@@ -148,6 +148,9 @@ messages(id TEXT PRIMARY KEY,       -- sha256(sourceId|uid|messageId) hex, 16 ch
          subject TEXT, sent_at TEXT,              -- ISO8601 with offset
          snippet TEXT, body TEXT, has_attach INTEGER,
          flags_json TEXT, fetched_at TEXT)
+task_activity(message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+              source_id TEXT, activity TEXT,     -- 'active' | 'inactive'
+              selection_key TEXT, observed_at TEXT, inactive_reason TEXT)
 events(id TEXT PRIMARY KEY,          -- sha256(calendarId|uid|recurrenceId)
        calendar_id TEXT, uid TEXT, recurrence_id TEXT,
        title TEXT, description TEXT, location TEXT,
@@ -170,6 +173,23 @@ search USING fts5(title, body, ref UNINDEXED, kind UNINDEXED, tokenize='porter u
 
 `bucket` is a closed set: `now | today | soon | waiting | promised | note | money`.
 `severity` is 0–3. Buckets and severities are validated in code, not trusted from the model.
+
+Schema 3 tracks task selection membership separately from historical message content.
+A task connector opts in with a `taskPrefix` namespace and returns
+`taskSnapshot: { selection, complete }` beside its parts. `selection` identifies the
+configured filter/horizon; the sweep stores its hash. A capped, partial, failed, or
+malformed read must not claim completeness. An observed task is active; an absent
+task becomes inactive only after a complete replacement selection is read. Absence
+means `not_in_current_selection`, not proof that a task was completed or deleted.
+
+Inactive task messages and items supported entirely by inactive task references are
+excluded from the active board, counts, default drafts, message lists, and sweep
+context. Their text and user decisions remain stored. Search can include them with
+`includeInactive:true`; those hits and resolved items carry `sourceInactive:true`.
+Resolved messages expose `task_activity`, `task_observed_at`, and
+`task_inactive_reason`. Reappearance restores source activity without reopening an
+item the user marked done or dismissed. Ordinary mail and mixed-source obligations
+are unaffected. Deleting a stored message also deletes its activity metadata.
 
 ## 3. `core/llm.mjs` — the model adapter
 

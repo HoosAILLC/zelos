@@ -60,16 +60,15 @@ one-time, ten-minute registration at Microsoft's site is the way in until Zelos 
 what Google's review of them costs.
 
 ```bash
-zelos              # run it — this is the one you want
-zelos sweep        # read your sources once, think, print what changed, stop
-zelos doctor       # check every part of the setup and say what to do about what is wrong
-zelos mcp          # serve the MCP read tools over stdio so another AI client can read your board
+node zelos.mjs              # open Zelos
+node zelos.mjs sweep        # check sources once and assess what changed
+node zelos.mjs doctor       # diagnose setup problems
+node zelos.mjs mcp          # expose the enabled MCP tools over standard input/output
 ```
 
-**The `zelos` command needs an install that does not exist yet.** `zelos-app` has never been
-published to npm — `npm view zelos-app` answers 404 — so `npx zelos-app` and `npm i -g zelos-app`
-both fail today. Run it from source (`node zelos.mjs sweep`, `node zelos.mjs doctor`, and so on)
-until somebody publishes. [docs/INSTALL.md](docs/INSTALL.md) has the details.
+The source download runs without installing dependencies. Desktop installers include
+Node and need no terminal setup. The npm package is not part of this release.
+[Installation and updates](docs/INSTALL.md) · [Release notes](docs/RELEASE-NOTES.md).
 
 Seven MCP tools, none of which sends, deletes or reconfigures anything. Six declare `readOnlyHint`;
 `zelos_board` does not, because reading the board does what opening the window does — wakes a snooze

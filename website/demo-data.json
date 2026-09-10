@@ -1,0 +1,1466 @@
+{
+  "_readme": [
+    "The demo dataset. Every person, company, address and message in this file is invented.",
+    "",
+    "Dates are stored as offsets, never as absolute stamps, so the demo is a live working week",
+    "on whatever day someone opens it. `day` is a whole-day offset from the visitor's today",
+    "(0 = today, -1 = yesterday, 2 = the day after tomorrow) and `time` is wall-clock 24h.",
+    "demo/lib/api.js materialises them into ISO strings carrying the visitor's own UTC offset,",
+    "which is what the calendar reads its chip positions off.",
+    "",
+    "demo/lib/demo-data.js is generated from this file by demo/build-data.mjs and is what the",
+    "page actually imports \u2014 a static ESM import means the demo makes no network request at all,",
+    "not even for its own data."
+  ],
+  "identity": {
+    "name": "Ivo Marchetti",
+    "email": "ivo@marchetti.works"
+  },
+  "config": {
+    "version": 1,
+    "identity": {
+      "name": "Ivo Marchetti",
+      "email": "ivo@marchetti.works",
+      "timezone": ""
+    },
+    "model": {
+      "protocol": "openai",
+      "label": "Ollama",
+      "baseUrl": "http://127.0.0.1:11434/v1",
+      "model": "llama3.1:8b",
+      "keyRef": "model.default",
+      "maxTokens": 8192,
+      "temperature": 0
+    },
+    "mail": [
+      {
+        "id": "m_4c81ab",
+        "enabled": true,
+        "label": "Studio",
+        "host": "imap.marchetti.works",
+        "port": 993,
+        "secure": true,
+        "user": "ivo@marchetti.works",
+        "keyRef": "mail.m_4c81ab",
+        "mailboxes": [
+          "INBOX",
+          "Projects"
+        ],
+        "sentMailbox": "Sent",
+        "lookbackDays": 14,
+        "maxMessages": 400
+      }
+    ],
+    "calendars": [
+      {
+        "id": "c_91de20",
+        "enabled": true,
+        "label": "Studio",
+        "kind": "ics",
+        "url": "https://cal.marchetti.works/studio.ics",
+        "user": "",
+        "keyRef": null
+      },
+      {
+        "id": "c_2f7b64",
+        "enabled": true,
+        "label": "Personal",
+        "kind": "caldav",
+        "url": "https://dav.marchetti.works/calendars/ivo/",
+        "user": "ivo@marchetti.works",
+        "keyRef": "calendar.c_2f7b64"
+      }
+    ],
+    "sweep": {
+      "intervalMinutes": 30,
+      "activeHours": [
+        6,
+        23
+      ],
+      "auto": true
+    },
+    "ui": {
+      "accent": "#5b8cff"
+    },
+    "privacy": {
+      "maxItemsPerSweep": 150,
+      "sendBodies": true,
+      "bodyChars": 4000
+    },
+    "sources": [
+      {
+        "id": "s_7a2f19",
+        "enabled": true,
+        "label": "GitHub",
+        "type": "github",
+        "keyRef": "github.s_7a2f19",
+        "settings": {}
+      },
+      {
+        "id": "s_b3c0de",
+        "enabled": true,
+        "label": "Planning notices",
+        "type": "rss",
+        "keyRef": null,
+        "settings": {
+          "url": "https://planning.alderbridge.example/notices.xml"
+        }
+      }
+    ],
+    "ai": {
+      "enabled": false,
+      "scopes": {
+        "board": true,
+        "calendar": true,
+        "mail.metadata": false,
+        "mail.bodies": false,
+        "drafts": false,
+        "people": false
+      },
+      "tokens": [
+        {
+          "id": "t_9f3a1c",
+          "label": "Claude Desktop",
+          "ref": "ai.t_9f3a1c",
+          "createdAtDaysAgo": -9,
+          "lastUsedMinutesAgo": 47
+        }
+      ],
+      "maxRows": 50
+    }
+  },
+  "aiClient": {
+    "command": "/usr/local/bin/node",
+    "args": [
+      "/Applications/Zelos.app/Contents/Resources/app/zelos.mjs",
+      "mcp"
+    ],
+    "home": "/Users/ivo/.zelos",
+    "httpUrl": "http://127.0.0.1:7777/api/mcp"
+  },
+  "aiAccess": [
+    {
+      "tool": "zelos_board",
+      "scope": "board",
+      "rows": 24,
+      "ok": true,
+      "detail": null,
+      "transport": "stdio",
+      "client": "Claude Desktop",
+      "tokenId": "t_9f3a1c",
+      "minutesAgo": 47
+    },
+    {
+      "tool": "zelos_calendar",
+      "scope": "calendar",
+      "rows": 12,
+      "ok": true,
+      "detail": null,
+      "windowFromDay": 0,
+      "windowToDay": 7,
+      "transport": "stdio",
+      "client": "Claude Desktop",
+      "tokenId": "t_9f3a1c",
+      "minutesAgo": 47
+    },
+    {
+      "tool": "zelos_search",
+      "scope": "mail.metadata",
+      "rows": 0,
+      "ok": false,
+      "detail": "scope mail.metadata is off",
+      "transport": "stdio",
+      "client": "Claude Desktop",
+      "tokenId": "t_9f3a1c",
+      "minutesAgo": 46
+    },
+    {
+      "tool": "zelos_item",
+      "scope": "board",
+      "rows": 1,
+      "ok": true,
+      "detail": "itm_pentland_bond",
+      "transport": "stdio",
+      "client": "Claude Desktop",
+      "tokenId": "t_9f3a1c",
+      "minutesAgo": 44
+    },
+    {
+      "tool": "zelos_drafts",
+      "scope": "drafts",
+      "rows": 0,
+      "ok": false,
+      "detail": "scope drafts is off",
+      "transport": "http",
+      "client": "unnamed client",
+      "tokenId": null,
+      "minutesAgo": 1490
+    },
+    {
+      "tool": "zelos_board",
+      "scope": "board",
+      "rows": 21,
+      "ok": true,
+      "detail": null,
+      "transport": "stdio",
+      "client": "Claude Desktop",
+      "tokenId": "t_9f3a1c",
+      "minutesAgo": 1512
+    }
+  ],
+  "secretRefs": [
+    "model.default",
+    "mail.m_4c81ab",
+    "calendar.c_2f7b64",
+    "github.s_7a2f19"
+  ],
+  "first": "itm_pentland_bond",
+  "notes": [
+    "Three separate threads now mention the Fenwick kickoff. Nobody has sent an agenda.",
+    "Halloran Rowe have paid late on four invoices running. The last two each needed a chase.",
+    "Your reply time to Brightsea has gone from four hours to six days since the term sheet landed."
+  ],
+  "items": [
+    {
+      "id": "itm_pentland_bond",
+      "kind": "task",
+      "bucket": "now",
+      "headline": "Send Pentland the signed bond rider before the surety office shuts",
+      "why": "Desmond needs it inside today's filing packet and has asked twice. The surety desk closes at 5.",
+      "person": "Desmond Okafor",
+      "person_email": "desmond.okafor@pentlandcivil.example",
+      "due": {
+        "day": 0,
+        "time": "16:00"
+      },
+      "severity": 3,
+      "link": "mailto:desmond.okafor@pentlandcivil.example",
+      "firstSeenDays": -3,
+      "seen_runs": 7,
+      "sourceRefs": [
+        "msg_pentland_2",
+        "msg_pentland_1"
+      ]
+    },
+    {
+      "id": "itm_brightsea_diligence",
+      "kind": "reply",
+      "bucket": "now",
+      "headline": "Answer Brightsea's two diligence questions",
+      "why": "Yuki asked about retention and the hosting line six days ago. Silence on an open term sheet reads as a problem.",
+      "person": "Yuki Tamsin",
+      "person_email": "yuki.tamsin@brightseacapital.example",
+      "due": {
+        "day": 0,
+        "time": "18:00"
+      },
+      "severity": 3,
+      "link": "mailto:yuki.tamsin@brightseacapital.example",
+      "firstSeenDays": -6,
+      "seen_runs": 11,
+      "sourceRefs": [
+        "msg_brightsea_1"
+      ]
+    },
+    {
+      "id": "itm_ardmore_conflict",
+      "kind": "reply",
+      "bucket": "now",
+      "headline": "Tell Ardmore & Vance whether the Fenwick work is a conflict",
+      "why": "Priya cannot open the matter until you answer, and the Fenwick kickoff is in two days.",
+      "person": "Priya Ardmore",
+      "person_email": "priya.ardmore@ardmorevance.example",
+      "due": {
+        "day": 1,
+        "time": "09:00"
+      },
+      "severity": 2,
+      "link": null,
+      "firstSeenDays": -2,
+      "seen_runs": 4,
+      "sourceRefs": [
+        "msg_ardmore_1"
+      ]
+    },
+    {
+      "id": "itm_halloran_rfi",
+      "kind": "task",
+      "bucket": "now",
+      "headline": "Answer RFI 214 on the Halloran stair detail",
+      "why": "The steel fabricator has stopped work on that assembly until the connection is confirmed.",
+      "person": "Marguerite Halloran",
+      "person_email": "m.halloran@halloranrowe.example",
+      "due": {
+        "day": 0,
+        "time": "15:00"
+      },
+      "severity": 2,
+      "link": null,
+      "firstSeenDays": -1,
+      "seen_runs": 2,
+      "sourceRefs": [
+        "msg_halloran_rfi"
+      ]
+    },
+    {
+      "id": "itm_meridian_clash",
+      "kind": "task",
+      "bucket": "today",
+      "headline": "Move the Meridian walkthrough \u2014 it lands on top of the Fenwick kickoff",
+      "why": "Both are booked for the same morning in two days' time. Aurelio has already offered the day after.",
+      "person": "Aurelio Sanz",
+      "person_email": "aurelio.sanz@meridianfreight.example",
+      "due": {
+        "day": 0,
+        "time": "17:30"
+      },
+      "severity": 2,
+      "link": null,
+      "firstSeenDays": -1,
+      "seen_runs": 2,
+      "sourceRefs": [
+        "evt_fenwick_kickoff",
+        "evt_meridian_walk"
+      ]
+    },
+    {
+      "id": "itm_cassowary_scope",
+      "kind": "task",
+      "bucket": "today",
+      "headline": "Send Cassowary the revised scope before their board meets",
+      "why": "Tobias has the board on Thursday and wants the number in the pack, not read out.",
+      "person": "Tobias Renn",
+      "person_email": "tobias.renn@cassowarylabs.example",
+      "due": {
+        "day": 1,
+        "time": "12:00"
+      },
+      "severity": 1,
+      "link": null,
+      "firstSeenDays": -2,
+      "seen_runs": 3,
+      "sourceRefs": [
+        "msg_cassowary_1"
+      ]
+    },
+    {
+      "id": "itm_coldharbour_photos",
+      "kind": "task",
+      "bucket": "today",
+      "headline": "Pick the three Coldharbour photographs for the case study",
+      "why": "Imogen has held the layout open for you and the printer's slot is booked.",
+      "person": "Imogen Vale",
+      "person_email": "imogen@coldharbourstudio.example",
+      "due": null,
+      "severity": 1,
+      "link": null,
+      "firstSeenDays": -2,
+      "seen_runs": 3,
+      "sourceRefs": [
+        "msg_coldharbour_1"
+      ]
+    },
+    {
+      "id": "itm_northgate_forms",
+      "kind": "task",
+      "bucket": "today",
+      "headline": "Return the Northgate site-access forms",
+      "why": "Nobody from the studio gets past the gate without them, and the first visit is next week.",
+      "person": "Anika Poole",
+      "person_email": "a.poole@northgatehealth.example",
+      "due": {
+        "day": 2,
+        "time": "12:00"
+      },
+      "severity": 1,
+      "link": null,
+      "firstSeenDays": -4,
+      "seen_runs": 6,
+      "sourceRefs": [
+        "msg_northgate_1"
+      ]
+    },
+    {
+      "id": "itm_lumen_licence",
+      "kind": "decision",
+      "bucket": "today",
+      "headline": "Decide the Lumen foundry licence tier before the quote expires",
+      "why": "The five-seat and the studio-wide tier are \u00a3340 apart and the quote is only good until Friday.",
+      "person": "Kestrel Ng",
+      "person_email": "kestrel@lumentype.example",
+      "due": {
+        "day": 3,
+        "time": "17:00"
+      },
+      "severity": 1,
+      "link": null,
+      "firstSeenDays": -5,
+      "seen_runs": 7,
+      "sourceRefs": [
+        "msg_lumen_1"
+      ]
+    },
+    {
+      "id": "itm_sable_receipts",
+      "kind": "task",
+      "bucket": "today",
+      "headline": "Get the March\u2013June receipts to Sable & Finch",
+      "why": "Dermot has asked four times. The quarter cannot close without them and the deadline is not his.",
+      "person": "Dermot Finch",
+      "person_email": "dermot.finch@sableandfinch.example",
+      "due": {
+        "day": 4,
+        "time": "17:00"
+      },
+      "severity": 1,
+      "link": "mailto:dermot.finch@sableandfinch.example",
+      "firstSeenDays": -19,
+      "seen_runs": 34,
+      "sourceRefs": [
+        "msg_sable_1"
+      ]
+    },
+    {
+      "id": "itm_backup_drive",
+      "kind": "task",
+      "bucket": "today",
+      "headline": "Replace the failing backup drive in the studio",
+      "why": "It has reported the same reallocated-sector warning every night for a week.",
+      "person": "",
+      "person_email": "",
+      "due": null,
+      "severity": 1,
+      "link": null,
+      "firstSeenDays": -6,
+      "seen_runs": 9,
+      "sourceRefs": []
+    },
+    {
+      "id": "itm_fenwick_survey",
+      "kind": "task",
+      "bucket": "soon",
+      "headline": "Book the Fenwick roof survey while the scaffold is still up",
+      "why": "The scaffold comes down at the end of the month and re-erecting it is a four-figure line.",
+      "person": "Roisin Fenwick",
+      "person_email": "roisin@fenwickdairy.example",
+      "due": {
+        "day": 9,
+        "time": "12:00"
+      },
+      "severity": 0,
+      "link": null,
+      "firstSeenDays": -3,
+      "seen_runs": 4,
+      "sourceRefs": [
+        "msg_fenwick_1"
+      ]
+    },
+    {
+      "id": "itm_indemnity_renewal",
+      "kind": "task",
+      "bucket": "soon",
+      "headline": "Renew the professional indemnity cover before it lapses",
+      "why": "Two live contracts name a minimum level of cover. A lapse breaches both of them quietly.",
+      "person": "",
+      "person_email": "",
+      "due": {
+        "day": 12,
+        "time": "09:00"
+      },
+      "severity": 1,
+      "link": null,
+      "firstSeenDays": -31,
+      "seen_runs": 52,
+      "sourceRefs": []
+    },
+    {
+      "id": "itm_drafter_brief",
+      "kind": "task",
+      "bucket": "soon",
+      "headline": "Write the brief for the part-time drafter",
+      "why": "You have said yes to three jobs on the assumption of a second pair of hands.",
+      "person": "",
+      "person_email": "",
+      "due": null,
+      "severity": 0,
+      "link": null,
+      "firstSeenDays": -8,
+      "seen_runs": 12,
+      "sourceRefs": []
+    },
+    {
+      "id": "itm_quarrymen_invoice",
+      "kind": "money",
+      "bucket": "money",
+      "headline": "Approve the Quarrymen invoice so their payroll clears",
+      "why": "\u00a314,280 for the stonework, already checked against the measure. Nils pays his people on Friday.",
+      "person": "Nils Bergstr\u00f6m",
+      "person_email": "nils@quarrymen.example",
+      "due": {
+        "day": 1,
+        "time": "16:00"
+      },
+      "severity": 2,
+      "link": null,
+      "firstSeenDays": -2,
+      "seen_runs": 3,
+      "sourceRefs": [
+        "msg_quarrymen_1"
+      ]
+    },
+    {
+      "id": "itm_halloran_overdue",
+      "kind": "money",
+      "bucket": "money",
+      "headline": "Chase Halloran Rowe on invoice 2214 \u2014 41 days overdue",
+      "why": "\u00a38,650. It is the fourth late one in a row and the last two each needed a phone call.",
+      "person": "Marguerite Halloran",
+      "person_email": "m.halloran@halloranrowe.example",
+      "due": null,
+      "severity": 2,
+      "link": null,
+      "firstSeenDays": -22,
+      "seen_runs": 38,
+      "sourceRefs": [
+        "msg_halloran_invoice"
+      ]
+    },
+    {
+      "id": "itm_wait_meridian_quote",
+      "kind": "waiting",
+      "bucket": "waiting",
+      "headline": "Meridian still owe the revised haulage quote",
+      "why": "Aurelio said Tuesday. It is eight days since you asked and the tender price depends on it.",
+      "person": "Aurelio Sanz",
+      "person_email": "aurelio.sanz@meridianfreight.example",
+      "due": null,
+      "severity": 1,
+      "link": null,
+      "firstSeenDays": -8,
+      "seen_runs": 13,
+      "sourceRefs": [
+        "msg_meridian_1"
+      ]
+    },
+    {
+      "id": "itm_wait_ardmore_redline",
+      "kind": "waiting",
+      "bucket": "waiting",
+      "headline": "Ardmore & Vance have had the redline for five days",
+      "why": "Priya's team took it for a two-day turnaround. Nothing has come back and the counterparty is waiting on you.",
+      "person": "Priya Ardmore",
+      "person_email": "priya.ardmore@ardmorevance.example",
+      "due": null,
+      "severity": 1,
+      "link": null,
+      "firstSeenDays": -5,
+      "seen_runs": 8,
+      "sourceRefs": [
+        "msg_ardmore_redline"
+      ]
+    },
+    {
+      "id": "itm_wait_hoarding_permit",
+      "kind": "waiting",
+      "bucket": "waiting",
+      "headline": "The borough has not acknowledged the hoarding permit",
+      "why": "Sixteen days with no reference number. The site fence cannot go up without one and the trades are booked.",
+      "person": "Borough highways desk",
+      "person_email": "highways@northmoorborough.example",
+      "due": null,
+      "severity": 2,
+      "link": null,
+      "firstSeenDays": -16,
+      "seen_runs": 27,
+      "sourceRefs": [
+        "msg_permit_1"
+      ]
+    },
+    {
+      "id": "itm_owe_yuki_metrics",
+      "kind": "promised",
+      "bucket": "promised",
+      "headline": "You promised Yuki the retention numbers by Wednesday",
+      "why": "You said \"by Wednesday, with the cohort split\" in writing. Wednesday is tomorrow.",
+      "person": "Yuki Tamsin",
+      "person_email": "yuki.tamsin@brightseacapital.example",
+      "due": {
+        "day": 1,
+        "time": "17:00"
+      },
+      "severity": 2,
+      "link": null,
+      "firstSeenDays": -4,
+      "seen_runs": 6,
+      "sourceRefs": [
+        "msg_brightsea_1"
+      ]
+    },
+    {
+      "id": "itm_owe_tobias_intro",
+      "kind": "promised",
+      "bucket": "promised",
+      "headline": "You promised Tobias an introduction at Brightsea",
+      "why": "Twelve days ago, in a thread you have since replied to twice without mentioning it.",
+      "person": "Tobias Renn",
+      "person_email": "tobias.renn@cassowarylabs.example",
+      "due": null,
+      "severity": 1,
+      "link": null,
+      "firstSeenDays": -12,
+      "seen_runs": 19,
+      "sourceRefs": [
+        "msg_cassowary_intro"
+      ]
+    },
+    {
+      "id": "itm_owe_imogen_credit",
+      "kind": "promised",
+      "bucket": "promised",
+      "headline": "You promised Imogen a photography credit line for the case study",
+      "why": "One sentence, and the layout is waiting on it.",
+      "person": "Imogen Vale",
+      "person_email": "imogen@coldharbourstudio.example",
+      "due": null,
+      "severity": 0,
+      "link": null,
+      "firstSeenDays": -3,
+      "seen_runs": 4,
+      "sourceRefs": [
+        "msg_coldharbour_1"
+      ]
+    },
+    {
+      "id": "itm_note_fenwick_grant",
+      "kind": "note",
+      "bucket": "note",
+      "headline": "Fenwick's grant window closes at the end of the quarter",
+      "why": "Roisin mentioned it once, in passing, in a thread about scaffolding.",
+      "person": "Roisin Fenwick",
+      "person_email": "roisin@fenwickdairy.example",
+      "due": null,
+      "severity": 0,
+      "link": null,
+      "firstSeenDays": -7,
+      "seen_runs": 10,
+      "sourceRefs": [
+        "msg_fenwick_1"
+      ]
+    },
+    {
+      "id": "itm_note_lumen_prices",
+      "kind": "note",
+      "bucket": "note",
+      "headline": "Lumen are raising foundry licence prices in September",
+      "why": "Buried in the footer of the quote. It is why the tier decision is worth making this week.",
+      "person": "Kestrel Ng",
+      "person_email": "kestrel@lumentype.example",
+      "due": null,
+      "severity": 0,
+      "link": null,
+      "firstSeenDays": -5,
+      "seen_runs": 7,
+      "sourceRefs": [
+        "msg_lumen_1"
+      ]
+    }
+  ],
+  "drafts": [
+    {
+      "id": "drf_yuki_metrics",
+      "item_id": "itm_owe_yuki_metrics",
+      "to_email": "yuki.tamsin@brightseacapital.example",
+      "subject": "Re: Diligence \u2014 retention and the hosting line",
+      "body": "Yuki,\n\nApologies for the gap. Both answers below.\n\nRetention: 91% of accounts that reach month three are still with us at month twelve, and the cohort split is in the attached sheet \u2014 the dip you spotted in the February cohort was one reseller consolidating eleven accounts into two, not eleven cancellations.\n\nHosting: the line grows with storage, not with headcount, which is why it looks disconnected from revenue. At current growth it is \u00a32,100 a month by the end of next year, and it moves to a reserved-instance rate at the point that is worth doing.\n\nHappy to walk either of them through on a call this week.\n\nIvo",
+      "createdHoursAgo": 4
+    },
+    {
+      "id": "drf_tobias_intro",
+      "item_id": "itm_owe_tobias_intro",
+      "to_email": "tobias.renn@cassowarylabs.example",
+      "subject": "Introduction \u2014 Brightsea",
+      "body": "Tobias,\n\nI owe you this and I have sat on it for far too long.\n\nThe right person at Brightsea is Yuki Tamsin, who runs their early-stage work and has spent the last year looking specifically at instrumentation. I have copied her here.\n\nYuki \u2014 Tobias runs Cassowary Labs. They build the measurement layer that the last two hardware companies you asked me about were missing. Worth an hour.\n\nI will get out of the way.\n\nIvo",
+      "createdHoursAgo": 4
+    },
+    {
+      "id": "drf_meridian_quote",
+      "item_id": "itm_wait_meridian_quote",
+      "to_email": "aurelio.sanz@meridianfreight.example",
+      "subject": "Re: Revised haulage quote",
+      "body": "Aurelio,\n\nChasing the revised haulage figure \u2014 you had said Tuesday and I know last week ran away from everyone.\n\nI can hold the tender until Thursday morning without it, but not past that; the rest of the price is built and yours is the only number still open.\n\nIf the revision is going to take longer, send me the old figure with a plus-or-minus and I will work with that.\n\nIvo",
+      "createdHoursAgo": 22
+    },
+    {
+      "id": "drf_ardmore_conflict",
+      "item_id": "itm_ardmore_conflict",
+      "to_email": "priya.ardmore@ardmorevance.example",
+      "subject": "Fenwick \u2014 conflict check",
+      "body": "Priya,\n\nOn the conflict question: we have no live engagement with Fenwick Dairy Co-op and no work for anyone on the other side of the co-op's supply agreement. The only prior contact is a feasibility sketch in 2023 that was never invoiced and never left the studio.\n\nAs far as I can see there is nothing to declare, but you have the better view of what counts.\n\nThe kickoff is in two days, so if you need anything else from me to open the matter, say so today.\n\nIvo",
+      "createdHoursAgo": 1
+    }
+  ],
+  "events": [
+    {
+      "id": "evt_standup_m2",
+      "calendar": "Studio",
+      "title": "Studio stand-up",
+      "day": -2,
+      "start": "09:30",
+      "end": "10:00",
+      "location": "Studio"
+    },
+    {
+      "id": "evt_halloran_walk",
+      "calendar": "Studio",
+      "title": "Site walk \u2014 Halloran stair",
+      "day": -2,
+      "start": "14:00",
+      "end": "15:30",
+      "location": "Halloran Rowe, 4 Cobb Lane",
+      "attendees": [
+        "Marguerite Halloran"
+      ]
+    },
+    {
+      "id": "evt_standup_m1",
+      "calendar": "Studio",
+      "title": "Studio stand-up",
+      "day": -1,
+      "start": "09:30",
+      "end": "10:00",
+      "location": "Studio"
+    },
+    {
+      "id": "evt_brightsea_diligence",
+      "calendar": "Studio",
+      "title": "Brightsea \u2014 diligence call",
+      "day": -1,
+      "start": "11:00",
+      "end": "12:00",
+      "location": "Video call",
+      "attendees": [
+        "Yuki Tamsin"
+      ]
+    },
+    {
+      "id": "evt_quarrymen_measure",
+      "calendar": "Studio",
+      "title": "Quarrymen \u2014 measure review",
+      "day": -1,
+      "start": "16:30",
+      "end": "17:15",
+      "location": "Video call",
+      "attendees": [
+        "Nils Bergstr\u00f6m"
+      ]
+    },
+    {
+      "id": "evt_swim",
+      "calendar": "Personal",
+      "title": "Swim",
+      "day": 0,
+      "start": "07:15",
+      "end": "08:00",
+      "location": "Northmoor baths"
+    },
+    {
+      "id": "evt_standup_0",
+      "calendar": "Studio",
+      "title": "Studio stand-up",
+      "day": 0,
+      "start": "09:30",
+      "end": "10:00",
+      "location": "Studio"
+    },
+    {
+      "id": "evt_pentland_bond",
+      "calendar": "Studio",
+      "title": "Pentland \u2014 bond rider walkthrough",
+      "day": 0,
+      "start": "11:00",
+      "end": "12:00",
+      "location": "Video call",
+      "attendees": [
+        "Desmond Okafor"
+      ]
+    },
+    {
+      "id": "evt_lunch_finch",
+      "calendar": "Personal",
+      "title": "Lunch with Dermot Finch",
+      "day": 0,
+      "start": "13:00",
+      "end": "14:00",
+      "location": "The Ropewalk",
+      "attendees": [
+        "Dermot Finch"
+      ]
+    },
+    {
+      "id": "evt_rfi_214",
+      "calendar": "Studio",
+      "title": "RFI 214 \u2014 steel fabricator",
+      "day": 0,
+      "start": "13:30",
+      "end": "14:30",
+      "location": "Video call",
+      "attendees": [
+        "Marguerite Halloran",
+        "Ola Sandvik"
+      ],
+      "description": "Double-booked against lunch. One of them is going to lose."
+    },
+    {
+      "id": "evt_surety_cutoff",
+      "calendar": "Studio",
+      "title": "Surety filing cut-off",
+      "day": 0,
+      "start": "16:00",
+      "end": "16:30",
+      "location": "Pentland Civil"
+    },
+    {
+      "id": "evt_northgate_brief",
+      "calendar": "Studio",
+      "title": "Northgate site-access briefing",
+      "day": 0,
+      "start": "18:30",
+      "end": "19:15",
+      "location": "Video call",
+      "attendees": [
+        "Anika Poole"
+      ]
+    },
+    {
+      "id": "evt_standup_1",
+      "calendar": "Studio",
+      "title": "Studio stand-up",
+      "day": 1,
+      "start": "09:30",
+      "end": "10:00",
+      "location": "Studio"
+    },
+    {
+      "id": "evt_cassowary_scope",
+      "calendar": "Studio",
+      "title": "Cassowary \u2014 revised scope",
+      "day": 1,
+      "start": "10:30",
+      "end": "11:30",
+      "location": "Video call",
+      "attendees": [
+        "Tobias Renn"
+      ]
+    },
+    {
+      "id": "evt_sable_quarter",
+      "calendar": "Studio",
+      "title": "Sable & Finch \u2014 quarter close",
+      "day": 1,
+      "start": "15:00",
+      "end": "16:00",
+      "location": "Sable & Finch, 12 Mint Yard",
+      "attendees": [
+        "Dermot Finch"
+      ]
+    },
+    {
+      "id": "evt_standup_2",
+      "calendar": "Studio",
+      "title": "Studio stand-up",
+      "day": 2,
+      "start": "09:30",
+      "end": "10:00",
+      "location": "Studio"
+    },
+    {
+      "id": "evt_fenwick_kickoff",
+      "calendar": "Studio",
+      "title": "Fenwick Dairy \u2014 project kickoff",
+      "day": 2,
+      "start": "10:00",
+      "end": "12:00",
+      "location": "Fenwick Dairy Co-op, Ballynure",
+      "attendees": [
+        "Roisin Fenwick",
+        "Priya Ardmore"
+      ]
+    },
+    {
+      "id": "evt_meridian_walk",
+      "calendar": "Studio",
+      "title": "Meridian freight walkthrough",
+      "day": 2,
+      "start": "10:30",
+      "end": "11:30",
+      "location": "Meridian yard, Dock Road",
+      "attendees": [
+        "Aurelio Sanz"
+      ],
+      "description": "Straight over the top of the Fenwick kickoff."
+    },
+    {
+      "id": "evt_coldharbour_selects",
+      "calendar": "Studio",
+      "title": "Coldharbour \u2014 photo selects",
+      "day": 2,
+      "start": "16:00",
+      "end": "16:45",
+      "location": "Video call",
+      "attendees": [
+        "Imogen Vale"
+      ]
+    },
+    {
+      "id": "evt_standup_3",
+      "calendar": "Studio",
+      "title": "Studio stand-up",
+      "day": 3,
+      "start": "09:30",
+      "end": "10:00",
+      "location": "Studio"
+    },
+    {
+      "id": "evt_lumen_licence",
+      "calendar": "Studio",
+      "title": "Lumen Type Foundry \u2014 licence call",
+      "day": 3,
+      "start": "12:00",
+      "end": "12:45",
+      "location": "Video call",
+      "attendees": [
+        "Kestrel Ng"
+      ]
+    },
+    {
+      "id": "evt_quarrymen_pour",
+      "calendar": "Studio",
+      "title": "Quarrymen \u2014 stone delivery window",
+      "day": 3,
+      "start": "07:00",
+      "end": "09:00",
+      "location": "Northmoor site"
+    },
+    {
+      "id": "evt_studio_closed",
+      "calendar": "Studio",
+      "title": "Studio closed \u2014 bank holiday",
+      "day": 4,
+      "allDay": true,
+      "days": 1
+    },
+    {
+      "id": "evt_ardmore_review",
+      "calendar": "Studio",
+      "title": "Ardmore & Vance \u2014 conflict review",
+      "day": 5,
+      "start": "10:00",
+      "end": "11:30",
+      "location": "Video call",
+      "attendees": [
+        "Priya Ardmore"
+      ]
+    },
+    {
+      "id": "evt_indemnity_window",
+      "calendar": "Personal",
+      "title": "Indemnity renewal window opens",
+      "day": 6,
+      "allDay": true,
+      "days": 1
+    },
+    {
+      "id": "evt_standup_7",
+      "calendar": "Studio",
+      "title": "Studio stand-up",
+      "day": 7,
+      "start": "09:30",
+      "end": "10:00",
+      "location": "Studio"
+    },
+    {
+      "id": "evt_brightsea_partners",
+      "calendar": "Studio",
+      "title": "Brightsea \u2014 partner meeting",
+      "day": 7,
+      "start": "14:00",
+      "end": "15:30",
+      "location": "Brightsea Capital, 30 Lisle Court",
+      "attendees": [
+        "Yuki Tamsin"
+      ]
+    },
+    {
+      "id": "evt_halloran_money",
+      "calendar": "Studio",
+      "title": "Halloran Rowe \u2014 the invoice conversation",
+      "day": 9,
+      "start": "11:00",
+      "end": "12:00",
+      "location": "Video call",
+      "attendees": [
+        "Marguerite Halloran"
+      ]
+    }
+  ],
+  "messages": [
+    {
+      "id": "msg_pentland_1",
+      "from_name": "Desmond Okafor",
+      "from_email": "desmond.okafor@pentlandcivil.example",
+      "subject": "Bond rider \u2014 need the signed copy",
+      "day": -3,
+      "time": "08:41",
+      "snippet": "The surety will not accept the packet without the rider signed by both parties.",
+      "body": "Ivo \u2014 the surety will not accept the filing packet without the bond rider signed by both parties. I have signed our side. Can you get yours back to me before the filing goes in?"
+    },
+    {
+      "id": "msg_pentland_2",
+      "from_name": "Desmond Okafor",
+      "from_email": "desmond.okafor@pentlandcivil.example",
+      "subject": "Re: Bond rider \u2014 need the signed copy",
+      "day": 0,
+      "time": "07:55",
+      "snippet": "Sorry to chase. Filing goes in at four and the surety desk shuts at five.",
+      "body": "Sorry to chase. The filing goes in at four this afternoon and the surety desk shuts at five, so anything after that is next week. If it is easier, sign the page and photograph it \u2014 they have taken that before."
+    },
+    {
+      "id": "msg_brightsea_1",
+      "from_name": "Yuki Tamsin",
+      "from_email": "yuki.tamsin@brightseacapital.example",
+      "subject": "Two things before we go to the partners",
+      "day": -6,
+      "time": "16:12",
+      "snippet": "Retention by cohort, and an explanation of the hosting line. Then we can move.",
+      "body": "Ivo \u2014 two things and then I think we can move. First, retention by cohort rather than in aggregate; the aggregate looks fine but I want to see the February shape. Second, the hosting line grows faster than revenue in your model and I do not understand why. Give me both and I will take it to the partners."
+    },
+    {
+      "id": "msg_ardmore_1",
+      "from_name": "Priya Ardmore",
+      "from_email": "priya.ardmore@ardmorevance.example",
+      "subject": "Fenwick \u2014 conflict check before we open the matter",
+      "day": -2,
+      "time": "11:02",
+      "snippet": "I cannot open the file until you confirm there is no prior engagement.",
+      "body": "I cannot open the matter until you confirm there is no prior engagement with Fenwick Dairy Co-op or with anyone on the other side of their supply agreement. A sentence is enough, but I need it in writing before the kickoff."
+    },
+    {
+      "id": "msg_ardmore_redline",
+      "from_name": "Priya Ardmore",
+      "from_email": "priya.ardmore@ardmorevance.example",
+      "subject": "Redline received",
+      "day": -5,
+      "time": "09:30",
+      "snippet": "We have it. Two days for the turnaround.",
+      "body": "We have the redline. Two days for the turnaround, which puts it back with you Thursday at the latest."
+    },
+    {
+      "id": "msg_halloran_rfi",
+      "from_name": "Ola Sandvik",
+      "from_email": "ola.sandvik@sandvikfabrication.example",
+      "subject": "RFI 214 \u2014 stair stringer connection",
+      "day": -1,
+      "time": "15:48",
+      "snippet": "We have stopped on that assembly until the connection is confirmed.",
+      "body": "RFI 214. The stringer-to-landing connection as drawn does not leave room for the bolt head. We have stopped on that assembly until someone confirms the detail \u2014 everything else on the stair is fine and we would rather not break the sequence."
+    },
+    {
+      "id": "msg_halloran_invoice",
+      "from_name": "Marguerite Halloran",
+      "from_email": "m.halloran@halloranrowe.example",
+      "subject": "Re: Invoice 2214",
+      "day": -12,
+      "time": "17:20",
+      "snippet": "With our finance people. I will chase them this week.",
+      "body": "It is with our finance people. I will chase them this week \u2014 I know it has been a while and I am sorry, our end has been a mess since the merger."
+    },
+    {
+      "id": "msg_cassowary_1",
+      "from_name": "Tobias Renn",
+      "from_email": "tobias.renn@cassowarylabs.example",
+      "subject": "Revised scope for the board pack",
+      "day": -2,
+      "time": "13:15",
+      "snippet": "If the number is in the pack it gets approved. If I read it out it gets discussed.",
+      "body": "Board is Thursday. If the revised number is in the pack it gets approved on the nod; if I have to read it out it becomes a discussion and then it becomes next month. Anything by Wednesday lunchtime works."
+    },
+    {
+      "id": "msg_cassowary_intro",
+      "from_name": "Tobias Renn",
+      "from_email": "tobias.renn@cassowarylabs.example",
+      "subject": "That introduction",
+      "day": -12,
+      "time": "10:05",
+      "snippet": "No rush at all, but you did mention someone at Brightsea.",
+      "body": "No rush at all, but you did mention someone at Brightsea who spends their time on instrumentation. If the introduction still makes sense I would take it."
+    },
+    {
+      "id": "msg_coldharbour_1",
+      "from_name": "Imogen Vale",
+      "from_email": "imogen@coldharbourstudio.example",
+      "subject": "Three photographs and a credit line",
+      "day": -3,
+      "time": "12:44",
+      "snippet": "Pick three from the selects, and send me how you want the credit worded.",
+      "body": "Pick three from the selects folder \u2014 I would go 04, 11 and 19 but it is your case study. And send me the credit line the way you want it worded; the layout has a hole in it where that sentence goes."
+    },
+    {
+      "id": "msg_northgate_1",
+      "from_name": "Anika Poole",
+      "from_email": "a.poole@northgatehealth.example",
+      "subject": "Site access forms",
+      "day": -4,
+      "time": "08:20",
+      "snippet": "Nobody gets past the gate without these, including me.",
+      "body": "Attached are the site-access forms. Nobody gets past the gate without them, including me, and security will not make an exception for a first visit. One per person, signed."
+    },
+    {
+      "id": "msg_lumen_1",
+      "from_name": "Kestrel Ng",
+      "from_email": "kestrel@lumentype.example",
+      "subject": "Licence quote \u2014 five seats or studio-wide",
+      "day": -5,
+      "time": "14:03",
+      "snippet": "\u00a3340 between the two tiers. Quote holds until Friday.",
+      "body": "Two options attached: five named seats, or studio-wide. There is \u00a3340 between them and studio-wide covers contractors, which from what you described is the one you actually want. Quote holds until Friday. Foundry licence prices go up across the board in September."
+    },
+    {
+      "id": "msg_sable_1",
+      "from_name": "Dermot Finch",
+      "from_email": "dermot.finch@sableandfinch.example",
+      "subject": "Receipts \u2014 March to June",
+      "day": -19,
+      "time": "09:12",
+      "snippet": "Fourth time of asking. The quarter cannot close without them.",
+      "body": "Fourth time of asking, and I promise this is the last time I will be polite about it. The quarter cannot close without March to June. A photograph of a shoebox is genuinely fine \u2014 we will do the sorting."
+    },
+    {
+      "id": "msg_quarrymen_1",
+      "from_name": "Nils Bergstr\u00f6m",
+      "from_email": "nils@quarrymen.example",
+      "subject": "Invoice \u2014 stonework, phase two",
+      "day": -2,
+      "time": "18:30",
+      "snippet": "\u00a314,280, measured and agreed on site. Payroll is Friday.",
+      "body": "Invoice attached for phase two stonework, \u00a314,280, measured and agreed on site with your foreman. I pay the crew on Friday, so an approval before then would keep me out of my own overdraft."
+    },
+    {
+      "id": "msg_meridian_1",
+      "from_name": "Aurelio Sanz",
+      "from_email": "aurelio.sanz@meridianfreight.example",
+      "subject": "Re: Haulage \u2014 revised quote",
+      "day": -8,
+      "time": "16:55",
+      "snippet": "Tuesday at the latest. Also, can we move the walkthrough?",
+      "body": "Revised quote Tuesday at the latest \u2014 the rate card changed under us and I would rather send you a real number than a fast one. Separately: if the walkthrough is awkward that morning I can do the day after, the yard is quieter anyway."
+    },
+    {
+      "id": "msg_fenwick_1",
+      "from_name": "Roisin Fenwick",
+      "from_email": "roisin@fenwickdairy.example",
+      "subject": "Scaffold, survey, and one other thing",
+      "day": -3,
+      "time": "10:38",
+      "snippet": "Scaffold comes down at the end of the month. Also the grant window closes with the quarter.",
+      "body": "The scaffold comes down at the end of the month, so if the roof survey is going to happen it wants to happen while it is still up. Also \u2014 and I keep forgetting to say this properly \u2014 the grant window closes with the quarter, so anything we want covered by it has to be committed before then."
+    },
+    {
+      "id": "msg_permit_1",
+      "from_name": "Northmoor Borough highways",
+      "from_email": "highways@northmoorborough.example",
+      "subject": "Automatic acknowledgement \u2014 application received",
+      "day": -16,
+      "time": "07:02",
+      "snippet": "This mailbox is not monitored. A reference number will follow.",
+      "body": "This mailbox is not monitored. Your application has entered the queue and a reference number will follow in due course. Please do not reply to this message."
+    }
+  ],
+  "run": {
+    "id": "run_5c1e88a4",
+    "kind": "full",
+    "startedMinutesAgo": 23,
+    "durationMs": 41800,
+    "model": "llama3.1:8b",
+    "tokens_in": 38214,
+    "tokens_out": 3106,
+    "stats": {
+      "messages": 214,
+      "events": 28,
+      "items": 24,
+      "now": 4,
+      "sources": [
+        {
+          "label": "Studio",
+          "kind": "mail",
+          "ok": true,
+          "count": 214
+        },
+        {
+          "label": "Studio",
+          "kind": "calendar",
+          "ok": true,
+          "count": 25
+        },
+        {
+          "label": "Personal",
+          "kind": "calendar",
+          "ok": true,
+          "count": 3
+        },
+        {
+          "label": "GitHub",
+          "kind": "github",
+          "ok": true,
+          "count": 6
+        },
+        {
+          "label": "Planning notices",
+          "kind": "rss",
+          "ok": true,
+          "count": 3
+        }
+      ]
+    }
+  },
+  "sweepProgress": [
+    {
+      "phase": "start",
+      "message": "Waking the sources\u2026",
+      "done": 0,
+      "total": 6,
+      "ms": 420
+    },
+    {
+      "phase": "mail",
+      "message": "Studio: connecting to imap.marchetti.works\u2026",
+      "done": 1,
+      "total": 6,
+      "ms": 620
+    },
+    {
+      "phase": "mail",
+      "message": "Studio: 214 messages, fetching headers\u2026",
+      "done": 2,
+      "total": 6,
+      "ms": 760
+    },
+    {
+      "phase": "calendar",
+      "message": "Studio: expanding recurrences\u2026",
+      "done": 3,
+      "total": 6,
+      "ms": 540
+    },
+    {
+      "phase": "calendar",
+      "message": "Personal: 3 events in the window",
+      "done": 4,
+      "total": 6,
+      "ms": 430
+    },
+    {
+      "phase": "model",
+      "message": "Asking llama3.1:8b to read the pile\u2026",
+      "done": 5,
+      "total": 6,
+      "ms": 1600
+    },
+    {
+      "phase": "merge",
+      "message": "Merging against the board you already had\u2026",
+      "done": 6,
+      "total": 6,
+      "ms": 520
+    }
+  ],
+  "sweepArrivals": [
+    {
+      "note": "Desmond has now asked three times about the bond rider. That is the shape of a thing about to become someone else's problem.",
+      "item": {
+        "id": "itm_new_pentland_chase",
+        "kind": "reply",
+        "bucket": "now",
+        "headline": "Desmond has asked a third time about the bond rider",
+        "why": "A message that arrived during this sweep, marked urgent, with the surety cut-off in the subject line.",
+        "person": "Desmond Okafor",
+        "person_email": "desmond.okafor@pentlandcivil.example",
+        "due": {
+          "day": 0,
+          "time": "16:00"
+        },
+        "severity": 3,
+        "link": null,
+        "firstSeenDays": 0,
+        "seen_runs": 1,
+        "sourceRefs": [
+          "msg_pentland_3"
+        ]
+      },
+      "message": {
+        "id": "msg_pentland_3",
+        "from_name": "Desmond Okafor",
+        "from_email": "desmond.okafor@pentlandcivil.example",
+        "subject": "URGENT: bond rider \u2014 surety cut-off",
+        "day": 0,
+        "minutesAgo": 3,
+        "snippet": "Ivo, I am at the surety desk. Anything at all, even a photograph.",
+        "body": "Ivo, I am physically standing at the surety desk. Anything at all \u2014 a photograph of the signature page on your phone \u2014 and I can file this today."
+      },
+      "makeFirst": true
+    },
+    {
+      "note": "Sable & Finch have gone from asking to giving you a date. That is usually the last step before they stop asking.",
+      "item": {
+        "id": "itm_new_sable_deadline",
+        "kind": "task",
+        "bucket": "today",
+        "headline": "Sable & Finch have put a date on the receipts",
+        "why": "Dermot has moved from asking to naming a deadline. He does not usually do that twice.",
+        "person": "Dermot Finch",
+        "person_email": "dermot.finch@sableandfinch.example",
+        "due": {
+          "day": 2,
+          "time": "17:00"
+        },
+        "severity": 2,
+        "link": null,
+        "firstSeenDays": 0,
+        "seen_runs": 1,
+        "sourceRefs": [
+          "msg_sable_2"
+        ]
+      },
+      "message": {
+        "id": "msg_sable_2",
+        "from_name": "Dermot Finch",
+        "from_email": "dermot.finch@sableandfinch.example",
+        "subject": "Re: Receipts \u2014 March to June",
+        "day": 0,
+        "minutesAgo": 11,
+        "snippet": "Friday, or we file an estimate and amend it later at your cost.",
+        "body": "Friday. After that we file an estimate and amend it later, which costs you more than an afternoon with a shoebox would have."
+      },
+      "draft": {
+        "id": "drf_sable_receipts",
+        "item_id": "itm_new_sable_deadline",
+        "to_email": "dermot.finch@sableandfinch.example",
+        "subject": "Re: Receipts \u2014 March to June",
+        "body": "Dermot,\n\nFriday is fine and I am sorry it took a deadline.\n\nMarch and April are already scanned and I will send those tonight. May and June are the shoebox; I will photograph the lot tomorrow morning and send it in one go rather than dribbling it at you.\n\nIf anything is missing after that, tell me what and I will chase the supplier for a copy.\n\nIvo",
+        "createdHoursAgo": 0
+      }
+    },
+    {
+      "note": "The borough answered. Sixteen days, and it was a reference number all along.",
+      "item": {
+        "id": "itm_new_permit_ref",
+        "kind": "task",
+        "bucket": "today",
+        "headline": "The hoarding permit has a reference number \u2014 send it to the fencing contractor",
+        "why": "The borough finally answered. The fence has been waiting on this one string for sixteen days.",
+        "person": "Borough highways desk",
+        "person_email": "highways@northmoorborough.example",
+        "due": {
+          "day": 1,
+          "time": "12:00"
+        },
+        "severity": 2,
+        "link": null,
+        "firstSeenDays": 0,
+        "seen_runs": 1,
+        "sourceRefs": [
+          "msg_permit_2"
+        ]
+      },
+      "message": {
+        "id": "msg_permit_2",
+        "from_name": "Northmoor Borough highways",
+        "from_email": "highways@northmoorborough.example",
+        "subject": "Hoarding permit NM-2214-HD \u2014 granted",
+        "day": 0,
+        "minutesAgo": 26,
+        "snippet": "Permit granted. Reference NM-2214-HD. Display a copy on the hoarding.",
+        "body": "Permit granted. Reference NM-2214-HD, valid twelve weeks from issue. A copy must be displayed on the hoarding and be legible from the footway."
+      },
+      "resolves": "itm_wait_hoarding_permit"
+    }
+  ],
+  "ask": {
+    "fallback": "I can only answer from what Zelos has indexed on this machine, and nothing in the mail, calendar or notes speaks to that directly. The nearest things it found are listed above \u2014 if one of them is the thread you meant, ask about it by name and I will read it properly.",
+    "scripts": [
+      {
+        "match": "bond|pentland|desmond|surety|rider",
+        "sources": [
+          "msg_pentland_2",
+          "msg_pentland_1",
+          "itm_pentland_bond",
+          "evt_surety_cutoff"
+        ],
+        "answer": "Desmond Okafor at Pentland Civil needs the bond rider signed by you before the surety desk closes at five today. He has asked twice \u2014 once three days ago when he signed Pentland's side, and again this morning to say the filing goes in at four.\n\nHe has also told you the escape hatch: sign the page, photograph it, send the photograph. The surety has accepted that before.\n\nThere is a walkthrough with him on your calendar at 11 this morning, which is the last moment this is a conversation rather than a chase."
+      },
+      {
+        "match": "brightsea|yuki|diligence|retention|term sheet|hosting",
+        "sources": [
+          "msg_brightsea_1",
+          "itm_brightsea_diligence",
+          "itm_owe_yuki_metrics",
+          "evt_brightsea_partners"
+        ],
+        "answer": "Yuki Tamsin at Brightsea asked you two questions six days ago and has had no answer.\n\nOne: retention by cohort rather than in aggregate \u2014 she specifically wants to see the February shape, which the aggregate hides. Two: why the hosting line in your model grows faster than revenue.\n\nYou also told her, in writing, that the retention numbers would be with her by Wednesday. That is tomorrow. There is a draft reply waiting in Owed that answers both \u2014 the February dip was a reseller consolidating eleven accounts into two.\n\nHer partner meeting is a week today, which is the real deadline underneath the stated one."
+      },
+      {
+        "match": "fenwick|kickoff|roisin|conflict|ardmore|priya",
+        "sources": [
+          "msg_ardmore_1",
+          "msg_fenwick_1",
+          "evt_fenwick_kickoff",
+          "evt_meridian_walk",
+          "itm_ardmore_conflict"
+        ],
+        "answer": "The Fenwick kickoff is in two days, from 10 until 12, at the co-op in Ballynure. Three things are attached to it.\n\nPriya Ardmore cannot open the matter until you confirm in writing that there is no conflict \u2014 she asked two days ago and a sentence is enough. There is a draft in Owed that says it.\n\nThe Meridian freight walkthrough is booked for 10:30 the same morning, straight over the top of it. Aurelio has already offered the following day and said the yard is quieter then.\n\nAnd Roisin mentioned once, in a thread about scaffolding, that the grant window closes with the quarter. Nobody has done anything with that."
+      },
+      {
+        "match": "owe|owed|waiting|chase|promised|late|overdue",
+        "sources": [
+          "itm_wait_hoarding_permit",
+          "itm_wait_meridian_quote",
+          "itm_owe_yuki_metrics",
+          "itm_halloran_overdue",
+          "msg_meridian_1"
+        ],
+        "answer": "Three people owe you something and three people are owed something by you.\n\nOwed to you: the borough has sat on the hoarding permit for sixteen days with no reference number, which is blocking the site fence. Meridian owe the revised haulage quote \u2014 Aurelio said Tuesday, eight days ago. Ardmore & Vance have had the redline for five days against a two-day turnaround.\n\nOwed by you: retention numbers to Yuki by tomorrow, an introduction you promised Tobias twelve days ago, and one sentence of photography credit to Imogen.\n\nSeparately, Halloran Rowe are 41 days late on invoice 2214 \u2014 \u00a38,650, and the fourth late invoice in a row."
+      },
+      {
+        "match": "money|invoice|paid|payment|quarrymen|nils|halloran|receipt|\u00a3|budget",
+        "sources": [
+          "itm_quarrymen_invoice",
+          "itm_halloran_overdue",
+          "msg_quarrymen_1",
+          "msg_sable_1",
+          "msg_halloran_invoice"
+        ],
+        "answer": "Two live money items and one administrative one.\n\nOut: the Quarrymen invoice for phase two stonework, \u00a314,280, measured and agreed on site. Nils pays his crew on Friday and has said an approval before then keeps him out of his own overdraft.\n\nIn: Halloran Rowe, invoice 2214, \u00a38,650, 41 days overdue. Marguerite last replied twelve days ago to say it was with their finance people. It is the fourth late one in a row and the previous two each needed a phone call.\n\nAnd Dermot Finch at Sable & Finch has asked four times for the March to June receipts. He has stopped being annoyed and started being polite about it, which is worse."
+      },
+      {
+        "match": "today|now|first|urgent|what should i|priority|priorities",
+        "sources": [
+          "itm_pentland_bond",
+          "itm_brightsea_diligence",
+          "itm_halloran_rfi",
+          "evt_rfi_214",
+          "evt_lunch_finch"
+        ],
+        "answer": "First: the Pentland bond rider. It is the only thing today with a hard external cut-off \u2014 the surety desk shuts at five and after that it is next week.\n\nThen the Brightsea answers, because six days of silence on an open term sheet is doing damage that a late reply cannot undo but an absent one compounds.\n\nThen RFI 214 \u2014 the steel fabricator has downed tools on that assembly and is waiting on one connection detail.\n\nYour calendar has a problem at half past one: lunch with Dermot Finch and the RFI call are booked over each other. Given that RFI 214 is on the board and Dermot has asked for receipts four times, neither is obviously the one to drop."
+      },
+      {
+        "match": "calendar|double|clash|conflict|booked|meeting|schedule",
+        "sources": [
+          "evt_lunch_finch",
+          "evt_rfi_214",
+          "evt_fenwick_kickoff",
+          "evt_meridian_walk"
+        ],
+        "answer": "Two collisions this week.\n\nToday at 13:30 the RFI 214 call with the steel fabricator runs straight into lunch with Dermot Finch, which starts at one. Half an hour of overlap and both of them think they have you.\n\nIn two days the Meridian freight walkthrough at 10:30 sits inside the Fenwick kickoff, which runs 10 until 12 and is an hour's drive from the Meridian yard. That one is not a scheduling problem, it is a choice \u2014 and Aurelio has already offered the following day.\n\nEverything else in the week is clean."
+      }
+    ]
+  }
+}

@@ -207,8 +207,8 @@ export const api = {
    * request in flight, a slow answer to `sur` can land after the answer to
    * `survey` and overwrite it with the wrong results.
    */
-  search: (q, { limit = null, signal = undefined } = {}) => {
-    const query = `q=${encodeURIComponent(q)}${limit === null ? '' : `&limit=${encodeURIComponent(limit)}`}`;
+  search: (q, { limit = null, signal = undefined, includeHistory = false } = {}) => {
+    const query = `q=${encodeURIComponent(q)}${limit === null ? '' : `&limit=${encodeURIComponent(limit)}`}${includeHistory ? '&includeHistory=1' : ''}`;
     return request(`/api/search?${query}`, { signal });
   },
 

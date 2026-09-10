@@ -1,0 +1,109 @@
+/* ==========================================================================
+   demo/demo.css — the only stylesheet in this directory that is not the app's.
+
+   Loaded after app.css, and it adds exactly one thing: the strip along the top
+   that says this is a demo. It borrows the app's own tokens — --accent, --paper,
+   --line, --ink-2, the mono stack — so it reads as part of the room rather than
+   as a website banner glued to an app. No new colours.
+
+   The three overrides below exist because the app's chrome sticks to the top of
+   the viewport, and there is now something above it: the header pins under the
+   strip, the rail pins under the header, and the shell stops claiming a full
+   viewport it no longer has.
+   ========================================================================== */
+
+:root {
+  /* demo-banner.js measures the strip and writes the real value here; this is
+     the pre-measurement fallback, not a constant to keep in sync. */
+  --demo-bar-h: 2.75rem;
+}
+
+.demo-bar {
+  position: sticky;
+  top: 0;
+  z-index: 60;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.9rem;
+  padding: 0.5rem clamp(0.9rem, 3vw, 2rem);
+  font-size: 0.8125rem;
+  line-height: 1.35;
+  color: var(--ink-2);
+  background: color-mix(in srgb, var(--accent) 7%, #000000);
+  border-bottom: 1px solid var(--accent-edge);
+  -webkit-backdrop-filter: blur(var(--glass-blur));
+  backdrop-filter: blur(var(--glass-blur));
+}
+
+.demo-bar-tag {
+  flex: none;
+  padding: 0.15rem 0.45rem;
+  font-family: var(--mono);
+  font-size: 0.6875rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--on-accent);
+  background: var(--accent);
+  border-radius: 3px;
+}
+
+.demo-bar-text { min-width: 0; }
+.demo-bar-em { color: var(--ink); }
+
+/* Only on Settings, where the fields look like they want a real password. */
+.demo-bar-warn {
+  color: var(--accent-text);
+}
+
+.demo-bar-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin-left: auto;
+}
+
+.demo-bar-link,
+.demo-bar-btn {
+  flex: none;
+  padding: 0.3rem 0.6rem;
+  font: inherit;
+  font-size: 0.75rem;
+  color: var(--ink);
+  background: var(--ground-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+.demo-bar-link:hover,
+.demo-bar-btn:hover { background: var(--ground-3); border-color: var(--line-strong); }
+
+.demo-bar-link {
+  color: var(--accent-text);
+  border-color: var(--accent-edge);
+}
+
+/* ---------------------------------------------------------------- offsets */
+
+/* The header used to stick to the viewport top; now the strip is there. */
+.topbar { top: var(--demo-bar-h); }
+
+/* One less viewport-height's worth of room, or the page always overscrolls. */
+.shell { min-height: calc(100dvh - var(--demo-bar-h)); }
+
+@media (min-width: 60rem) {
+  .rail {
+    top: calc(var(--demo-bar-h) + var(--topbar-h));
+    max-height: calc(100dvh - var(--demo-bar-h) - var(--topbar-h));
+  }
+}
+
+/* The onboarding flow drops the chrome entirely, so it needs no offset — but
+   its own top padding lands under the strip without this. */
+.shell-bare .view-onboarding { padding-top: clamp(1rem, 4vh, 2.5rem); }
+
+@media (max-width: 34rem) {
+  .demo-bar { font-size: 0.75rem; }
+  .demo-bar-actions { margin-left: 0; }
+}

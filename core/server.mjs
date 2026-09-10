@@ -58,6 +58,7 @@ import { CALENDAR_DEFAULTS, loadConfig, saveConfig, validateConfig, paths, isVal
    ask it instead. It costs this process nothing new: every module it pulls in —
    core/sources/imap.mjs, caldav.mjs, ics.mjs — is already imported below. */
 import { describe as describeConnectors, typesFor } from './connectors/index.mjs';
+import { readSourceStatus } from './source-status.mjs';
 import { getSecret, setSecret, deleteSecret, listRefs, backend } from './secrets.mjs';
 import {
   listBoard, bucketCounts, listEvents, listDrafts, updateDraft, lastRun,
@@ -841,7 +842,8 @@ function boardNarrative(db) {
     }
   }
   const first = getKV(db, 'sweep.first');
-  return { notes, first: first && getItem(db, first) ? first : null };
+  const firstItem = first ? getItem(db, first) : null;
+  return { notes, first: firstItem && !firstItem.sourceInactive ? first : null };
 }
 
 /**
@@ -992,6 +994,7 @@ async function handleState(ctx) {
     events: listEvents(db, { from, to, limit: 1000 }),
     drafts: listDrafts(db, { states: ['pending', 'edited'], limit: 200 }),
     runs: { last: lastRun(db) },
+    sourceStatus: readSourceStatus(db, cfg, { now }),
     notes: narrative.notes,
     first: narrative.first,
     /* WHICH DAYS `events` IS AN ANSWER ABOUT — the contract that stops the
@@ -2185,7 +2188,7 @@ const QUESTION_NOISE = new Set([
  * precise match precise.
  */
 function groundingHits(db, question, limit) {
-  const whole = search(db, question, { limit });
+  const whole = search(db, question, { limit, includeInactive: true });
   if (whole.length) return whole;
 
   const terms = [...new Set(question.toLowerCase().match(/[\p{L}\p{N}]{3,}/gu) || [])]
@@ -2193,12 +2196,12 @@ function groundingHits(db, question, limit) {
     .slice(0, 8);
   if (!terms.length) return [];
 
-  const narrowed = search(db, terms.join(' '), { limit });
+  const narrowed = search(db, terms.join(' '), { limit, includeInactive: true });
   if (narrowed.length) return narrowed;
 
   const byRef = new Map();
   for (const term of terms) {
-    for (const hit of search(db, term, { limit })) {
+    for (const hit of search(db, term, { limit, includeInactive: true })) {
       const seen = byRef.get(hit.ref);
       if (!seen || hit.score > seen.score) byRef.set(hit.ref, hit);
     }
@@ -2217,6 +2220,9 @@ function askContext(db, question, privacy) {
     if (!row) continue;
     let title = hit.title || '';
     const facts = [];
+    if (hit.sourceInactive) {
+      facts.push('Historical task evidence: no longer in the source’s current selection. Absence does not prove completion; original open status and due dates describe an earlier read, not a current obligation.');
+    }
     if (hit.kind === 'message') {
       title = row.subject || '(no subject)';
       facts.push(`from: ${row.from_name || ''} <${row.from_email || ''}>`.trim());
@@ -2236,7 +2242,7 @@ function askContext(db, question, privacy) {
       facts.push(`noted: ${row.created_at}`, cap(row.text, ASK_CONTEXT_CHARS));
     }
 
-    sources.push({ ref: hit.ref, kind: hit.kind, title: cap(title, 120), excerpt: cap(hit.excerpt, 200) });
+    sources.push({ ref: hit.ref, kind: hit.kind, title: cap(title, 120), excerpt: cap(hit.excerpt, 200), ...(hit.sourceInactive ? { sourceInactive: true } : {}) });
     blocks.push(`[${hit.ref}] ${title}\n${scrubForPrompt(facts.filter(Boolean).join('\n'))}`);
   }
 
@@ -2345,7 +2351,7 @@ async function handleAsk(ctx) {
       if (!sse.open) break; // the client left; stop pulling tokens
       if (event.type === 'delta') sse.send('delta', { text: event.text });
       else if (event.type === 'done') {
-        sse.send('done', { usage: event.usage, model: event.model, grounded: true });
+        sse.send('done', { usage: event.usage, model: event.model, grounded: true, stopReason: event.stopReason });
         // Reported to this one client, and now recorded for the counter every
         // client reads. Both, not either: the SSE frame is what the Ask panel
         // shows about this answer, and the counter is what the rail shows about
@@ -2393,7 +2399,8 @@ function handleSearch(ctx) {
   const q = ctx.url.searchParams.get('q') || '';
   if (q.length > 200) throw new HttpError(400, 'q is too long');
   const limit = Math.min(50, Math.max(1, Number(ctx.url.searchParams.get('limit')) || 20));
-  sendJSON(ctx.res, 200, { q, results: search(ctx.db, q, { limit }) });
+  const includeInactive = ctx.url.searchParams.get('includeHistory') === '1';
+  sendJSON(ctx.res, 200, { q, results: search(ctx.db, q, { limit, includeInactive }) });
 }
 
 /**

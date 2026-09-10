@@ -1,93 +1,44 @@
 # Installing Zelos
 
-There are three ways to run Zelos, and all three run **the same program**. The
-desktop app is not a different Zelos — it is the same core, in a window, with
-a tray icon.
+Zelos is available as a desktop app or a source download. Both run the same
+program. The desktop app includes its runtime and opens in its own window.
 
 **Not a programmer?** You want the desktop app. Download it for your Mac or
 Windows PC from [zelos-app.netlify.app](https://zelos-app.netlify.app/#download).
-The first time you open it your computer shows a warning; that is because
-nobody has paid the yearly fee that makes the warning go away, not because
-anything is wrong, and
+These builds do not have a verified publisher signature, so your computer may
+show a warning. Continue only if you trust the download. The sections
 [Installing on macOS](#installing-on-macos--and-what-you-will-actually-see) and
 [Installing on Windows](#installing-on-windows--and-what-you-will-actually-see)
 below say what to click. The rest of this page is for people who type commands.
 
-|  | `npx zelos-app` | Run from source | Desktop app |
-|---|---|---|---|
-| What you install | nothing permanent | Node.js | a `.dmg` or a `.exe` |
-| Third-party code | none | none | Electron (the window), and only in the shell |
-| Where the board opens | your own browser | your own browser | its own window |
-| Download | ~720 KB (plus Node, if you don't have it) — **but see the warning below** | ~60 MB (Node) | ~120 MB, ~300 MB installed |
-| Runs in the background | while the terminal is open | while the terminal is open | yes, from the tray — **except on Linux**, where closing the window quits unless you set `ZELOS_TRAY_RESIDENT=1` |
-| Warns on first open | no | no | **yes — see below.** These builds are ad-hoc signed at best |
+## Updating from an earlier version
 
-> **The package is not published yet, so `npx zelos-app` does not work today.**
-> `npm view zelos-app` answers `404 Not Found`. Publishing is a deliberate,
-> manual step and nobody has taken it. Until somebody does, **Path 2 — run from
-> source — is the path that works**, and it is the same program. Path 1 is
-> written out below because it is what the command will do once the package is
-> up, not because you can run it right now.
+Quit Zelos, then copy the data folder shown in Settings to a safe location before
+installing the update. The usual folder is `~/.zelos`. Install the new app over
+the old one; it retains your data and upgrades the database on first launch.
+Keep the copy if you may need to return to an older version. A board snapshot
+is not a complete backup, and credentials in your operating system's keychain
+may need reconnecting on another computer.
 
----
+Release notes, all four installers, source, and SHA-256 checksums are on the
+[GitHub releases page](https://github.com/HoosAILLC/zelos/releases).
 
-## Path 1 — `npx zelos-app`
+## Path 1 — Command-line usage
 
-**Not yet.** This section describes a command that 404s today: `zelos-app` has
-never been published to npm. Skip to [Path 2](#path-2--run-it-from-source)
-unless you are reading to find out what publishing would give you.
-
-You need **Node.js 22.16 or newer, or 24 or newer** — and not the Node 23 line,
-which is a real exclusion rather than a typo (the next section says why, and how
-to check what you have). Then:
-
-```
-npx zelos-app
-```
-
-That downloads one package, runs it, and opens your browser at the board. There
-is no install step, no configuration file to write first, and nothing to undo
-afterwards.
-
-To keep it around instead:
-
-```
-npm install -g zelos-app     # installs the `zelos` command
-zelos                        # …and this starts it
-```
-
-**What that would actually download.** One package and nothing else — Zelos has
-no dependencies, so there is no tree of other people's code behind it. It
-declares no install scripts either, so `npm` runs nothing on the way in:
-downloading it and running it are two separate decisions, and you make both.
-
-The size, measured rather than remembered — run it yourself in the repo:
-
-```
-npm pack --dry-run
-```
-
-**69 files, about 740 kB packed, 2.3 MB unpacked** at the time of writing — run
-the command rather than trusting the number, since editing these very documents
-moves it. One thing is deliberately *excluded*: `assets/icon.png`, the
-1024px app icon, which is 290 kB and was briefly 40% of this download: it is
-read only by the desktop shell (`desktop/main.js`, and electron-builder), and
-`desktop/` is not in the package, so it was shipping to nobody. `core/sources/oauth.mjs` *does* ship now: it carries **Sign in with Google** for mail (PKCE, loopback callback on the Zelos port) and the calendar OAuth plumbing — see [OAUTH.md](OAUTH.md). The Microsoft *mail* sign-in is the device-code flow in `core/sources/imap.mjs` § 6; both reach the app from **Settings → Mail**. The web UI's
-icon is `assets/icon.svg`, which is 22 kB and does ship.
-
-> The npm name is **`zelos-app`** (`zelos` was taken), and as of this writing
-> nothing has been published under it.
+Download and unpack the source archive, then open a terminal in its `zelos`
+folder. The npm package is not part of this release; use `node zelos.mjs`
+followed by any subcommand below.
 
 ### The four things you can type
 
 ```
-zelos                Run the app. This is the one you want.
-zelos sweep          Read your sources once, think about them, print what
+node zelos.mjs                Run the app. This is the one you want.
+node zelos.mjs sweep          Read your sources once, think about them, print what
                      changed, and stop. Exits non-zero if the sweep failed,
                      so it is safe to put in a cron job.
-zelos doctor         Check every part of the setup and say, in plain words,
+node zelos.mjs doctor         Check every part of the setup and say, in plain words,
                      what to do about anything that is wrong.
-zelos mcp            Serve Zelos's read-only tools over MCP on stdin/stdout,
+node zelos.mjs mcp            Serve Zelos's read-only tools over MCP on stdin/stdout,
                      for an AI client that spawns it. Off unless you have
                      switched AI access on in Settings.
 ```
@@ -162,7 +113,7 @@ Path 3.)
 You will see a banner like this, and your browser will open:
 
 ```
-  ZELOS 1.5.0
+  ZELOS 1.7.0
   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   Open   http://127.0.0.1:7777/?t=9c1f…
@@ -245,10 +196,10 @@ installer built from a failing tree. What comes out is attached to that run as
 an artifact:
 
 ```
-Zelos-1.5.0-arm64.dmg          Apple Silicon
-Zelos-1.5.0-x64.dmg            Intel Macs
-Zelos-1.5.0-setup-x64.exe      Windows, 64-bit — ordinary PCs
-Zelos-1.5.0-setup-arm64.exe    Windows on ARM
+Zelos-1.7.0-arm64.dmg          Apple Silicon
+Zelos-1.7.0-x64.dmg            Intel Macs
+Zelos-1.7.0-setup-x64.exe      Windows, 64-bit — ordinary PCs
+Zelos-1.7.0-setup-arm64.exe    Windows on ARM
 ```
 
 Windows also gets a third installer from the same run, carrying both
@@ -293,9 +244,8 @@ the top-level `package.json`, which has no `dependencies` field at all.
 ## Installing on macOS — and what you will actually see
 
 **In plain English first.** Your Mac shows a warning the first time you open
-Zelos because we have not paid Apple's yearly developer fee — not because
-anything is wrong. The program is free, runs only on your computer, and anyone
-can read its code. Here is what to click, once: press **Done** on the warning
+Zelos because its publisher has not been verified by Apple. Only continue if
+you trust this release. Here is what to click: press **Done** on the warning
 (not *Move to Trash*), then open **System Settings → Privacy & Security**,
 scroll to the bottom, and press **Open Anyway**. Everything below this paragraph
 is the technical explanation of why.
@@ -370,9 +320,8 @@ the signature.
 
 **In plain English first.** Windows shows a blue box that says **Windows
 protected your PC** the first time you run the installer. Click **More info**,
-then **Run anyway**. It appears because we have not paid the yearly fee for the
-stamp that makes it go away — not because anything is wrong. Everything below
-this paragraph is the technical explanation of why.
+then **Run anyway** only if you trust this release. Windows cannot verify the
+publisher of these installers. Everything below this paragraph explains why.
 
 **These builds are not signed at all** — not even ad-hoc. There is no signing
 configuration in the `win` block of `desktop/package.json`, so nothing is
@@ -389,7 +338,7 @@ reasonable to click past *this* one is that you can read the source and build
 the installer yourself.
 
 1. **Take the installer that matches your machine.**
-   `Zelos-1.5.0-setup-x64.exe` for an ordinary PC, `-arm64` for Windows on ARM,
+   `Zelos-1.7.0-setup-x64.exe` for an ordinary PC, `-arm64` for Windows on ARM,
    or the combined installer if you are not sure. The wrong one either runs
    slowly under emulation or does not run at all.
 2. **Your browser may refuse to keep the file.** Edge says *"…setup.exe was
@@ -427,7 +376,7 @@ can clear it first: right-click the `.exe` → **Properties** → tick **Unblock
 at the bottom of the **General** tab → **OK**. In PowerShell that is:
 
 ```
-Unblock-File .\Zelos-1.5.0-setup-x64.exe
+Unblock-File .\Zelos-1.7.0-setup-x64.exe
 ```
 
 That marker is a real safety mechanism — clear it only from something you built

@@ -16,6 +16,20 @@ import { api } from '../lib/api.js';
 
 const SAVE_DEBOUNCE_MS = 900;
 
+// A card can be rebuilt while its previous instance is still saving. Keep the
+// write order and discard gate with the draft, so an old autosave cannot undo
+// a Discard made from the new card.
+const draftWriters = new Map();
+function writerFor(id) {
+  if (!draftWriters.has(id)) draftWriters.set(id, { tail: Promise.resolve(), discarding: false, heldSaves: new Set() });
+  return draftWriters.get(id);
+}
+function writeDraft(id, writer, patch) {
+  const pending = writer.tail.then(() => api.updateDraft(id, patch));
+  writer.tail = pending.catch(() => {});
+  return pending;
+}
+
 /**
  * Where a mailto address stops being honoured. Real email programs cut the
  * whole thing off somewhere shortly past two thousand characters, and the
@@ -59,6 +73,7 @@ export function mailtoDraft(to, subject, body) {
  * than a stale count.
  */
 function draftCard(draft, itemsById) {
+  const writer = writerFor(draft.id);
   const item = itemsById.get(draft.item_id) || null;
   const status = el('span', { class: 'draft-status mono', role: 'status', text: 'Saved' });
   const area = el('textarea', {
@@ -84,6 +99,7 @@ function draftCard(draft, itemsById) {
   let dirty = false;
 
   async function save() {
+    if (writer.discarding) { writer.heldSaves.add(save); return; }
     if (inFlight) { dirty = true; return; }
     inFlight = true;
     dirty = false;
@@ -100,7 +116,7 @@ function draftCard(draft, itemsById) {
     status.textContent = 'Saving…';
     status.classList.remove('is-bad');
     try {
-      await api.updateDraft(draft.id, { body, state: 'edited' });
+      await writeDraft(draft.id, writer, { body, state: 'edited' });
       status.textContent = 'Saved';
     } catch (err) {
       status.textContent = err.message;
@@ -161,12 +177,41 @@ function draftCard(draft, itemsById) {
         : null,
       button('Discard', {
         class: 'btn quiet',
-        onClick: async () => {
+        onClick: async (e) => {
+          if (writer.discarding) return;
+          writer.discarding = true;
+          const wasEditing = status.textContent === 'Editing…' || dirty;
+          clearTimeout(timer);
+          dirty = false;
+          const discardButton = e.currentTarget;
+          discardButton.disabled = true;
+          area.disabled = true;
           try {
-            await api.updateDraft(draft.id, { state: 'discarded' });
+            await writeDraft(draft.id, writer, { state: 'discarded' });
+          } catch (err) {
+            writer.discarding = false;
+            discardButton.disabled = false;
+            area.disabled = false;
+            // Restore the autosave cancelled above before notify can repaint
+            // the card; the words still on screen must remain recoverable.
+            for (const resume of writer.heldSaves) resume();
+            writer.heldSaves.clear();
+            if (wasEditing) save();
+            notify(`Could not discard that draft: ${err.message}`, { tone: 'warn' });
+            return;
+          }
+          writer.heldSaves.clear();
+          // A failed refetch should still leave the successful discard in
+          // place. Detached cards retain their closed writer gate.
+          state.board = {
+            ...state.board,
+            drafts: state.board.drafts.filter(d => d.id !== draft.id),
+          };
+          draftWriters.delete(draft.id);
+          try {
             await refreshBoard();
           } catch (err) {
-            notify(`Could not discard that draft: ${err.message}`, { tone: 'warn' });
+            notify(`Could not refresh the board: ${err.message}`, { tone: 'warn' });
           }
         },
       }),

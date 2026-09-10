@@ -21,6 +21,7 @@ import { askClaude } from './settings.js';
 import { byUrgency, sweepSummary, plural } from '../lib/format.js';
 import { state, startSweep, itemsInBucket, snoozedItems, finishedItems, boardNotes } from '../lib/store.js';
 import { humanDelta, instant } from '../lib/time.js';
+import { readingStatus } from '../lib/source-status.js';
 
 const MAX_NOW_ROWS = 4;
 
@@ -259,6 +260,9 @@ export function renderNow(ctx) {
       button('Open Today', { class: 'link', onClick: () => navigate('#/today') }),
     ]));
   }
+
+  const connections = readingStatus(navigate);
+  if (connections) body.appendChild(connections);
 
   // The snoozed, folded and dimmed at the very bottom: off the board but never
   // off the record. Each row says when it comes back, and Wake lives in the

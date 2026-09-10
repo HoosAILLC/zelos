@@ -11,6 +11,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { execFileSync } from 'node:child_process';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -26,6 +27,33 @@ test('the root and desktop manifests carry the same version', () => {
   const desktop = JSON.parse(fs.readFileSync(path.join(ROOT, 'desktop', 'package.json'), 'utf8'));
   assert.equal(desktop.version, root.version,
     'package.json and desktop/package.json disagree on the version — a release bump edits both');
+  const lock = JSON.parse(fs.readFileSync(path.join(ROOT, 'desktop/package-lock.json'), 'utf8'));
+  assert.equal(lock.version, root.version);
+  assert.equal(lock.packages[''].version, root.version);
+});
+
+test('the website ships the current UI and versioned download routes together', () => {
+  execFileSync(process.execPath, ['scripts/build-website.mjs'], { cwd: ROOT, stdio: 'pipe' });
+  const output = path.join(ROOT, '.site-dist');
+  const version = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')).version;
+  const walk = (dir) => fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) =>
+    entry.isDirectory() ? walk(path.join(dir, entry.name)) : [path.join(dir, entry.name)]);
+  for (const source of walk(path.join(ROOT, 'ui'))) {
+    const relative = path.relative(path.join(ROOT, 'ui'), source);
+    if (relative === 'index.html' || relative === path.join('lib', 'api.js')) continue;
+    assert.equal(fs.readFileSync(path.join(output, 'demo', relative), 'utf8'), fs.readFileSync(source, 'utf8'), relative);
+  }
+  const data = fs.readFileSync(path.join(output, 'demo/lib/demo-data.js'), 'utf8');
+  assert.equal(JSON.parse(data.replace(/^export default /, '').replace(/;\s*$/, '')).version, version);
+  assert.match(fs.readFileSync(path.join(output, 'index.html'), 'utf8'), new RegExp(`Version ${version.replaceAll('.', '\\.')}`));
+  const redirects = fs.readFileSync(path.join(output, '_redirects'), 'utf8').trim().split('\n');
+  for (const alias of ['Zelos-mac-apple-silicon.dmg', 'Zelos-mac-intel.dmg', 'Zelos-windows-x64.exe', 'Zelos-windows-arm64.exe', 'zelos-source.zip']) {
+    const route = redirects.find((line) => line.startsWith(`/downloads/${alias} `));
+    assert.ok(route, `Missing download alias ${alias}`);
+    assert.ok(route.includes(`/releases/download/v${version}/`), `Stale download ${route}`);
+  }
+  assert.ok(!fs.readFileSync(path.join(output, 'demo/lib/api.js'), 'utf8').includes("const TOKEN_KEY = 'zelos.token'"), 'The demo must use its in-memory adapter');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(output, 'release.json'), 'utf8')).version, version);
 });
 
 test('CI installs the shell\'s build tools from the lockfile, with no fallback', () => {
