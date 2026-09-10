@@ -16,6 +16,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import vm from 'node:vm';
 import { after, before, describe, it } from 'node:test';
 import { PassThrough } from 'node:stream';
 import { registerHooks } from 'node:module';
@@ -35,6 +36,33 @@ import { acquireHomeLock, holdHome, lockHolderState, readHomeLock } from '../cor
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, '..');
+
+it('shutdown retries native quit after Electron clears its reentrant quit guard', async () => {
+  const source = fs.readFileSync(path.join(REPO, 'desktop/main.js'), 'utf8');
+  const shutdown = /function beginShutdown\(\) \{[\s\S]*?\n\}/.exec(source)?.[0];
+  assert.ok(shutdown, 'exercise the real shutdown function');
+  const observed = { inNativeQuit: true, released: false, ignored: 0, exited: false };
+  // Electron drains JS microtasks inside will-quit, before it resets its
+  // native is_quitting flag after a prevented event. Model that boundary;
+  // a plain EventEmitter misses the reentrant second-quit failure.
+  vm.runInNewContext(`
+    let shuttingDown = null, crashTimer = null, windowState = null;
+    let zelos = { stop: async () => { observed.released = true; } };
+    ${shutdown}
+    beginShutdown();
+  `, {
+    observed, setImmediate, clearTimeout,
+    app: { quit() {
+      if (observed.inNativeQuit) observed.ignored++;
+      else observed.exited = true;
+    } },
+  }, { microtaskMode: 'afterEvaluate' });
+  observed.inNativeQuit = false;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(observed.released, true);
+  assert.equal(observed.ignored, 0, 'Electron ignored the reentrant second quit');
+  assert.equal(observed.exited, true, 'the core stopped but the native shell stayed alive');
+});
 
 /* ------------------------------------------------------------------ *
  * guard.js
@@ -93,9 +121,10 @@ describe('classifyTarget', () => {
 });
 
 describe('guardWebContents', () => {
-  function harness({ port = 7777 } = {}) {
+  function harness({ port = 7777, openExternal, onExternalOpenError } = {}) {
     const opened = [];
     const warned = [];
+    const logs = [];
     const handlers = new Map();
     const contents = {
       on(event, handler) {
@@ -106,8 +135,12 @@ describe('guardWebContents', () => {
     };
     guardWebContents(contents, {
       getPort: () => port,
-      openExternal: (url) => opened.push(url),
-      logger: { info() {}, warn: (msg, meta) => warned.push(meta?.url ?? msg) },
+      openExternal: openExternal ?? ((url) => opened.push(url)),
+      onExternalOpenError,
+      logger: {
+        info: (msg, meta) => logs.push({ msg, meta }),
+        warn: (msg, meta) => { warned.push(meta ?? msg); logs.push({ msg, meta }); },
+      },
     });
     const navigate = (url) => {
       let prevented = false;
@@ -115,7 +148,7 @@ describe('guardWebContents', () => {
       for (const handler of handlers.get('will-navigate')) handler(event, url);
       return prevented;
     };
-    return { contents, opened, warned, navigate, handlers };
+    return { contents, opened, warned, logs, navigate, handlers };
   }
 
   it('lets the board navigate itself and nothing else', () => {
@@ -128,7 +161,7 @@ describe('guardWebContents', () => {
 
     assert.equal(h.navigate('file:///etc/passwd'), true);
     assert.deepEqual(h.opened, ['https://evil.example/steal']); // still just the one
-    assert.deepEqual(h.warned, ['file:///etc/passwd']);
+    assert.deepEqual(h.warned, [{ scheme: 'file:', host: null, reason: 'file: is not a scheme the shell will open' }]);
   });
 
   it('guards redirects too, not just clicks', () => {
@@ -166,9 +199,61 @@ describe('guardWebContents', () => {
     const h = harness();
     for (const url of ['http://127.0.0.1:7777/?t=garbage', 'http://localhost:7777/?t=garbage', 'http://[::1]:7777/#/settings']) {
       assert.deepEqual(h.contents.windowOpen({ url }), { action: 'deny' });
-      assert.ok(h.warned.includes(url), `${url} was not logged as refused`);
+      assert.deepEqual(h.warned.at(-1), {
+        scheme: 'http:', host: new URL(url).hostname, reason: 'the board opens no popups of its own',
+      });
     }
     assert.equal(h.opened.length, 0, 'none of them belongs in the system browser either');
+  });
+
+  it('logs only scheme and host, keeping draft bodies, credentials, paths and tokens out of logs', () => {
+    const h = harness();
+    const mail = 'mailto:PRIVATE_RECIPIENT@example.com?subject=PRIVATE_SUBJECT&body=PRIVATE_DRAFT';
+    const web = 'https://PRIVATE_USER:PRIVATE_PASSWORD@example.com/PRIVATE_PATH?token=PRIVATE_TOKEN#PRIVATE_FRAGMENT';
+    h.navigate(mail);
+    h.contents.windowOpen({ url: web });
+    h.navigate('data:text/plain,PRIVATE_BLOCKED_CONTENT');
+    h.navigate('PRIVATE_INVALID_URL');
+    h.contents.windowOpen({ url: 'http://127.0.0.1:7777/?t=PRIVATE_SESSION_TOKEN' });
+
+    assert.deepEqual(h.opened, [mail, web], 'the external app still receives the complete link');
+    assert.equal(JSON.stringify(h.logs).includes('PRIVATE_'), false);
+    assert.deepEqual(h.logs[0].meta, { scheme: 'mailto:', host: null });
+    assert.deepEqual(h.logs[1].meta, { scheme: 'https:', host: 'example.com' });
+    assert.deepEqual(h.logs[3].meta, {
+      scheme: null, host: null, reason: 'not a URL the shell can parse',
+    });
+  });
+
+  it('reports rejected external opens without leaking the URL or the platform error', async () => {
+    const failures = [];
+    const h = harness({
+      openExternal: () => Promise.reject(new Error('PRIVATE_PLATFORM_ERROR')),
+      onExternalOpenError: (target) => failures.push(target),
+    });
+    assert.equal(h.navigate('mailto:PRIVATE_RECIPIENT@example.com?body=PRIVATE_DRAFT'), true);
+    assert.deepEqual(h.contents.windowOpen({ url: 'https://example.com/PRIVATE_PATH' }), { action: 'deny' });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(failures, [
+      { scheme: 'mailto:', host: null }, { scheme: 'https:', host: 'example.com' },
+    ]);
+    assert.equal(h.warned.length, 2);
+    assert.equal(JSON.stringify(h.logs).includes('PRIVATE_'), false);
+  });
+
+  it('handles synchronous opener failures and callback failures without interrupting navigation guards', async () => {
+    for (const callback of [undefined, () => { throw new Error('PRIVATE_CALLBACK_ERROR'); },
+      () => Promise.reject(new Error('PRIVATE_CALLBACK_ERROR'))]) {
+      const h = harness({
+        openExternal: () => { throw new Error('PRIVATE_OPENER_ERROR'); },
+        onExternalOpenError: callback,
+      });
+      assert.equal(h.navigate('mailto:PRIVATE_RECIPIENT@example.com?body=PRIVATE_DRAFT'), true);
+      assert.deepEqual(h.contents.windowOpen({ url: 'https://example.com/PRIVATE_PATH' }), { action: 'deny' });
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(JSON.stringify(h.logs).includes('PRIVATE_'), false);
+      assert.equal(h.navigate('http://127.0.0.1:7777/#/now'), false, 'the board stays usable');
+    }
   });
 
   it('refuses a webview', () => {
@@ -530,7 +615,7 @@ class WebContentsStub {
   once(event, handler) { push(this.handlers, event, handler); return this; }
   setWindowOpenHandler(handler) { this.windowOpenHandler = handler; }
   setWebRTCIPHandlingPolicy(policy) { this.webRTCIPHandlingPolicy = policy; }
-  executeJavaScript(code) { this.executed.push(code); return Promise.resolve(); }
+  executeJavaScript(code) { this.executed.push(code); return Promise.resolve(code.includes('__zelosFlushDrafts') ? true : undefined); }
   emit(event, ...args) { return fire(this.handlers, event, ...args); }
 }
 
@@ -621,7 +706,9 @@ export const app = {
   emit(event, ...args) { return fire(recorded.appEvents, event, ...args); },
   quit() {
     recorded.quits += 1;
-    fire(recorded.appEvents, 'before-quit', { preventDefault() {} });
+    let prevented = false;
+    fire(recorded.appEvents, 'before-quit', { preventDefault() { prevented = true; } });
+    if (prevented) return;
     fire(recorded.appEvents, 'will-quit', { preventDefault() {} });
   },
 };
@@ -696,6 +783,7 @@ describe('the shell, booted against a stub Electron', () => {
   let sandbox;
   let home;
   let recorded;
+  let electron;
   let main;
   let booted;
 
@@ -725,7 +813,8 @@ describe('the shell, booted against a stub Electron', () => {
       },
     });
 
-    ({ recorded } = await import(stubUrl));
+    electron = await import(stubUrl);
+    ({ recorded } = electron);
     main = await import(pathToFileURL(path.join(REPO, 'desktop', 'main.js')).href);
     booted = await main.ready;
     // ready-to-show is delivered on the next turn, as it is in Electron.
@@ -1171,7 +1260,7 @@ describe('the shell, booted against a stub Electron', () => {
     }
   });
 
-  it('closing honours the residency rule rather than a hardcoded answer', async () => {
+  it('closing honours residency and protects unsaved drafts before destructive close', async (t) => {
     /* What is being tested here is the WIRING: that the close handler asks
        shouldStayResidentOnClose and does what it says. The rule's own truth
        table is tested separately, further down, where every platform is
@@ -1191,14 +1280,17 @@ describe('the shell, booted against a stub Electron', () => {
     });
 
     const win = recorded.windows[0];
+    if (!expected) t.mock.method(win.webContents, 'executeJavaScript', async () => { throw new Error('Draft save failed'); });
     let prevented = false;
     win.emit('close', { preventDefault: () => { prevented = true; } });
 
-    assert.equal(prevented, expected,
-      expected
-        ? 'this platform can keep a scheduled Zelos running, so closing must not end it'
-        : 'with nowhere to go, closing must really close rather than hide into nowhere');
+    assert.equal(prevented, true, 'close must hide a resident window or wait for its draft saves');
     if (expected) assert.equal(win.visible, false, 'it should have gone to the background');
+    else {
+      await new Promise(resolve => setImmediate(resolve));
+      assert.ok(readHomeLock(home), 'a failed save must keep the core running');
+      assert.equal(win.visible, true, 'a failed save must leave the editable page visible');
+    }
 
     // Where it was is remembered either way: that is not a residency question.
     const state = JSON.parse(fs.readFileSync(path.join(home, 'window.json'), 'utf8'));
@@ -1256,7 +1348,84 @@ describe('the shell, booted against a stub Electron', () => {
     assert.equal(held.port, booted.zelos.port, 'the lock does not say where the board is');
   });
 
-  it('closes the server and the database on quit, and lets go of the home', async () => {
+  it('repeating the Search shortcut refocuses its field on the current route', () => {
+    const contents = recorded.windows[0].webContents;
+    booted.actions.showView('search');
+    const code = contents.executed.at(-1);
+    let focused = false;
+    const field = { focus() { focused = true; } };
+    const window = { location: { hash: '#/search' } };
+    const document = { querySelector(selector) { assert.equal(selector, '.search-field'); return field; } };
+    new Function('window', 'document', code)(window, document);
+    assert.equal(focused, true, 'same-route Search left focus on another control');
+    window.location.hash = '#/now';
+    focused = false;
+    new Function('window', 'document', code)(window, document);
+    assert.equal(window.location.hash, '#/search');
+    assert.equal(focused, false, 'arriving Search lets the newly rendered view focus its field');
+  });
+
+  it('reload waits for draft saves, and a failed save keeps the page open', async (t) => {
+    const win = recorded.windows[0];
+    let finish;
+    const execute = t.mock.method(win.webContents, 'executeJavaScript', () => new Promise(resolve => { finish = resolve; }));
+    const loaded = win.loaded.length;
+    const reloading = booted.actions.reloadBoard();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(win.loaded.length, loaded, 'reload destroyed the page before its draft save returned');
+    assert.match(execute.mock.calls[0].arguments[0], /__zelosFlushDrafts/);
+    finish(true);
+    await reloading;
+    assert.equal(win.loaded.length, loaded + 1);
+    execute.mock.mockImplementation(async () => { throw new Error('synthetic private draft error'); });
+    const notices = recorded.messageBoxes.length;
+    await booted.actions.reloadBoard();
+    assert.equal(win.loaded.length, loaded + 1, 'a failed save must cancel reload');
+    assert.equal(recorded.messageBoxes.length, notices + 1);
+    assert.match(recorded.messageBoxes.at(-1).detail, /draft|copy/i);
+    assert.ok(!JSON.stringify(recorded.messageBoxes.at(-1)).includes('synthetic private draft error'));
+  });
+
+  it('a page that has not loaded its draft editor can leave without importing anything', async () => {
+    const contents = { executeJavaScript: code => Promise.resolve(new Function('globalThis', `return (${code});`)({})) };
+    await main.flushDraftsInPage(contents);
+  });
+
+  it('a stalled draft flush times out without leaving the page', async () => {
+    const contents = { executeJavaScript: () => new Promise(() => {}) };
+    await assert.rejects(main.flushDraftsInPage(contents, { timeoutMs: 15 }), /saving/i);
+  });
+
+  it('a rejected browser handoff is explained without exposing the handoff or error', async (t) => {
+    t.mock.method(electron.shell, 'openExternal', async () => { throw new Error('private-handoff-canary'); });
+    const notices = recorded.messageBoxes.length;
+    await booted.actions.openInBrowser();
+    assert.equal(recorded.messageBoxes.length, notices + 1);
+    assert.match(recorded.messageBoxes.at(-1).message, /browser/i);
+    assert.ok(!JSON.stringify(recorded.messageBoxes.at(-1)).includes('private-handoff-canary'));
+  });
+
+  it('failed draft saving cancels native quit and allows another attempt', async (t) => {
+    t.mock.method(recorded.windows[0].webContents, 'executeJavaScript', async () => { throw new Error('Save failed'); });
+    const notices = recorded.messageBoxes.length;
+    electron.app.quit();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.ok(readHomeLock(home));
+    assert.equal((await fetch(booted.zelos.url)).status, 200);
+    assert.equal(recorded.messageBoxes.length, notices + 1);
+    assert.match(recorded.messageBoxes.at(-1).message, /draft edits open/);
+  });
+
+  it('native quit waits for draft saves before closing the server and releasing the home', async (t) => {
+    const win = recorded.windows[0];
+    let finish;
+    t.mock.method(win.webContents, 'executeJavaScript', () => new Promise(resolve => { finish = resolve; }));
+    electron.app.quit();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.ok(readHomeLock(home), 'quit shut down before the renderer acknowledged its draft saves');
+    assert.equal((await fetch(booted.zelos.url)).status, 200);
+    finish(true);
+    await new Promise(resolve => setImmediate(resolve));
     await main.shutdown();
     await assert.rejects(fetch(booted.zelos.url), 'the socket is still open after shutdown');
     assert.equal(readHomeLock(home), null, 'the lock outlived the process that took it');

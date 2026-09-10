@@ -9,8 +9,8 @@
  * slides four hours. So Date is never consulted for placement here.
  *
  * Overlaps are packed cluster-then-greedy-column (see format.js `packColumns`),
- * and month cells sort conflicts first so a triple-booked day cannot hide behind
- * "+4".
+ * and month cells show all-day entries first, then appointments in time order.
+ * A day-level clash flag includes overlaps hidden behind "+4".
  *
  * The grid opens where the day is, not at 00:00: the now-line when today is on
  * screen, otherwise the first event in the range. It does that on arrival and
@@ -566,7 +566,10 @@ function timeGrid(keys, { wasOnScreen }) {
 const MONTH_VISIBLE = 3;
 
 function monthCell(key, { todayKeyStr, monthPrefix }) {
-  const spans = conflictsFirst(spansForDay(key));
+  // Keep conflict marks across the full day, but read in displayed time order
+  // before splitting visible and overflow entries. The day flag covers both.
+  const spans = conflictsFirst(spansForDay(key))
+    .sort((a, b) => Number(b.allDay) - Number(a.allDay) || a.start - b.start);
   const [, , d] = key.split('-').map(Number);
   const outside = key.slice(0, 7) !== monthPrefix;
   const hasConflict = spans.some((s) => s.conflict);

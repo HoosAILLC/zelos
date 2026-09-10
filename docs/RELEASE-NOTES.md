@@ -1,14 +1,13 @@
-# Zelos 1.7.0
+# Zelos 1.7.1
 
-This release makes the board follow changes in your sources more reliably and makes setup failures easier to recover from.
+This patch fixes problems found while testing Zelos on a Mac.
 
-- Todoist and Linear tasks that disappear from a complete source selection stop generating active obligations. History stays searchable, and reappearing tasks become active again. A missing task is labelled as outside the current selection; it is not assumed completed.
-- Source cards show their last successful read and current error. Failed or partial reads keep the previous success time.
-- Setup stays in place until you finish or skip it, with visible errors and retry for sample data. Finished items have clear Restore/Reopen actions, and custom snooze dates explain invalid input.
-- Changed messages and events trigger reassessment even when no new row is added. Cancelled calendar events stop contributing conflicts, and complete calendar reads retire vanished events conservatively.
-- Draft autosave and discard are ordered safely. Interrupted or malformed model responses report failure, and answers cut short by the model show a notice without losing the partial text.
-- Credentials are isolated by data folder, revoked AI tokens are checked again before dispatch, and logging failures no longer crash the app.
-- The website demo, source archive, and four desktop downloads are built from the same tagged source. SHA256SUMS.txt and release.json identify the published files.
+- Draft edits are saved before reloading or quitting the desktop app, including the last keystrokes typed before the action. If saving fails, Zelos keeps the window and latest text open for retry or copying. Older failed saves cannot overwrite newer edits after a card is rebuilt.
+- Quitting fully exits the Mac app after cleanup, so opening Zelos again starts a working window.
+- Command-F returns focus to the search box even when Search is already open.
+- External-link logs omit private draft text, credentials, paths, and query strings. If the operating system cannot open a link, Zelos shows recovery guidance.
+- Month view lists each day's appointments in time order, with all-day events first and clash indicators retained.
+- The native sample correctly describes the half-hour overlap between its afternoon review and delivery.
 
 ## Install or update
 

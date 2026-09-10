@@ -116,6 +116,8 @@ let actions = null;
 let windowState = null;
 let quitting = false;
 let shuttingDown = null;
+let leaving = null;
+let leaveAction = null;
 let crashes = [];      // timestamps of recent render-process-gone events
 let crashTimer = null;
 
@@ -299,9 +301,10 @@ function createWindow() {
   win.on('show', () => setBadge(0));
 
   win.on('close', (event) => {
-    if (quitting || !staysResidentOnClose()) return;
+    if (quitting) return;
     event.preventDefault();
-    win.hide();
+    if (staysResidentOnClose()) win.hide();
+    else leaveBoard(() => { quitting = true; app.quit(); }, { quit: true });
   });
   win.on('closed', () => { mainWindow = null; });
 
@@ -447,8 +450,12 @@ function showWindow() {
 function showView(id) {
   if (!VIEWS.some((view) => view.id === id)) return;
   showWindow();
+  const navigate = `window.location.hash = ${JSON.stringify(`#/${id}`)};`;
+  const script = id === 'search'
+    ? `if (window.location.hash === '#/search') { document.querySelector('.search-field')?.focus({ preventScroll: true }); } else { ${navigate} }`
+    : navigate;
   mainWindow?.webContents
-    .executeJavaScript(`window.location.hash = ${JSON.stringify(`#/${id}`)};`)
+    .executeJavaScript(script)
     .catch((err) => zelos?.logger.warn('desktop: could not switch view', { view: id, error: err.message }));
 }
 
@@ -614,9 +621,9 @@ function buildActions() {
     },
     openBoard: () => showWindow(),
     showView,
-    reloadBoard: () => {
-      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.loadURL(zelos.tokenUrl);
-    },
+    reloadBoard: () => leaveBoard(() => {
+      if (mainWindow && !mainWindow.isDestroyed()) return mainWindow.loadURL(zelos.tokenUrl);
+    }),
     /**
      * The same board, in the system browser. The bare address lands on the
      * refusal screen — it carries no session token — and the token itself must
@@ -629,12 +636,16 @@ function buildActions() {
      * command line would trade the failure for the leak the handoff exists to
      * prevent.
      */
-    openInBrowser: () => {
+    openInBrowser: async () => {
       try {
         const at = zelos?.server?.zelos?.mintHandoff?.();
-        if (typeof at === 'string' && at) shell.openExternal(new URL(at, zelos.url).href);
-      } catch (err) {
-        zelos?.logger.warn('desktop: could not mint a browser handoff', { error: err.message });
+        if (typeof at !== 'string' || !at) throw new Error('No browser handoff');
+        await shell.openExternal(new URL(at, zelos.url).href);
+      } catch {
+        // Neither the handoff URL nor the OS error belongs in a log: both can
+        // contain the single-use credential passed to the browser.
+        zelos?.logger.warn('desktop: could not open the board in a browser');
+        await explainExternalOpenFailure({ scheme: 'http:' });
       }
     },
     /**
@@ -686,16 +697,75 @@ function buildActions() {
         home: zelos?.paths.home ?? '',
       }));
     },
-    quit: () => {
-      quitting = true;
-      app.quit();
-    },
+    quit: () => app.quit(),
   };
 }
 
 /* ------------------------------------------------------------------ *
  * Shutdown
  * ------------------------------------------------------------------ */
+
+/** Fixed page callback; no renderer-provided code or new preload powers.
+ * A stalled local write cancels leaving after a bounded wait. It may still
+ * finish later, but the page stays open until the user asks again.
+ */
+export async function flushDraftsInPage(contents, { timeoutMs = 10_000 } = {}) {
+  let timer;
+  try {
+    const saved = await Promise.race([
+      contents.executeJavaScript('globalThis.__zelosFlushDrafts ? globalThis.__zelosFlushDrafts() : true'),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('Drafts are still saving.')), timeoutMs);
+      }),
+    ]);
+    if (saved !== true) throw new Error('Draft saving was not confirmed.');
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function leaveBoard(action, { quit = false } = {}) {
+  // Repeated shortcuts share one save. Quit takes precedence over a reload
+  // already waiting for the same edits, so a second request is not lost.
+  if (leaving) {
+    if (quit) leaveAction = action;
+    return leaving;
+  }
+  leaveAction = action;
+  leaving = (async () => {
+    try {
+      const win = mainWindow;
+      if (win && !win.isDestroyed() && !win.webContents.isCrashed?.()) await flushDraftsInPage(win.webContents);
+      await leaveAction();
+      return true;
+    } catch {
+      try {
+        showWindow();
+        await dialog.showMessageBox({
+          type: 'warning', buttons: ['Keep editing'], defaultId: 0,
+          message: 'Zelos kept your draft edits open',
+          detail: 'The drafts could not finish saving, so Zelos stayed open. Try quitting or reloading again. If saving still fails, use Copy the text on each edited draft to keep your words.',
+        });
+      } catch { /* Leaving remains cancelled even if the OS cannot show a dialog. */ }
+      return false;
+    } finally {
+      leaving = null;
+      leaveAction = null;
+    }
+  })();
+  return leaving;
+}
+
+async function explainExternalOpenFailure({ scheme }) {
+  const mail = scheme === 'mailto:';
+  try {
+    await dialog.showMessageBox({
+      type: 'warning', buttons: ['OK'],
+      message: mail ? 'Could not open your mail app' : 'Could not open your browser',
+      detail: `Choose a default ${mail ? 'mail app' : 'browser'} in your computer’s settings, then try again.${mail ? ' You can also use Copy the text and paste the draft into your email.' : ''}`,
+    });
+  } catch { /* A dialog failure must not turn an OS opener refusal into a crash. */ }
+}
 
 function beginShutdown() {
   if (shuttingDown) return shuttingDown;
@@ -712,7 +782,10 @@ function beginShutdown() {
       // stop existing anyway.
     } finally {
       zelos = null;
-      app.quit();
+      // Electron drains microtasks inside will-quit while its native quit
+      // guard is still set. Wait for that event to return before retrying,
+      // or an idle core can stop while the second app.quit is ignored.
+      setImmediate(() => app.quit());
     }
   })();
   return shuttingDown;
@@ -793,14 +866,18 @@ async function bootstrap() {
     app.quit();
   });
 
-  app.on('before-quit', () => { quitting = true; });
+  app.on('before-quit', (event) => {
+    if (quitting || !mainWindow || mainWindow.isDestroyed()) { quitting = true; return; }
+    event.preventDefault();
+    leaveBoard(() => { quitting = true; app.quit(); }, { quit: true });
+  });
   app.on('will-quit', (event) => {
     if (shuttingDown) return; // second pass: everything is closed, let it go
     event.preventDefault();
     beginShutdown();
   });
   for (const signal of ['SIGINT', 'SIGTERM']) {
-    process.on(signal, () => { quitting = true; app.quit(); });
+    process.on(signal, () => app.quit());
   }
 
   // whenReady() is called before the first await so its listener is attached
@@ -873,6 +950,7 @@ async function bootstrap() {
       // "no port" means nothing counts as internal.
       getPort: () => zelos?.port ?? 0,
       openExternal: (url) => shell.openExternal(url),
+      onExternalOpenError: explainExternalOpenFailure,
       logger,
     });
   });

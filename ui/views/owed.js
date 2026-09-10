@@ -15,20 +15,59 @@ import { state, itemsInBucket, openDrafts, refreshBoard, notify } from '../lib/s
 import { api } from '../lib/api.js';
 
 const SAVE_DEBOUNCE_MS = 900;
+const SAVE_TIMEOUT_MS = 8_000;
 
 // A card can be rebuilt while its previous instance is still saving. Keep the
 // write order and discard gate with the draft, so an old autosave cannot undo
 // a Discard made from the new card.
 const draftWriters = new Map();
 function writerFor(id) {
-  if (!draftWriters.has(id)) draftWriters.set(id, { tail: Promise.resolve(), discarding: false, heldSaves: new Set() });
+  if (!draftWriters.has(id)) draftWriters.set(id, { tail: Promise.resolve(), discarding: false, heldSaves: new Set(), pendingSaves: new Set(), revision: 0 });
   return draftWriters.get(id);
 }
 function writeDraft(id, writer, patch) {
-  const pending = writer.tail.then(() => api.updateDraft(id, patch));
+  const pending = writer.tail.then(async () => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), SAVE_TIMEOUT_MS);
+    try {
+      return await api.updateDraft(id, patch, { signal: controller.signal });
+    } catch (err) {
+      if (controller.signal.aborted) throw new Error('Saving took too long. Your text is still here; try again.');
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  });
   writer.tail = pending.catch(() => {});
   return pending;
 }
+
+function rememberDraftBody(id, body) {
+  state.board = {
+    ...state.board,
+    drafts: state.board.drafts.map(d => d.id === id ? { ...d, body, state: 'edited' } : d),
+  };
+}
+
+/** The desktop shell waits here before quitting or replacing the page. A
+ * failure keeps the renderer and its unsaved text alive for copying or retry.
+ * Recheck after awaits: another edit may arrive while an earlier write runs.
+ */
+export async function flushDrafts() {
+  do {
+    for (const writer of draftWriters.values()) {
+      await writer.tail;
+      if (writer.discarding) continue;
+      const saved = await Promise.all([...writer.pendingSaves].map(save => save()));
+      if (saved.some(ok => !ok)) throw new Error('Some draft edits could not be saved.');
+    }
+  } while ([...draftWriters.values()].some(writer => !writer.discarding && writer.pendingSaves.size));
+  return true;
+}
+
+// The shell asks only this fixed callback. A page that has not loaded its
+// draft editor cannot hold edits, so it needs no module load before exiting.
+globalThis.__zelosFlushDrafts = flushDrafts;
 
 /**
  * Where a mailto address stops being honoured. Real email programs cut the
@@ -75,13 +114,15 @@ export function mailtoDraft(to, subject, body) {
 function draftCard(draft, itemsById) {
   const writer = writerFor(draft.id);
   const item = itemsById.get(draft.item_id) || null;
-  const status = el('span', { class: 'draft-status mono', role: 'status', text: 'Saved' });
+  const status = el('span', { class: 'draft-status mono', role: 'status', text: writer.pendingSaves.size ? 'Unsaved edits' : 'Saved' });
   const area = el('textarea', {
     class: 'draft-body',
     spellcheck: 'true',
     'aria-label': `Draft to ${draft.to_email || 'unknown recipient'}`,
   });
-  area.value = draft.body || '';
+  // A refresh may return an older server copy after saving failed. Keep the
+  // latest local words visible, including to Copy, until a write succeeds.
+  area.value = writer.pendingSaves.size ? writer.pendingBody : draft.body || '';
   autogrow(area, { min: 120 });
 
   // The mailto is rebuilt from the LIVE textarea at the moment it is used, so
@@ -95,39 +136,60 @@ function draftCard(draft, itemsById) {
   syncNote();
 
   let timer = null;
-  let inFlight = false;
+  let inFlight = null;
   let dirty = false;
+  let revision = writer.revision;
 
   async function save() {
-    if (writer.discarding) { writer.heldSaves.add(save); return; }
-    if (inFlight) { dirty = true; return; }
-    inFlight = true;
+    clearTimeout(timer);
+    if (writer.discarding) { writer.heldSaves.add(save); return true; }
+    // A detached card may retain a failed save. Once a newer card has been
+    // edited, retrying the old textarea would overwrite the newer words.
+    if (revision < writer.revision) {
+      dirty = false;
+      writer.pendingSaves.delete(save);
+      return true;
+    }
+    if (inFlight) {
+      const ok = await inFlight;
+      return ok && dirty ? save() : ok;
+    }
+    if (!dirty) return true;
     dirty = false;
     const body = area.value;
+    const savingRevision = revision;
     // The board's copy is patched before the request goes out: a deferred
     // re-render can flush the moment this textarea blurs, and a rebuilt card
     // reads `state.board.drafts` — which still held the body fetched before
     // the edit, so the user watched their own words revert while the server
     // was saving them.
-    state.board = {
-      ...state.board,
-      drafts: state.board.drafts.map((d) => (d.id === draft.id ? { ...d, body, state: 'edited' } : d)),
-    };
+    rememberDraftBody(draft.id, body);
     status.textContent = 'Saving…';
     status.classList.remove('is-bad');
-    try {
-      await writeDraft(draft.id, writer, { body, state: 'edited' });
+    inFlight = writeDraft(draft.id, writer, { body, state: 'edited' }).then(() => {
+      // A board fetch may have returned the old body while this write was in
+      // flight. Refresh the visible copy on acknowledgement, but never replace
+      // words typed in a newer card with this older response.
+      if (savingRevision === writer.revision) rememberDraftBody(draft.id, body);
       status.textContent = 'Saved';
-    } catch (err) {
+      return true;
+    }, (err) => {
+      dirty = true;
       status.textContent = err.message;
       status.classList.add('is-bad');
-    } finally {
-      inFlight = false;
-      if (dirty) save();
-    }
+      return false;
+    }).finally(() => { inFlight = null; });
+    const ok = await inFlight;
+    if (ok && dirty) return save();
+    if (ok) writer.pendingSaves.delete(save);
+    return ok;
   }
 
   area.addEventListener('input', () => {
+    dirty = true;
+    revision = ++writer.revision;
+    writer.pendingBody = area.value;
+    writer.pendingSaves.add(save);
     status.textContent = 'Editing…';
     status.classList.remove('is-bad');
     syncNote();
@@ -196,11 +258,12 @@ function draftCard(draft, itemsById) {
             // the card; the words still on screen must remain recoverable.
             for (const resume of writer.heldSaves) resume();
             writer.heldSaves.clear();
-            if (wasEditing) save();
+            if (wasEditing) { dirty = true; save(); }
             notify(`Could not discard that draft: ${err.message}`, { tone: 'warn' });
             return;
           }
           writer.heldSaves.clear();
+          writer.pendingSaves.clear();
           // A failed refetch should still leave the successful discard in
           // place. Detached cards retain their closed writer gate.
           state.board = {
