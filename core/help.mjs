@@ -162,12 +162,12 @@ const PLATFORM_LINE = {
 };
 
 const WHAT_ZELOS_IS =
-  'You are helping someone set up Zelos. Zelos is a free program on the person’s own computer that reads their email and calendar with an AI they choose; it has no server, nothing is sent to anyone but the AI service they pick, and it never sends, moves or deletes mail. You are helping them through its setup screens.';
+  'You are helping someone set up Zelos, a free program on their computer that reads email and calendars with an AI they choose. Its archive stays on their computer; source and AI requests use configured services, and manual update checks contact GitHub. It never sends, moves or deletes mail. You are helping them through its setup screens.';
 
 /* The Welcome screen, ui/views/onboarding.js startScreen(). */
 function generalPrompt() {
   return [
-    'The screen they are on: the Welcome screen, the first thing Zelos shows. The title says “Zelos reads your email and calendar, and tells you what needs you.” Under it: “It never sends, moves or deletes anything. Everything stays on this computer.” There are two buttons, “Set up Zelos” and “Look around with made-up data first” (a week of invented mail, removable in one click), and a small “Skip the rest” link.',
+    'The screen they are on: the Welcome screen, the first thing Zelos shows. The title says “Zelos reads your email and calendar, and tells you what needs you.” Under it: “It never sends, moves or deletes your mail. Your archive is stored on this computer.” There are two buttons, “Set up Zelos” and “Look around with made-up data first” (a week of invented mail, removable in one click), and a small “Skip the rest” link.',
     'Setup is five named steps along the top — Welcome, AI, Email, Calendar, Done — and every one can be skipped. Step 2, AI: pick the AI that reads the mail (Claude or OpenAI, or a program already on this computer) and paste a key from that company’s website. Step 3, Email: type the email address, and Zelos says what that provider needs — usually a special app password made on the provider’s website, never the normal password. Step 4, Calendar: Google Calendar, iCloud or Outlook. Step 5, Done: press “Read my mail now” and Zelos reads the recent mail once.',
     'Find out first what they want — to set Zelos up now, or to look around with the made-up data — and then which step they are stuck on.',
   ];

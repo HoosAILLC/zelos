@@ -85,7 +85,7 @@ node zelos.mjs
 You will see something like this:
 
 ```
-  ZELOS 1.8.0
+  ZELOS 1.8.1
   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   Open   http://127.0.0.1:7777/?t=fb52ad7d…a43da8be
@@ -147,10 +147,12 @@ Google, Groq, Mistral, DeepSeek, Ollama and LM Studio all speak the one labelled
 `openai`. In Settings you pick a provider from the list and Zelos fills in the
 technical parts.
 
-### Option A — a model on your own machine (nothing leaves at all)
+### Option A — a model on your own machine
 
-This is the setup that makes the privacy claim absolute. Zelos looks for these
-automatically when you first open Settings and offers whatever it finds first.
+AI assessment and answers stay on your computer with a local model. Reading
+connected sources still contacts their services, and manual update checks contact
+GitHub. Zelos looks for local models automatically when you first open Settings
+and offers whatever it finds first.
 
 **Ollama** — the simplest one to start with.
 
@@ -509,7 +511,7 @@ server.
 
 ---
 
-## Checking for yourself that nothing leaves
+## Checking Zelos's network requests
 
 Don't take the promise on trust. Here are four checks, from easiest to most
 convincing.
@@ -671,9 +673,9 @@ The strongest test, and the shortest:
 2. Run one sweep so it has your mail.
 3. **Turn off your Wi-Fi.**
 4. Use Zelos. The board still works. Ask questions on the Ask page; you'll get
-   real, streamed answers about your own mail. Everything except fetching *new*
-   mail keeps working with the network physically disconnected — because at that
-   point there is nothing outside your computer involved.
+   real, streamed answers about your archived mail from the local model. Viewing
+   your stored board and asking that local model still work with the network
+   disconnected. Online source refreshes and update checks need a network connection.
 
 For the full technical account — what the model actually receives, what happens
 to a malicious email that tries to give the model instructions, and an honest

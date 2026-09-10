@@ -702,8 +702,8 @@ export function aboutText({ version, commit = '', url = null, home = '' }) {
       `Board   ${url ?? 'not running'}`,
       `Data    ${home}`,
       '',
-      'Listening on 127.0.0.1 only. Nothing leaves this machine except the',
-      'calls to the model you chose and to the sources you added.',
+      'Listening on 127.0.0.1 only. Reading and AI use the services you configure.',
+      'Update checks contact GitHub only when you request them.',
     ].join('\n'),
     buttons: ['OK'],
   };
@@ -1059,7 +1059,7 @@ async function bootstrap() {
     app.setAboutPanelOptions({
       applicationName: APP_NAME,
       applicationVersion: versionLabel(app.getVersion(), BUILD_COMMIT),
-      copyright: 'MIT licensed. Local-first: nothing leaves this machine except the model calls you configure and the sources you add.',
+      copyright: 'MIT licensed. Local-first: reading and AI use the services you configure. Update checks contact GitHub only when you request them.',
     });
   }
   if (process.platform === 'darwin' && app.dock) {

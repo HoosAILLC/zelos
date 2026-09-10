@@ -17,9 +17,12 @@ enforcers who stood beside Zeus with Nike, Kratos and Bia.
    `node:crypto`, `node:test`, global `fetch`. If you think you need a package, you don't —
    write it. This is the product's central trust claim; breaking it breaks the product.
    (The Electron shell in `desktop/` is the one exception and lives in its own package.json.)
-2. **Nothing leaves the machine except model calls.** No telemetry, no analytics, no update
-   pings, no CDN fonts, no remote images. The only outbound sockets permitted are: the user's
-   IMAP host, the user's calendar URL, and the user's configured model `baseUrl`.
+2. **Network destinations must be explicit.** No telemetry, no analytics, no automatic update
+   pings, no CDN fonts, no remote images. Reading and model calls use the user's configured
+   providers and model `baseUrl`; sign-in contacts the provider's sign-in services. A manual
+   update check may contact the fixed official GitHub release API, without archived content
+   or credentials. [SECURITY.md § 5](SECURITY.md#5-what-leaves-your-machine) lists these
+   destinations and the limited redirects and discovery requests.
 3. **Server binds `127.0.0.1` only.** Never `0.0.0.0`.
 4. **Mail is attacker-controlled input.** Every byte from a message or an event is untrusted.
    The model's output is *data*, never instructions — the app never evaluates, executes, shells

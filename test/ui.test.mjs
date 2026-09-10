@@ -3541,7 +3541,7 @@ test('no screen in onboarding, and no mail card, shows a first-timer a protocol 
   assert.match(seen, /Step 1 of 5/);
   for (const name of ['Welcome', 'AI', 'Email', 'Calendar', 'Done']) assert.match(seen, new RegExp(`\\b${name}\\b`), `step name ${name} is not on the first screen`);
   assert.match(seen, /Zelos reads your email and calendar, and tells you what needs you\./);
-  assert.match(seen, /It never sends, moves or deletes anything\. Everything stays on this computer\./);
+  assert.match(seen, /It never sends, moves or deletes your mail\. Your archive is stored on this computer\./);
   assert.ok(findButton(view, 'Set up Zelos'), 'no "Set up Zelos" button');
   await settle();
   assert.ok(findButton(view, 'Look around with made-up data first'), 'no "Look around with made-up data first" button');
