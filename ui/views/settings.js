@@ -27,7 +27,7 @@ import { el, button, meander, section, copyText, replace } from '../lib/dom.js';
    of /api/connectors, and a one-line wrapper in ui/lib/api.js would be a second
    place to look for a call that has exactly one call site. */
 import { api, request } from '../lib/api.js';
-import { state, saveConfig, loadConfig, setAccent, applyAccent, currentAccent, DEFAULT_ACCENT, markOnboarded, nowMark, notify } from '../lib/store.js';
+import { state, saveConfig, loadConfig, setAccent, applyAccent, currentAccent, DEFAULT_ACCENT, markOnboarded, nowMark, notify, startSweep, subscribe } from '../lib/store.js';
 import { plural, tokenLine } from '../lib/format.js';
 import { monthName } from '../lib/time.js';
 import { aiAccessPanel } from './ai-access.js';
@@ -2825,12 +2825,66 @@ export function calendarPanel({ compact = false, onDone = null, rerender, connec
 
 /* ------------------------------------------------------------------ sources */
 
+function messagesSetupHelp() {
+  return el('div', { class: 'chosen stack' }, [
+    el('h3', { class: 'chosen-label', text: 'Read the texts already on this Mac' }),
+    el('p', { text: '1. Open Messages on this Mac and check that your texts appear. Your iPhone and Mac must use the same Apple Account. If SMS texts are missing, check Messages in iCloud or Text Message Forwarding on your iPhone.' }),
+    el('p', { text: '2. On this Mac, open System Settings → Privacy & Security → Full Disk Access. Add the installed Zelos app and turn access on yourself, then quit and reopen Zelos. This is a broad macOS permission needed to read the local Messages database; Zelos cannot grant it for you.' }),
+    el('p', { text: '3. Save this source, then choose Read sources now below. It imports locally available text without asking AI. It cannot read texts that have not reached this Mac.' }),
+    el('p', { class: 'quiet-note', text: 'Text only: no attachments, calls or voicemail. Zelos never sends, changes, deletes or marks your messages read. Names may appear as phone numbers or email addresses.' }),
+    el('p', { class: 'quiet-note' }, [
+      'For local-only import, keep automatic checks off in ',
+      el('a', { href: '#/settings/sweep', text: 'Schedule' }),
+      '. Imported text stays in Zelos on this Mac until you request an AI review or share it with an AI. A full review sends selected excerpts to your configured AI; Check now and automatic checks can also request that review.',
+    ]),
+  ]);
+}
+
+/** Collection is an explicit mode: never let an automatic/full review stand in
+ * for the local-only action promised by this button. The existing sweep stream
+ * owns completion; acceptance of the POST is only the beginning of the read. */
+function readSourcesControl() {
+  const status = statusLine();
+  const hasSources = () => ['mail', 'calendars', 'sources'].some(key =>
+    (state.config?.[key] || []).some(source => source.enabled !== false));
+  const read = button('Read sources now', {
+    class: 'btn quiet',
+    onClick: async () => {
+      if (state.sweep.running || !hasSources()) return;
+      await startSweep('light');
+      paint();
+    },
+  });
+  function paint() {
+    read.disabled = state.sweep.running || !hasSources();
+    if (state.sweep.running) status.working('A check is running. Reading results will appear in each connection’s status.');
+    else if (state.sweep.error) status.bad(state.sweep.error);
+    else if (!hasSources()) status.clear();
+    else {
+      const result = state.sweep.lastResult;
+      if (result?.mode !== 'light') status.clear();
+      else if (result.ok === false || result.stats?.sourcesFailed > 0) status.bad('Some sources could not be read. Review each connection’s reading status for details.');
+      else status.good('Finished reading sources without asking AI. Review each connection’s reading status for details.');
+    }
+  }
+  const unsubscribe = subscribe(() => {
+    if (!read.isConnected) { unsubscribe(); return; }
+    paint();
+  });
+  paint();
+  return el('div', { class: 'stack' }, [
+    read,
+    el('p', { class: 'quiet-note', text: 'Reads all enabled email accounts, calendars and other sources into Zelos without asking AI. Existing waiting times still apply. This does not turn automatic checks on or off.' }),
+    status.node,
+  ]);
+}
+
 /**
  * The editor for `config.sources` — the third place config keeps a source, and
  * until now the one with no screen at all.
  *
- * There is nothing about any particular connector in this function, and that is
- * the whole point of it: the picker is the registry's `sources` connectors, the
+ * Setup help can explain a source's platform permissions; the controls still
+ * come from its manifest. The picker is the registry's `sources` connectors, the
  * body is whatever `fields[]` that connector declared, and the credential is the
  * one it asked for in the words it asked for it. A feed, a ticket queue and a
  * repository each get a form nobody wrote.
@@ -2864,6 +2918,7 @@ export function sourceForm(source, { manifests = [], onSaved, onCancel }) {
       stored: state.secretRefs.includes(draft.keyRef),
     });
     body.replaceChildren(
+      ...(manifest?.type === 'imessage' ? [messagesSetupHelp()] : []),
       ...controls.nodes,
       credential ? credential.node : el('p', { class: 'quiet-note', text: 'This source needs no credential.' }),
     );
@@ -2930,7 +2985,7 @@ export function sourcesPanel({ rerender, connectionId = null } = {}) {
   const editor = el('div', { class: 'editor' });
   const status = statusLine();
 
-  wrap.appendChild(el('p', { class: 'panel-lede', text: 'Most people need nothing here. If you use any of these work tools, add them. Zelos only ever reads them — nothing is ever written back.' }));
+  wrap.appendChild(el('p', { class: 'panel-lede', text: 'Add other accounts or local sources you want Zelos to read. It never sends messages or changes the original content.' }));
 
   wrap.appendChild(el('div', { class: 'stack' }, sources.length
     ? sources.map((src) => el('div', connectionCardProps(src, connectionId), [
@@ -2990,6 +3045,7 @@ export function sourcesPanel({ rerender, connectionId = null } = {}) {
   })));
   wrap.appendChild(editor);
   wrap.appendChild(status.node);
+  wrap.appendChild(readSourcesControl());
   if (connectionId && !sources.some(src => src.id === connectionId)) wrap.prepend(missingConnection());
   return wrap;
 }

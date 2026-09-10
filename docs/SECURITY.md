@@ -338,9 +338,9 @@ true.
    (`slack.mjs`), Linear `https://api.linear.app` (`linear.mjs`), Todoist
    `https://api.todoist.com` (`todoist.mjs`), Fireflies
    `https://api.fireflies.ai` (`fireflies.mjs`); a feed declares nothing and
-   may reach only the feed address you typed (`rss.mjs`); a folder and a
-   WhatsApp export declare nothing and contact nothing (`folder.mjs`,
-   `whatsapp.mjs`). One more that is not a source: a mailbox set to **Sign in
+   may reach only the feed address you typed (`rss.mjs`); a folder, a
+   WhatsApp export and iPhone texts declare nothing and contact nothing
+   (`folder.mjs`, `whatsapp.mjs`, `imessage.mjs`). One more that is not a source: a mailbox set to **Sign in
    with Microsoft** talks to `https://login.microsoftonline.com`
    (`MS_LOGIN_ORIGIN` in `core/sources/imap.mjs`) to get and refresh its
    token. A URL that arrived inside a payload — a feed's `<link>`, a
@@ -400,10 +400,25 @@ consider the mere fact that `lawyer@example.com` wrote to you to be sensitive,
 at a local model instead — that is the only setting that makes the question go
 away entirely.
 
-Everything read from your mail and calendar is stored **on your machine**, in
+Everything read from your mail, calendar and other sources, including iPhone
+texts, is stored **on your machine**, in
 `~/.zelos/zelos.db` (or `$ZELOS_HOME`), in plain SQLite. That file is not
 encrypted. Anyone who can read your home directory can read your mail cache —
 the same as with any local mail client.
+
+**iPhone texts** are read from the Messages database on your Mac through a
+read-only SQLite connection. Zelos does not send messages, change read receipts,
+download attachments or alter Messages records. SQLite may update the shared
+memory sidecar used to coordinate concurrent readers; the database and its
+write-ahead log are not changed by the import. Full Disk Access belongs to the
+installed Zelos app, not to Terminal or a development tool.
+
+Imported texts use the same untrusted-message boundary and body privacy settings
+as mail. **Read sources now** performs a local import without calling the model;
+an AI review can include the imported texts in its context. Automatic reviews
+must remain off if you want local imports only. The cached texts are also subject
+to the existing MCP message-body permission. Deleting or retracting a message in
+Apple Messages does not remove a copy already stored in Zelos.
 
 What it does have, **on macOS and Linux**, is permissions. The Zelos home is
 `0700` and every file Zelos writes in it is `0600`, including the database and

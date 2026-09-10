@@ -368,7 +368,7 @@ it. Useful for exports and for calendars that only publish downloads.
 
 ## Connecting everything else
 
-Mail and calendar are the two Zelos needs. Beyond them it can read eight more
+Mail and calendar are the two Zelos needs. Beyond them it can read nine more
 things, all of them from **Settings → Sources**:
 
 | | |
@@ -379,11 +379,12 @@ things, all of them from **Settings → Sources**:
 | **Linear** | The issues assigned to you that are due |
 | **Todoist** | Tasks due today or overdue |
 | **A feed** | Any RSS or Atom address |
+| **iPhone texts** | Text already synced to Messages on this Mac, with your permission |
 | **A folder** | Anything a script drops into a directory on this machine |
 | **A WhatsApp export** | A chat you exported yourself |
 
 Every one of them is a credential **you** mint in your own account, or a file on
-your own disk. For these eight, Zelos publishes no OAuth app — no client id, no
+your own disk. For these additional sources, Zelos publishes no OAuth app — no client id, no
 consent screen, no "Connect with…" button. The two built for mail — Google and
 Microsoft sign-in, [OAUTH.md](OAUTH.md), whose own registrations are not
 shipped yet — need no server either: the Google one comes back to the Zelos
@@ -400,6 +401,16 @@ you go looking for them:
   can write into buys the same thing with no public URL and no token to leak.
 - **The WhatsApp source is an archive, not a connection.** It shows nothing new
   until you export the chat again.
+- **iPhone texts come from the Mac's Messages app.** Sign in with the same Apple
+  Account, make sure the texts are already on the Mac, and grant the installed
+  Zelos app Full Disk Access yourself. It imports text only, with no sending,
+  attachments, calls or voicemail. See the [Messages setup guide](SOURCES.md#iphone-texts-from-messages-on-this-mac).
+
+**Read sources now** in Sources imports all enabled connections without asking
+AI. Keep automatic checks off in **Settings → Schedule** for local-only import.
+**Check now**, a full review, automatic checks, or a question to the AI can use
+the imported text with your configured AI. Saving a source changes neither the
+schedule nor the AI settings.
 
 And one whole category needs no source at all. **[NOTETAKERS.md](NOTETAKERS.md)**
 covers the AI notetakers — Fireflies, Otter, Grain, Fathom, tl;dv, Read.ai,

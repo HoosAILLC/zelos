@@ -201,6 +201,21 @@ Press `Ctrl-C` in the terminal to stop it.
 - No second copy of anything. The shell runs the Zelos core **inside its own
   process** — it does not launch a background Node.
 
+### Optional: read iPhone texts already on your Mac
+
+The Messages source needs texts to be available in Messages on this Mac and
+**Full Disk Access for the installed Zelos app**, granted by you in macOS
+System Settings → Privacy & Security. Quit and reopen Zelos after granting it.
+No Apple password is entered in Zelos. Follow the
+[Messages setup guide](SOURCES.md#iphone-texts-from-messages-on-this-mac) for
+iPhone syncing, permissions and import limits.
+
+Use **Read sources now** inside Zelos to import without asking AI. Keep
+automatic checks off in **Settings → Schedule** for local-only import; a later
+AI review or question can send selected imported text to your configured AI.
+This imports text only; it does not send messages or read attachments, calls or
+voicemail.
+
 ### Where a build comes from
 
 There is no download page in this repository, and no release binary committed to

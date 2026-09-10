@@ -506,6 +506,7 @@ function chunksOf(text) {
 
 const sweepListeners = new Set();
 let sweepRunning = false;
+let sweepMode = null;
 
 function emitSweep(event, data) {
   for (const listener of [...sweepListeners]) {
@@ -518,7 +519,7 @@ function emitSweep(event, data) {
 }
 
 function sweepStatus() {
-  return { running: sweepRunning, runId: sweepRunning ? db.run.id : null, mode: sweepRunning ? 'full' : null, startedAt: null };
+  return { running: sweepRunning, runId: sweepRunning ? db.run.id : null, mode: sweepRunning ? sweepMode : null, startedAt: null };
 }
 
 /**
@@ -532,12 +533,17 @@ function sweepStatus() {
  * dishonest version of this demo.
  */
 async function runFakeSweep(mode) {
+  const light = mode === 'light';
   sweepRunning = true;
+  sweepMode = mode;
   db.sweeps += 1;
   emitSweep('started', { mode, startedAt: nowISO() });
 
   let elapsed = 0;
-  for (const step of demo.sweepProgress) {
+  const progress = light
+    ? [{ phase: 'sources', message: 'Reading sample sources without AI…', done: 1, total: 1, ms: 300 }]
+    : demo.sweepProgress;
+  for (const step of progress) {
     await sleep(step.ms);
     elapsed += step.ms;
     emitSweep('progress', {
@@ -548,7 +554,9 @@ async function runFakeSweep(mode) {
     });
   }
 
-  const arrival = db.arrivals.shift();
+  // Light mode demonstrates reading the existing sample archive. Its next
+  // prewritten AI decision stays queued until the visitor requests a review.
+  const arrival = light ? null : db.arrivals.shift();
   let newMessages = 0;
 
   if (arrival) {
@@ -576,7 +584,7 @@ async function runFakeSweep(mode) {
       }
     }
     if (arrival.makeFirst && arrival.item) db.first = arrival.item.id;
-  } else {
+  } else if (!light) {
     // Nothing new: rotate the hero through the open Now items so the board is
     // still visibly re-read rather than frozen.
     const nowOpen = db.items.filter((i) => i.bucket === 'now' && i.state === 'open');
@@ -587,7 +595,7 @@ async function runFakeSweep(mode) {
   }
 
   const runId = `run_${Math.random().toString(16).slice(2, 10)}`;
-  for (const item of db.items) {
+  for (const item of light ? [] : db.items) {
     if (!ON_BOARD.has(item.state)) continue;
     item.seen_runs += 1;
     item.last_seen_run = runId;
@@ -605,12 +613,12 @@ async function runFakeSweep(mode) {
   db.run = {
     ...db.run,
     id: runId,
-    kind: 'full',
+    kind: light ? 'light' : 'full',
     started_at: minutesAgoISO(elapsed / 60_000),
     ended_at: nowISO(),
     ok: 1,
-    tokens_in: 30_000 + Math.round(Math.random() * 12_000),
-    tokens_out: 2_400 + Math.round(Math.random() * 1_200),
+    tokens_in: light ? 0 : 30_000 + Math.round(Math.random() * 12_000),
+    tokens_out: light ? 0 : 2_400 + Math.round(Math.random() * 1_200),
     error: null,
     stats,
   };
