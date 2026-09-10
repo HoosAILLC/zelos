@@ -27,7 +27,7 @@ import { el, button, meander, section, copyText, replace } from '../lib/dom.js';
    of /api/connectors, and a one-line wrapper in ui/lib/api.js would be a second
    place to look for a call that has exactly one call site. */
 import { api, request } from '../lib/api.js';
-import { state, saveConfig, loadConfig, setAccent, applyAccent, currentAccent, DEFAULT_ACCENT, markOnboarded, nowMark } from '../lib/store.js';
+import { state, saveConfig, loadConfig, setAccent, applyAccent, currentAccent, DEFAULT_ACCENT, markOnboarded, nowMark, notify } from '../lib/store.js';
 import { plural, tokenLine } from '../lib/format.js';
 import { monthName } from '../lib/time.js';
 import { aiAccessPanel } from './ai-access.js';
@@ -739,6 +739,7 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
     baseUrl: cfg.baseUrl || '',
     model: cfg.model || '',
     keyRef: cfg.keyRef || 'model.default',
+    maxTokens: cfg.maxTokens ?? 8192,
     // The guided card to show, or null for the expert form alone. Set by
     // choose(); restored from the saved config once the presets arrive.
     guide: null,
@@ -753,6 +754,7 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
   guidedWrap.hidden = true;
   const formWrap = el('div', { class: 'chosen' });
   const probeNote = el('p', { class: 'quiet-note' });
+  const advanced = fold('Advanced', [probeNote, formWrap]);
   // The "Stuck?" line, redrawn with the card's name once one is chosen so the
   // message Claude gets is about Anthropic's key page and not both.
   const helpSlot = el('div');
@@ -772,6 +774,23 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
 
     const baseInput = input({ value: draft.baseUrl, placeholder: 'https://…' });
     baseInput.addEventListener('input', () => { draft.baseUrl = baseInput.value.trim(); });
+
+    const limitInput = input({ type: 'number', value: String(draft.maxTokens), min: '1', max: '1000000', step: '1' });
+    limitInput.addEventListener('input', () => { draft.maxTokens = limitInput.value; });
+
+    function responseLimit() {
+      const value = Number(limitInput.value);
+      if (!Number.isInteger(value) || value < 1 || value > 1_000_000) {
+        status.bad('Response limit must be a whole number from 1 to 1,000,000.');
+        limitInput.setAttribute('aria-invalid', 'true');
+        const toggle = advanced.querySelector('.unfold-toggle');
+        if (toggle?.getAttribute('aria-expanded') === 'false') toggle.click();
+        limitInput.focus();
+        return null;
+      }
+      limitInput.removeAttribute('aria-invalid');
+      return value;
+    }
 
     // One key box. It sits in the guided card when there is one and in the
     // Advanced form otherwise; the helpers below read it wherever it is.
@@ -840,6 +859,8 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
     }
 
     async function save() {
+      const maxTokens = responseLimit();
+      if (maxTokens === null) return false;
       if (!draft.baseUrl || !draft.model) {
         status.bad('An address and a model id are both required — both are under Advanced.');
         return false;
@@ -861,6 +882,7 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
             baseUrl: draft.baseUrl,
             model: draft.model,
             keyRef: draft.keyRef,
+            maxTokens,
           },
         });
         status.good('Saved.');
@@ -908,6 +930,7 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
      * for the person to type but the key.
      */
     async function checkItWorks() {
+      if (responseLimit() === null) return false;
       if (!draft.model) {
         status.bad('Zelos could not pick a model for this service — choose one under Advanced.');
         return false;
@@ -916,7 +939,11 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
       if (!answered) return false;
       const saved = await save();
       if (!saved) return false;
-      status.good(`Working. Zelos will use ${friendly()}.`);
+      const message = `Working. Zelos will use ${friendly()}.`;
+      status.good(message);
+      // Saving replaces this panel. The shared notification remains visible
+      // after that render and after onboarding advances to its next step.
+      notify(message);
       onDone?.();
       return true;
     }
@@ -978,6 +1005,9 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
       field('Model', modelInput, {
         hint: isLocal() ? 'Whatever your runtime has pulled.' : 'The provider’s model id, exactly as they spell it.',
       }),
+      field('Response limit (tokens)', limitInput, {
+        hint: 'The maximum response size in tokens (small pieces of text), including reasoning for models that use it. Raise this if a review is cut short. Larger replies can take longer and cost more; your model may have a lower maximum.',
+      }),
       datalist,
       el('div', { class: 'row-inline' }, [
         button('List available models', { class: 'btn quiet', onClick: loadModels }),
@@ -993,6 +1023,7 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
           class: 'btn solid',
           onClick: async () => {
             const ok = await save();
+            if (ok) notify('AI settings saved.');
             if (ok && onDone) onDone();
           },
         }),
@@ -1130,7 +1161,7 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
     choiceWrap,
     guidedWrap,
     fold('More choices', moreWrap),
-    fold('Advanced', [probeNote, formWrap]),
+    advanced,
     helpSlot,
   ]);
 }

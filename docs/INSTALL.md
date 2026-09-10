@@ -129,7 +129,7 @@ Path 3.)
 You will see a banner like this, and your browser will open:
 
 ```
-  ZELOS 1.8.1
+  ZELOS 1.8.2
   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   Open   http://127.0.0.1:7777/?t=9c1f…
@@ -214,10 +214,10 @@ installer built from a failing tree. What comes out is attached to that run as
 an artifact:
 
 ```
-Zelos-1.8.1-arm64.dmg          Apple Silicon
-Zelos-1.8.1-x64.dmg            Intel Macs
-Zelos-1.8.1-setup-x64.exe      Windows, 64-bit — ordinary PCs
-Zelos-1.8.1-setup-arm64.exe    Windows on ARM
+Zelos-1.8.2-arm64.dmg          Apple Silicon
+Zelos-1.8.2-x64.dmg            Intel Macs
+Zelos-1.8.2-setup-x64.exe      Windows, 64-bit — ordinary PCs
+Zelos-1.8.2-setup-arm64.exe    Windows on ARM
 ```
 
 Windows also gets a third installer from the same run, carrying both
@@ -356,7 +356,7 @@ reasonable to click past *this* one is that you can read the source and build
 the installer yourself.
 
 1. **Take the installer that matches your machine.**
-   `Zelos-1.8.1-setup-x64.exe` for an ordinary PC, `-arm64` for Windows on ARM,
+   `Zelos-1.8.2-setup-x64.exe` for an ordinary PC, `-arm64` for Windows on ARM,
    or the combined installer if you are not sure. The wrong one either runs
    slowly under emulation or does not run at all.
 2. **Your browser may refuse to keep the file.** Edge says *"…setup.exe was
@@ -394,7 +394,7 @@ can clear it first: right-click the `.exe` → **Properties** → tick **Unblock
 at the bottom of the **General** tab → **OK**. In PowerShell that is:
 
 ```
-Unblock-File .\Zelos-1.8.1-setup-x64.exe
+Unblock-File .\Zelos-1.8.2-setup-x64.exe
 ```
 
 That marker is a real safety mechanism — clear it only from something you built
@@ -520,6 +520,19 @@ directly.
 to "here is the line to fix", and it names the specific next action rather than
 the exception it caught. From source that is `node zelos.mjs doctor`; in the
 desktop app, **Settings → About** shows the same findings.
+
+**Claude connects, but an inbox review reaches its response limit.**
+Open **Settings → AI → Advanced → Response limit (tokens)**. [Sonnet 5 uses this
+allowance for reasoning and the visible answer together](https://platform.claude.com/docs/en/models/sonnet-5/whats-new-sonnet-5). A starting allowance of
+32,768 can help a review that stops at 8,192; stay within your chosen model's
+supported output limit. The allowance is a ceiling, not a request to fill it,
+but a longer answer can use more paid tokens. Save and run the review again.
+
+**A long Claude review times out even though the connection test works.**
+Use Zelos 1.8.2 or later. Full Anthropic reviews receive the response as it is
+produced, so thinking and keepalive messages count as progress. The connection
+still fails after two minutes without progress, and an incomplete response is
+never saved as a finished board.
 
 **"Zelos could not start" on launch.**
 Almost always a port or a data folder problem. The dialog names the actual

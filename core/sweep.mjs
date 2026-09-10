@@ -923,6 +923,9 @@ export async function runSweep({
       maxTokens: config?.model?.maxTokens,
       temperature: config?.model?.temperature,
       json: true,
+      // Claude can spend minutes thinking before its first board text. Read
+      // its pings/thinking as liveness, collecting only the finished answer.
+      stream: config?.model?.protocol === 'anthropic',
       signal,
     });
   } catch (err) {
@@ -932,6 +935,16 @@ export async function runSweep({
 
   stats.tokensIn = Number(answer?.usage?.input) || 0;
   stats.tokensOut = Number(answer?.usage?.output) || 0;
+  if (abort()) return finish(false, 'Sweep cancelled');
+  // A balanced JSON fragment is still unsafe when the provider says it ran
+  // out of room. Reject before merging or consuming any pending source work.
+  if (answer?.stopReason === 'length') {
+    const sample = modelSample(answer?.text);
+    return finish(
+      false,
+      storedMessage(`The model's reply was cut off at its token limit before the board was complete${sample ? ` — it began "${sample}"` : ''}. Raise Response limit (tokens) in Settings → AI → Advanced and sweep again.`),
+    );
+  }
 
   const parsed = extractJSON(answer?.text ?? '');
   // extractJSON is deliberately forgiving, and one thing it forgives is a reply
@@ -946,14 +959,6 @@ export async function runSweep({
     ('items' in parsed || 'first' in parsed || 'notes' in parsed);
   if (!looksLikeBoard) {
     const sample = modelSample(answer?.text);
-    if (answer?.stopReason === 'length') {
-      // The reply was cut off at the token ceiling, so no model swap will fix
-      // it — the same model with more room will.
-      return finish(
-        false,
-        storedMessage(`The model's reply was cut off at its token limit before the board was complete${sample ? ` — it began "${sample}"` : ''}. Raise model.maxTokens in Settings and sweep again.`),
-      );
-    }
     return finish(
       false,
       parsed
@@ -987,12 +992,6 @@ export async function runSweep({
     const why = merged.errors.slice(0, 2)
       .map((e) => (e.path ? `${e.path}: ${e.message}` : e.message))
       .join('; ') || 'the reply was not a usable board';
-    if (answer?.stopReason === 'length') {
-      return finish(
-        false,
-        storedMessage(`The model's reply was cut off at its token limit before the board was usable (${why}). Raise model.maxTokens in Settings and sweep again.`),
-      );
-    }
     return finish(
       false,
       storedMessage(`The model's reply was not a usable board (${why}). Try a larger model, or one that follows a format instruction.`),
