@@ -289,7 +289,7 @@ export function conflictsFirst(entries) {
 }
 
 /**
- * "3 emails · 2 appointments" — the sweep's own numbers, in the words a
+ * "3 messages · 2 appointments" — the sweep's own numbers, in the words a
  * person uses for them. The run's duration is deliberately not here: "41.8s"
  * beside the counts read as a machine readout, and it lives in the hover
  * title the header gives the line (sweepDetail below) rather than on it.
@@ -298,7 +298,7 @@ export function sweepSummary(run) {
   if (!run) return '';
   const s = run.stats || {};
   const bits = [];
-  if (s.messages) bits.push(`${s.messages} email${s.messages === 1 ? '' : 's'}`);
+  if (s.messages) bits.push(`${s.messages} message${s.messages === 1 ? '' : 's'}`);
   if (s.events) bits.push(`${s.events} appointment${s.events === 1 ? '' : 's'}`);
   if (s.items) bits.push(`${s.items} item${s.items === 1 ? '' : 's'}`);
   return bits.join(' · ');

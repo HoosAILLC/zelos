@@ -410,13 +410,13 @@ test('every bucket has a label a person can read without decoding', () => {
 });
 
 test('sweepSummary reads as a sentence, and survives a run with no stats', () => {
-  // In a person's words — emails, appointments — and without the duration,
+  // In a person's words — messages, appointments — and without the duration,
   // which reads as a machine readout beside them and lives in the hover title.
   assert.equal(
     fmt.sweepSummary({ stats: { messages: 1, events: 2, items: 3, ms: 8_430 } }),
-    '1 email · 2 appointments · 3 items',
+    '1 message · 2 appointments · 3 items',
   );
-  assert.equal(fmt.sweepSummary({ stats: { messages: 214, events: 28 } }), '214 emails · 28 appointments');
+  assert.equal(fmt.sweepSummary({ stats: { messages: 214, events: 28 } }), '214 messages · 28 appointments');
   assert.equal(fmt.sweepSummary({ stats: {} }), '');
   assert.equal(fmt.sweepSummary(null), '');
   assert.equal(fmt.sweepDetail({ stats: { ms: 41_800 } }), 'took 41.8s');
@@ -4882,9 +4882,9 @@ test('Settings opens on Email, reads in plain words, keeps every route, and puts
   const first = plainWalk(share).find((n) => n.attributes.role === 'tabpanel').children[0];
   assert.match(textOf(first), /^This is NOT where you choose the AI that reads your mail — that is under AI\. Leave this off unless you know what it is\./);
 
-  // Other things it can read opens by telling most people to leave.
+  // Other things it can read includes optional accounts and local sources.
   const other = settings.renderSettings({ sub: 'sources', navigate() {}, rerender() {} });
-  assert.match(onScreen(other), /Most people need nothing here\. If you use any of these work tools, add them\./);
+  assert.match(onScreen(other), /Add other accounts or local sources you want Zelos to read\./);
 
   // You: the address is "yours", and a blank name is explained in terms of the replies.
   const you = settings.renderSettings({ sub: 'you', navigate() {}, rerender() {} });

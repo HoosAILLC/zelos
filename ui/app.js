@@ -128,7 +128,7 @@ function announce(node, text) {
  * live region above, so this line is where "Checking your mail…", "Finished
  * checking" and a check's failure are spoken as well as shown.
  *
- * What it says is "Last checked 20 minutes ago · 214 emails · 28
+ * What it says is "Last checked 20 minutes ago · 214 messages · 28
  * appointments". The run's duration and the day's token spend — "41.8s",
  * "9.8k tokens in · 135 out" — were the most prominent numbers on the screen
  * and the least explicable ones (bus tokens? is this costing me money?), so
@@ -147,7 +147,7 @@ function buildSweepLine() {
   };
 }
 
-/** "Last checked 20 minutes ago · 3 emails", or the state of the check under way. */
+/** "Last checked 20 minutes ago · 3 messages", or the state of the check under way. */
 export function sweepLineText(s, last, scheduler = null) {
   if (s.running) return s.message || 'Checking your mail…';
   // One paint after a check ends: what it found, before the line settles back

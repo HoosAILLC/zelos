@@ -1,12 +1,14 @@
 # Sources
 
-**Beyond mail and calendar, Zelos reads eight more things. This page is one
+**Beyond mail and calendar, Zelos reads nine more things. This page is one
 section per source: what it reads, where you mint the credential, what it costs,
 what it deliberately does not do, and where it stops.**
 
-You add them in **Settings → Sources**. Each one asks for the credential in its
-own words, with a link to the page where you mint it, and each has a **Test**
-that says what it found rather than "OK".
+You add them in **Settings → Other things it can read (optional)**, also called
+Sources. Each one asks for the credential or local file it needs. **Read sources
+now** reads all enabled connections without asking AI; each connection's reading
+status records success or explains a problem. **Check now** can also ask your AI
+to review what was read.
 
 ---
 
@@ -14,9 +16,9 @@ that says what it found rather than "OK".
 
 These are properties of the code, not promises about it. They are worth reading
 once, because they answer most of the questions the sections below would
-otherwise have to answer eight times.
+otherwise have to answer for each source.
 
-**You mint the credential, in your own account.** For these eight sources,
+**You mint the credential, in your own account.** For these additional sources,
 Zelos publishes no OAuth app. There is no client id, no client secret, no
 consent screen, no callback and no "Connect with…" button. The mail sign-ins
 are the exception ([OAUTH.md](OAUTH.md)), and even they need no server of
@@ -528,6 +530,47 @@ anything.
   the article's identity, so a publisher changing escaping — `&#038;` to
   `&amp;`, or a CDN normalising on the way out — would make the same article
   arrive again as new, and turn one article into two threads.
+
+---
+
+## iPhone texts from Messages on this Mac
+
+**What it reads.** Text already available in the Mac's Messages database,
+including iMessage and forwarded SMS, MMS and RCS text. The default is the last
+14 days, up to 400 messages per read. Messages sent by you retain their outgoing
+direction. Zelos does not access Contacts, so people may appear as phone numbers
+or email addresses.
+
+**Setup.**
+
+1. Open Messages on the Mac and confirm the texts you want are visible. Use the
+   same Apple Account on the iPhone and Mac. If carrier texts are missing, check
+   Messages in iCloud or Text Message Forwarding on the iPhone. Apple's
+   [forwarding guide](https://support.apple.com/en-us/102545) explains both options.
+2. In macOS **System Settings → Privacy & Security → Full Disk Access**, add the
+   installed **Zelos** app and enable it yourself. Quit and reopen Zelos. This
+   broad system permission allows access to protected data such as Messages;
+   Zelos cannot grant it. See Apple's
+   [privacy settings guide](https://support.apple.com/guide/mac-help/mchl211c911f/mac).
+3. In Zelos, add **iPhone texts (Messages on this Mac)**. Normally leave the
+   Messages database location at `~/Library/Messages/chat.db`. Save the source,
+   then press **Read sources now** in the installed app. No Apple password goes
+   into Zelos, and no extra permission for a browser or AI coding tool is needed.
+
+**Local import and AI are separate.** Reading sources stores the imported text
+in Zelos on this Mac without asking AI. Keep automatic checks off in
+**Settings → Schedule** if you want local-only import. A requested full review
+sends selected excerpts to your configured AI; **Check now**, automatic checks,
+and questions you ask the AI can also use imported text. Adding the source does
+not turn automatic checks on or off.
+
+**Where it stops.** This imports available text, not attachments, calls or
+voicemail. It cannot retrieve phone-only messages that have not synced to the
+Mac. Reaction/system entries and unavailable text formats are skipped. Zelos
+never sends, changes, deletes or marks Apple messages read. It keeps its own
+archive: deleting or retracting a message in Messages does not remove an earlier
+import from Zelos. Apple can change its database format; an access or format
+error is reported rather than treated as an empty inbox.
 
 ---
 
