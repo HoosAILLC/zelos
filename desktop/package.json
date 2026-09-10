@@ -1,7 +1,7 @@
 {
   "name": "zelos-desktop",
   "productName": "Zelos",
-  "version": "1.7.1",
+  "version": "1.8.0",
   "description": "The Electron shell for Zelos \u2014 a local-first second brain. The core it runs is dependency-free; Electron lives only in this package.",
   "author": {
     "name": "Zelos"
@@ -27,7 +27,7 @@
   "build": {
     "appId": "app.zelos.desktop",
     "productName": "Zelos",
-    "copyright": "MIT licensed. Local-first: nothing leaves this machine except the model calls you configure.",
+    "copyright": "MIT licensed. Local-first: reading and AI use the services you configure; update checks are manual.",
     "asar": false,
     "npmRebuild": false,
     "forceCodeSigning": false,

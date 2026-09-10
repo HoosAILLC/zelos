@@ -298,8 +298,9 @@ in **Settings → Sources**. All of them are ones you typed in yourself.
    `core/connectors/http.mjs`, which refuses any other origin before a socket
    exists. Footnote 4 below has the list.
 
-That is the complete list: three by default, and nothing you did not type.
-There is no telemetry, no analytics, no crash reporting, no update check, no
+Those are the configured reading and model destinations. A manual update check
+adds the official GitHub release API, as described below.
+There is no telemetry, no analytics, no crash reporting, no automatic update check, no
 CDN, no remote font, no remote image, no "anonymous usage statistics". The
 package has zero third-party runtime dependencies, which is what makes that
 claim checkable rather than merely stated: there is no transitive package that
@@ -307,7 +308,7 @@ could phone home behind Zelos's back. You can verify it with `lsof -i` or
 Little Snitch or `tcpdump` and count the conversations against your own
 settings.
 
-Six footnotes, because "three destinations" is nearly true rather than exactly
+Seven footnotes, because "three destinations" is nearly true rather than exactly
 true.
 
 1. **A server you configured can redirect, and Zelos follows one hop** — so a
@@ -372,6 +373,15 @@ true.
    a constant of the provider in `core/sources/oauth.mjs`). Mail then comes
    from `imap.gmail.com` or `outlook.office365.com` exactly as with a
    password, under item 1. [OAUTH.md](OAUTH.md) has the table of every step.
+
+7. **Manual update checks.** Pressing Settings → About → Check for updates calls
+   `POST /api/updates/check` through the normal local session gate. The server
+   fetches only `https://api.github.com/repos/HoosAILLC/zelos/releases/latest`,
+   refuses redirects, caps the response at 1 MiB, and applies an eight-second
+   deadline. It sends an Accept header and a fixed User-Agent, with no account
+   content, credentials, request body or installation identifier. Successful
+   results are cached for five minutes. Only exact official release destinations
+   are offered; the check downloads and installs nothing. No check runs at startup.
 
 ### `privacy.sendBodies`
 
@@ -571,11 +581,12 @@ does exactly what opening the Zelos window does, because it is the same code:
   `core/db.mjs`, run at the top of `listBoard`, which is also what `/api/state`
   and the sweep call;
 - the **`now` bucket is held to four items** — `capNowBucket` in
-  `core/sweep.mjs`, which *demotes* the overflow to `today`. Its statement is
-  `UPDATE items SET …`; there is no `DELETE` in it, so an item that loses its
-  place moves, never disappears.
+  `core/sweep.mjs`, which calls `setItemBucket` to *demote* the overflow to
+  `today`. An item that loses its place moves, never disappears;
+- these actual changes append an **automatic item-history revision**, atomically
+  with the item update. An unchanged board adds no revision.
 
-That is the entire extent of it: no other table, no other column. The headline,
+That is the extent of board maintenance, alongside the separate access audit below. The headline,
 the reasoning, the person, the due date, the severity, the link and the source
 references of every item are byte-identical before and after, and no item is
 created, deleted or finished.
@@ -739,13 +750,24 @@ legacy index raises an error instead of silently generating a new identity.
 way.** The key that decrypts `secrets.enc` sits in `.seed` in the same
 directory, readable by the same user. That means:
 
-- It protects your credentials **at rest** — in a backup, on a stolen disk
-  image (if the disk is otherwise unencrypted), in a synced folder, in a
-  support bundle someone copies off the machine.
+- A copied `secrets.enc` cannot be decrypted without the seed. A copy of the
+  whole folder includes that seed and can decrypt the credentials; the same is
+  true of a disk image or support bundle containing both files.
 - It protects them **not at all** against a process running as you. Any such
   process can read `.seed`, read `secrets.enc`, and decrypt them. It is
-  obfuscation against another user of the machine and real encryption against
-  someone holding the files without the account.
+  encryption at the file level, with filesystem permissions protecting the seed.
+
+**Guided desktop backups** contain the portable database and credential files,
+including the encrypted-file seed where present, in an owner-only archive.
+They are not password protected. Native file dialogs select paths; no HTTP route
+or renderer-supplied path can export credentials or replace the data folder.
+Restore verifies a bounded manifest, fixed portable paths, file hashes, database
+schema and integrity before confirmation. The runtime pauses requests and checks,
+cancels and drains sign-ins, refuses other active database clients, and keeps a
+recovery archive plus a replacement journal. Startup recovers an interrupted
+replacement before opening SQLite. External OS keychain values are not exported,
+and may require reconnecting on another machine. SHA-256 detects corruption; it
+does not make an untrusted backup safe or authenticate its author.
 
 `backend()` returns that limitation as a `note`, and the UI is required to
 display it verbatim rather than paraphrasing it into something comforting. If

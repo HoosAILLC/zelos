@@ -28,9 +28,12 @@
  */
 
 import path from 'node:path';
+import fs from 'node:fs';
 import { pathToFileURL } from 'node:url';
+import { Worker } from 'node:worker_threads';
 
 import { acquireHomeLock } from '../core/home-lock.mjs';
+import { acquireMaintenance, registerDataConnection, releaseDataConnection } from '../core/data-lease.mjs';
 
 /** How long a shutdown waits for the socket before leaving anyway. */
 const CLOSE_GRACE_MS = 3_000;
@@ -52,14 +55,63 @@ async function waitForSweepToSettle(server, budgetMs) {
 
 async function loadCore(root) {
   const load = (rel) => import(pathToFileURL(path.join(root, 'core', rel)).href);
-  const [config, db, server, sweep, logmod] = await Promise.all([
+  const [config, db, server, sweep, logmod, backup] = await Promise.all([
     load('config.mjs'),
     load('db.mjs'),
     load('server.mjs'),
     load('sweep.mjs').catch(() => null), // optional: a broken sweep engine must not stop the board
     load('log.mjs'),
+    load('backup.mjs'),
   ]);
-  return { config, db, server, sweep, log: logmod };
+  return { config, db, server, sweep, log: logmod, backup };
+}
+
+/** Gate before invoking handlers and track their promises, including the time
+ * after a response/socket closes. An aborted socket is not a completed write.
+ */
+export function requestBarrier(server) {
+  const handlers = server.listeners('request');
+  const pending = new Set();
+  let paused = false;
+  for (const handler of handlers) server.removeListener('request', handler);
+  server.on('request', (req, res) => {
+    if (paused) {
+      res.writeHead(503, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'Retry-After': '2' });
+      res.end(JSON.stringify({ error: 'Zelos is backing up or restoring data. Please try again shortly.' }));
+      return;
+    }
+    for (const handler of handlers) {
+      const work = Promise.resolve().then(() => handler(req, res));
+      pending.add(work);
+      work.finally(() => pending.delete(work)).catch(() => { if (!res.writableEnded) res.destroy(); });
+    }
+  });
+  return { pause: () => { paused = true; }, resume: () => { paused = false; }, idle: () => pending.size === 0 };
+}
+
+async function bounded(work, timeoutMs) {
+  let timer;
+  try {
+    return await Promise.race([work, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('Zelos is still finishing a request. Nothing was replaced; try again after it finishes.')), timeoutMs);
+    })]);
+  } finally { clearTimeout(timer); }
+}
+
+function backupWork(root, operation, args) {
+  return new Promise((resolve, reject) => {
+    // This is a file worker even when a packaged smoke/embedding host was
+    // launched with --input-type=module -e. That flag is invalid for files.
+    const worker = new Worker(pathToFileURL(path.join(root, 'core', 'backup-worker.mjs')), { workerData: { operation, args }, execArgv: [] });
+    let answered = false;
+    worker.once('message', (message) => {
+      answered = true;
+      if (message.ok) resolve(message.result);
+      else reject(Object.assign(new Error(message.error), { code: message.code }));
+    });
+    worker.once('error', reject);
+    worker.once('exit', () => { if (!answered) reject(new Error('The backup worker stopped before finishing.')); });
+  });
 }
 
 /**
@@ -81,8 +133,17 @@ export async function startCore({ root, home = null, port = null } = {}) {
 
   const core = await loadCore(root);
 
-  const config = core.config.loadConfig();
   const where = core.config.paths();
+  if (fs.existsSync(path.join(where.home, '.restore-journal.json'))) {
+    const maintenance = acquireMaintenance({ home: where.home, recovering: true });
+    try { core.backup.recoverRestore({ home: where.home }); } finally { maintenance.release(); }
+  }
+  const startup = registerDataConnection(where.db);
+  try { return await bootCore({ root, core, where, port }); } finally { startup.release(); }
+}
+
+async function bootCore({ root, core, where, port }) {
+  const config = core.config.loadConfig();
 
   // Before the database is opened, not after: if this home is already being
   // swept the person should hear about it before a second scheduler is armed
@@ -114,6 +175,7 @@ export async function startCore({ root, home = null, port = null } = {}) {
   let server;
   let scheduler = null;
   let bound;
+  let barrier;
   try {
     db = core.db.open(where.db);
     core.db.migrate(db);
@@ -129,6 +191,7 @@ export async function startCore({ root, home = null, port = null } = {}) {
       logger,
       logFile: path.join(where.logsDir, 'desktop.log'),
     });
+    barrier = requestBarrier(server);
 
     // Same ordering as the CLI launcher: the server exists first so the
     // scheduler's progress has somewhere to be reported, then the scheduler is
@@ -168,6 +231,38 @@ export async function startCore({ root, home = null, port = null } = {}) {
   lock.setPort(bound.port);
 
   let stopping = null;
+  let maintaining = false;
+  let closed = false;
+
+  async function quiesce({ timeoutMs = 15_000 } = {}) {
+    if (maintaining || stopping || closed || lock.contested || lock.degraded) throw new Error('Close other Zelos and AI clients before backing up or restoring this data.');
+    const lease = acquireMaintenance({ home: where.home, connection: db });
+    maintaining = true;
+    barrier.pause();
+    scheduler?.stop();
+    server.zelos.sweeps.abort();
+    const resume = () => {
+      maintaining = false;
+      lease.release();
+      if (!closed) { barrier.resume(); scheduler?.start(); }
+    };
+    let cancelled = false;
+    try {
+      // Cancel flows already running, then again after begin handlers settle:
+      // an accepted handler may still be saving its client secret at first.
+      const first = server.zelos.cancelSignInsAndWait();
+      await bounded((async () => {
+        while (!barrier.idle() || server.zelos.sweeps.status().running) {
+          if (cancelled) return;
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        await first;
+        if (cancelled) return;
+        await server.zelos.cancelSignInsAndWait();
+      })(), timeoutMs);
+      return resume;
+    } catch (err) { cancelled = true; resume(); throw err; }
+  }
 
   const handle = {
     root,
@@ -195,6 +290,7 @@ export async function startCore({ root, home = null, port = null } = {}) {
      * this same supervisor.
      */
     async sweepNow(mode = 'auto') {
+      if (maintaining || closed) return { started: false, reason: 'Zelos is backing up or restoring data.' };
       try {
         return await server.zelos.sweeps.start(mode);
       } catch (err) {
@@ -234,6 +330,35 @@ export async function startCore({ root, home = null, port = null } = {}) {
       }
     },
 
+    /** Native-only paths, selected by trusted file dialogs. */
+    async createBackup(destination, { appVersion, timeoutMs } = {}) {
+      const resume = await quiesce({ timeoutMs });
+      try { return await backupWork(root, 'create', { home: where.home, destination, appVersion, config: server.zelos.config }); }
+      finally { resume(); }
+    },
+
+    async stageBackup(source) {
+      const staged = await backupWork(root, 'stage', { home: where.home, source });
+      return { ...staged, cleanup: () => fs.rmSync(staged.directory, { recursive: true, force: true }) };
+    },
+
+    async restoreBackup(staged, { appVersion }) {
+      const resume = await quiesce();
+      try {
+        const recoveryFile = core.backup.recoveryDestination(where.home);
+        await backupWork(root, 'create', { home: where.home, destination: recoveryFile, appVersion, config: server.zelos.config });
+        // No handlers or background writes remain. Close SQLite before any
+        // replacement, retaining our home and maintenance locks through it.
+        await new Promise((resolve) => { server.closeAllConnections?.(); server.close(resolve); });
+        db.close(); closed = true; releaseDataConnection(db);
+        const { id, directory, manifest } = staged;
+        const result = await backupWork(root, 'apply', { home: where.home, staged: { id, directory, manifest }, recoveryFile });
+        return result;
+      } finally { resume(); }
+    },
+
+    get closed() { return closed; },
+
     stop() {
       if (stopping) return stopping;
       stopping = (async () => {
@@ -251,7 +376,7 @@ export async function startCore({ root, home = null, port = null } = {}) {
             resolve();
           });
         });
-        try { core.db.close(db); } catch (err) { logger.warn('desktop: the database did not close cleanly', { error: err.message }); }
+        if (!closed) try { core.db.close(db); closed = true; } catch (err) { logger.warn('desktop: the database did not close cleanly', { error: err.message }); }
         // Last, after the database is shut: while the lock is there, this home
         // is ours, and it stops being ours only once nothing is holding it.
         lock.release();

@@ -1,9 +1,10 @@
 /**
  * desktop/preload.js — the entire bridge between the shell and the page.
  *
- * It exposes four read-only strings and one function, and the function can
- * do exactly one thing: ask the shell to show the Zelos folder in Finder or
- * Explorer. That is the point. The board is an ordinary web page that talks
+ * It exposes app identity and three argument-free actions: reveal the data
+ * folder, create a backup, and restore a backup. Native dialogs select every
+ * backup path and confirm replacement; paths and secret bytes never cross
+ * this bridge. The board is an ordinary web page that talks
  * to 127.0.0.1 over fetch; it needs almost nothing from the main process, so
  * it is given almost nothing — no `require`, no open IPC channel, no file
  * access, no "just one more helper". The tray's Sweep now runs inside the
@@ -45,6 +46,8 @@ try {
       electron: process.versions.electron,
       chrome: process.versions.chrome,
       showHome: () => ipcRenderer.invoke(SHOW_HOME_CHANNEL).then((shown) => shown === true, () => false),
+      createBackup: () => ipcRenderer.invoke('zelos:create-backup').catch(() => ({ ok: false, error: 'The backup could not finish. Please try again.' })),
+      restoreBackup: () => ipcRenderer.invoke('zelos:restore-backup').catch(() => ({ ok: false, error: 'The restore could not finish. Please try again.' })),
     }),
   );
 } catch (err) {

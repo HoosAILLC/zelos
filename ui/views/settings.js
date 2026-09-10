@@ -31,7 +31,9 @@ import { state, saveConfig, loadConfig, setAccent, applyAccent, currentAccent, D
 import { plural, tokenLine } from '../lib/format.js';
 import { monthName } from '../lib/time.js';
 import { aiAccessPanel } from './ai-access.js';
-import { sourceStatusLine } from '../lib/source-status.js';
+import { sourceStatusLine, connectionRecovery, setupStatus } from '../lib/source-status.js';
+import { backupPanel, canUseBackups } from '../lib/backup.js';
+import { updatesPanel } from '../lib/updates.js';
 
 /**
  * The tab strip, in the order a person looks for things. The ids are routes
@@ -2359,7 +2361,7 @@ export function simpleMailForm({ onSaved, onCancel }) {
   ]);
 }
 
-export function mailPanel({ compact = false, onDone = null, rerender } = {}) {
+export function mailPanel({ compact = false, onDone = null, rerender, connectionId = null } = {}) {
   const accounts = state.config?.mail || [];
   const wrap = el('div', { class: 'panel panel-mail' });
 
@@ -2368,13 +2370,14 @@ export function mailPanel({ compact = false, onDone = null, rerender } = {}) {
   }
 
   const list = el('div', { class: 'stack' }, accounts.length
-    ? accounts.map((account) => el('div', { class: 'account' }, [
+    ? accounts.map((account) => el('div', connectionCardProps(account, connectionId), [
       el('div', { class: 'account-head' }, [
         el('span', { class: 'account-label', text: account.label || account.user }),
         account.enabled === false ? el('span', { class: 'chip', text: 'off' }) : null,
       ]),
       el('p', { class: 'quiet-note', text: `${account.user} · the last ${account.lookbackDays} days` }),
       sourceStatusLine(account.id, 'mail'),
+      account.id === connectionId ? connectionRecovery(account.id, 'mail') : null,
       el('div', { class: 'row-inline' }, [
         button(account.enabled === false ? 'Enable' : 'Disable', {
           class: 'btn quiet',
@@ -2427,6 +2430,7 @@ export function mailPanel({ compact = false, onDone = null, rerender } = {}) {
   });
 
   wrap.appendChild(list);
+  if (connectionId && !accounts.some(account => account.id === connectionId)) wrap.prepend(missingConnection());
   wrap.appendChild(el('div', { class: 'row-inline' }, addButton));
   wrap.appendChild(editor);
   wrap.appendChild(help);
@@ -2705,7 +2709,7 @@ async function openEditor(editor, status, build) {
   }
 }
 
-export function calendarPanel({ compact = false, onDone = null, rerender } = {}) {
+export function calendarPanel({ compact = false, onDone = null, rerender, connectionId = null } = {}) {
   const calendars = state.config?.calendars || [];
   const wrap = el('div', { class: 'panel panel-calendars' });
   const editor = el('div', { class: 'editor' });
@@ -2718,13 +2722,14 @@ export function calendarPanel({ compact = false, onDone = null, rerender } = {})
   }
 
   wrap.appendChild(el('div', { class: 'stack' }, calendars.length
-    ? calendars.map((calendar) => el('div', { class: 'account' }, [
+    ? calendars.map((calendar) => el('div', connectionCardProps(calendar, connectionId), [
       el('div', { class: 'account-head' }, [
         el('span', { class: 'account-label', text: calendar.label || calendar.url }),
         el('span', { class: 'quiet-note', text: KIND_WORDS[calendar.kind] || calendar.kind }),
       ]),
       el('p', { class: 'quiet-note', text: calendar.url }),
       sourceStatusLine(calendar.id, 'calendars'),
+      calendar.id === connectionId ? connectionRecovery(calendar.id, 'calendars') : null,
       el('div', { class: 'row-inline' }, [
         button('Edit', {
           class: 'btn quiet',
@@ -2783,6 +2788,7 @@ export function calendarPanel({ compact = false, onDone = null, rerender } = {})
   wrap.appendChild(editor);
   wrap.appendChild(status.node);
   wrap.appendChild(helpSlot);
+  if (connectionId && !calendars.some(calendar => calendar.id === connectionId)) wrap.prepend(missingConnection());
   return wrap;
 }
 
@@ -2887,7 +2893,7 @@ export function sourceForm(source, { manifests = [], onSaved, onCancel }) {
   ]);
 }
 
-export function sourcesPanel({ rerender } = {}) {
+export function sourcesPanel({ rerender, connectionId = null } = {}) {
   const sources = state.config?.sources || [];
   const wrap = el('div', { class: 'panel panel-sources' });
   const editor = el('div', { class: 'editor' });
@@ -2896,13 +2902,14 @@ export function sourcesPanel({ rerender } = {}) {
   wrap.appendChild(el('p', { class: 'panel-lede', text: 'Most people need nothing here. If you use any of these work tools, add them. Zelos only ever reads them — nothing is ever written back.' }));
 
   wrap.appendChild(el('div', { class: 'stack' }, sources.length
-    ? sources.map((src) => el('div', { class: 'account' }, [
+    ? sources.map((src) => el('div', connectionCardProps(src, connectionId), [
       el('div', { class: 'account-head' }, [
         el('span', { class: 'account-label', text: src.label || src.id }),
         el('span', { class: 'mono account-host', text: src.type }),
         src.enabled === false ? el('span', { class: 'chip', text: 'off' }) : null,
       ]),
       sourceStatusLine(src.id, 'sources'),
+      src.id === connectionId ? connectionRecovery(src.id, 'sources') : null,
       el('div', { class: 'row-inline' }, [
         button(src.enabled === false ? 'Enable' : 'Disable', {
           class: 'btn quiet',
@@ -2952,7 +2959,23 @@ export function sourcesPanel({ rerender } = {}) {
   })));
   wrap.appendChild(editor);
   wrap.appendChild(status.node);
+  if (connectionId && !sources.some(src => src.id === connectionId)) wrap.prepend(missingConnection());
   return wrap;
+}
+
+function connectionCardProps(connection, target) {
+  const selected = connection.id === target;
+  return {
+    class: `account${selected ? ' is-connection-target' : ''}`,
+    'data-connection-target': selected ? '' : null,
+    tabindex: selected ? '-1' : null,
+    'aria-label': selected ? `Connection: ${connection.label || connection.user || connection.id}` : null,
+  };
+}
+
+function missingConnection() {
+  return el('p', { class: 'quiet-note is-bad', 'data-connection-target': '', tabindex: '-1',
+    text: 'This connection is no longer configured. Choose a connection below or add it again.' });
 }
 
 /* ----------------------------------------------------------------- sweeps */
@@ -3175,8 +3198,11 @@ function dataPanel() {
   };
 
   return el('div', { class: 'panel' }, [
-    el('p', { class: 'panel-lede', text: 'Your board and saved history live in one folder on this computer. For a complete data backup, quit Zelos first, then copy the whole folder to a private location. Passwords kept in your computer’s password storage may need to be entered again on a different computer.' }),
+    el('p', { class: 'panel-lede', text: canUseBackups()
+      ? 'Your board and saved history live on this computer. Create a backup before moving computers or making a big change.'
+      : 'Your board and saved history live in one folder on this computer. For a complete data backup, quit Zelos first, then copy the whole folder to a private location. Passwords kept in your computer’s password storage may need to be entered again on a different computer.' }),
     dataStats(),
+    backupPanel(),
     field('The Zelos folder', input({ value: home, readonly: true })),
     el('div', { class: 'row-inline' }, [
       canShowFolder()
@@ -3190,7 +3216,7 @@ function dataPanel() {
         : button('Copy the folder path', { class: 'btn solid', onClick: copyPath }),
       button('Save board snapshot', { class: 'btn quiet', onClick: exportSnapshot }),
     ]),
-    el('p', { class: 'quiet-note', text: 'The snapshot includes the current board and settings, without passwords. It does not include your full mail archive, captures or complete item history. Keep the whole data folder for a backup you can restore.' }),
+    el('p', { class: 'quiet-note', text: 'The snapshot includes the current board and settings, without passwords. It does not include your full mail archive, captures or complete item history. Use a backup to restore your data.' }),
     canShowFolder() ? null : el('p', { class: 'quiet-note', text: folderHint(platform) }),
     section('Erasing everything', {}, [
       el('p', { class: 'quiet-note', text: 'To erase everything: quit Zelos, then drag this folder to the Trash and empty the Trash.' }),
@@ -3243,6 +3269,7 @@ function aboutPanel() {
       lifetimeUsage ? el('dd', { text: `${lifetimeUsage}${lifetimeAsked ? ` · asked to think ${plural(lifetimeAsked, 'time')}` : ''}.` }) : null,
     ]),
     el('p', { class: 'panel-lede', text: plainSecretNotes(backend.name).about }),
+    updatesPanel(),
     fold('Security details', [
       el('dl', { class: 'facts' }, [
         el('dt', { text: 'Secret store' }), el('dd', { class: 'mono', text: backend.name }),
@@ -3255,7 +3282,7 @@ function aboutPanel() {
       section('Where Zelos stands', {}, [
         el('ul', { class: 'plain-list' }, [
           el('li', { text: 'The server binds 127.0.0.1 and nothing else. Every API call carries a session token minted at launch; no CORS header is ever sent, so a page in another tab cannot read one. The one exception is /api/mcp, the read-only channel an AI client uses: it is off until you switch it on under Share with another AI, and it carries the separate AI token you mint there rather than the session token — that one is meant to outlive a restart, and it lasts until you turn sharing off or revoke it.' }),
-          el('li', { text: 'The only outbound connections are the ones you configured: your IMAP host, your calendar address, your model endpoint.' }),
+          el('li', { text: 'Reading and AI checks contact the services you configured. Pressing Check for updates also contacts the official Zelos releases on GitHub; it sends no account content or credentials.' }),
           el('li', { text: 'Mail is untrusted input, and so is anything the model writes after reading it. Zelos never executes, shells out to, or navigates to anything derived from either. It renders them, and you click.' }),
           el('li', { text: 'Drafts are drafts. Zelos has no send path at all — not a disabled button, no code.' }),
           el('li', { text: 'Prompt-injection defences here are mitigation, not proof. The guarantee is the one above: nothing acts on model output but you.' }),
@@ -3420,9 +3447,9 @@ export function renderSettings(ctx) {
 
   let body;
   if (panel === 'you') body = youPanel();
-  else if (panel === 'mail') body = mailPanel({ rerender });
-  else if (panel === 'calendars') body = calendarPanel({ rerender });
-  else if (panel === 'sources') body = sourcesPanel({ rerender });
+  else if (panel === 'mail') body = mailPanel({ rerender, connectionId: ctx.connectionId });
+  else if (panel === 'calendars') body = calendarPanel({ rerender, connectionId: ctx.connectionId });
+  else if (panel === 'sources') body = sourcesPanel({ rerender, connectionId: ctx.connectionId });
   else if (panel === 'sweep') body = sweepPanel();
   else if (panel === 'privacy') body = privacyPanel();
   else if (panel === 'ai') {
@@ -3456,6 +3483,7 @@ export function renderSettings(ctx) {
       el('h1', { class: 'view-title', text: 'Settings' }),
     ]),
     meander(),
+    setupStatus(ctx.navigate),
     tabs,
     errors.length
       ? el('div', { class: 'banner banner-warn', role: 'status' }, [

@@ -1404,7 +1404,7 @@ test('every import in the shipped code is a node: builtin or a relative path', (
   }
 });
 
-test('nothing in the shipped code reaches a hard-coded remote host', () => {
+test('UI remote destinations are limited to the explicitly requested official release link', () => {
   const files = [];
   for (const dir of ['ui']) {
     (function walk(d) {
@@ -1416,7 +1416,9 @@ test('nothing in the shipped code reaches a hard-coded remote host', () => {
     })(path.join(REPO, dir));
   }
   for (const file of files) {
-    const source = fs.readFileSync(file, 'utf8');
+    const original = fs.readFileSync(file, 'utf8');
+    const source = file === path.join(REPO, 'ui/lib/updates.js')
+      ? original.replace('const official = `https://github.com/HoosAILLC/zelos/releases/tag/v${release.latestVersion}`;', '') : original;
     const remotes = [...source.matchAll(/https?:\/\/([A-Za-z0-9.-]+)/g)]
       .map((m) => m[1])
       .filter((host) => !['127.0.0.1', 'localhost', 'www.w3.org'].includes(host));

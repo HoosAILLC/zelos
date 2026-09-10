@@ -2912,6 +2912,52 @@ test('the Google callback takes no session token, and takes nothing it did not i
   assert.equal(google.tokenRequests().length, 0);
 });
 
+test('native maintenance cancels an in-flight Google exchange and waits until it can no longer save credentials', async (t) => {
+  let entered;
+  let release;
+  let signal;
+  const started = new Promise((resolve) => { entered = resolve; });
+  const waiting = new Promise((resolve) => { release = resolve; });
+  const keyRef = 'mail.m_backup_cancel';
+  await deleteSecret(keyRef);
+  const ctx = await startServer(t, { browserAuth: {
+    authorizeUrl: 'http://127.0.0.1:12345/auth', tokenUrl: 'http://127.0.0.1:12345/token',
+    fetchImpl: async (_url, options) => {
+      signal = options.signal; entered();
+      // A transport/credential operation may ignore cancellation until its
+      // current await ends. Maintenance must not infer completion from abort.
+      await waiting;
+      return new Response(JSON.stringify({ access_token: 'fixture-access', refresh_token: 'fixture-refresh', expires_in: 3600, token_type: 'Bearer' }));
+    },
+  } });
+  const began = await call(ctx, 'POST', '/api/mail/oauth', { body: { provider: 'google', keyRef, clientId: GOOGLE_CLIENT } });
+  const state = new URL(began.json.authUrl).searchParams.get('state');
+  const callback = fetch(`${ctx.base}/oauth/callback?state=${state}&code=fixture-code`);
+  await started;
+  let done = false;
+  const quiesced = ctx.server.zelos.cancelSignInsAndWait().then(() => { done = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(signal.aborted, true);
+  assert.equal(done, false, 'aborting an exchange is not proof its write work ended');
+  release(); await quiesced;
+  assert.equal((await callback).status, 400);
+  assert.equal(await getSecret(keyRef), null, 'cancelled credentials must not be stored after quiescence');
+});
+
+test('native maintenance cancels Microsoft authorization even before its user code arrives', async (t) => {
+  let entered;
+  const started = new Promise((resolve) => { entered = resolve; });
+  const upstream = http.createServer((_req, _res) => { entered(); });
+  await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => { upstream.closeAllConnections(); upstream.close(resolve); }));
+  const ctx = await startServer(t, { deviceAuth: { endpoint: `http://127.0.0.1:${upstream.address().port}` } });
+  const request = call(ctx, 'POST', '/api/mail/oauth', { body: { keyRef: 'mail.m_backup_start', clientId: '11111111-2222-3333-4444-555555555555' } });
+  await started;
+  await ctx.server.zelos.cancelSignInsAndWait();
+  assert.equal((await request).status, 502);
+  assert.equal(await getSecret('mail.m_backup_start'), null);
+});
+
 test('a Google sign-in nobody comes back to expires, and an exchange Google refuses fails without leaking', async (t) => {
   const google = await startMockGoogle(t, { requireSecret: GOOGLE_SECRET });
   const secretRef = googleSecretRefFor(oauthClient(null, 'google'), GOOGLE_CLIENT);

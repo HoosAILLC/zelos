@@ -23,6 +23,22 @@ may need reconnecting on another computer.
 Release notes, all four installers, source, and SHA-256 checksums are on the
 [GitHub releases page](https://github.com/HoosAILLC/zelos/releases).
 
+Starting with 1.8, the desktop app also offers **Settings → Your data → Create backup**.
+It saves a consistent archive of the database, captures, drafts, item history,
+settings and portable credentials. Keep the `.zelos-backup` file private: it is
+not password protected and can include credentials. Passwords held outside the
+data folder by the operating system may need reconnecting on another computer.
+
+**Restore a backup…** validates the file and previews its date and contents before
+asking to replace your current data. Zelos keeps a private recovery copy, then
+restarts after a successful restore. Close other Zelos sessions and connected AI
+clients before starting; restore refuses to replace data while another client is
+using it. Only restore a backup you trust, with a version that supports its schema.
+The command-line/browser app retains the full-folder backup procedure above.
+
+**Settings → About → Check for updates** checks the official GitHub release when
+pressed. It sends no account content or credentials, and does not install anything.
+
 ## Path 1 — Command-line usage
 
 Download and unpack the source archive, then open a terminal in its `zelos`
@@ -113,7 +129,7 @@ Path 3.)
 You will see a banner like this, and your browser will open:
 
 ```
-  ZELOS 1.7.1
+  ZELOS 1.8.0
   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   Open   http://127.0.0.1:7777/?t=9c1f…
@@ -196,10 +212,10 @@ installer built from a failing tree. What comes out is attached to that run as
 an artifact:
 
 ```
-Zelos-1.7.1-arm64.dmg          Apple Silicon
-Zelos-1.7.1-x64.dmg            Intel Macs
-Zelos-1.7.1-setup-x64.exe      Windows, 64-bit — ordinary PCs
-Zelos-1.7.1-setup-arm64.exe    Windows on ARM
+Zelos-1.8.0-arm64.dmg          Apple Silicon
+Zelos-1.8.0-x64.dmg            Intel Macs
+Zelos-1.8.0-setup-x64.exe      Windows, 64-bit — ordinary PCs
+Zelos-1.8.0-setup-arm64.exe    Windows on ARM
 ```
 
 Windows also gets a third installer from the same run, carrying both
@@ -338,7 +354,7 @@ reasonable to click past *this* one is that you can read the source and build
 the installer yourself.
 
 1. **Take the installer that matches your machine.**
-   `Zelos-1.7.1-setup-x64.exe` for an ordinary PC, `-arm64` for Windows on ARM,
+   `Zelos-1.8.0-setup-x64.exe` for an ordinary PC, `-arm64` for Windows on ARM,
    or the combined installer if you are not sure. The wrong one either runs
    slowly under emulation or does not run at all.
 2. **Your browser may refuse to keep the file.** Edge says *"…setup.exe was
@@ -376,7 +392,7 @@ can clear it first: right-click the `.exe` → **Properties** → tick **Unblock
 at the bottom of the **General** tab → **OK**. In PowerShell that is:
 
 ```
-Unblock-File .\Zelos-1.7.1-setup-x64.exe
+Unblock-File .\Zelos-1.8.0-setup-x64.exe
 ```
 
 That marker is a real safety mechanism — clear it only from something you built
@@ -438,8 +454,9 @@ server some stray web page can be pointed at.
    `zelos doctor`; the folder itself now records the answer in
    `secrets.backend.json`.
 
-**Settings → Data** inside the app shows you the exact path, copies it to the
-clipboard, and can export a JSON snapshot of the database first. The
+**Settings → Your data** inside the app shows the exact path and offers a board
+snapshot containing the current board and settings without passwords. The desktop
+app also offers backup and restore; a board snapshot alone cannot restore the full archive. The
 `Board → Show data folder` and `Board → Show logs` menu items open these
 directly.
 

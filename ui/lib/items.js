@@ -13,6 +13,7 @@
 
 import { el, button, meander, replace } from './dom.js';
 import { setItemState, state, timezone } from './store.js';
+import { itemHistory } from './item-history.js';
 import {
   todayKey, addDaysToKey, weekdayOfKey, dayKey, offsetFor, toZonedISO, formatTime, formatDay,
 } from './time.js';
@@ -233,18 +234,21 @@ function snoozeControl(item) {
  * the time and three equal buttons make you read all three.
  */
 function moreControls(item) {
-  const snooze = snoozeControl(item);
+  const snooze = item.sourceInactive ? null : snoozeControl(item);
+  const history = itemHistory(item);
   const panel = el('div', { class: 'row-more', hidden: true }, [
-    snooze.toggle,
-    button('Not a thing', {
+    snooze?.toggle,
+    !item.sourceInactive ? button('Not a thing', {
       class: 'btn quiet',
       onClick: () => setItemState(item.id, 'dismissed'),
       title: 'Dismiss — it stays in the database, it just leaves the board',
-    }),
-    item.state === 'snoozed'
+    }) : null,
+    !item.sourceInactive && item.state === 'snoozed'
       ? button('Wake', { class: 'btn quiet', onClick: () => setItemState(item.id, 'open') })
       : null,
-    snooze.panel,
+    history.toggle,
+    snooze?.panel,
+    history.panel,
   ]);
 
   // Three dots are a picture, not a name. "More" is the name, in the tooltip
@@ -269,7 +273,7 @@ function moreControls(item) {
 /** The dense row used by Today, Owed and the Now list. */
 export function itemRow(item, { tz, showBucket = true } = {}) {
   const sev = severityOf(item);
-  const { toggle, panel } = item.sourceInactive ? { toggle: null, panel: null } : moreControls(item);
+  const { toggle, panel } = moreControls(item);
   const link = linkFor(item);
 
   return el('article', {

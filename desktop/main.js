@@ -118,6 +118,7 @@ let quitting = false;
 let shuttingDown = null;
 let leaving = null;
 let leaveAction = null;
+let maintenanceActive = false;
 let crashes = [];      // timestamps of recent render-process-gone events
 let crashTimer = null;
 
@@ -583,6 +584,103 @@ function installShowHome() {
   }));
 }
 
+export const CREATE_BACKUP_CHANNEL = 'zelos:create-backup';
+export const RESTORE_BACKUP_CHANNEL = 'zelos:restore-backup';
+
+/** Only fixed native actions, never a renderer-supplied path or option. The
+ * dependency boundary also lets tests exercise cancellation and failure without
+ * opening an OS dialog or loading any real user data.
+ */
+export function backupHandlers({ isBoard, getCore, getWindow, dialogs, flush, appVersion, restart, setBusy = () => {} }) {
+  let busy = false;
+  const safeError = (err) => {
+    if (err?.code === 'ZELOS_DATA_BUSY' || err?.code === 'ZELOS_RESTORE_PENDING' || err?.message?.startsWith('Backup: ')) return err.message;
+    return 'Zelos could not finish this operation. Check that other Zelos and AI clients are closed, finish any active request, and try again. Your recovery copies are kept in the data folder’s backups folder.';
+  };
+  const run = (restore) => async (event, ...args) => {
+    // Frame identity matters: an embedded or navigated frame must not inherit
+    // a filesystem action merely because it lives in the same webContents.
+    if (args.length || !isBoard(event)) return { ok: false, error: 'This action is only available in the Zelos desktop board.' };
+    if (busy) return { ok: false, error: 'A backup or restore is already in progress.' };
+    const core = getCore();
+    const win = getWindow();
+    if (!core || !win || win.isDestroyed()) return { ok: false, error: 'The Zelos board is not ready.' };
+    busy = true; setBusy(true);
+    let staged;
+    let success = false;
+    let disabled = false;
+    try {
+      const selected = restore
+        ? await dialogs.showOpenDialog(win, { title: 'Restore a Zelos backup', properties: ['openFile'], filters: [{ name: 'Zelos backup', extensions: ['zelos-backup'] }] })
+        : await dialogs.showSaveDialog(win, { title: 'Create a Zelos backup', defaultPath: `Zelos-${new Date().toISOString().slice(0, 10)}.zelos-backup`, filters: [{ name: 'Zelos backup', extensions: ['zelos-backup'] }], message: 'This file contains private archive data and may include credentials. Keep it in a safe location.' });
+      const selectedPath = restore ? selected.filePaths?.[0] : selected.filePath;
+      if (selected.canceled || !selectedPath) return { ok: false, cancelled: true };
+      win.setEnabled?.(false);
+      disabled = true;
+      if (restore) {
+        staged = await core.stageBackup(selectedPath);
+        const info = staged.manifest;
+        const count = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
+        const choice = await dialogs.showMessageBox(win, {
+          type: 'warning', title: 'Restore this backup?', message: 'Replace the current Zelos data?',
+          detail: [
+            `Backup date: ${new Date(info.createdAt).toLocaleString()}`,
+            `Created by Zelos ${info.appVersion}`,
+            `${count(info.counts.messages, 'archived message')} · ${count(info.counts.events, 'event')} · ${count(info.counts.items, 'board item')}`,
+            `${count(info.counts.drafts, 'draft')} · ${count(info.counts.captures, 'note')} · ${count(info.counts.runs, 'run')} · ${count(info.counts.item_history, 'history revision')}`,
+            '',
+            'Your current data will be replaced. Zelos will first keep a private recovery copy in the data folder’s backups folder, then reopen.',
+            info.credentials === 'encrypted-file-included'
+              ? 'This backup includes the local encrypted credential file and its key. Treat the backup like a password. Credentials held in an operating-system keychain may still need reconnecting.'
+              : 'Operating-system keychain credentials are not portable. You may need to reconnect mail, calendars, task sources, and your model after restoring.',
+            'Restore only a backup you trust. Local calendar files outside the Zelos folder must be copied separately.',
+          ].join('\n'),
+          buttons: ['Cancel', 'Restore and reopen'], defaultId: 0, cancelId: 0, noLink: true,
+        });
+        if (choice.response !== 1) return { ok: false, cancelled: true };
+      }
+      // Flush after file selection and confirmation: the most recent keystroke
+      // is included, and a failed save keeps the renderer and its edits alive.
+      await flush(win.webContents);
+      if (restore) await core.restoreBackup(staged, { appVersion });
+      else await core.createBackup(selectedPath, { appVersion });
+      success = true;
+      return { ok: true };
+    } catch (err) {
+      const error = safeError(err);
+      await dialogs.showMessageBox(win, { type: 'warning', buttons: ['OK'], message: restore ? 'Restore could not finish' : 'Backup could not finish', detail: `${error}${core.closed ? '\nZelos will reopen to recover or load its data.' : '\nZelos kept the current board open. If a draft could not save, copy its text before leaving.'}` }).catch(() => {});
+      return { ok: false, error };
+    } finally {
+      // Never remove a transaction whose journal is needed by startup recovery.
+      if (staged && !fs.existsSync(path.join(core.paths.home, '.restore-journal.json'))) staged.cleanup();
+      if (disabled && !win.isDestroyed()) win.setEnabled?.(true);
+      busy = false; setBusy(false);
+      if (restore && core.closed) await restart({ restored: success });
+    }
+  };
+  return { createBackup: run(false), restoreBackup: run(true) };
+}
+
+function installBackups() {
+  const handlers = backupHandlers({
+    isBoard: (event) => Boolean(mainWindow) && !mainWindow.isDestroyed()
+      && event?.sender === mainWindow.webContents && event.senderFrame === mainWindow.webContents.mainFrame
+      && classifyTarget(event.senderFrame?.url, { port: zelos?.port ?? 0 }).action === 'internal',
+    getCore: () => zelos, getWindow: () => mainWindow, dialogs: dialog,
+    flush: flushDraftsInPage, appVersion: app.getVersion(), setBusy: (value) => { maintenanceActive = value; },
+    restart: async () => {
+      // Geometry is outside the portable data set. Preserve it once, then stop
+      // the shell cleanly and let a fresh process load restored configuration.
+      windowState?.capture();
+      app.relaunch();
+      quitting = true;
+      app.quit();
+    },
+  });
+  ipcMain.handle(CREATE_BACKUP_CHANNEL, handlers.createBackup);
+  ipcMain.handle(RESTORE_BACKUP_CHANNEL, handlers.restoreBackup);
+}
+
 function installAppMenu() {
   if (!actions) return;
   Menu.setApplicationMenu(Menu.buildFromTemplate(buildAppMenuTemplate({ appName: APP_NAME, actions })));
@@ -725,6 +823,7 @@ export async function flushDraftsInPage(contents, { timeoutMs = 10_000 } = {}) {
 }
 
 function leaveBoard(action, { quit = false } = {}) {
+  if (maintenanceActive) return Promise.resolve(false);
   // Repeated shortcuts share one save. Quit takes precedence over a reload
   // already waiting for the same edits, so a second request is not lost.
   if (leaving) {
@@ -867,6 +966,7 @@ async function bootstrap() {
   });
 
   app.on('before-quit', (event) => {
+    if (maintenanceActive) { event.preventDefault(); return; }
     if (quitting || !mainWindow || mainWindow.isDestroyed()) { quitting = true; return; }
     event.preventDefault();
     leaveBoard(() => { quitting = true; app.quit(); }, { quit: true });
@@ -972,6 +1072,7 @@ async function bootstrap() {
   createTray(actions);
   createWindow();
   installShowHome();
+  installBackups();
 
   // The badge is the only thing a swept-in-the-background Zelos says while its
   // window is shut. It is set when a sweep ends — from the clock or by hand,

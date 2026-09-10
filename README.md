@@ -70,6 +70,12 @@ The source download runs without installing dependencies. Desktop installers inc
 Node and need no terminal setup. The npm package is not part of this release.
 [Installation and updates](docs/INSTALL.md) · [Release notes](docs/RELEASE-NOTES.md).
 
+In the desktop app, **Settings → Your data** creates and restores private backups.
+Item cards offer **More → What changed?** for recorded deadline, priority and status changes.
+The **Commands** button, or **⌘/Ctrl+Shift+P**, searches navigation and common actions.
+Connection warnings lead to the relevant account, and **Settings → About → Check for updates**
+checks the official release only when you ask.
+
 Seven MCP tools, none of which sends, deletes or reconfigures anything. Six declare `readOnlyHint`;
 `zelos_board` does not, because reading the board does what opening the window does — wakes a snooze
 that has come due, and holds the `now` bucket to four items. [docs/SECURITY.md § 6a](docs/SECURITY.md)
@@ -85,13 +91,15 @@ or Microsoft adds that provider's sign-in service — `accounts.google.com` and
 `oauth2.googleapis.com`, or `login.microsoftonline.com` — for the length of the sign-in and of each
 token refresh, and still no Zelos server. Of all of those, only
 the model request carries what Zelos read; point it at a local model and nothing it read leaves at
-all. No telemetry, no analytics, no update pings, no crash reports.
+all. **Check for updates** makes a manual request to the official GitHub release API,
+without account content or credentials. No telemetry, analytics, automatic update pings or crash reports.
 
 Your keys live in your operating system's keychain — **when there is one**. With no keychain
 available (a headless Linux box, or a desktop without `secret-tool`), they go to `secrets.enc` in
-`~/.zelos`, encrypted with a key held in `.seed` **in the same folder**. That protects a copied disk
-or a stray backup and nothing else; anything running as you can read both files. Zelos says so in
-the app, and `zelos doctor` says which backend this home is actually on.
+`~/.zelos`, encrypted with a key held in `.seed` **in the same folder**. A copied credential file
+needs that seed to decrypt it; anything running as you can read both files. Zelos says so in
+the app, and `zelos doctor` says which backend this home is actually on. A backup containing
+both files can decrypt those credentials: keep it private. Guided backups are not password protected.
 
 On macOS and Linux the database is `0600` inside a `0700` home; on Windows there are no POSIX modes
 to set, so the protection is the ACL on your user profile — see

@@ -139,8 +139,8 @@ for (const type of ['todoist', 'linear']) {
   test(`${type}: the first complete read after upgrading retires legacy task evidence without deleting it`, async () => {
     const h = setup(type);
     const legacy = dbm.upsertMessage(h.db, { sourceId: type, messageId: `${type === 'todoist' ? 'todoist:task:' : 'linear:issue:'}legacy`, subject: 'Legacy obligation', date: new Date().toISOString(), text: 'Previously due today' });
-    h.db.exec('DROP TABLE task_activity; PRAGMA user_version = 2');
-    assert.deepEqual(dbm.migrate(h.db), { version: 3, applied: 1 });
+    h.db.exec('DROP TABLE task_activity; DROP TABLE item_history; PRAGMA user_version = 2');
+    assert.deepEqual(dbm.migrate(h.db), { version: dbm.SCHEMA_VERSION, applied: dbm.SCHEMA_VERSION - 2 });
     assert.equal(dbm.getMessage(h.db, legacy.id).task_activity, null);
     assert.equal(dbm.listMessages(h.db).length, 1, 'migration alone does not infer activity');
     h.setResponse(new Error('first read failed')); await h.sweep();

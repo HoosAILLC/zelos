@@ -5,7 +5,8 @@ you now, what you owe people, what people owe you, and what's coming.**
 
 It runs on your computer. Your mail stays on your computer. The only thing that
 ever leaves is the question Zelos asks the model you chose — and if you choose
-a model running on your own machine, nothing leaves at all.
+a model running on your own machine, none of that content leaves. Manual update
+checks contact GitHub without account content or credentials.
 
 Named for **Ζῆλος / Zelos**, the Greek daimon of zeal — one of the four winged
 enforcers who stood beside Zeus.
@@ -24,9 +25,9 @@ and asking you to trust them. Zelos is built the other way round:
   Ollama, LM Studio, llama.cpp — Zelos treats them exactly like a paid API.
   With one of those selected, Zelos makes no outbound connection except to
   your own mail and calendar servers, and to the host of any source you add
-  in Settings → Sources.
+  in Settings → Sources, unless you request a manual update check.
 - **Nothing else phones home.** No analytics, no telemetry, no crash reports, no
-  update checks, no web fonts, no tracking pixels. There is no code in Zelos
+  automatic update checks, no web fonts, no tracking pixels. There is no code in Zelos
   that talks to us, because there is no "us" to talk to.
 - **It has no third-party code.** Zelos is written entirely against what Node
   ships with. There are no packages to audit, no supply chain, nothing that can
@@ -84,7 +85,7 @@ node zelos.mjs
 You will see something like this:
 
 ```
-  ZELOS 1.7.1
+  ZELOS 1.8.0
   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   Open   http://127.0.0.1:7777/?t=fb52ad7d…a43da8be
@@ -553,17 +554,17 @@ pattern can still miss — a bare alias like `const go = fetch` — and
 `grep -rnw fetch core/ zelos.mjs` is the noisier superset that cannot. Run
 it after this one if you want to be sure.
 
-The command above returns **22 lines** today. Eleven of them are not network
+The command above returns **23 lines** today. Eleven of them are not network
 calls, and you can throw them out by two rules:
 
-- **Comments.** Eight of the twenty-two are prose inside `/* */` or `//`
+- **Comments.** Eight of the twenty-three are prose inside `/* */` or `//`
   blocks that happen to mention `fetch(`.
 - **Zelos's own IMAP object.** Three lines in `core/sources/imap.mjs` say
   `async fetch(` or `client.fetch(`. That is Zelos's IMAP client having a
   method named after the IMAP `FETCH` command. It talks on a socket that is
   already open; it does not open one.
 
-So: **eleven real outbound calls**, and this is all of them. They are named by
+So: **twelve real outbound calls**, and this is all of them. They are named by
 function rather than by line, because the line numbers in the last version of
 this table went stale within a week and nobody noticed; a function name is
 something you can `grep` for, and the test named below checks that each of
@@ -581,9 +582,10 @@ these still exists in the file this table says it is in.
 | `core/doctor.mjs` | `DEFAULT_DEPS.fetchImpl` | the one `fetch` `zelos doctor` uses, to try your model endpoint and your calendar address — both from your settings |
 | `core/connectors/http.mjs` | `createHttp` | **every source in Settings → Sources**, through one transport: GitHub, Slack, Linear, Todoist, Fireflies and a feed each reach the host their connector declares in `origins` (`core/connectors/*.mjs`), plus any address you typed into that source's own fields. Anything else is refused before a socket exists |
 | `core/sources/oauth.mjs` | `postForm` | `oauth2.googleapis.com`, and only for a mailbox you set to **Sign in with Google** — the code exchange when you sign in, and the token refresh before a sweep; see [OAUTH.md](OAUTH.md) |
+| `core/updates.mjs` | `createUpdateChecker` | the official Zelos latest-release endpoint on `api.github.com`, only when you press **Check for updates**, with no account content or credentials |
 
-Every one of them goes to an address that came from your own settings. There is
-no twelfth through these three primitives — the one question that leaves
+Reading and model calls go to configured services; the manual update check has
+one fixed official destination. There is no thirteenth through these three primitives — the one question that leaves
 another way is counted below. The one directory in that table that grows is
 `core/connectors/`, and the test *no connector reaches the network except
 through ctx.http* in `test/repo.test.mjs` fails the build on a connector that

@@ -899,6 +899,95 @@ describe('the shell, booted against a stub Electron', () => {
     assert.ok(!/require\('(fs|child_process|path)'\)/.test(preload), 'the preload must not reach into Node');
   });
 
+  it('exposes only argument-free backup actions and refuses foreign frames or renderer paths', async () => {
+    const calls = [];
+    let bridge;
+    vm.runInNewContext(fs.readFileSync(path.join(REPO, 'desktop', 'preload.js'), 'utf8'), {
+      require: () => ({ contextBridge: { exposeInMainWorld: (_name, value) => { bridge = value; } }, ipcRenderer: { invoke: (...args) => { calls.push(args); return Promise.resolve({ ok: true }); } } }),
+      process: { platform: 'darwin', versions: {} }, console,
+    });
+    await bridge.createBackup('/renderer/path'); await bridge.restoreBackup('/renderer/path');
+    assert.deepEqual(calls, [[main.CREATE_BACKUP_CHANNEL], [main.RESTORE_BACKUP_CHANNEL]]);
+    const board = recorded.windows[0].webContents;
+    const frame = { url: booted.zelos.url };
+    board.mainFrame = frame;
+    for (const name of [main.CREATE_BACKUP_CHANNEL, main.RESTORE_BACKUP_CHANNEL]) {
+      const handler = recorded.ipcHandlers.get(name);
+      assert.equal((await handler({ sender: board, senderFrame: frame }, '/renderer/path')).ok, false);
+      assert.equal((await handler({ sender: board, senderFrame: { url: frame.url } })).ok, false);
+      assert.equal((await handler({ sender: {}, senderFrame: frame })).ok, false);
+      frame.url = 'https://untrusted.example/';
+      assert.equal((await handler({ sender: board, senderFrame: frame })).ok, false);
+      frame.url = booted.zelos.url;
+    }
+  });
+
+  function backupHarness({ cancel = false, confirm = 1, failFlush = false, failRestore = false } = {}) {
+    const order = [];
+    const nativePath = '/native-dialog-selected.zelos-backup';
+    const win = { isDestroyed: () => false, webContents: {}, setEnabled: (value) => order.push(`enabled:${value}`) };
+    const core = {
+      paths: { home }, closed: false,
+      stageBackup: (file) => { assert.equal(file, nativePath); order.push('stage'); return { manifest: { createdAt: '2026-09-10T12:00:00Z', appVersion: '1.8.0', credentials: 'encrypted-file-included', counts: { messages: 1, events: 2, items: 3, drafts: 4, captures: 5, runs: 6, item_history: 7 } }, cleanup: () => order.push('cleanup') }; },
+      createBackup: async (file) => { assert.equal(file, nativePath); order.push('backup'); },
+      restoreBackup: async () => { order.push('restore'); core.closed = true; if (failRestore) throw new Error('fixture failure'); },
+    };
+    const handlers = main.backupHandlers({
+      isBoard: () => true, getCore: () => core, getWindow: () => win, appVersion: '1.8.0',
+      dialogs: {
+        showSaveDialog: async () => ({ canceled: cancel, filePath: nativePath }),
+        showOpenDialog: async () => ({ canceled: cancel, filePaths: [nativePath] }),
+        showMessageBox: async (_win, options) => { order.push(options.buttons.includes('Restore and reopen') ? 'confirm' : 'warning'); if (options.buttons.includes('Restore and reopen')) { assert.match(options.detail, /7 history revisions/); assert.match(options.detail, /credential file and its key/); assert.equal(options.defaultId, 0); } return { response: confirm }; },
+      },
+      flush: async () => { order.push('flush'); if (failFlush) throw new Error('pending edits'); },
+      restart: async () => { order.push('restart'); },
+    });
+    return { handlers, order, core };
+  }
+
+  it('cancels native backup and restore without flushing, replacing, or restarting', async () => {
+    const h = backupHarness({ cancel: true });
+    assert.equal((await h.handlers.createBackup({})).cancelled, true);
+    assert.equal((await h.handlers.restoreBackup({})).cancelled, true);
+    assert.deepEqual(h.order, []);
+    const preview = backupHarness({ confirm: 0 });
+    assert.equal((await preview.handlers.restoreBackup({})).cancelled, true);
+    assert.deepEqual(preview.order, ['enabled:false', 'stage', 'confirm', 'cleanup', 'enabled:true']);
+  });
+
+  it('flushes latest drafts before native backup and keeps edits open if saving fails', async () => {
+    const h = backupHarness();
+    assert.deepEqual(await h.handlers.createBackup({}), { ok: true });
+    assert.deepEqual(h.order, ['enabled:false', 'flush', 'backup', 'enabled:true']);
+    const failed = backupHarness({ failFlush: true });
+    assert.equal((await failed.handlers.restoreBackup({})).ok, false);
+    assert.ok(!failed.order.includes('restore')); assert.ok(!failed.order.includes('restart'));
+    assert.ok(failed.order.includes('warning')); assert.equal(failed.order.at(-1), 'enabled:true');
+  });
+
+  it('shows the restore preview, flushes, replaces, then reopens; post-close failures also reopen for recovery', async () => {
+    for (const failRestore of [false, true]) {
+      const h = backupHarness({ failRestore });
+      assert.equal((await h.handlers.restoreBackup({})).ok, !failRestore);
+      assert.ok(h.order.indexOf('confirm') < h.order.indexOf('flush'));
+      assert.ok(h.order.indexOf('flush') < h.order.indexOf('restore'));
+      assert.equal(h.order.at(-1), 'restart');
+      if (failRestore) assert.ok(h.order.includes('warning'));
+    }
+  });
+
+  it('serializes native backup dialogs so a second operation cannot race the first', async () => {
+    let finish;
+    let opened = 0;
+    const handlers = main.backupHandlers({
+      isBoard: () => true, getCore: () => ({ paths: { home } }), getWindow: () => ({ isDestroyed: () => false }), appVersion: '1.8.0', flush: async () => {}, restart: async () => {},
+      dialogs: { showSaveDialog: () => { opened++; return new Promise((resolve) => { finish = resolve; }); } },
+    });
+    const first = handlers.createBackup({});
+    assert.equal((await handlers.restoreBackup({})).ok, false); assert.equal(opened, 1);
+    finish({ canceled: true }); assert.equal((await first).cancelled, true);
+  });
+
   it('serves the board and refuses the API without the token', async () => {
     const base = booted.zelos.url;
 

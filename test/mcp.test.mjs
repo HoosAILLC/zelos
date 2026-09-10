@@ -1019,7 +1019,7 @@ describe('nothing here writes, except the one thing that says it does', () => {
       'the scan no longer finds names it certainly should — it must be broken');
   });
 
-  test('the SQL in this file targets its own audit log, and the borrowed write targets items', () => {
+  test('the SQL in this file targets its own audit log, and the borrowed write records only item demotion history', () => {
     const targets = [...MCP_SOURCE.matchAll(/\b(insert\s+into|update|delete\s+from)\s+([A-Za-z_][A-Za-z0-9_]*)/gi)]
       .map((m) => m[2].toLowerCase());
     assert.ok(targets.length > 0, 'the scan found nothing — it must be broken');
@@ -1028,17 +1028,24 @@ describe('nothing here writes, except the one thing that says it does', () => {
     /* Half the question, and for a long time it was mistaken for all of it: the
        board repair is not this file's SQL, it is sweep.mjs's, run through the
        one helper the allowlist above permits. So the other half is asserted
-       where the statement actually lives. `items` and nothing else, and no
-       DELETE anywhere in it — an item that loses its place is demoted, never
-       removed. */
+       where the statement actually lives. The item demotion now records its
+       matching history atomically; no DELETE may remove the item. */
     const sweepSource = fs.readFileSync(path.join(ROOT, 'core', 'sweep.mjs'), 'utf8');
     const borrowed = sweepSource.slice(sweepSource.indexOf('export function capNowBucket'));
     const body = borrowed.slice(0, borrowed.indexOf('\n}\n') + 2);
-    assert.ok(body.includes('DEMOTE_ITEM_BUCKET'), 'capNowBucket no longer runs the statement this test knows about');
-    const demote = sweepSource.match(/const DEMOTE_ITEM_BUCKET = `([^`]*)`/);
-    assert.ok(demote, 'the demotion statement moved');
-    assert.match(demote[1], /^\s*UPDATE items SET\b/);
-    assert.equal(/delete\s+from/i.test(demote[1]), false, 'the demotion must never delete a row');
+    assert.ok(body.includes('setItemBucket'), 'capNowBucket no longer uses the recorded demotion helper');
+    const dbSource = fs.readFileSync(path.join(ROOT, 'core', 'db.mjs'), 'utf8');
+    const helper = dbSource.slice(dbSource.indexOf('export function setItemBucket'));
+    const demote = helper.slice(0, helper.indexOf('\n}\n') + 2);
+    assert.match(demote, /UPDATE items SET bucket = \?, updated_at = \? WHERE id = \?/);
+    assert.equal(/delete\s+from/i.test(demote), false, 'the demotion must never delete a row');
+    assert.ok(demote.includes("origin: 'automatic'"));
+    assert.ok(demote.includes('recordItemRevision'));
+    const recorder = dbSource.slice(dbSource.indexOf('function recordItemRevision'));
+    const recorderBody = recorder.slice(0, recorder.indexOf('\n}\n') + 2);
+    const historyTargets = [...recorderBody.matchAll(/\b(insert\s+into|update|delete\s+from)\s+([A-Za-z_][A-Za-z0-9_]*)/gi)]
+      .map((match) => match[2].toLowerCase());
+    assert.deepEqual(historyTargets, ['item_history']);
   });
 
   test('no tool is write-shaped, and the annotation matches what the tool does', () => {

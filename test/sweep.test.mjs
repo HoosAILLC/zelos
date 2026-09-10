@@ -1676,6 +1676,52 @@ test('the scheduler does not drift, and skips slots it slept through', async (t)
   scheduler.stop();
 });
 
+test('a keychain read completing after stop and restart cannot launch a retired sweep', async (t) => {
+  const db = fresh();
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.UTC(2026, 7, 8, 10, 0, 0) });
+  let finishKey, runs = 0;
+  const scheduler = new Scheduler({ db,
+    config: blankModelConfig({ model: { ...DEFAULTS.model, model: 'test-model' } }),
+    deps: { getSecret: () => new Promise(resolve => { finishKey = resolve; }) },
+    run: async () => { runs++; return { ok: true }; },
+  });
+  scheduler.start(); t.mock.timers.tick(31 * 60_000); await flush();
+  assert.equal(typeof finishKey, 'function');
+  assert.equal(scheduler.status().busy, true, 'maintenance must drain the credential read');
+  scheduler.stop();
+  assert.equal(scheduler.status().busy, true, 'stopping does not hide a pending credential write');
+  scheduler.start();
+  const next = scheduler.status().nextRunAt;
+  finishKey('synthetic-key'); await flush();
+  assert.equal(scheduler.status().busy, false, 'the retired preflight has now settled');
+  assert.equal(runs, 0, 'no write may begin from the old tick after maintenance');
+  assert.equal(scheduler.status().nextRunAt, next, 'the fresh schedule keeps its timer');
+  t.mock.timers.tick(30 * 60_000); await flush();
+  finishKey('synthetic-key'); await flush();
+  assert.equal(runs, 1, 'the new schedule still works');
+  scheduler.stop();
+});
+
+test('resuming after an outage runs once, reports failure, and recovers on the next slot', async (t) => {
+  const db = fresh();
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.UTC(2026, 7, 8, 10, 0, 0) });
+  let runs = 0;
+  const scheduler = new Scheduler({ db, config: baseConfig(), run: async () => {
+    runs++;
+    if (runs === 1) throw new Error('Synthetic network outage');
+    return { ok: true };
+  } });
+  scheduler.start(); t.mock.timers.tick(95 * 60_000); await flush();
+  assert.equal(runs, 1);
+  assert.equal(scheduler.status().busy, false);
+  assert.match(scheduler.status().lastResult.error, /network outage/);
+  assert.equal(scheduler.status().nextRunAt, '2026-08-08T12:00:00+00:00');
+  t.mock.timers.tick(25 * 60_000); await flush();
+  assert.equal(runs, 2);
+  assert.deepEqual(scheduler.status().lastResult, { ok: true });
+  scheduler.stop();
+});
+
 test('a config save that does not touch the schedule does not move the next sweep', async (t) => {
   const db = fresh();
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.UTC(2026, 7, 8, 10, 0, 0) });

@@ -497,7 +497,7 @@ test('no file in ui/ can put a string into the DOM as markup', () => {
   }
 });
 
-test('the page loads nothing from the network', () => {
+test('the page loads no remote resources; its one fixed release link is navigation only', () => {
   // Zero CDN, works offline, and the server's CSP would refuse it anyway.
   const remote = /(https?:)?\/\/(?!127\.0\.0\.1|localhost)[a-z0-9]/i;
   for (const file of uiFiles()) {
@@ -506,6 +506,10 @@ test('the page loads nothing from the network', () => {
       if (/^\s*(\*|\/\/|<!--)/.test(line)) continue;      // prose
       if (line.includes('http://www.w3.org/2000/svg')) continue; // an XML namespace, not a fetch
       if (line.includes('hale.example') || line.includes('example.com')) continue; // placeholder copy
+      // This exact constant verifies an external link after a user-initiated
+      // local API check. maintenance-ui.test proves render makes no request.
+      if (file === path.join(UI, 'lib/updates.js')
+        && line.trim() === 'const official = `https://github.com/HoosAILLC/zelos/releases/tag/v${release.latestVersion}`;') continue;
       assert.ok(!remote.test(line), `${path.relative(ROOT, file)}:${i + 1} ${line.trim()}`);
     }
   }
@@ -4288,7 +4292,7 @@ test('connection status keeps successful read times separate from failures, paus
   assert.match(onScreen(board), /Reading status/);
   assert.match(onScreen(board), /Studio mail.*Sign in again/);
   findButton(board, 'Review connection').fire('click');
-  assert.deepEqual(paths, ['#/settings/mail']);
+  assert.deepEqual(paths, ['#/settings/mail/m1']);
 });
 
 test('an older server never invents a successful read time for missing or failed source reports', async (t) => {
@@ -4374,7 +4378,9 @@ test('inactive finished tasks explain why they cannot be restored onto the curre
   assert.equal(tick.attributes.disabled, '');
   assert.equal(findButton(row, 'Restore'), undefined);
   assert.equal(findButton(row, 'Reopen'), undefined);
-  assert.equal(plainWalk(row).some(n => n.attributes.class === 'disclosure'), false);
+  assert.equal(plainWalk(row).some(n => n.attributes.class === 'disclosure'), true);
+  assert.ok(findButton(row, 'What changed?'));
+  for (const label of ['Snooze', 'Wake', 'Not a thing']) assert.equal(findButton(row, label), undefined);
   assert.match(onScreen(row), /No longer in task selection.*include this task in your source selection again/);
 });
 
