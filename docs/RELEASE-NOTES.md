@@ -1,6 +1,6 @@
-# Zelos 1.8.0
+# Zelos 1.8.1
 
-This release adds backup and recovery tools, a clearer record of changes, and faster navigation.
+This patch corrects outdated privacy wording in the native About window, Settings and documentation: manual update checks contact GitHub only when requested. It includes the backup and recovery tools, recorded item history, and navigation improvements introduced in 1.8.
 
 - **Back up and restore:** Settings → Your data can create a private backup of the archive, drafts, captures, history, settings and portable credentials. Restore validates the file, previews its contents, asks before replacement, and keeps a recovery copy. Other Zelos and AI clients must close before the data is replaced.
 - **What changed?:** Item cards show recorded changes to deadlines, priority, status and explanations. Repeated unchanged assessments add no noise. History begins with this version; older changes are not invented. Task-selection changes remain distinct from completing a task.

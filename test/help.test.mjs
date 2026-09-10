@@ -194,7 +194,7 @@ test('every message ends with the rules for Claude, word for word, and starts wi
   assert.equal(HELP_RULES.length, 5);
   for (const m of everyMessage()) {
     for (const rule of HELP_RULES) assert.ok(m.prompt.includes(rule), `${label(m.args)} is missing the rule “${rule}”`);
-    assert.match(m.prompt, /^You are helping someone set up Zelos\. Zelos is a free program on the person’s own computer that reads their email and calendar with an AI they choose; it has no server/);
+    assert.match(m.prompt, /^You are helping someone set up Zelos, a free program on their computer that reads email and calendars with an AI they choose\./);
     assert.match(m.prompt, /never sends, moves or deletes mail/);
     assert.match(m.prompt, /helping them through its setup screens/);
     assert.match(m.prompt, /Start by asking, in one short question, what they see on the screen right now\.$/);
@@ -249,7 +249,7 @@ const screens = `${onboardingSrc}\n${settingsSrc}`;
 
 /** The quoted controls a message names, and the step that names them. */
 const CONTROLS = {
-  general: ['Zelos reads your email and calendar, and tells you what needs you.', 'It never sends, moves or deletes anything. Everything stays on this computer.', 'Set up Zelos', 'Look around with made-up data first', 'Skip the rest'],
+  general: ['Zelos reads your email and calendar, and tells you what needs you.', 'It never sends, moves or deletes your mail. Your archive is stored on this computer.', 'Set up Zelos', 'Look around with made-up data first', 'Skip the rest'],
   ai: ['Pick the AI that reads your mail.', 'Claude, by Anthropic', 'OpenAI, who make ChatGPT', 'Press Create Key and copy it.', 'Paste it here.', 'Your key', 'Check it works', 'More choices', 'Advanced', 'a key is saved — paste a new one to replace it', 'Paste the key first'],
   email: ['Connect your email.', 'Add an email account', 'Your email address', 'Get an app password', 'App password', 'Connect', 'Server settings (for experts)'],
   calendar: ['Add your calendar.', 'Google Calendar', 'iPhone or Mac (iCloud)', 'Outlook', 'Something else', 'Check it works and save', 'The secret address', 'Your Apple ID email', 'The app-specific password', 'The ICS link'],

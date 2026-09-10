@@ -1063,7 +1063,7 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
       }),
     }, [
       el('span', { class: 'preset-label', text: `An AI program on this computer — ${rt.label}` }),
-      el('span', { class: 'preset-note', text: 'Most private. Nothing leaves this computer.' }),
+      el('span', { class: 'preset-note', text: 'Most private. The AI processes what Zelos reads on this computer.' }),
     ])));
   }).catch((err) => {
     probeNote.textContent = `Could not look for an AI program on this computer: ${err.message}`;
@@ -1125,7 +1125,7 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
   return el('div', { class: 'panel panel-model' }, [
     el('p', { class: 'panel-lede', text: compact
       ? 'Zelos sends your mail summaries to the AI you pick here, and to nothing else.'
-      : 'Pick the AI that reads your mail. Zelos talks to it and to nothing else; your mail summaries go there and nowhere else.' }),
+      : 'Pick the AI that reads your mail. Your mail summaries go to the AI you choose.' }),
     localWrap,
     choiceWrap,
     guidedWrap,
@@ -3062,7 +3062,7 @@ function privacyPanel() {
       hint: 'Switched off, the AI sees only who wrote, the subject, and the first couple of lines. It will be worse at judging what matters, and it will say less about why.',
     }),
     fold('Advanced', [
-      el('p', { class: 'quiet-note', text: 'There is no telemetry, no analytics, no update check and no remote font; the one outbound request is the one to the AI. These two numbers cap what each request carries.' }),
+      el('p', { class: 'quiet-note', text: 'There is no telemetry, analytics or remote font. Reading and AI use your configured services; Check for updates contacts GitHub only when you press it. These two numbers cap what each AI request carries.' }),
       el('div', { class: 'grid-2' }, [
         field('Characters of each email sent to the AI', charsInput),
         field('Most items per check', maxInput),

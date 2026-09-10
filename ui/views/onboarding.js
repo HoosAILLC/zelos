@@ -264,12 +264,12 @@ function startScreen(rerender, navigate) {
 
   return shell(rerender, navigate, {
     title: 'Zelos reads your email and calendar, and tells you what needs you.',
-    lede: 'It never sends, moves or deletes anything. Everything stays on this computer.',
+    lede: 'It never sends, moves or deletes your mail. Your archive is stored on this computer.',
     body: el('div', { class: 'stack' }, [
       sampleNote,
       el('ul', { class: 'ob-points' }, [
         el('li', { text: 'Zelos only looks at your mail. It never marks anything read, never moves anything, never deletes anything.' }),
-        el('li', { text: 'The thinking is done by an AI you choose. Choose one running on this computer and nothing leaves it at all.' }),
+        el('li', { text: 'The thinking is done by an AI you choose. Choose one running on this computer to process what Zelos reads here.' }),
         el('li', { text: 'Zelos never sends mail. It writes replies for you; you press send, in your own email program.' }),
       ]),
     ]),
