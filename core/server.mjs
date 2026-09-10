@@ -59,11 +59,12 @@ import { CALENDAR_DEFAULTS, loadConfig, saveConfig, validateConfig, paths, isVal
    core/sources/imap.mjs, caldav.mjs, ics.mjs — is already imported below. */
 import { describe as describeConnectors, typesFor } from './connectors/index.mjs';
 import { readSourceStatus } from './source-status.mjs';
+import { createUpdateChecker } from './updates.mjs';
 import { getSecret, setSecret, deleteSecret, listRefs, backend } from './secrets.mjs';
 import {
   listBoard, bucketCounts, listEvents, listDrafts, updateDraft, lastRun,
   setItemState, insertCapture, search, getKV, getItem, resolveRef,
-  listFinished, dataCounts, databaseSizes,
+  listFinished, dataCounts, databaseSizes, listItemHistory,
 } from './db.mjs';
 import {
   // `mintToken` is renamed: this file already exports one for the browser
@@ -1080,6 +1081,32 @@ async function handleItemState(ctx, [id]) {
   sendJSON(ctx.res, 200, item);
 }
 
+function handleItemHistory(ctx, [id]) {
+  const parsePage = (name, fallback, maximum) => {
+    const values = ctx.url.searchParams.getAll(name);
+    if (!values.length) return fallback;
+    if (values.length !== 1 || !/^[1-9]\d*$/.test(values[0])) throw new HttpError(400, `${name} must be a positive integer`);
+    const value = Number(values[0]);
+    if (!Number.isSafeInteger(value) || value > maximum) throw new HttpError(400, `${name} must be at most ${maximum}`);
+    return value;
+  };
+  const limit = parsePage('limit', 20, 50);
+  const before = parsePage('before', null, Number.MAX_SAFE_INTEGER);
+  if (!getItem(ctx.db, id)) throw new HttpError(404, 'This item is no longer available.');
+  sendJSON(ctx.res, 200, listItemHistory(ctx.db, id, { limit, before }));
+}
+
+async function handleUpdateCheck(ctx) {
+  const body = await readJSON(ctx.req);
+  if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).length) {
+    throw new HttpError(400, 'Update checks do not accept settings or credentials.');
+  }
+  let result;
+  try { result = await ctx.releaseChecker(); }
+  catch { throw new HttpError(502, 'The update check could not reach the official release. Try again later.'); }
+  sendJSON(ctx.res, 200, result);
+}
+
 async function handleCapture(ctx) {
   const body = await readJSON(ctx.req);
   const text = requireString(body, 'text', { max: 4_000 });
@@ -1512,6 +1539,7 @@ class DeviceSignInPad {
     this.sleep = sleep;
     this.logger = logger;
     this.flows = new Map();
+    this.runs = new Set();
   }
 
   /** Forget anything finished long enough ago that nobody is still reading it. */
@@ -1572,6 +1600,9 @@ class DeviceSignInPad {
       finishedAt: 0,
       controller,
     };
+    // Register before the first network await, so maintenance can cancel a
+    // sign-in that has not yet received its user code.
+    this.flows.set(flow.id, flow);
 
     /* `connectDeviceCode` is begin + poll + store in one call, and it is used
        whole rather than as its three parts so that every protocol DECISION stays
@@ -1620,7 +1651,8 @@ class DeviceSignInPad {
     // Nothing awaits `run`; it is the background half. Swallowed here so a
     // rejection that somehow escapes the catch above cannot become an
     // unhandledRejection that takes the whole process down at 07:00.
-    run.catch(() => {});
+    this.runs.add(run);
+    run.finally(() => this.runs.delete(run)).catch(() => {});
 
     /* Whichever comes first: the code to show, or the flow ending without one.
        A bad client id, an unreachable endpoint and a tenant that is not a tenant
@@ -1660,6 +1692,8 @@ class DeviceSignInPad {
     for (const flow of this.flows.values()) flow.controller.abort();
     this.flows.clear();
   }
+
+  async cancelAndWait() { this.closeAll(); await Promise.allSettled([...this.runs]); }
 }
 
 /**
@@ -1743,6 +1777,7 @@ class BrowserSignInPad {
     this.boundPort = boundPort;
     this.logger = logger;
     this.flows = new Map();
+    this.runs = new Set();
   }
 
   /** Expire what nobody came back for; forget what finished long enough ago. */
@@ -1825,6 +1860,7 @@ class BrowserSignInPad {
       code: null,
       reconnect: false,
       finishedAt: 0,
+      controller: new AbortController(),
     };
     this.flows.set(flow.id, flow);
     this.logger.info('server: started a Google sign-in', { keyRef });
@@ -1841,6 +1877,7 @@ class BrowserSignInPad {
     const flow = this.flows.get(id);
     if (!flow) return null;
     if (flow.state === 'pending') {
+      flow.controller.abort();
       flow.state = 'cancelled';
       flow.nonce = null;
       flow.verifier = null;
@@ -1868,7 +1905,14 @@ class BrowserSignInPad {
    * the grant is in the secret store, so the page a person reads is never
    * ahead of the truth.
    */
-  async callback({ state = '', code = '', error = '' } = {}) {
+  callback(args = {}) {
+    const run = this.#callback(args);
+    this.runs.add(run);
+    run.finally(() => this.runs.delete(run)).catch(() => {});
+    return run;
+  }
+
+  async #callback({ state = '', code = '', error = '' } = {}) {
     this.#sweep();
     const flow = state ? this.#flowFor(state) : null;
     if (!flow) {
@@ -1909,8 +1953,10 @@ class BrowserSignInPad {
         redirectUri: flow.redirectUri,
         tokenUrl: this.tokenUrl,
         fetchImpl: this.fetchImpl,
+        signal: flow.controller.signal,
       });
       flow.verifier = null;
+      flow.controller.signal.throwIfAborted();
       if (!tokens.refreshToken) {
         /* `access_type=offline` plus `prompt=consent` asks for one every time,
            so its absence means the consent screen was not shown — which
@@ -1940,8 +1986,11 @@ class BrowserSignInPad {
 
   /** Every flow, abandoned. Called when the server closes. */
   closeAll() {
+    for (const flow of this.flows.values()) flow.controller.abort();
     this.flows.clear();
   }
+
+  async cancelAndWait() { this.closeAll(); await Promise.allSettled([...this.runs]); }
 }
 
 async function handleMailOAuthBegin(ctx) {
@@ -2888,6 +2937,8 @@ const ROUTES = [
   ['POST', /^\/api\/sweep$/, handleSweepStart],
   ['GET', /^\/api\/sweep\/stream$/, handleSweepStream],
   ['POST', new RegExp(`^/api/items/${ID}/state$`), handleItemState],
+  ['GET', new RegExp(`^/api/items/${ID}/history$`), handleItemHistory],
+  ['POST', /^\/api\/updates\/check$/, handleUpdateCheck],
   ['POST', /^\/api\/capture$/, handleCapture],
   ['GET', /^\/api\/config$/, handleConfigGet],
   ['PUT', /^\/api\/config$/, handleConfigPut],
@@ -3027,6 +3078,8 @@ export function createServer({
    * answer. Not reachable from a request; production passes nothing.
    */
   dns = {},
+  // The checker runs only for the explicit POST route, never during startup.
+  releaseChecker = createUpdateChecker({ currentVersion: VERSION }),
 } = {}) {
   if (!db) throw new TypeError('createServer needs an open database (core/db.mjs open())');
 
@@ -3243,6 +3296,7 @@ export function createServer({
       deviceSignIns,
       browserSignIns,
       dns,
+      releaseChecker,
     };
 
     try {
@@ -3277,6 +3331,11 @@ export function createServer({
   server.sessionToken = token;
   server.zelos = {
     sweeps,
+    // Native maintenance waits through the last credential write, not merely
+    // through cancellation of the network request that preceded it.
+    async cancelSignInsAndWait() {
+      await Promise.all([deviceSignIns.cancelAndWait(), browserSignIns.cancelAndWait()]);
+    },
     get config() { return current; },
     get scheduler() { return clock; },
     /**

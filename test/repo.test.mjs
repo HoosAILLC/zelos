@@ -686,10 +686,12 @@ describe('every import in core/, ui/ and test/', () => {
     assert.deepEqual(drift, [], `imported names that do not exist:\n  ${drift.join('\n  ')}`);
   });
 
-  test('no UI file loads anything over the network', () => {
+  test('no UI file loads a remote resource; the verified release link is navigation only', () => {
     const offenders = [];
     for (const file of filesUnder('ui')) {
-      const src = fs.readFileSync(file, 'utf8');
+      const original = fs.readFileSync(file, 'utf8');
+      const src = file === path.join(ROOT, 'ui/lib/updates.js')
+        ? original.replace('const official = `https://github.com/HoosAILLC/zelos/releases/tag/v${release.latestVersion}`;', '') : original;
       for (const m of src.matchAll(/\b(?:https?:)?\/\/[a-z0-9.-]+\.[a-z]{2,}/gi)) {
         // A URL in a comment is prose; one in code would be a fetch.
         const line = src.slice(0, m.index).split('\n').pop();

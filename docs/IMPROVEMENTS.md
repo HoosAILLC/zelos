@@ -1,5 +1,14 @@
 # Product improvements
 
+## Included in 1.8.0
+
+- Native private backup and guided restore with integrity checks, a preview, a recovery copy and protection against concurrent writers.
+- Item change history for deadlines, priorities, status, explanations and task-selection visibility, recorded from this version onward.
+- A searchable command menu with keyboard navigation and focus return.
+- Exact-account connection recovery and a setup summary that distinguishes configured sources from successful reads.
+- Manual update checks against the official release, with no account data sent.
+- Faster initial archive indexing, a repeatable 50,000-message benchmark, and an offline synthetic AI evaluation corpus.
+
 ## Included in 1.7.1
 
 - Save draft edits before desktop reload and quit; preserve failed edits across card refreshes.
@@ -19,8 +28,8 @@
 ## Next product work
 
 1. **Publisher signing and provider registrations.** Register the application with Apple/Microsoft and configure signing credentials; complete provider reviews before advertising a warning-free install or shared OAuth sign-in. These depend on the publisher's accounts and approvals.
-2. **Guided backup and restore.** Produce a consistent local backup, check its integrity, preview what will be restored, and explain which credentials need reconnecting on another machine.
-3. **Item activity history.** Show changed deadlines or priorities with prior values, assessment times, and source links. Use saved facts and explanations.
-4. **Keyboard command menu.** Add discoverable navigation, capture, search, and check-now actions with clear focus handling.
+2. **Live provider acceptance.** Exercise real Gmail, Microsoft, iCloud and task-provider accounts through expiry, revocation and reconnect; synthetic connector tests cannot establish provider acceptance.
+3. **Live model evaluation.** Run the synthetic assessment cases with the models people use, then review missed work, invented claims and wording alongside the structured results.
+4. **Signed automatic updates.** The manual release check is available now. Automatic installation needs verified publisher signing and a separately reviewed update path.
 
 Automatic sending and cloud synchronization require separate product and permission decisions. Zelos continues to read connected sources and lets the user decide what to do.

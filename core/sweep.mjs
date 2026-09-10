@@ -50,6 +50,7 @@ import {
   getKV,
   setKV,
   getItem,
+  setItemBucket,
   withTransaction,
 } from './db.mjs';
 import { buildSweepPrompt, mergeSweep, SWEEP_KV } from './triage.mjs';
@@ -1203,10 +1204,6 @@ function gatherPromptInput(db, config, now) {
   };
 }
 
-const DEMOTE_ITEM_BUCKET = `
-UPDATE items SET bucket = :bucket, updated_at = :now
-WHERE id = :id AND state = 'open'`;
-
 /**
  * Hold the four-item `now` bar on the board itself.
  *
@@ -1247,9 +1244,8 @@ export function capNowBucket(db, { now = nowISO() } = {}) {
     ...inNow.filter((i) => i.payload?.sample === true),
   ];
   const overflow = ranked.slice(NOW_BOARD_LIMIT);
-  const stmt = db.prepare(DEMOTE_ITEM_BUCKET);
   withTransaction(db, () => {
-    for (const item of overflow) stmt.run({ bucket: 'today', now, id: item.id });
+    for (const item of overflow) setItemBucket(db, item.id, 'today', { now });
   });
   slog.info(`board held ${inNow.length} now items; demoted ${overflow.length} to today`, {
     demoted: overflow.map((i) => i.id),
@@ -1339,8 +1335,10 @@ function sameSchedule(a, b) {
  */
 export class Scheduler {
   #timer = null;
+  #generation = 0;
   #running = false;
   #busy = false;
+  #preflights = 0;
   #targetMs = null;
   #controller = null;
   #runs = 0;
@@ -1370,6 +1368,7 @@ export class Scheduler {
   /** Idempotent. Starting an already-started scheduler does nothing. */
   start() {
     if (this.#running) return this.status();
+    this.#generation += 1;
     this.#running = true;
     this.#targetMs = this.#firstTarget();
     this.#arm();
@@ -1383,6 +1382,7 @@ export class Scheduler {
 
   /** Stops the timer and cancels a sweep that is in flight. */
   stop() {
+    this.#generation += 1;
     this.#running = false;
     if (this.#timer) {
       clearTimeout(this.#timer);
@@ -1396,7 +1396,9 @@ export class Scheduler {
   status() {
     return {
       running: this.#running,
-      busy: this.#busy,
+      // A key read can repair credential files. Maintenance must wait for it
+      // even when stop() has already retired the tick that requested it.
+      busy: this.#busy || this.#preflights > 0,
       auto: this.config?.sweep?.auto !== false,
       intervalMinutes: intervalMinutesOf(this.config),
       activeHours: activeHoursOf(this.config),
@@ -1422,6 +1424,7 @@ export class Scheduler {
     const before = this.config;
     this.config = config;
     if (this.#running && !sameSchedule(before, config)) {
+      this.#generation += 1;
       this.#targetMs = this.#firstTarget();
       this.#arm();
     }
@@ -1452,6 +1455,7 @@ export class Scheduler {
   async #tick() {
     this.#timer = null;
     if (!this.#running) return;
+    const generation = this.#generation;
 
     if (this.config?.sweep?.auto === false) {
       this.#advance();
@@ -1465,7 +1469,19 @@ export class Scheduler {
     // Logged once per distinct reason, not every tick: the operator's own home
     // had a line like this every half hour for as long as the app lived.
     const { getSecret } = { ...DEFAULT_DEPS, ...this.deps };
-    const reason = await modelNotReadyReason(this.config, getSecret);
+    let reason;
+    this.#preflights += 1;
+    try { reason = await modelNotReadyReason(this.config, getSecret); }
+    finally { this.#preflights -= 1; }
+    // Keychain access can outlive stop(), a restart or a schedule change.
+    // A retired tick must never start writing after maintenance closes SQLite,
+    // or replace the timer installed by the newer schedule.
+    if (!this.#running || generation !== this.#generation) return;
+    if (this.config?.sweep?.auto === false) {
+      this.#advance();
+      this.#arm();
+      return;
+    }
     if (reason) {
       this.#lastResult = { ok: false, skipped: true, reason };
       if (this.#skipLogged !== reason) {
@@ -1479,6 +1495,7 @@ export class Scheduler {
     this.#skipLogged = null;
 
     await this.#execute('auto');
+    if (!this.#running || generation !== this.#generation) return;
     this.#advance();
     this.#arm();
   }

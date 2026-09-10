@@ -31,9 +31,10 @@ import { DatabaseSync } from 'node:sqlite';
 
 import { paths } from './config.mjs';
 import { nowISO, instant, dayKey, toZonedISO } from './time.mjs';
-import { log } from './log.mjs';
+import { log, redact } from './log.mjs';
+import { registerDataConnection, attachDataConnection, releaseDataConnection } from './data-lease.mjs';
 
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
 /** Closed set, in board order: the rail reads top to bottom. */
 export const BUCKETS = Object.freeze(['now', 'today', 'soon', 'waiting', 'promised', 'note', 'money']);
@@ -93,34 +94,43 @@ export class UnsupportedRuntimeError extends Error {
 }
 
 export function open(dbPath = paths().db) {
-  if (dbPath !== ':memory:') {
-    const dir = path.dirname(path.resolve(dbPath));
-    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  }
-  const db = new DatabaseSync(dbPath);
-  db.exec('PRAGMA journal_mode = WAL');
-  db.exec('PRAGMA foreign_keys = ON');
-  db.exec('PRAGMA busy_timeout = 5000');
-  // After the WAL pragma: that is what creates the sidecars.
-  if (dbPath !== ':memory:') tightenDbFiles(dbPath);
+  const lease = registerDataConnection(dbPath);
+  let db;
+  try {
+    if (dbPath !== ':memory:') {
+      const dir = path.dirname(path.resolve(dbPath));
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    }
+    db = new DatabaseSync(dbPath);
+    db.exec('PRAGMA journal_mode = WAL');
+    db.exec('PRAGMA foreign_keys = ON');
+    db.exec('PRAGMA busy_timeout = 5000');
+    // After the WAL pragma: that is what creates the sidecars.
+    if (dbPath !== ':memory:') tightenDbFiles(dbPath);
 
-  if (!hasFts5(db)) {
-    try { db.close(); } catch { /* it is going away regardless */ }
-    throw new UnsupportedRuntimeError(
-      `This copy of Node (${process.version}) was built without SQLite's FTS5 extension, `
-      + 'which Zelos uses for its search index — so it cannot open the database at all.\n\n'
-      + 'Node 22.16 or newer, or Node 24 or newer, has it. The whole Node 23 line does not, '
-      + 'whatever its version number suggests.\n\n'
-      + 'Install a newer Node and run Zelos again; nothing in your Zelos home has been changed.',
-    );
+    if (!hasFts5(db)) {
+      throw new UnsupportedRuntimeError(
+        `This copy of Node (${process.version}) was built without SQLite's FTS5 extension, `
+        + 'which Zelos uses for its search index — so it cannot open the database at all.\n\n'
+        + 'Node 22.16 or newer, or Node 24 or newer, has it. The whole Node 23 line does not, '
+        + 'whatever its version number suggests.\n\n'
+        + 'Install a newer Node and run Zelos again; nothing in your Zelos home has been changed.',
+      );
+    }
+    attachDataConnection(db, lease);
+    return db;
+  } catch (error) {
+    try { db?.close(); } catch { /* preserve the initialization failure */ }
+    lease.release();
+    throw error;
   }
-  return db;
 }
 
 export function close(db) {
   try {
     statementCache.delete(db);
     db.close();
+    releaseDataConnection(db);
   } catch (err) {
     log.warn('db: close failed', { error: err.message });
   }
@@ -220,6 +230,23 @@ const MIGRATIONS = [
         inactive_reason TEXT
       );
       CREATE INDEX task_activity_source ON task_activity(source_id, activity);`);
+    },
+  },
+  {
+    version: 4,
+    up(db) {
+      // No backfill: the current row cannot tell us how it arrived here.
+      db.exec(`CREATE TABLE item_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        item_id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+        recorded_at TEXT NOT NULL,
+        origin TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('created', 'changed')),
+        changes_json TEXT NOT NULL CHECK(length(changes_json) <= 12000)
+      );
+      CREATE INDEX item_history_page ON item_history(item_id, id DESC);`);
+      db.prepare('INSERT OR IGNORE INTO kv (k, v) VALUES (?, ?)')
+        .run('itemHistory.startedAt', nowISO());
     },
   },
 ];
@@ -413,7 +440,11 @@ function sourceRowChanged(before, after, ignored, preserveEmptyBody = false) {
  * keeps the body and snippet a fuller fetch already stored — losing a body
  * because the second pass was cheaper would be a silent regression.
  */
-export function upsertMessage(db, msg, { now = nowISO() } = {}) {
+export function upsertMessage(db, msg, opts = {}) {
+  return saveMessage(db, msg, opts);
+}
+
+function saveMessage(db, msg, { now = nowISO() } = {}, unindexedRefs = null) {
   if (!msg || typeof msg !== 'object') throw new TypeError('db: upsertMessage needs a message object');
   const sourceId = str(msg.sourceId ?? msg.source_id);
   const messageId = str(msg.messageId ?? msg.message_id);
@@ -458,7 +489,8 @@ export function upsertMessage(db, msg, { now = nowISO() } = {}) {
   const kept = existed && (!str(msg.snippet) || !str(msg.text ?? msg.body))
     ? prep(db, 'SELECT snippet, body FROM messages WHERE id = ?').get(id)
     : null;
-  indexDoc(db, {
+  const writeIndex = !existed && unindexedRefs?.has(`msg:${id}`) ? insertDoc : indexDoc;
+  writeIndex(db, {
     ref: `msg:${id}`,
     kind: 'message',
     title: `${str(msg.subject)} ${from.name} ${from.email}`.trim(),
@@ -471,15 +503,17 @@ export function upsertMessage(db, msg, { now = nowISO() } = {}) {
 }
 
 export function upsertMessages(db, list, opts = {}) {
+  const rows = Array.from(list || []);
   const ids = [];
   const before = new Map();
   let inserted = 0;
   let changed = 0;
   withTransaction(db, () => {
-    for (const msg of list || []) {
+    const unindexedRefs = missingIndexRefs(db, rows.map((msg) => `msg:${messageIdentity(msg)}`));
+    for (const msg of rows) {
       const id = messageIdentity(msg);
       if (!before.has(id)) before.set(id, prep(db, 'SELECT * FROM messages WHERE id = ?').get(id));
-      const r = upsertMessage(db, msg, opts);
+      const r = saveMessage(db, msg, opts, unindexedRefs);
       ids.push(r.id);
       if (r.inserted) inserted += 1;
     }
@@ -554,6 +588,10 @@ export function reconcileTaskActivity(db, { sourceId, prefix, selection, complet
   let changed = 0;
   withTransaction(db, () => {
     // Adoption is neutral: these rows were already active before migration.
+    const beforeItems = prep(db, `SELECT items.id FROM items
+      WHERE EXISTS (SELECT 1 FROM json_each(${ITEM_REFS_SQL}) AS refs
+        JOIN messages ON refs.value = 'msg:' || messages.id WHERE messages.source_id = ?)`).all(sourceId)
+      .map(({ id }) => itemHistorySnapshot(db, id));
     prep(db, `INSERT OR IGNORE INTO task_activity (message_id, source_id, activity)
       SELECT id, source_id, 'active' FROM messages
       WHERE source_id = ? AND substr(message_id, 1, length(?)) = ?`).run(sourceId, prefix, prefix);
@@ -568,6 +606,11 @@ export function reconcileTaskActivity(db, { sourceId, prefix, selection, complet
         inactive.run(now, entry.message_id);
         changed++;
       }
+    }
+    // Compare the final selection, not each task as it passes through the loop.
+    // Mixed evidence remains active; absence never means the user finished it.
+    for (const before of beforeItems) {
+      recordItemRevision(db, before, itemHistorySnapshot(db, before.id), { now, origin: 'source' });
     }
   });
   return changed;
@@ -600,7 +643,11 @@ ON CONFLICT(id) DO UPDATE SET
   fetched_at     = excluded.fetched_at`;
 
 /** Accepts an `Event` (SPEC §5) plus `calendarId`. */
-export function upsertEvent(db, ev, { now = nowISO() } = {}) {
+export function upsertEvent(db, ev, opts = {}) {
+  return saveEvent(db, ev, opts);
+}
+
+function saveEvent(db, ev, { now = nowISO() } = {}, unindexedRefs = null) {
   if (!ev || typeof ev !== 'object') throw new TypeError('db: upsertEvent needs an event object');
   const calendarId = str(ev.calendarId ?? ev.calendar_id);
   const uid = str(ev.uid);
@@ -633,7 +680,8 @@ export function upsertEvent(db, ev, { now = nowISO() } = {}) {
   prep(db, EVENT_UPSERT).run(record);
   const changed = sourceRowChanged(before, record, EVENT_CHANGE_IGNORED);
 
-  indexDoc(db, {
+  const writeIndex = !existed && unindexedRefs?.has(`evt:${id}`) ? insertDoc : indexDoc;
+  writeIndex(db, {
     ref: `evt:${id}`,
     kind: 'event',
     title: str(ev.title),
@@ -644,15 +692,17 @@ export function upsertEvent(db, ev, { now = nowISO() } = {}) {
 }
 
 export function upsertEvents(db, list, opts = {}) {
+  const rows = Array.from(list || []);
   const ids = [];
   const before = new Map();
   let inserted = 0;
   let changed = 0;
   withTransaction(db, () => {
-    for (const ev of list || []) {
+    const unindexedRefs = missingIndexRefs(db, rows.map((ev) => `evt:${eventIdentity(ev)}`));
+    for (const ev of rows) {
       const id = eventIdentity(ev);
       if (!before.has(id)) before.set(id, prep(db, 'SELECT * FROM events WHERE id = ?').get(id));
-      const r = upsertEvent(db, ev, opts);
+      const r = saveEvent(db, ev, opts, unindexedRefs);
       ids.push(r.id);
       if (r.inserted) inserted += 1;
     }
@@ -761,32 +811,36 @@ ON CONFLICT(id) DO UPDATE SET
  * without one, repeat upserts all look like the same (null) run and the counter
  * stops at 1.
  */
-export function upsertItem(db, item, { runId = null, now = nowISO() } = {}) {
+export function upsertItem(db, item, { runId = null, now = nowISO(), origin = null } = {}) {
   if (!item || typeof item !== 'object') throw new TypeError('db: upsertItem needs an item object');
   const key = str(item.key);
   if (!key) throw new TypeError('db: upsertItem needs a non-empty key — it is what carries item identity across runs');
   const id = itemRowId(key);
-  const before = prep(db, 'SELECT first_seen, seen_runs, state FROM items WHERE id = ?').get(id);
-
-  prep(db, ITEM_UPSERT).run({
-    id,
-    kind: str(item.kind),
-    bucket: assertBucket(item.bucket),
-    headline: str(item.headline),
-    why: str(item.why),
-    person: str(item.person),
-    person_email: str(item.personEmail ?? item.person_email),
-    due_at: strOrNull(item.dueAt ?? item.due_at),
-    severity: clampSeverity(item.severity),
-    link: strOrNull(item.link),
-    source_refs_json: json(item.sourceRefs ?? item.source_refs ?? []),
-    payload_json: json(item.payload ?? {}),
-    state: ITEM_STATES.includes(item.state) ? item.state : 'open',
-    run_id: strOrNull(runId),
-    now,
+  return withHistoryWrite(db, () => {
+    const before = itemHistorySnapshot(db, id);
+    prep(db, ITEM_UPSERT).run({
+      id,
+      kind: str(item.kind),
+      bucket: assertBucket(item.bucket),
+      headline: str(item.headline),
+      why: str(item.why),
+      person: str(item.person),
+      person_email: str(item.personEmail ?? item.person_email),
+      due_at: strOrNull(item.dueAt ?? item.due_at),
+      severity: clampSeverity(item.severity),
+      link: strOrNull(item.link),
+      source_refs_json: json(item.sourceRefs ?? item.source_refs ?? []),
+      payload_json: json(item.payload ?? {}),
+      state: ITEM_STATES.includes(item.state) ? item.state : 'open',
+      run_id: strOrNull(runId),
+      now,
+    });
+    const runKind = runId ? prep(db, 'SELECT kind FROM runs WHERE id = ?').get(runId)?.kind : null;
+    recordItemRevision(db, before, itemHistorySnapshot(db, id), {
+      now, origin: origin ?? (runKind === 'sample' ? 'sample' : runId ? 'model' : 'unknown'),
+    });
+    return { id, inserted: !before, firstSeen: before ? before.first_seen : now };
   });
-
-  return { id, inserted: !before, firstSeen: before ? before.first_seen : now };
 }
 
 // Missing/mixed/non-task evidence is never enough to hide an obligation. Only
@@ -796,6 +850,86 @@ const INACTIVE_ITEM_SQL = `(json_type(${ITEM_REFS_SQL}) = 'array' AND json_array
   AND NOT EXISTS (SELECT 1 FROM json_each(${ITEM_REFS_SQL}) AS refs
     WHERE NOT EXISTS (SELECT 1 FROM task_activity AS task
       WHERE substr(refs.value, 1, 4) = 'msg:' AND task.message_id = substr(refs.value, 5) AND task.activity = 'inactive')))`;
+
+const HISTORY_FIELDS = ['headline', 'why', 'due_at', 'bucket', 'severity', 'state', 'snoozed_until', 'sourceInactive'];
+const HISTORY_ORIGINS = new Set(['model', 'source', 'user', 'automatic', 'sample', 'unknown']);
+let historySavepoint = 0;
+
+// A savepoint also works inside triage's wider transaction. Either the item and
+// its explanation both commit, or neither does; no partially written history.
+function withHistoryWrite(db, fn) {
+  const name = `item_history_${++historySavepoint}`;
+  db.exec(`SAVEPOINT ${name}`);
+  try {
+    const result = fn();
+    db.exec(`RELEASE ${name}`);
+    return result;
+  } catch (error) {
+    try { db.exec(`ROLLBACK TO ${name}; RELEASE ${name}`); } catch { /* preserve the write failure */ }
+    throw error;
+  }
+}
+
+function itemHistorySnapshot(db, id) {
+  const row = prep(db, `SELECT id, first_seen, headline, why, due_at, bucket, severity,
+    state, snoozed_until, ${INACTIVE_ITEM_SQL} AS sourceInactive FROM items WHERE id = ?`).get(id);
+  return row ? { ...row, sourceInactive: !!row.sourceInactive } : null;
+}
+
+function historyValue(value, field) {
+  if (value === null || value === undefined) return { value: null };
+  if (typeof value !== 'string') return { value };
+  const safe = redact(value)
+    .replace(/\b(?:password|passwd|(?:access_|refresh_)?token|secret|api[-_ ]?key|authorization)\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi,
+      (match) => `${match.slice(0, match.search(/[:=]/) + 1)}[redacted]`)
+    .replace(/(https?:\/\/)[^\s/@]+:[^\s/@]+@/gi, '$1[redacted]@');
+  const max = field === 'why' ? 2000 : field === 'headline' ? 500 : 80;
+  return { value: safe.length > max ? `${safe.slice(0, max)}…` : safe, truncated: safe.length > max, redacted: safe !== value };
+}
+
+function recordItemRevision(db, before, after, { now, origin }) {
+  if (!after) return;
+  const changes = [];
+  for (const field of HISTORY_FIELDS) {
+    const oldValue = before?.[field] ?? null;
+    const newValue = after[field] ?? null;
+    if (oldValue === newValue || (!before && (newValue === '' || newValue === false))) continue;
+    const from = historyValue(oldValue, field);
+    const to = historyValue(newValue, field);
+    changes.push({ field, before: from.value, after: to.value,
+      ...(from.truncated || to.truncated ? { truncated: true } : {}),
+      ...(from.redacted || to.redacted ? { redacted: true } : {}),
+    });
+  }
+  if (!changes.length) return;
+  prep(db, `INSERT INTO item_history (item_id, recorded_at, origin, kind, changes_json)
+    VALUES (?, ?, ?, ?, ?)`).run(after.id, String(now).slice(0, 64), HISTORY_ORIGINS.has(origin) ? origin : 'unknown',
+      before ? 'changed' : 'created', JSON.stringify(changes));
+}
+
+/** Newest first, with a stable cursor unaffected by newer changes arriving. */
+export function listItemHistory(db, id, { limit = 20, before = null } = {}) {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 50) throw new TypeError('history limit must be an integer from 1 to 50');
+  if (before !== null && (!Number.isSafeInteger(before) || before < 1)) throw new TypeError('history before must be a positive integer');
+  const rows = prep(db, `SELECT id, recorded_at, origin, kind, changes_json FROM item_history
+    WHERE item_id = ? ${before === null ? '' : 'AND id < ?'} ORDER BY id DESC LIMIT ?`)
+    .all(str(id), ...(before === null ? [] : [before]), limit + 1);
+  const entries = rows.slice(0, limit).map(({ changes_json, ...row }) => ({ ...row, changes: parseJson(changes_json, []) }));
+  return { entries, nextBefore: rows.length > limit ? entries.at(-1).id : null,
+    recordedSince: getKV(db, 'itemHistory.startedAt') };
+}
+
+/** Automatic board demotion preserves the user's state and its history. */
+export function setItemBucket(db, id, bucket, { now = nowISO() } = {}) {
+  assertBucket(bucket);
+  return withHistoryWrite(db, () => {
+    const before = itemHistorySnapshot(db, str(id));
+    if (!before || before.state !== 'open' || before.bucket === bucket) return false;
+    prep(db, 'UPDATE items SET bucket = ?, updated_at = ? WHERE id = ?').run(bucket, now, str(id));
+    recordItemRevision(db, before, itemHistorySnapshot(db, str(id)), { now, origin: 'automatic' });
+    return true;
+  });
+}
 
 export function getItem(db, id) {
   return hydrateItem(prep(db, `SELECT items.*, ${INACTIVE_ITEM_SQL} AS source_inactive FROM items WHERE id = ?`).get(str(id)));
@@ -819,10 +953,16 @@ export function setItemState(db, id, state, { now = nowISO(), snoozedUntil = nul
     throw new TypeError(`db: state must be one of ${ITEM_STATES.join('|')}, got ${JSON.stringify(state)}`);
   }
   const until = state === 'snoozed' ? strOrNull(snoozedUntil) : null;
-  const res = prep(db, 'UPDATE items SET state = ?, state_at = ?, updated_at = ?, snoozed_until = ? WHERE id = ?')
-    .run(state, now, now, until, str(id));
-  if (!res.changes) return null;
-  return getItem(db, id);
+  return withHistoryWrite(db, () => {
+    const before = itemHistorySnapshot(db, str(id));
+    if (!before) return null;
+    if (before.state !== state || before.snoozed_until !== until) {
+      prep(db, 'UPDATE items SET state = ?, state_at = ?, updated_at = ?, snoozed_until = ? WHERE id = ?')
+        .run(state, now, now, until, str(id));
+      recordItemRevision(db, before, itemHistorySnapshot(db, str(id)), { now, origin: 'user' });
+    }
+    return getItem(db, id);
+  });
 }
 
 const BUCKET_RANK_SQL = `CASE bucket ${BUCKETS.map((b, i) => `WHEN '${b}' THEN ${i}`).join(' ')} ELSE ${BUCKETS.length} END`;
@@ -851,7 +991,13 @@ WHERE state = 'snoozed' AND snoozed_until IS NOT NULL
  * NULL, and NULL never satisfies the comparison: garbage sleeps, safely.
  */
 export function listBoard(db, { states = ['open'], buckets = null, limit = 500, now = nowISO(), includeInactive = false } = {}) {
-  prep(db, WAKE_DUE_SNOOZES).run({ now });
+  const due = prep(db, `SELECT id FROM items WHERE state = 'snoozed'
+    AND snoozed_until IS NOT NULL AND datetime(snoozed_until) <= datetime(?)`).all(now);
+  if (due.length) withHistoryWrite(db, () => {
+    const before = due.map(({ id }) => itemHistorySnapshot(db, id));
+    prep(db, WAKE_DUE_SNOOZES).run({ now });
+    for (const row of before) recordItemRevision(db, row, itemHistorySnapshot(db, row.id), { now, origin: 'automatic' });
+  });
   const args = [];
   const where = [];
   if (!includeInactive) where.push(`NOT ${INACTIVE_ITEM_SQL}`);
@@ -1100,12 +1246,30 @@ export function databaseSizes(db) {
  * FTS5 has no unique constraint, so "upsert" is delete-then-insert on `ref`.
  * Refs are namespaced: msg:<id>, evt:<id>, item:<id>, cap:<id>.
  */
-export function indexDoc(db, { ref, kind = '', title = '', body = '' }) {
+function insertDoc(db, { ref, kind = '', title = '', body = '' }) {
   const r = str(ref);
   if (!r) throw new TypeError('db: indexDoc needs a ref');
-  prep(db, 'DELETE FROM search WHERE ref = ?').run(r);
   prep(db, 'INSERT INTO search (title, body, ref, kind) VALUES (?,?,?,?)').run(str(title), str(body), r, str(kind));
   return r;
+}
+
+// FTS5 ref is unindexed: testing every new document separately scans the growing
+// archive for each insert. Check once per source batch, inside its transaction.
+// Existing/orphaned refs still take the replacement path, as do duplicate rows
+// within a batch and standalone upserts. No deduplication promise is weakened.
+function missingIndexRefs(db, refs) {
+  const missing = new Set(refs);
+  if (!missing.size) return missing;
+  for (const row of prep(db, 'SELECT ref FROM search WHERE ref IN (SELECT value FROM json_each(?))')
+    .all(JSON.stringify([...missing]))) missing.delete(row.ref);
+  return missing;
+}
+
+export function indexDoc(db, doc) {
+  const ref = str(doc?.ref);
+  if (!ref) throw new TypeError('db: indexDoc needs a ref');
+  prep(db, 'DELETE FROM search WHERE ref = ?').run(ref);
+  return insertDoc(db, doc);
 }
 
 export function removeDoc(db, ref) {

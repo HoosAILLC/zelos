@@ -44,6 +44,7 @@ import { localTimezone, nowISO } from './time.mjs';
    ics.mjs) is already imported above. */
 import { get as connectorFor, enabledSources, originsFor, unknownSources } from './connectors/index.mjs';
 import { createHttp } from './connectors/http.mjs';
+import { assertNoMaintenance, registerDataConnection } from './data-lease.mjs';
 
 /**
  * The floor is not the version that added `node:sqlite` — it is the version
@@ -1134,7 +1135,23 @@ function checkUnknownSources(cfg) {
  * `ok` is true only when nothing failed. Warnings do not make it false: "you
  * have not connected mail yet" is a fact about a new install, not a fault.
  */
-export async function diagnose({ config = null, timeoutMs = 10_000, signal, deps = {} } = {}) {
+export async function diagnose(options = {}) {
+  const home = homeDirPath();
+  assertNoMaintenance(home);
+  const homeCheck = checkHome(home);
+  if (homeCheck.status === 'fail') {
+    const checks = [checkNode(), homeCheck];
+    const counts = { pass: 0, warn: 0, fail: 0, skip: 0 };
+    for (const item of checks) counts[item.status]++;
+    return { ok: false, ready: false, status: 'fail', checks, counts, home, node: process.versions.node, ranAt: new Date().toISOString(), ms: 0 };
+  }
+  // Doctor opens SQLite directly and can refresh OAuth credentials while
+  // testing a mailbox. Its whole diagnostic lifetime must exclude restore.
+  const lease = registerDataConnection(path.join(home, 'zelos.db'));
+  try { return await diagnoseUnlocked(options, homeCheck); } finally { lease.release(); }
+}
+
+async function diagnoseUnlocked({ config = null, timeoutMs = 10_000, signal, deps = {} } = {}, homeCheck) {
   const startedMs = Date.now();
   const d = { ...DEFAULT_DEPS, ...deps };
   const checks = [];
@@ -1142,7 +1159,7 @@ export async function diagnose({ config = null, timeoutMs = 10_000, signal, deps
   // Before anything resolves paths(): that call creates and chmods the folder.
   const home = homeDirPath();
   checks.push(checkNode());
-  checks.push(checkHome(home));
+  checks.push(homeCheck);
   checks.push(checkDatabase(home));
 
   let cfg = config;

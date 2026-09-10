@@ -25,6 +25,8 @@ import {
 import { api, hasToken } from './lib/api.js';
 import { BUCKET_LABEL, sweepSummary, sweepDetail, tokenLine } from './lib/format.js';
 import { humanDelta, formatDay } from './lib/time.js';
+import { createCommandMenu, commandShortcut } from './lib/commands.js';
+import { parseConnectionTarget } from './lib/source-status.js';
 
 import { renderNow } from './views/now.js';
 import { renderToday } from './views/today.js';
@@ -76,10 +78,11 @@ function showOnboarding() {
 
 function parseHash() {
   const raw = (window.location.hash || '#/now').replace(/^#\/?/, '');
-  const [view, sub] = raw.split('/');
+  const [view, sub, target] = raw.split('/');
   if (view === 'welcome') return { view: 'welcome', sub: null };
   const known = VIEWS.find((v) => v.id === view);
-  return { view: known ? known.id : 'now', sub: sub || null };
+  return { view: known ? known.id : 'now', sub: sub || null,
+    connectionId: view === 'settings' ? parseConnectionTarget(target) : null };
 }
 
 function navigate(hash) {
@@ -89,7 +92,7 @@ function navigate(hash) {
     // view and detaches the button that was pressed. Focus has to be put back
     // here too, or the one case that changes nothing is the one that loses it.
     render({ force: true });
-    refocusSelectedTab();
+    if (!focusConnectionTarget()) refocusSelectedTab();
     return;
   }
   window.location.hash = hash;
@@ -260,6 +263,31 @@ function buildChrome() {
     onClick: () => startSweep('auto'),
   });
   const sweep = buildSweepLine();
+  const commandsButton = button('Commands', {
+    class: 'btn quiet', 'aria-haspopup': 'dialog',
+    'aria-keyshortcuts': 'Control+Shift+P Meta+Shift+P',
+    title: 'Commands (⌘/Ctrl+Shift+P)',
+    onClick: () => commands.open(),
+  });
+  const commands = createCommandMenu({
+    fallbackFocus: () => commandsButton,
+    onError: err => notify(`Could not run that command: ${err.message}`, { tone: 'warn' }),
+    getCommands: () => [
+      ...VIEWS.map((view, index) => ({
+        id: `view-${view.id}`, label: `Go to ${view.label}`,
+        keywords: view.id === 'owed' ? 'drafts replies waiting' : 'navigate',
+        shortcut: window.zelos?.desktop ? (view.id === 'search' ? '⌘/Ctrl+F' : `⌘/Ctrl+${index + 1}`) : null,
+        run: () => navigate(`#/${view.id}`),
+      })),
+      { id: 'capture', label: 'Add a reminder', keywords: 'capture note', run: () => {
+        capture.panel.hidden = false;
+        capture.toggle.setAttribute('aria-expanded', 'true');
+        focusQuietly(capture.box);
+      } },
+      { id: 'check', label: 'Check now', keywords: 'refresh read connections',
+        disabled: state.sweep.running, reason: 'A check is already running', run: () => startSweep('auto') },
+    ],
+  });
   const topbarNode = el('header', { class: 'topbar' }, [
     el('div', { class: 'topbar-row' }, [
       el('a', { class: 'wordmark', href: '#/now' }, [
@@ -268,7 +296,7 @@ function buildChrome() {
         el('span', { class: 'wordmark-greek', 'aria-hidden': 'true', title: 'Zelos, in Greek', text: 'ΖΗΛΟΣ' }),
       ]),
       dateNode,
-      el('div', { class: 'topbar-actions' }, [capture.toggle, sweepBtn]),
+      el('div', { class: 'topbar-actions' }, [commandsButton, capture.toggle, sweepBtn]),
     ]),
     capture.panel,
     sweep.node,
@@ -279,6 +307,7 @@ function buildChrome() {
     sweepBtn,
     sweep,
     capture,
+    commands,
     railNode: rail(route.view),
     tabbarNode: tabbar(route.view),
     // The toast lives in a slot so showing and clearing it never moves its
@@ -413,6 +442,7 @@ function renderKey() {
   return [
     route.view,
     route.sub || '',
+    route.connectionId || '',
     state.phase,
     state.rev,
     state.fatal ? '1' : '0',
@@ -428,6 +458,7 @@ function currentView() {
     tz: timezone(),
     navigate,
     sub: route.sub,
+    connectionId: route.connectionId,
     rerender: () => render({ force: true }),
   };
   if (showOnboarding()) return renderOnboarding(ctx);
@@ -582,6 +613,9 @@ function render({ force = false } = {}) {
   }
   replace(main, currentView());
   paintChrome();
+  const connectionKey = route.view === 'settings' && route.connectionId ? `${route.sub}/${route.connectionId}` : null;
+  if (connectionKey && connectionKey !== focusedConnection) focusConnectionTarget();
+  focusedConnection = connectionKey;
 }
 
 /**
@@ -608,6 +642,7 @@ function paintChrome() {
   chrome.dateNode.textContent = nm.key ? formatDay(nm.key) : '';
   chrome.sweepBtn.textContent = state.sweep.running ? 'Checking…' : 'Check now';
   chrome.sweepBtn.disabled = state.sweep.running;
+  if (chrome.commands.isOpen) chrome.commands.refresh();
 
   paintSweepLine(chrome.sweep);
 
@@ -633,13 +668,16 @@ function paintChrome() {
 }
 
 /**
- * The one document-level keyboard shortcut: Escape closes the capture panel
- * and hands focus back to the button that opened it, so the keyboard user is
- * exactly where they were. It lives on the document because the key should
- * work from inside the textarea and from anywhere else alike; there are no
- * other shortcuts, and this listener must stay the only one.
+ * Shared document shortcuts: the command menu and capture Escape use one
+ * listener, so Escape never closes both surfaces at once.
  */
 document.addEventListener('keydown', (e) => {
+  if (commandShortcut(e) && chrome?.topbarNode.isConnected) {
+    e.preventDefault();
+    chrome.commands.open();
+    return;
+  }
+  if (chrome?.commands.isOpen) return;
   if (e.key !== 'Escape') return;
   if (!chrome || chrome.capture.panel.hidden || !chrome.capture.panel.isConnected) return;
   chrome.capture.panel.hidden = true;
@@ -715,6 +753,16 @@ function refocusSelectedTab() {
   return Boolean(selected);
 }
 
+let focusedConnection = null;
+function focusConnectionTarget() {
+  if (route.view !== 'settings' || !route.connectionId) return false;
+  const target = main?.querySelector('[data-connection-target]');
+  if (!target) return false;
+  focusQuietly(target);
+  target.scrollIntoView({ block: 'center' });
+  return true;
+}
+
 function onRoute() {
   const before = route.view;
   const beforeSub = route.sub;
@@ -729,6 +777,7 @@ function onRoute() {
   } else if (beforeSub !== route.sub) {
     refocusSelectedTab();
   }
+  if (route.connectionId) focusConnectionTarget();
 }
 
 /* --------------------------------------------------------------------- boot */

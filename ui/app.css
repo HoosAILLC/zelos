@@ -340,7 +340,7 @@ textarea.input, .draft-body, .ask-field, .capture-field {
 }
 
 .topbar-date { flex: 1; font-size: 0.8125rem; color: var(--ink-3); }
-.topbar-actions { display: flex; gap: 0.5rem; margin-left: auto; }
+.topbar-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-left: auto; }
 
 /* On a phone the header keeps the name and the two controls; the date is a
    tap away in every view that needs it, and a three-row header is not. */
@@ -1982,3 +1982,43 @@ textarea.input:focus,
 .data-stats { display: grid; gap: 0.35rem; margin-bottom: 1rem; }
 .data-stats:empty { display: none; }
 .data-stats .facts { margin-top: 0.35rem; }
+
+/* Commands use a native modal dialog: the page behind it stays out of the
+   keyboard order, and filtering never changes focus away from its field. */
+.command-menu {
+  width: min(38rem, calc(100vw - 2rem));
+  max-height: calc(100dvh - 2rem);
+  padding: 1.25rem;
+  color: var(--ink);
+  background: #101014;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+.command-menu::backdrop { background: rgba(0, 0, 0, 0.72); }
+.command-head { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-bottom: 1rem; }
+.command-head h2 { margin: 0; font-size: 1.25rem; }
+.command-search { width: 100%; margin-bottom: 0.75rem; }
+.command-results { max-height: min(24rem, 50dvh); overflow-y: auto; }
+.command-option { display: flex; align-items: center; justify-content: space-between; gap: 1rem; min-height: var(--tap); padding: 0.65rem; border-radius: var(--radius); cursor: pointer; overflow-wrap: anywhere; }
+.command-option[aria-selected="true"] { background: var(--accent-wash); color: var(--accent-text); }
+.command-option[aria-disabled="true"] { color: var(--ink-3); cursor: default; }
+.command-option kbd { color: var(--ink-3); font-size: 0.75rem; white-space: nowrap; }
+.command-option .quiet-note { font-size: 0.75rem; margin: 0; }
+.command-menu > .quiet-note { margin: 0.75rem 0 0; }
+
+.setup-status { margin: 0 0 1rem; border-bottom: 1px solid var(--line); padding-bottom: 0.75rem; }
+.setup-status summary { cursor: pointer; min-height: var(--tap); padding: 0.5rem 0; font-weight: 600; }
+.setup-status-list { list-style: none; padding: 0; margin: 0; }
+.setup-status-list li { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.5rem 1rem; padding: 0.4rem 0; color: var(--ink-2); }
+.setup-status-list li span { flex: 1 1 15rem; overflow-wrap: anywhere; }
+.account.is-connection-target { border-color: var(--accent-edge); background: var(--accent-wash); }
+.connection-recovery { margin: 0.75rem 0; }
+.connection-recovery .quiet-note { overflow-wrap: anywhere; }
+
+.item-history { flex: 1 0 100%; width: 100%; min-width: 0; margin-top: 0.75rem; overflow-wrap: anywhere; }
+.item-history-list { list-style: none; margin: 0.5rem 0 1rem; padding: 0 0 0 1rem; border-left: 1px solid var(--line-strong); }
+.item-history-entry { margin: 0 0 1rem; }
+.item-history-meta { margin: 0 0 0.4rem; white-space: normal; }
+.item-history-changes { list-style: disc; margin: 0; padding-left: 1.25rem; color: var(--ink-2); }
+.item-history-changes li { margin: 0.25rem 0; }

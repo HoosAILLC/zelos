@@ -654,6 +654,16 @@ export async function main(argv = process.argv.slice(2)) {
   // Rule 1: the home directory has to be settled before any module resolves it.
   if (flags.home) process.env.ZELOS_HOME = path.resolve(flags.home);
 
+  // Before loadConfig can repair a malformed file, and before doctor/MCP
+  // can touch a credential store belonging to a restore in progress.
+  const { assertNoMaintenance, registerDataConnection } = await import('./core/data-lease.mjs');
+  const { paths: dataPaths } = await import('./core/config.mjs');
+  assertNoMaintenance(dataPaths().home);
+  const lease = registerDataConnection(dataPaths().db);
+  try { return await runWithData(flags); } finally { lease.release(); }
+}
+
+async function runWithData(flags) {
   if (flags.command === 'doctor') return commandDoctor(flags);
   if (flags.command === 'sweep') return commandSweep(flags);
   if (flags.command === 'mcp') return commandMcp(flags);

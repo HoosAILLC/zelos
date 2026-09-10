@@ -286,6 +286,17 @@ function sourceStatus() {
   })));
 }
 
+function modelHealth() {
+  const model = db.config.model || {};
+  // Match the Settings local-runtime affordance. This is configuration only:
+  // the demo never probes a runtime, reads a key or verifies a hosted account.
+  const local = /^https?:\/\/(127\.0\.0\.1|localhost|\[?::1\]?)(:|\/|$)/i.test(model.baseUrl || '');
+  return {
+    configured: Boolean(model.baseUrl && model.model && (local || db.secretRefs.includes(model.keyRef))),
+    label: model.label || model.model || '', protocol: model.protocol, local,
+  };
+}
+
 // The token dates are offsets in the dataset, like everything else.
 db.config.ai.tokens = db.config.ai.tokens.map((t) => ({
   id: t.id,
@@ -301,6 +312,27 @@ db.config.ai.tokens = db.config.ai.tokens.map((t) => ({
 
 const BUCKETS = ['now', 'today', 'soon', 'waiting', 'promised', 'note', 'money'];
 const ON_BOARD = new Set(['open', 'snoozed']);
+
+// History begins when this tab opens. The sample items arrive without an
+// invented past; only changes the visitor actually makes or sees are recorded.
+const historySince = nowISO();
+const itemHistory = new Map();
+const HISTORY_FIELDS = ['headline', 'why', 'due_at', 'bucket', 'severity', 'state', 'snoozed_until', 'sourceInactive'];
+let historyId = 0;
+
+function recordItemChange(before, after, origin) {
+  const changes = HISTORY_FIELDS.flatMap(field => {
+    const previous = before?.[field] ?? null;
+    const next = after[field] ?? null;
+    if (previous === next || (!before && (next === '' || next === false))) return [];
+    return [{ field, before: previous, after: next }];
+  });
+  if (!changes.length) return;
+  const entries = itemHistory.get(after.id) || [];
+  entries.unshift({ id: ++historyId, recorded_at: nowISO(), origin,
+    kind: before ? 'changed' : 'created', changes });
+  itemHistory.set(after.id, entries);
+}
 
 function counts() {
   const out = Object.fromEntries(BUCKETS.map((b) => [b, 0]));
@@ -323,15 +355,22 @@ function clampNow() {
   open
     .sort((a, b) => b.severity - a.severity)
     .slice(4)
-    .forEach((item) => { item.bucket = 'today'; });
+    .forEach((item) => {
+      const before = clone(item);
+      item.bucket = 'today';
+      recordItemChange(before, item, 'automatic');
+    });
 }
 
 function board() {
   for (const item of db.items) {
     if (item.state === 'snoozed' && item.snoozed_until && Date.parse(item.snoozed_until) <= Date.now()) {
+      const before = clone(item);
       item.state = 'open';
       item.snoozed_until = null;
       item.state_at = nowISO();
+      item.updated_at = item.state_at;
+      recordItemChange(before, item, 'automatic');
     }
   }
   clampNow();
@@ -518,7 +557,9 @@ async function runFakeSweep(mode) {
       newMessages += 1;
     }
     if (arrival.item) {
-      db.items.unshift(makeItem(arrival.item));
+      const item = makeItem(arrival.item);
+      db.items.unshift(item);
+      recordItemChange(null, item, 'sample');
       clampNow();
     }
     if (arrival.draft) db.drafts.unshift(makeDraft(arrival.draft));
@@ -526,8 +567,12 @@ async function runFakeSweep(mode) {
     if (arrival.resolves) {
       const done = db.items.find((i) => i.id === arrival.resolves);
       if (done) {
+        const before = clone(done);
         done.state = 'done';
+        done.snoozed_until = null;
         done.state_at = nowISO();
+        done.updated_at = done.state_at;
+        recordItemChange(before, done, 'sample');
       }
     }
     if (arrival.makeFirst && arrival.item) db.first = arrival.item.id;
@@ -848,12 +893,35 @@ const ROUTES = [
       writable: true,
       note: 'Passwords and API keys are held by the system keychain under the service com.zelos.app. In this demo nothing is stored at all — anything typed into a key field is discarded, unread.',
     },
-    model: { configured: true, label: db.config.model.label, protocol: db.config.model.protocol, local: true },
+    model: modelHealth(),
     sweep: sweepStatus(),
     scheduler: { running: true, busy: sweepRunning, nextAt: isoLocal(new Date(Date.now() + 18 * 60_000)) },
   })],
 
   ['GET', /^\/api\/state$/, () => board()],
+
+  ['POST', /^\/api\/updates\/check$/, () => ({
+    demo: true,
+    message: 'This website demo cannot check an installed copy of Zelos. Visit the download page for released installers.',
+  })],
+
+  ['GET', /^\/api\/items\/([^/]+)\/history$/, (url, body, [id]) => {
+    const pageNumber = (name, fallback, max) => {
+      const values = url.searchParams.getAll(name);
+      if (!values.length) return fallback;
+      const value = Number(values[0]);
+      if (values.length !== 1 || !/^[1-9]\d*$/.test(values[0]) || !Number.isSafeInteger(value) || value > max) {
+        throw new ApiError(`${name} must be a positive integer at most ${max}`, { status: 400, path: url.pathname });
+      }
+      return value;
+    };
+    const limit = pageNumber('limit', 20, 50);
+    const before = pageNumber('before', null, Number.MAX_SAFE_INTEGER);
+    if (!db.items.some(item => item.id === id)) throw new ApiError('This item is no longer available.', { status: 404, path: url.pathname });
+    const rows = (itemHistory.get(id) || []).filter(row => before === null || row.id < before);
+    const entries = clone(rows.slice(0, limit));
+    return { entries, nextBefore: rows.length > limit ? entries.at(-1).id : null, recordedSince: historySince };
+  }],
 
   /* Search, over the same rows the board is built from. The real server has an
      FTS5 index; matching that here would mean shipping a search engine to a
@@ -942,10 +1010,12 @@ const ROUTES = [
         until = toZonedISO(new Date(stamp), tz);
       }
     }
+    const before = clone(item);
     item.state = next;
     item.snoozed_until = until;
     item.state_at = nowISO();
     item.updated_at = item.state_at;
+    recordItemChange(before, item, 'user');
     return clone(item);
   }],
 
@@ -1392,8 +1462,8 @@ export const api = {
   mailOAuthStatus: (id) => request(`/api/mail/oauth/${encodeURIComponent(id)}`),
   cancelMailOAuth: (id) =>
     request(`/api/mail/oauth/${encodeURIComponent(id)}`, { method: 'DELETE' }),
-  updateDraft: (id, patch) =>
-    request(`/api/drafts/${encodeURIComponent(id)}`, { method: 'PUT', body: patch }),
+  updateDraft: (id, patch, { signal } = {}) =>
+    request(`/api/drafts/${encodeURIComponent(id)}`, { method: 'PUT', body: patch, signal }),
   // `limit` and `signal` exactly as the real api.js takes them: the search
   // view asks for more rows than a source list does, and abandons a query the
   // moment the next keystroke supersedes it.

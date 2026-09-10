@@ -54,7 +54,7 @@
 
 <section class="band" aria-labelledby="privacy-title">
   <div class="band-head">
-    <p class="eyebrow">Privacy policy · effective 22 August 2026</p>
+    <p class="eyebrow">Privacy policy · effective 10 September 2026</p>
     <h2 id="privacy-title">There is no Zelos server. This page is short because of it.</h2>
     <p class="band-note">Zelos is a program you download and run on your own computer. It has no
       account to create, no backend to talk to, and no way to see what you do with it. What follows
@@ -68,7 +68,7 @@
       <h2>What Zelos collects about you</h2>
       <p><strong>Nothing.</strong> The people who make Zelos do not receive your mail, your
         calendar, your address, your name, a device identifier, usage statistics, crash reports,
-        or a record that you installed it. There is no telemetry, no analytics, no update check,
+        or a record that you installed it. There is no telemetry, no analytics, no automatic update check,
         no remote font, no remote image. The source is public, the program has zero third-party
         dependencies, and the only outbound connections it can make are the ones listed on this
         page — you can watch it with <code>lsof -i</code> and count them against your own
@@ -76,6 +76,11 @@
       <p>This website is a static page on Netlify. It sets no cookies of its own and runs no
         analytics. Netlify keeps ordinary server logs for the requests that fetch it, under its own
         privacy policy, which we do not see.</p>
+      <p><strong>Check for updates</strong> in the app asks GitHub for the latest public Zelos
+        release only when you press it. That request includes no mail, calendar data, credentials
+        or installed version. GitHub receives ordinary connection information, such as your IP
+        address. Opening Settings does not start a check, and no update installs itself. The
+        website demo does not perform this check.</p>
     </div>
 
     <div class="glass pane boundary">
@@ -86,6 +91,7 @@
         <li><span class="dot"></span>Your model endpoint <em>you chose it — or localhost</em></li>
         <li><span class="dot"></span>Each source you add <em>you chose it — one host apiece</em></li>
         <li><span class="dot"></span>Google or Microsoft sign-in <em>only while signing in and refreshing</em></li>
+        <li><span class="dot"></span>GitHub releases <em>only when you press Check for updates</em></li>
       </ul>
       <p class="boundary-foot">Never a server of ours. There isn't one.</p>
     </div>

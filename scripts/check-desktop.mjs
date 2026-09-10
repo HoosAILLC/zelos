@@ -18,14 +18,19 @@ const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'zelos-packaged-smoke-'));
 const moduleURL = (name) => pathToFileURL(path.join(resources, 'core', name)).href;
 const program = `
   import assert from 'node:assert/strict';
-  import { DatabaseSync } from 'node:sqlite';
+  import path from 'node:path';
   import { createServer, listen } from ${JSON.stringify(moduleURL('server.mjs'))};
-  import { migrate, close } from ${JSON.stringify(moduleURL('db.mjs'))};
+  import { open, migrate, close, setKV, getKV } from ${JSON.stringify(moduleURL('db.mjs'))};
   import { loadConfig } from ${JSON.stringify(moduleURL('config.mjs'))};
-  const db = new DatabaseSync(':memory:');
-  db.exec('CREATE VIRTUAL TABLE runtime_probe USING fts5(text)');
+  import { createBackup, stageBackup, applyRestore, recoveryDestination } from ${JSON.stringify(moduleURL('backup.mjs'))};
+  import { acquireMaintenance } from ${JSON.stringify(moduleURL('data-lease.mjs'))};
+  import { startCore } from ${JSON.stringify(pathToFileURL(path.join(resources, 'app', 'runtime.js')).href)};
+  const home = process.env.ZELOS_HOME;
+  const databasePath = path.join(home, 'zelos.db');
+  const db = open(databasePath);
   migrate(db);
-  const server = createServer({ db, config: loadConfig() });
+  const config = loadConfig();
+  const server = createServer({ db, config });
   try {
     const { port } = await listen(server, { port: 0 });
     const headers = { 'X-Zelos-Token': server.sessionToken };
@@ -39,12 +44,41 @@ const program = `
     const page = await fetch(base + '/', { headers });
     assert.equal(page.status, 200);
     assert.ok((await page.text()).includes('<title>Zelos</title>'));
-    console.log(JSON.stringify({ version: ${JSON.stringify(version)}, node: process.versions.node, electron: process.versions.electron, platform: process.platform, arch: process.arch, packagedCore: 'passed' }));
   } finally {
     server.closeAllConnections();
     await new Promise(resolve => server.close(resolve));
-    close(db);
   }
+  const lease = acquireMaintenance({ home, connection: db });
+  try {
+    setKV(db, 'smoke.backup', 'original');
+    const archive = recoveryDestination(home);
+    createBackup({ home, db, destination: archive, appVersion: ${JSON.stringify(version)}, config });
+    const staged = stageBackup({ home, source: archive });
+    setKV(db, 'smoke.backup', 'changed');
+    const recoveryFile = recoveryDestination(home);
+    createBackup({ home, db, destination: recoveryFile, appVersion: ${JSON.stringify(version)}, config });
+    close(db);
+    assert.equal(applyRestore({ home, staged, recoveryFile }).ok, true);
+  } finally { lease.release(); }
+  const restored = open(databasePath);
+  try { assert.equal(getKV(restored, 'smoke.backup'), 'original'); }
+  finally { close(restored); }
+  // The native shell uses a worker for large archives. Exercise that exact
+  // packaged path too: source tests alone cannot verify Electron's workers.
+  const runtime = await startCore({ root: ${JSON.stringify(resources)}, home, port: 0 });
+  try {
+    const archive = recoveryDestination(home);
+    setKV(runtime.db, 'smoke.worker', 'original');
+    await runtime.createBackup(archive, { appVersion: ${JSON.stringify(version)} });
+    const staged = await runtime.stageBackup(archive);
+    setKV(runtime.db, 'smoke.worker', 'changed');
+    assert.equal((await runtime.restoreBackup(staged, { appVersion: ${JSON.stringify(version)} })).ok, true);
+    assert.equal(runtime.closed, true);
+  } finally { await runtime.stop(); }
+  const workerRestored = open(databasePath);
+  try { assert.equal(getKV(workerRestored, 'smoke.worker'), 'original'); }
+  finally { close(workerRestored); }
+  console.log(JSON.stringify({ version: ${JSON.stringify(version)}, node: process.versions.node, electron: process.versions.electron, platform: process.platform, arch: process.arch, packagedCore: 'passed', backupRoundtrip: 'passed', nativeWorkerRoundtrip: 'passed' }));
 `;
 try {
   const result = spawnSync(executable, ['--input-type=module', '-e', program], {

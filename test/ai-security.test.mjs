@@ -937,7 +937,7 @@ describe('the write surface: there is not one', () => {
    * every argument shape, the six read-only tools write nothing at all, and
    * `zelos_board` writes nothing except the two moves the four-item bar is
    * allowed — a due snooze woken, an overflow item demoted. No text, no
-   * deletion, no new row, and nothing outside `items`.
+   * deletion, no new item, and only matching automatic history outside `items`.
    */
   test('every tool, over HTTP, with every argument shape, writes nothing but the board bar', async () => {
     const r = await rig({ seed: boardTheRepairWillTouch() });
@@ -959,6 +959,7 @@ describe('the write surface: there is not one', () => {
       const configBefore = fs.readFileSync(path.join(r.home, 'config.json'), 'utf8');
       const before = snapshot();
       const itemsBefore = r.db.prepare('SELECT * FROM items ORDER BY id').all();
+      const historyBefore = r.db.prepare('SELECT * FROM item_history ORDER BY id').all();
 
       const everyShape = [
         {}, { limit: 50 }, { id: r.itemId }, { query: 'invoice' },
@@ -987,7 +988,7 @@ describe('the write surface: there is not one', () => {
 
       const after = snapshot();
       for (const table of tables) {
-        if (table === 'items') continue;
+        if (table === 'items' || table === 'item_history') continue;
         assert.equal(after[table], before[table], `the board read changed the ${table} table`);
       }
 
@@ -996,6 +997,7 @@ describe('the write surface: there is not one', () => {
         'the fixture is back to being one the repair has nothing to do on — this test proves nothing again');
       assert.equal(itemsAfter.length, itemsBefore.length, 'a read deleted or invented an item');
       const was = new Map(itemsBefore.map((row) => [row.id, row]));
+      const expectedHistory = [];
       for (const row of itemsAfter) {
         const prior = was.get(row.id);
         assert.ok(prior, 'a read invented an item');
@@ -1006,7 +1008,27 @@ describe('the write surface: there is not one', () => {
         assert.ok(['open', 'snoozed'].includes(row.state), `a read moved an item to ${row.state}`);
         assert.ok(row.bucket === prior.bucket || row.bucket === 'today',
           `a read moved an item to ${row.bucket}, which is not the demotion the bar performs`);
+        if (row.state !== prior.state) {
+          assert.equal(prior.state, 'snoozed');
+          assert.equal(row.state, 'open');
+          expectedHistory.push({ item_id: row.id, origin: 'automatic', kind: 'changed', changes: [
+            { field: 'state', before: prior.state, after: row.state },
+            { field: 'snoozed_until', before: prior.snoozed_until, after: row.snoozed_until },
+          ] });
+        }
+        if (row.bucket !== prior.bucket) expectedHistory.push({ item_id: row.id, origin: 'automatic', kind: 'changed', changes: [
+          { field: 'bucket', before: prior.bucket, after: row.bucket },
+        ] });
       }
+      const historyAfter = r.db.prepare('SELECT * FROM item_history ORDER BY id').all();
+      assert.deepEqual(historyAfter.slice(0, historyBefore.length), historyBefore, 'board repair rewrote earlier history');
+      const actualHistory = historyAfter.slice(historyBefore.length).map(({ item_id, origin, kind, changes_json, recorded_at }) => {
+        assert.ok(Number.isFinite(Date.parse(recorded_at)), 'automatic history needs an observed timestamp');
+        return { item_id, origin, kind, changes: JSON.parse(changes_json) };
+      });
+      const orderHistory = (rows) => rows.map((row) => JSON.stringify(row)).sort();
+      assert.deepEqual(orderHistory(actualHistory), orderHistory(expectedHistory),
+        'only the actual automatic demotion/wake may add history, once each');
       assert.equal(r.db.prepare("SELECT COUNT(*) AS n FROM items WHERE state = 'open' AND bucket = 'now'").get().n, 4,
         'the bar the repair exists to hold');
       assert.equal(dbm.getItem(r.db, r.asleep).state, 'open',

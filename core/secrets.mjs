@@ -48,7 +48,7 @@ const NOTES = {
   libsecret:
     'Stored in your desktop keyring via secret-tool (service "com.zelos.app"). Zelos never passes the value on a command line.',
   'encrypted-file':
-    'No system keychain was available, so secrets are stored in an AES-256-GCM encrypted file in your Zelos home, mode 0600, keyed by a random machine seed in .seed. This protects the file at rest — a copied disk or a stray backup is unreadable. It does NOT protect against a process already running as this user: that process can read .seed and decrypt the file exactly as Zelos does. Install a system keychain for stronger protection.',
+    'No system keychain was available, so secrets are stored in an AES-256-GCM encrypted file in your Zelos home, mode 0600, keyed by a random machine seed in .seed. A copy of the encrypted file needs that seed to decrypt it. A backup or disk copy containing both files can decrypt your credentials. It does NOT protect against a process already running as this user: that process can read .seed and decrypt the file exactly as Zelos does. Keep backups private. Install a system keychain for stronger protection.',
 };
 
 /* -------------------------------------------------------------- timeouts
