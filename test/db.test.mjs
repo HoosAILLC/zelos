@@ -114,7 +114,7 @@ test('migrate() is idempotent and versioned by PRAGMA user_version', () => {
   dbs.push(db);
 
   assert.equal(db.prepare('PRAGMA user_version').get().user_version, 0);
-  assert.deepEqual(migrate(db), { version: SCHEMA_VERSION, applied: 2 });
+  assert.deepEqual(migrate(db), { version: SCHEMA_VERSION, applied: 3 });
 
   upsertItem(db, ITEM, { runId: 'run_1' });
 
@@ -155,7 +155,7 @@ test('migration 2 upgrades a version-1 database without touching its rows', () =
               VALUES ('legacy1', 'now', 'Carried over from v1', 'snoozed', '2026-08-01T10:00:00-04:00', '2026-08-01T10:00:00-04:00')`).run();
   db.exec('PRAGMA user_version = 1');
 
-  assert.deepEqual(migrate(db), { version: 2, applied: 1 });
+  assert.deepEqual(migrate(db), { version: SCHEMA_VERSION, applied: 2 });
   const columns = db.prepare('PRAGMA table_info(items)').all().map((c) => c.name);
   assert.ok(columns.includes('snoozed_until'), 'v2 adds the snoozed_until column');
 

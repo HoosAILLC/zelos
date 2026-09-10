@@ -37,15 +37,17 @@ function linkFor(item) {
   return url.href;
 }
 
-function tick(item, { label = 'Mark done' } = {}) {
+function tick(item, { label = null } = {}) {
   const done = item.state === 'done';
   const node = el('button', {
     type: 'button',
     class: 'tick',
     role: 'checkbox',
+    disabled: item.sourceInactive === true,
+    title: item.sourceInactive ? 'Include this task in your source selection again to bring it back.' : null,
     'aria-checked': done ? 'true' : 'false',
-    'aria-label': `${label}: ${item.headline || 'item'}`,
-    onclick: () => setItemState(item.id, done ? 'open' : 'done'),
+    'aria-label': `${label || (done ? 'Reopen' : 'Mark done')}: ${item.headline || 'item'}`,
+    onclick: () => { if (!item.sourceInactive) setItemState(item.id, done ? 'open' : 'done'); },
   }, el('span', { class: 'tick-mark', 'aria-hidden': 'true' }));
   return node;
 }
@@ -172,22 +174,36 @@ function snoozeControl(item) {
       if (!open) {
         const tz = timezone();
         const min = addDaysToKey(todayKey(tz), 1);
+        const errorId = `snooze-date-error-${item.id}`;
+        const error = el('p', { id: errorId, class: 'quiet-note is-bad', role: 'status' });
+        const checkDate = (showEmpty = false) => {
+          const stamp = Date.parse(`${day.value}T12:00:00Z`);
+          const valid = /^\d{4}-\d{2}-\d{2}$/.test(day.value)
+            && Number.isFinite(stamp) && new Date(stamp).toISOString().slice(0, 10) === day.value
+            && day.value >= min;
+          const showError = !valid && (Boolean(day.value) || showEmpty);
+          confirm.disabled = !valid;
+          day.setAttribute('aria-invalid', showError ? 'true' : 'false');
+          error.textContent = showError ? 'Choose a valid date from tomorrow onward.' : '';
+          return valid;
+        };
         const day = el('input', {
           type: 'date',
           class: 'input snooze-day',
           min,
           'aria-label': 'The day it comes back',
-          oninput() { confirm.disabled = !this.value; },
+          'aria-describedby': errorId,
+          oninput() { checkDate(); },
         });
         const confirm = button('Back that morning · 9 AM', {
           class: 'btn quiet',
           disabled: true,
           onClick: () => {
-            if (!/^\d{4}-\d{2}-\d{2}$/.test(day.value) || day.value < min) return;
+            if (!checkDate(true)) return;
             setItemState(item.id, 'snoozed', { until: morningISO(day.value, tz) });
           },
         });
-        const pick = el('div', { class: 'snooze-pick', hidden: true }, [day, confirm]);
+        const pick = el('div', { class: 'snooze-pick', hidden: true }, [day, confirm, error]);
         replace(panel, [
           ...snoozeChoices(tz).map(({ label, when, until }) =>
             button(`${label} · ${when}`, {
@@ -253,7 +269,7 @@ function moreControls(item) {
 /** The dense row used by Today, Owed and the Now list. */
 export function itemRow(item, { tz, showBucket = true } = {}) {
   const sev = severityOf(item);
-  const { toggle, panel } = moreControls(item);
+  const { toggle, panel } = item.sourceInactive ? { toggle: null, panel: null } : moreControls(item);
   const link = linkFor(item);
 
   return el('article', {
@@ -269,8 +285,15 @@ export function itemRow(item, { tz, showBucket = true } = {}) {
         ]),
         item.why ? el('p', { class: 'why', text: item.why }) : null,
         metaLine(item, { tz }),
+        item.sourceInactive ? el('p', { class: 'quiet-note', text: 'No longer in task selection. To bring it back, include this task in your source selection again.' }) : null,
       ]),
       el('div', { class: 'row-tools' }, [
+        !item.sourceInactive && ['done', 'dismissed'].includes(item.state)
+          ? button(item.state === 'done' ? 'Reopen' : 'Restore', {
+            class: 'btn quiet',
+            'aria-label': `${item.state === 'done' ? 'Reopen' : 'Restore'}: ${item.headline || 'item'}`,
+            onClick: () => setItemState(item.id, 'open'),
+          }) : null,
         link ? el('a', {
           class: 'btn quiet',
           href: link,

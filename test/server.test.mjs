@@ -938,6 +938,53 @@ test('/api/ask says so plainly when nothing is indexed', async (t) => {
   assert.equal(upstream.received.length, 0);
 });
 
+test('inactive task history is opt-in for Search and explicitly historical in Ask', async (t) => {
+  const upstream = await startMockUpstream(t);
+  const ctx = await startServer(t, { config: baseConfig({
+    model: { protocol: 'openai', baseUrl: upstream.baseUrl, model: 'mock-model' },
+  }) });
+  const task = db.upsertMessage(ctx.db, {
+    sourceId: 'todoist', messageId: 'todoist:task:budget',
+    subject: 'Budget review obligation', text: 'Still open; budget review due tomorrow.',
+    date: '2026-09-01T12:00:00Z',
+  });
+  db.reconcileTaskActivity(ctx.db, { sourceId: 'todoist', prefix: 'todoist:task:', selection: 'all', complete: true, rows: [] });
+  const active = await call(ctx, 'GET', '/api/search?q=Budget');
+  assert.equal(active.status, 200);
+  assert.equal(active.json.results.length, 0);
+  const historical = await call(ctx, 'GET', '/api/search?q=Budget&includeHistory=1');
+  assert.equal(historical.json.results[0].ref, `msg:${task.id}`);
+  assert.equal(historical.json.results[0].sourceInactive, true);
+
+  const response = await fetch(`${ctx.base}/api/ask`, {
+    method: 'POST', headers: { 'X-Zelos-Token': ctx.token, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ question: 'What was the budget review obligation?' }),
+  });
+  assert.equal(response.status, 200);
+  const frames = (await readStream(response, null, { until: (f) => f.startsWith('event: done') })).map(parseFrame);
+  assert.equal(frames.find((f) => f.event === 'sources').data[0].sourceInactive, true);
+  const prompt = upstream.received.find((r) => r.url.startsWith('/chat/completions')).body.messages.map((m) => m.content).join('\n');
+  assert.match(prompt, /Historical task evidence/);
+  assert.match(prompt, /Absence does not prove completion/);
+});
+
+test('/api/state exposes durable source health without losing the last successful read', async (t) => {
+  const { recordSourceResults } = await import('../core/source-status.mjs');
+  const ctx = await startServer(t, { config: baseConfig({
+    sources: [{ id: 'tasks', type: 'todoist', enabled: true, keyRef: 'tasks.key', settings: {} }],
+  }) });
+  recordSourceResults(ctx.db, [{ id: 'tasks', kind: 'task', ok: true }], '2026-09-01T12:00:00Z');
+  recordSourceResults(ctx.db, [{ id: 'tasks', kind: 'task', ok: false, error: 'Could not connect' }], '2026-09-02T12:00:00Z');
+  const response = await call(ctx, 'GET', '/api/state');
+  assert.equal(response.status, 200);
+  const status = response.json.sourceStatus.find((s) => s.id === 'tasks');
+  assert.equal(status.ok, false);
+  assert.equal(status.lastSuccessAt, '2026-09-01T12:00:00.000Z');
+  assert.equal(status.lastAttemptAt, '2026-09-02T12:00:00.000Z');
+  assert.match(status.error, /Could not connect/);
+  assert.equal(status.keyRef, undefined);
+});
+
 test('/api/ask preserves non-streamed answers and records their usage', async (t) => {
   const upstream = await startMockUpstream(t, { jsonReply: {
     model: 'fallback-model', choices: [{ message: { content: 'Budget review is on Tuesday.' }, finish_reason: 'stop' }],

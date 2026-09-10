@@ -487,6 +487,7 @@ export default {
   /* Not `events`. An issue with a due date is something you owe, and the board
      puts what you owe in `now`/`today`/`soon` — never in the day's schedule. */
   sink: 'messages',
+  taskPrefix: 'linear:issue:',
 
   /* Reading Linear is a POST, because Linear has no read API that is not one.
      `ctx.http.postJson` refuses to work without this line
@@ -611,6 +612,7 @@ export default {
       viewer = { name: collapse(me.name).slice(0, NAME_CHARS), email: collapse(me.email).slice(0, NAME_CHARS) };
       const connection = me.assignedIssues ?? {};
       const nodes = Array.isArray(connection.nodes) ? connection.nodes : [];
+      if (!Array.isArray(connection.nodes)) partial = 'The response omitted the issue list.';
       // Not `issues.push(...nodes)`; see MAX_ISSUES. A spread is one call
       // argument per node, and a page big enough blows the stack instead of
       // being read or refused.
@@ -622,6 +624,11 @@ export default {
         issues.push(node);
       }
       const info = connection.pageInfo ?? {};
+      if (typeof info.hasNextPage !== 'boolean' || (info.hasNextPage && !collapse(info.endCursor))) {
+        partial = 'The response did not confirm whether more issue pages remain.';
+        break;
+      }
+      if (partial) break;
       if (info.hasNextPage !== true || !collapse(info.endCursor)) break;
       if (page === MAX_PAGES - 1) {
         /* Linear says there is another page and this sweep has no call left for
@@ -639,10 +646,12 @@ export default {
        transaction. Measured with two distinct issues: one row survived. A row
        that cannot be identified cannot be tracked between sweeps, so the drop is
        counted into the note rather than being silent. */
-    const usable = issues.filter((issue) => issue && typeof issue === 'object' && str(issue.id));
+    const usable = issues.filter(issue => issue && typeof issue === 'object' &&
+      (typeof issue.id === 'string' || (typeof issue.id === 'number' && Number.isFinite(issue.id))) && str(issue.id).trim());
     const unidentified = issues.length - usable.length;
 
     const ranked = usable
+      .filter(issue => !['completed', 'canceled'].includes(issue.state?.type))
       .map((issue) => ({ issue, ...dueness(issue.dueDate, today) }))
       .sort(byUrgency);
 
@@ -697,7 +706,10 @@ export default {
        `ctx.cursor`, and a stale one fed in leaves the outgoing variables
        identical. Clearing it would cost a `kv` write on every sweep forever to
        tidy a row nobody reads. */
-    return { parts: [{ label: '', rows, error: null, note }] };
+    return {
+      parts: [{ label: '', rows, error: null, note }],
+      taskSnapshot: { selection: JSON.stringify({ horizon, timezone: str(ctx.timezone) }), complete: !note && ctx.signal?.aborted !== true },
+    };
   },
 
   /**

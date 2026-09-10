@@ -37,6 +37,7 @@ import {
   upsertMessages,
   upsertEvents,
   reconcileEvents,
+  reconcileTaskActivity,
   listMessages,
   listEvents,
   listCaptures,
@@ -64,6 +65,7 @@ import {
   localTimezone,
 } from './time.mjs';
 import { log } from './log.mjs';
+import { recordSourceResults } from './source-status.mjs';
 
 const slog = log.child('[sweep]');
 
@@ -581,6 +583,7 @@ export async function runSweep({
     changedMessages: 0,
     changedEvents: 0,
     removedEvents: 0,
+    taskActivityChanges: 0,
     sourcesOk: 0,
     sourcesFailed: 0,
   };
@@ -589,6 +592,7 @@ export async function runSweep({
   const finish = (ok, error, extra = {}) => {
     stats.ms = Date.now() - startedMs;
     const endedAt = nowISO(tz);
+    recordSourceResults(db, sources, now);
     finishRun(db, runId, {
       ok,
       error,
@@ -685,7 +689,8 @@ export async function runSweep({
          `authResting` already writes to the debug log, so the user reads what
          the log reads: not until when, and that a new credential lifts it. */
       slog.debug(`source resting: ${label}`, { id: source.id, why: stillRefused });
-      sources.push({ kind: connector.family, id: source.id, label, ok: false, count: 0, error: storedError(stillRefused) });
+      sources.push({ kind: connector.family, id: source.id, label, ok: false, count: 0, error: storedError(stillRefused),
+        attempted: false, retryAt: new Date(state.authBlockedUntil).toISOString() });
       return nothing;
     }
 
@@ -733,11 +738,18 @@ export async function runSweep({
 
       const rows = [];
       let snapshotComplete = connector.sink === 'events' && result?.snapshotComplete === true;
+      // Only an opted-in task connector may describe a complete selection.
+      // The selection key records filter changes without storing their text.
+      const taskSnapshot = connector.taskPrefix && typeof result?.taskSnapshot?.selection === 'string' && result.taskSnapshot.selection
+        ? { prefix: connector.taskPrefix, selection: secretHash(result.taskSnapshot.selection),
+          complete: result.taskSnapshot.complete === true && Array.isArray(result.parts) && result.parts.length > 0 }
+        : null;
       const maxRows = Number.isInteger(connector.limits.maxRows) ? connector.limits.maxRows : null;
       for (const part of result?.parts || []) {
         const at = part.label ? `${label} / ${part.label}` : label;
         if (part.error) {
           snapshotComplete = false;
+          if (taskSnapshot) taskSnapshot.complete = false;
           slog.warn(`${connector.family} source failed: ${at}`, { error: storedError(part.error) });
           sources.push({ kind: connector.family, id: source.id, label: at, ok: false, count: 0, error: storedError(part.error) });
           continue;
@@ -752,6 +764,7 @@ export async function runSweep({
           kept = kept.slice(0, maxRows);
         }
         if (note || !Array.isArray(part.rows)) snapshotComplete = false;
+        if (taskSnapshot && (note || !Array.isArray(part.rows))) taskSnapshot.complete = false;
         rows.push(...kept.map(stampFor(connector, source)));
         sources.push({
           kind: connector.family,
@@ -764,7 +777,7 @@ export async function runSweep({
       }
 
       record({ lastOkAt: startedMs, notBefore: 0, authBlockedUntil: 0, secretHash: null });
-      return { sink: connector.sink, rows, cursor: result?.cursor, sourceId: source.id, snapshotComplete };
+      return { sink: connector.sink, rows, cursor: result?.cursor, sourceId: source.id, snapshotComplete, taskSnapshot };
     } catch (err) {
       slog.warn(`${connector.family} source failed: ${label}`, { error: storedError(err) });
       sources.push({ kind: connector.family, id: source.id, label, ok: false, count: 0, error: storedError(err) });
@@ -809,6 +822,12 @@ export async function runSweep({
     // Each sink commits separately. Preserve work from this successful write
     // before a later sink can fail, or its retry sees only unchanged rows.
     bumpPendingNew(db, m.inserted + m.changed);
+    for (const result of results) {
+      if (!result.taskSnapshot) continue;
+      const changed = reconcileTaskActivity(db, { sourceId: result.sourceId, ...result.taskSnapshot, rows: result.rows, now });
+      stats.taskActivityChanges += changed;
+      bumpPendingNew(db, changed);
+    }
     const e = upsertEvents(db, fetchedEvents, { now });
     stats.events = e.ids.length;
     stats.newEvents = e.inserted;
@@ -849,7 +868,7 @@ export async function runSweep({
   /* ---- 3. light or full ------------------------------------------- */
 
   let full = wantFull;
-  const sourceChanges = stats.newMessages + stats.newEvents + stats.changedMessages + stats.changedEvents + stats.removedEvents;
+  const sourceChanges = stats.newMessages + stats.newEvents + stats.changedMessages + stats.changedEvents + stats.removedEvents + stats.taskActivityChanges;
   if (!full && mode === 'auto' && sourceChanges > 0) {
     // This fetch itself brought in information the model has never seen. Waiting a
     // whole interval to think about it is exactly the delay the product exists
@@ -1255,7 +1274,7 @@ function recomputeDerived(db, { now = nowISO() } = {}) {
 
   const firstId = getKV(db, SWEEP_KV.first);
   const current = firstId ? getItem(db, firstId) : null;
-  if (!current || current.state !== 'open') {
+  if (!current || current.state !== 'open' || current.sourceInactive) {
     const board = listBoard(db, { states: ['open'], limit: 1 });
     setKV(db, SWEEP_KV.first, board.length ? board[0].id : '');
   }

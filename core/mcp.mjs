@@ -448,6 +448,7 @@ function itemView(row, rt) {
     severity: Number(row.severity) || 0,
     link: link(row.link),
     state: row.state,
+    sourceInactive: row.sourceInactive === true,
     firstSeen: row.first_seen || null,
     seenRuns: Number(row.seen_runs) || 0,
     sourceRefs: Array.isArray(row.sourceRefs)
@@ -479,6 +480,9 @@ function messageView(row, rt) {
     date: row.sent_at || null,
     snippet: text(row.snippet, 240),
     hasAttachments: !!row.has_attach,
+    taskActivity: row.task_activity || null,
+    taskObservedAt: row.task_observed_at || null,
+    taskInactiveReason: row.task_inactive_reason || null,
   };
   if (rt.state.bodies) {
     const body = typeof row.body === 'string' ? row.body : '';

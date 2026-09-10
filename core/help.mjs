@@ -280,7 +280,7 @@ function firstCheckPrompt() {
 
 /* The first open, docs/INSTALL.md. Shown on the website, not in the app — a person who can see the app is past it. */
 function installPrompt(platform) {
-  const download = `Zelos is downloaded from its own site${at(ZELOS_DOWNLOAD)}. The warning appears because nobody has paid the yearly fee that makes it go away, not because anything is wrong: the program is free, runs only on their computer, and anyone can read its code.`;
+  const download = `Zelos is downloaded from its own site${at(ZELOS_DOWNLOAD)}. These builds do not carry a verified publisher signature. A warning does not establish whether the program is safe. Use the official download and matching release checksums, and continue only if you trust this release.`;
   if (platform === 'windows') {
     return [
       'The screen they are on: the first run of the Zelos installer on Windows.',

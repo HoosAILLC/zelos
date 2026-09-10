@@ -41,6 +41,7 @@ function sourceList(sources) {
     el('ul', { class: 'sources-list' }, sources.map((s) => el('li', { class: 'source' }, [
       el('span', { class: 'source-kind mono', text: KIND_LABEL[s.kind] || s.kind || 'source' }),
       el('span', { class: 'source-title', text: s.title || s.ref }),
+      s.sourceInactive ? el('span', { class: 'source-excerpt', text: 'No longer in task selection' }) : null,
       s.excerpt ? el('span', { class: 'source-excerpt', text: s.excerpt }) : null,
     ]))),
   ]);

@@ -31,6 +31,7 @@ import { state, saveConfig, loadConfig, setAccent, applyAccent, currentAccent, D
 import { plural, tokenLine } from '../lib/format.js';
 import { monthName } from '../lib/time.js';
 import { aiAccessPanel } from './ai-access.js';
+import { sourceStatusLine } from '../lib/source-status.js';
 
 /**
  * The tab strip, in the order a person looks for things. The ids are routes
@@ -2373,6 +2374,7 @@ export function mailPanel({ compact = false, onDone = null, rerender } = {}) {
         account.enabled === false ? el('span', { class: 'chip', text: 'off' }) : null,
       ]),
       el('p', { class: 'quiet-note', text: `${account.user} · the last ${account.lookbackDays} days` }),
+      sourceStatusLine(account.id, 'mail'),
       el('div', { class: 'row-inline' }, [
         button(account.enabled === false ? 'Enable' : 'Disable', {
           class: 'btn quiet',
@@ -2722,6 +2724,7 @@ export function calendarPanel({ compact = false, onDone = null, rerender } = {})
         el('span', { class: 'quiet-note', text: KIND_WORDS[calendar.kind] || calendar.kind }),
       ]),
       el('p', { class: 'quiet-note', text: calendar.url }),
+      sourceStatusLine(calendar.id, 'calendars'),
       el('div', { class: 'row-inline' }, [
         button('Edit', {
           class: 'btn quiet',
@@ -2899,6 +2902,7 @@ export function sourcesPanel({ rerender } = {}) {
         el('span', { class: 'mono account-host', text: src.type }),
         src.enabled === false ? el('span', { class: 'chip', text: 'off' }) : null,
       ]),
+      sourceStatusLine(src.id, 'sources'),
       el('div', { class: 'row-inline' }, [
         button(src.enabled === false ? 'Enable' : 'Disable', {
           class: 'btn quiet',
