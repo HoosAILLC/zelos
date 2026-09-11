@@ -157,3 +157,19 @@ test('a full sweep contains an adversarial reply and keeps credentials out of mo
   assert.equal(getItemByKey(db, 'attack-result').link, null);
   assert.equal(result.stats.tokensOut, 50);
 });
+
+test('calendar descriptions respect a character limit below the usual snippet length', () => {
+  const description = `${'ordinary '.repeat(24)}FICTITIOUS-PAST-LIMIT`;
+  for (const bodyChars of [200, 0, 240]) {
+    const built = buildSweepPrompt({ now: NOW, privacy: { sendBodies: true, bodyChars, maxItemsPerSweep: 150 },
+      events: [{ id: 'calendar-cap-fixture', title: 'Fictional review', starts_at: NOW,
+        ends_at: '2026-09-10T15:00:00Z', description }],
+    });
+    const content = built.messages[0].content;
+    assert.ok(content.includes('Fictional review'), 'the event remains in context');
+    const notes = /^  notes: (.*)$/m.exec(content)?.[1] ?? '';
+    assert.ok(notes.length <= bodyChars, `calendar description exceeded ${bodyChars} characters`);
+    if (bodyChars >= description.length) assert.equal(notes, description, 'an in-budget description survives');
+    else assert.ok(!content.includes('FICTITIOUS-PAST-LIMIT'));
+  }
+});

@@ -1129,7 +1129,7 @@ export function buildSweepPrompt({
   const eventEntries = eventRows.map((e) => ({
     text: {
       bare: renderEvent(e, ctx, 'bare', 0),
-      plain: renderEvent(e, ctx, 'plain', sendBodies ? Math.max(SNIPPET_CHARS, Math.min(bodyChars, 600)) : 0),
+      plain: renderEvent(e, ctx, 'plain', sendBodies ? Math.min(bodyChars, 600) : 0),
     },
   }));
   const eventFit = fitSection(eventEntries, eventAllowance);
