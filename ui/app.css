@@ -687,6 +687,7 @@ textarea.input, .draft-body, .ask-field, .capture-field {
 
 .row-tools { display: flex; align-items: center; gap: 0.25rem; }
 .row-tools .btn { min-height: 2.25rem; padding: 0.3rem 0.6rem; font-size: 0.8125rem; }
+.source-link { max-width: min(40vw, 16rem); overflow-wrap: anywhere; }
 
 .disclosure {
   width: var(--tap);

@@ -825,6 +825,24 @@ test('one dead source does not cost the run the others', async () => {
   assert.equal(model.calls.length, 1, 'the model still got to think about what did arrive');
 });
 
+test('an unnamed calendar never uses its private subscription URL as a diagnostic label', async () => {
+  const db = fresh();
+  const privateUrl = 'https://calendar.example.invalid/private-ical-token-9372/basic.ics?token=fictional-5291';
+  for (const label of ['', 'Family calendar']) {
+    const progress = [];
+    const result = await runSweep({ db, mode: 'light', onProgress: event => progress.push(event),
+      config: baseConfig({ calendars: [{ id: 'c_private', enabled: true, kind: 'ics', label, url: privateUrl }] }),
+      deps: { getSecret: SECRETS, fetchEvents: async () => { throw new Error('Fixture calendar unavailable'); } },
+    });
+    const source = result.stats.sources[0];
+    assert.equal(source.ok, false);
+    assert.ok(source.label && source.label !== privateUrl);
+    if (label) assert.equal(source.label, label, 'an explicitly chosen label survives');
+    const visible = JSON.stringify({ result, progress, stored: getRun(db, result.runId) });
+    assert.ok(!visible.includes('private-ical-token-9372') && !visible.includes('fictional-5291'));
+  }
+});
+
 test('a calendar whose kind names no reader is still read as a subscribed .ics', async () => {
   /* enabledSources routes an unrecognised calendar kind — the hand-edited
      `webcal`, a legacy value — to the ics connector on purpose, but

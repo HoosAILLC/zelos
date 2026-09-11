@@ -4892,12 +4892,14 @@ test('Settings opens on Email, reads in plain words, keeps every route, and puts
   assert.match(onScreen(you), /If you leave this blank, the replies Zelos writes for you will not be signed\./);
   assert.doesNotMatch(onScreen(you), /prompt/, 'the You tab still talks about prompts');
 
-  // Privacy: two sentences and one switch on the card; the two numbers under Advanced.
+  // Privacy: explain hosted sharing and the content switch; numbers stay under Advanced.
   const privacy = settings.renderSettings({ sub: 'privacy', navigate() {}, rerender() {} });
-  assert.match(onScreen(privacy), /Zelos only talks to the AI service you chose\. It sends nothing to us and nothing to anyone else\./);
-  assert.match(onScreen(privacy), /Let the AI read the full text of your emails \(recommended — it does a better job\)/);
-  assert.doesNotMatch(onScreen(privacy), /Characters of each|Most items per|telemetry|endpoint/, 'the expert numbers are on the Privacy card');
-  assert.match(anywhere(privacy), /Characters of each email sent to the AI/, 'the expert numbers are gone rather than folded');
+  assert.match(onScreen(privacy), /AI reviews and Ask send selected board content to your chosen AI service/);
+  assert.match(onScreen(privacy), /With Claude, that content goes to Anthropic/);
+  assert.match(onScreen(privacy), /Include full message text and calendar descriptions in AI reviews/);
+  assert.match(onScreen(privacy), /questions, notes and existing board summaries can also contain private information/);
+  assert.doesNotMatch(onScreen(privacy), /Characters from each|Most items per|telemetry|endpoint/, 'the expert numbers are on the Privacy card');
+  assert.match(anywhere(privacy), /Characters from each message or calendar description/, 'the expert numbers are gone rather than folded');
 
   // About: one plain line on passwords, the spend as "AI usage today", the essay folded and un-shouted.
   const about = settings.renderSettings({ sub: 'about', navigate() {}, rerender() {} });

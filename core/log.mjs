@@ -1,5 +1,5 @@
 /**
- * core/log.mjs — logging that cannot leak a credential.
+ * core/log.mjs — logging with credential redaction.
  *
  * Zelos handles mail passwords and API keys. A log line is the easiest place
  * in a program for one of those to escape, so redaction happens here, on every
@@ -18,6 +18,8 @@ const SECRET_SHAPES = [
   /\bgsk_[A-Za-z0-9]{20,}/g,                // Groq
   /\bAIza[0-9A-Za-z_-]{20,}/g,              // Google
   /\bxai-[A-Za-z0-9]{16,}/g,
+  /\bGOCSPX-[A-Za-z0-9_-]{16,}/g,           // Google OAuth client secret
+  /\bya29\.[A-Za-z0-9._-]{16,}/g,          // Google OAuth access token
   // Zelos's own AI-access token (core/ai-access.mjs). It is the credential that
   // hands somebody's mail to another program, so it is redacted by shape as
   // well as by key name — a log line that interpolates one into a sentence
@@ -29,13 +31,70 @@ const SECRET_SHAPES = [
 
 /** Keys whose *value* is always redacted, whatever it looks like. */
 const SECRET_KEYS = new Set([
-  'pass', 'password', 'apikey', 'api_key', 'key', 'token', 'secret',
-  'authorization', 'x-api-key', 'sessiontoken', 'value',
+  'pass', 'password', 'passwd', 'apppassword', 'apikey', 'key', 'token', 'secret',
+  'authorization', 'xapikey', 'sessiontoken', 'value', 'credentials',
+  'accesstoken', 'refreshtoken', 'clientsecret', 'devicecode',
 ]);
+
+const normalizedKey = key => key.toLowerCase().replace(/[-_\s]/g, '');
+const URL_TEXT = /\b(?:https?|webcal):\/\/[^\s<>"'\\\x00-\x1f]+/gi;
+// Error strings can contain JSON or form fields instead of structured metadata.
+// Do not guess that an arbitrary UUID or a 16-letter word is a password: the
+// field name supplies that evidence. Quoted values can contain spaces/escapes.
+const SECRET_ASSIGNMENT = /((?:^|[^\w])['"]?(?:pass(?:word|wd)?|app[-_ ]?password|api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|client[-_ ]?secret|device[-_ ]?code|session[-_ ]?token|x-api-key|authorization|credentials|secret|token)['"]?\s*[:=]\s*)("(?:\\.|[^"\\])*"?|'(?:\\.|[^'\\])*'?|[^\s,;&}\]]+)/gi;
+
+/** A destination suitable for diagnostics: never a private path or URL grant. */
+export function diagnosticAddress(raw) {
+  try {
+    const url = new URL(String(raw).replace(/^webcal:/i, 'https:'));
+    return /^https?:$/.test(url.protocol) ? `${url.protocol}//${url.host}` : 'configured address';
+  } catch { return 'configured address'; }
+}
+
+function withUrlPunctuation(raw, transform) {
+  // Prose such as "(via host:port)" includes punctuation in URL_TEXT's token.
+  // Separate unmatched closing delimiters, while keeping IPv6 brackets and
+  // balanced parentheses in a URL path. Count once so long input stays linear.
+  const balance = { ')': 0, ']': 0, '}': 0 };
+  const opening = { '(': ')', '[': ']', '{': '}' };
+  for (const char of raw) {
+    if (Object.hasOwn(balance, char)) balance[char] += 1;
+    else if (opening[char]) balance[opening[char]] -= 1;
+  }
+  let end = raw.length;
+  while (end > 0) {
+    const char = raw[end - 1];
+    if (/[.,;!?]/.test(char)) end -= 1;
+    else if (balance[char] > 0) { balance[char] -= 1; end -= 1; }
+    else break;
+  }
+  return transform(raw.slice(0, end)) + raw.slice(end);
+}
+
+function redactUrl(raw) {
+  try {
+    const url = new URL(raw.replace(/^webcal:/i, 'https:'));
+    const secretQuery = [...url.searchParams.keys()].some(key =>
+      SECRET_KEYS.has(normalizedKey(key)) || /^(?:auth|credential|signature|sig|code)$/i.test(key));
+    // Subscription links are bearer grants even when they have no password
+    // field. Preserve normal source URLs: item history also uses redact().
+    if (url.username || url.password || secretQuery || /(?:\/private[-/]|\/calendar\/ical\/|\.ics(?:$|[?#]))/i.test(raw)) {
+      return `${diagnosticAddress(raw)}/[redacted]`;
+    }
+  } catch { /* a non-URL is handled by the other redactors */ }
+  return raw;
+}
+
+/** Untrusted diagnostic prose may echo an arbitrary secret subscription path. */
+export function diagnosticText(value) {
+  return redact(String(value ?? '')).replace(URL_TEXT, raw => withUrlPunctuation(raw, diagnosticAddress));
+}
 
 export function redact(input, seen = new WeakSet()) {
   if (typeof input === 'string') {
     let out = input;
+    out = out.replace(URL_TEXT, raw => withUrlPunctuation(raw, redactUrl));
+    out = out.replace(SECRET_ASSIGNMENT, (_match, prefix) => `${prefix}[redacted]`);
     for (const re of SECRET_SHAPES) out = out.replace(re, (m) => mask(m));
     return out;
   }
@@ -45,7 +104,7 @@ export function redact(input, seen = new WeakSet()) {
   if (Array.isArray(input)) return input.map((v) => redact(v, seen));
   const out = {};
   for (const [k, v] of Object.entries(input)) {
-    if (SECRET_KEYS.has(k.toLowerCase())) out[k] = typeof v === 'string' && v ? mask(v) : v ? '[redacted]' : v;
+    if (SECRET_KEYS.has(normalizedKey(k))) out[k] = typeof v === 'string' && v ? mask(v) : v ? '[redacted]' : v;
     else out[k] = redact(v, seen);
   }
   return out;

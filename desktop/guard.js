@@ -77,7 +77,7 @@ function portOf(url) {
   return DEFAULT_PORTS[url.protocol] ?? -1;
 }
 
-function safeTarget(raw) {
+export function safeTarget(raw) {
   try {
     const url = new URL(raw);
     return { scheme: url.protocol, host: url.hostname || null };

@@ -1120,6 +1120,20 @@ describe('the shell, booted against a stub Electron', () => {
     assert.equal(verdicts.at(-1), false);
   });
 
+  it('logs only the destination host when blocking an outbound request', () => {
+    const messages = [];
+    const previousWarn = booted.zelos.logger.warn;
+    booted.zelos.logger.warn = (message, meta) => messages.push({ message, meta });
+    try {
+      recorded.beforeRequest.handler({ url: 'https://blocked.example/private/FICTIONAL_PATH?value=FICTIONAL_QUERY#FICTIONAL_FRAGMENT' }, result => {
+        assert.equal(result.cancel, true);
+      });
+      assert.equal(messages.length, 1);
+      assert.deepEqual(messages[0].meta, { scheme: 'https:', host: 'blocked.example' });
+      assert.doesNotMatch(JSON.stringify(messages), /FICTIONAL_|private\/|value=/);
+    } finally { booted.zelos.logger.warn = previousWarn; }
+  });
+
   it('shuts WebRTC off: the board\'s CSP gains webrtc \'block\', and the peer layer gets no UDP', () => {
     /* WebRTC is not a URL request. ICE, STUN/TURN and data channels never
        enter the onBeforeRequest pipeline the test above exercises, and

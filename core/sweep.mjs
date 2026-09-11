@@ -628,20 +628,10 @@ export async function runSweep({
   const from = new Date(Date.now() - CALENDAR_BACK_DAYS * 86_400_000).toISOString();
   const to = new Date(Date.now() + CALENDAR_FORWARD_DAYS * 86_400_000).toISOString();
 
-  /**
-   * One loop, every source, whatever kind it is.
-   *
-   * This replaced two near-identical loops — one for mail, one for calendars —
-   * that between them held every string a user reads when a fetch goes wrong.
-   * The acceptance criterion for the replacement was that every one of those
-   * strings comes out byte-identical, so they are quoted here rather than
-   * rephrased: `label` falls through the same chain (`host` is undefined on a
-   * calendar and `url` is undefined on a mail account, so each lands where it
-   * always did — verified against both of the chains this replaced), and the
-   * no-password sentence is the sentence, not a description of one.
-   */
+  // Labels appear in progress, durable run history and logs. A subscribed
+  // calendar URL can itself be its bearer credential; never use it as a name.
   const sourceTasks = enabledSources(config).map(async ({ connector, source }) => {
-    const label = source.label || source.host || source.url || source.id;
+    const label = source.label || source.host || connector.label || source.id;
     const nothing = { sink: connector.sink, rows: [], cursor: undefined, sourceId: source.id };
     const state = readSourceState(db, source.id);
     const startedMs = Date.now();
