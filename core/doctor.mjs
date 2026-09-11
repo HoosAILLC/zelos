@@ -36,6 +36,7 @@ import { guessImapHost, testConnection as testImapConnection } from './sources/i
 import { testConnection as testCalDavConnection } from './sources/caldav.mjs';
 import { parseICS } from './sources/ics.mjs';
 import { safeUrl } from './safety.mjs';
+import { diagnosticAddress, diagnosticText } from './log.mjs';
 import { localTimezone, nowISO } from './time.mjs';
 /* The registry, for the same reason core/sweep.mjs reads it: a diagnostic that
    keeps its own list of source kinds is a second list, and the one that goes
@@ -897,12 +898,15 @@ function checkContext(connector, source, deps, { timeoutMs, signal, secret = nul
 }
 
 async function checkCalendar(calendar, deps, { timeoutMs, signal, timezone }) {
-  const name = calendar.label || calendar.url || calendar.id;
+  const address = diagnosticAddress(calendar.url);
+  const name = diagnosticText(calendar.label || address || calendar.id);
   const id = `calendar.${calendar.id}`;
   const label = `Calendar · ${name}`;
+  const report = (status, detail, action) => check(id, label, status, diagnosticText(detail),
+    action == null ? action : diagnosticText(action));
 
   if (!calendar.url) {
-    return check(id, label, 'fail', 'This calendar has no address.',
+    return report('fail', 'This calendar has no address.',
       'Open Settings → Calendars and paste the subscription link (it ends in .ics), the CalDAV server address, or the path to a local file.');
   }
 
@@ -916,13 +920,13 @@ async function checkCalendar(calendar, deps, { timeoutMs, signal, timezone }) {
   if (connector?.check) {
     try {
       const verdict = await connector.check(calendar, checkContext(connector, calendar, deps, { timeoutMs, signal, timezone }));
-      return check(id, label, verdict?.status ?? 'fail', verdict?.detail ?? '', verdict?.action ?? null);
+      return report(verdict?.status ?? 'fail', verdict?.detail ?? '', verdict?.action ?? null);
     } catch (err) {
       /* A check that throws is a bug in a connector, and a bug in a connector
          must not take the whole report down with it: the person running this
          command is already stuck, and "zelos doctor crashed" is the least
          useful thing it could tell them. */
-      return check(id, label, 'fail', `${calendar.url}: ${errorText(err)}`,
+      return report('fail', `${address}: ${errorText(err)}`,
         'That is a failure inside Zelos rather than in your settings. Check the address in Settings → Calendars, and report this if it keeps happening.');
     }
   }
@@ -935,7 +939,7 @@ async function checkCalendar(calendar, deps, { timeoutMs, signal, timezone }) {
   // webcal: is how Apple and friends publish an https .ics.
   const url = safeUrl(String(calendar.url).replace(/^webcal:/i, 'https:'));
   if (!url || !/^https?:/i.test(url)) {
-    return check(id, label, 'fail', `${calendar.url} is not an http, https or webcal address.`,
+    return report('fail', `${address} is not an http, https or webcal address.`,
       'Open Settings → Calendars and paste the subscription link your calendar provider gives you — it starts with https:// or webcal:// and usually ends in .ics.');
   }
 
@@ -980,14 +984,14 @@ async function checkCalendar(calendar, deps, { timeoutMs, signal, timezone }) {
     if (response.status >= 300 && response.status < 400) {
       const location = response.headers.get('location');
       if (!location) {
-        return check(id, label, 'fail', `${url} answered ${response.status} but did not say where to.`,
+        return report('fail', `${address} answered ${response.status} but did not say where to.`,
           'That is a broken redirect on the calendar host, not a setting here. Open the link in a browser: whatever it shows you is what Zelos is getting.');
       }
       const next = new URL(location, url);
       const sameOrigin = next.origin === new URL(url).origin;
       response = await request(next, sameOrigin);
       if (response.status >= 300 && response.status < 400) {
-        return check(id, label, 'fail', `${url} redirects more than once (via ${next.origin}), and Zelos follows exactly one hop.`,
+        return report('fail', `${address} redirects more than once (via ${next.origin}), and Zelos follows exactly one hop.`,
           `Copy the address it ends up at and paste that into Settings → Calendars instead. Zelos will not walk a redirect chain: each extra hop is another host contacting${calendar.user && calendar.keyRef ? ', with your calendar password attached whenever the origin has not changed' : ''}.`);
       }
     }
@@ -997,16 +1001,16 @@ async function checkCalendar(calendar, deps, { timeoutMs, signal, timezone }) {
         : response.status === 404
           ? 'That link no longer exists. Re-copy the subscription link from your calendar provider.'
           : 'Open the link in a browser: whatever it shows you is what Zelos is getting.';
-      return check(id, label, 'fail', `${url} answered ${response.status} ${response.statusText}`, advice);
+      return report('fail', `${address} answered ${response.status} ${response.statusText}`, advice);
     }
     const parsed = parseICS(await readCapped(response, MAX_ICS_BYTES));
     if (!parsed.vevents.length) {
-      return check(id, label, 'warn', `${url} is reachable but has no entries in it.`,
+      return report('warn', `${address} is reachable but has no entries in it.`,
         'That is fine if the calendar really is empty. If it should not be, check you copied the link for the right calendar.');
     }
-    return check(id, label, 'pass', `${parsed.calname || url} · ${parsed.vevents.length} entr${parsed.vevents.length === 1 ? 'y' : 'ies'}`);
+    return report('pass', `${parsed.calname || address} · ${parsed.vevents.length} entr${parsed.vevents.length === 1 ? 'y' : 'ies'}`);
   } catch (err) {
-    return check(id, label, 'fail', `${url}: ${errorText(err)}`,
+    return report('fail', `${address}: ${errorText(err)}`,
       'Check the address in Settings → Calendars, and that this machine can reach it. A subscription link that works in a browser will work here.');
   }
 }

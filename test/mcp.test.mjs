@@ -930,6 +930,22 @@ describe('JSON-RPC 2.0', () => {
     assert.equal((await handle([], c)).error.code, ERROR_CODES.INVALID_REQUEST);
   });
 
+  test('a nested batch entry is rejected without dispatching its request', async () => {
+    let dispatched = 0;
+    const c = { config: () => { dispatched += 1; return cfg(ALL_ON); } };
+    const res = await handle([[rpc('ping', undefined, 1)], rpc('ping', undefined, 2)], c);
+    assert.equal(dispatched, 1, 'only the ordinary request may reach its handler');
+    assert.equal(res.length, 2);
+    assert.equal(res[0].id, null);
+    assert.equal(res[0].error.code, ERROR_CODES.INVALID_REQUEST);
+    assert.deepEqual(res[1], { jsonrpc: '2.0', id: 2, result: {} });
+
+    const ordinary = await handle([rpc('ping', undefined, 3), rpc('ping', undefined, 4)], c);
+    assert.equal(dispatched, 3);
+    assert.deepEqual(ordinary.map(response => response.id), [3, 4]);
+    assert.ok(ordinary.every(response => response.result && !response.error));
+  });
+
   test('a missing database is an error object rather than a stack trace', async () => {
     const res = await call({ db: null, config: cfg(ALL_ON) }, 'zelos_board', {});
     assert.equal(res.error.code, ERROR_CODES.NO_DATABASE);
@@ -1254,6 +1270,31 @@ describe('the stdio transport', () => {
     assert.equal(parsed[0].error.code, ERROR_CODES.PARSE_ERROR);
     assert.equal(parsed[0].id, null);
     assert.deepEqual(parsed[1], { jsonrpc: '2.0', id: 7, result: {} });
+  });
+
+  test('a complete line over the configured size limit is refused before dispatch, then normal input still works', async () => {
+    const input = new PassThrough();
+    const output = new PassThrough();
+    let dispatched = 0;
+    let received = '';
+    output.on('data', chunk => { received += chunk.toString('utf8'); });
+    const limit = 128;
+    const server = createStdioServer({ input, output, maxLineChars: limit,
+      config: () => { dispatched += 1; return cfg(ALL_ON); } });
+    const normal = JSON.stringify(rpc('ping', undefined, 7));
+    const tooLong = normal + ' '.repeat(limit + 1 - normal.length);
+    assert.equal(tooLong.length, limit + 1);
+    server.start();
+    input.end(`${tooLong}\n${normal}\n`);
+    await server.done;
+    const parsed = received.trim().split('\n').map(line => JSON.parse(line));
+    assert.equal(dispatched, 1, 'the oversized line must not reach a request handler');
+    assert.equal(parsed[0].error.code, ERROR_CODES.INVALID_REQUEST);
+    assert.match(parsed[0].error.message, /128 characters/);
+    assert.deepEqual(parsed[1], { jsonrpc: '2.0', id: 7, result: {} });
+    const direct = await server.handleLine(tooLong);
+    assert.equal(direct.error.code, ERROR_CODES.INVALID_REQUEST, 'direct line handling uses the same limit');
+    assert.equal(dispatched, 1);
   });
 
   test('a message split across chunks — including mid-character — survives', async () => {

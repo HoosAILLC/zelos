@@ -105,7 +105,7 @@ import {
 } from './sources/caldav.mjs';
 import { parseICS } from './sources/ics.mjs';
 import { nowISO, toZonedISO, localTimezone, instant, offsetFor, addDaysToKey, todayKey } from './time.mjs';
-import { log } from './log.mjs';
+import { log, diagnosticAddress, diagnosticText } from './log.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
@@ -2182,12 +2182,12 @@ async function handleCalendarTest(ctx) {
   try {
     const response = await fetchIcsOnce(url, headers);
     if (!response.ok) {
-      sendJSON(ctx.res, 200, { ok: false, calendars: [], error: `${url} answered ${response.status} ${response.statusText}` });
+      sendJSON(ctx.res, 200, { ok: false, calendars: [], error: `${diagnosticAddress(url)} answered ${response.status}` });
       return;
     }
     const parsed = parseICS(await readCapped(response, MAX_ICS_BYTES));
     if (!parsed.vevents.length) {
-      sendJSON(ctx.res, 200, { ok: false, calendars: [], error: `${url} returned no calendar events` });
+      sendJSON(ctx.res, 200, { ok: false, calendars: [], error: `${diagnosticAddress(url)} returned no calendar events` });
       return;
     }
     sendJSON(ctx.res, 200, {
@@ -2197,7 +2197,8 @@ async function handleCalendarTest(ctx) {
       error: null,
     });
   } catch (err) {
-    sendJSON(ctx.res, 200, { ok: false, calendars: [], error: `${url}: ${err.message}` });
+    const message = pass ? String(err.message).split(pass).join('[redacted]') : err.message;
+    sendJSON(ctx.res, 200, { ok: false, calendars: [], error: `${diagnosticAddress(url)}: ${diagnosticText(message)}` });
   }
 }
 
@@ -2282,7 +2283,7 @@ function askContext(db, question, privacy) {
       facts.push(`when: ${row.starts_at || 'unknown'}${row.ends_at ? ` to ${row.ends_at}` : ''}`);
       if (row.location) facts.push(`where: ${row.location}`);
       if (row.organizer) facts.push(`organiser: ${row.organizer}`);
-      facts.push(cap(row.description, ASK_CONTEXT_CHARS));
+      if (privacy.sendBodies) facts.push(cap(row.description, Math.min(privacy.bodyChars, ASK_CONTEXT_CHARS)));
     } else if (hit.kind === 'item') {
       title = row.headline || '(no headline)';
       facts.push(`bucket: ${row.bucket}`, `state: ${row.state}`, cap(row.why, ASK_CONTEXT_CHARS));
@@ -2292,7 +2293,7 @@ function askContext(db, question, privacy) {
     }
 
     sources.push({ ref: hit.ref, kind: hit.kind, title: cap(title, 120), excerpt: cap(hit.excerpt, 200), ...(hit.sourceInactive ? { sourceInactive: true } : {}) });
-    blocks.push(`[${hit.ref}] ${title}\n${scrubForPrompt(facts.filter(Boolean).join('\n'))}`);
+    blocks.push(scrubForPrompt(`[${hit.ref}] ${cap(title, 240)}\n${facts.filter(Boolean).join('\n')}`));
   }
 
   return { sources, context: blocks.join('\n\n---\n\n') };

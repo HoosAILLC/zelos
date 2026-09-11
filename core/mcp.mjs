@@ -1652,7 +1652,11 @@ export async function handle(request, ctx = {}) {
     }
     const out = [];
     for (const entry of request) {
-      const res = await handle(entry, ctx);
+      // A batch contains request objects, never another batch. Reject an
+      // array here without dispatching anything inside it.
+      const res = Array.isArray(entry)
+        ? fail(null, ERROR_CODES.INVALID_REQUEST, 'a batch entry must be a JSON request object')
+        : await handle(entry, ctx);
       if (res) out.push(res);
     }
     return out.length ? out : null;
@@ -1711,7 +1715,12 @@ export function createStdioServer({
   transport = 'stdio',
   tokenId = null,
   scopes = null,
+  // Tests and embedders may lower the ceiling, never raise the production cap.
+  maxLineChars = MAX_LINE_CHARS,
 } = {}) {
+  if (!Number.isSafeInteger(maxLineChars) || maxLineChars < 1 || maxLineChars > MAX_LINE_CHARS) {
+    throw new TypeError(`maxLineChars must be an integer between 1 and ${MAX_LINE_CHARS}`);
+  }
   const decoder = new TextDecoder('utf-8');
   let pending = '';
   /* Set when a message runs past MAX_LINE_CHARS with no newline in sight. The
@@ -1738,6 +1747,14 @@ export function createStdioServer({
   }
 
   async function processLine(line) {
+    // Also check complete frames: a newline in the same chunk bypasses the
+    // incomplete-buffer guard below. Direct handleLine calls share this gate.
+    if (line.length > maxLineChars) {
+      handled += 1;
+      const res = tooLong();
+      write(res);
+      return res;
+    }
     const trimmed = line.trim();
     if (!trimmed) return null;
     handled += 1;
@@ -1774,7 +1791,7 @@ export function createStdioServer({
   const tooLong = () => fail(
     null,
     ERROR_CODES.INVALID_REQUEST,
-    `a single message may not exceed ${MAX_LINE_CHARS} characters`,
+    `a single message may not exceed ${maxLineChars} characters`,
   );
 
   function onData(chunk) {
@@ -1796,7 +1813,7 @@ export function createStdioServer({
       }
       cut = pending.indexOf('\n');
     }
-    if (pending.length > MAX_LINE_CHARS) {
+    if (pending.length > maxLineChars) {
       overlong = true;
       pending = '';
     }

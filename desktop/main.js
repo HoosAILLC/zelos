@@ -45,7 +45,7 @@ import {
   app, BrowserWindow, Menu, Tray, dialog, ipcMain, nativeImage, nativeTheme, screen, session, shell,
 } from 'electron';
 
-import { classifyTarget, guardWebContents } from './guard.js';
+import { classifyTarget, guardWebContents, safeTarget } from './guard.js';
 import { buildAppMenuTemplate, buildTrayMenuTemplate, VIEWS } from './menus.js';
 import { startCore } from './runtime.js';
 import { clampToDisplays, WindowState } from './window-state.js';
@@ -489,7 +489,7 @@ function hardenSession(ses) {
   ses.webRequest.onBeforeRequest({ urls: ['<all_urls>'] }, (details, callback) => {
     const verdict = classifyTarget(details.url, { port: zelos?.port ?? 0 });
     if (verdict.action !== 'internal') {
-      zelos?.logger.warn('desktop: cancelled an outbound request from the board', { url: verdict.url });
+      zelos?.logger.warn('desktop: cancelled an outbound request from the board', safeTarget(verdict.url));
     }
     callback({ cancel: verdict.action !== 'internal' });
   });

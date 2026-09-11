@@ -107,6 +107,32 @@ const ICS = [
   'SUMMARY:Standup', 'END:VEVENT', 'END:VCALENDAR', '',
 ].join('\r\n');
 
+test('calendar diagnostics never disclose a private subscription path or echoed credentials', async (t) => {
+  const privateUrl = 'https://calendar.example/arbitrary-fictional-secret?opaque=fictional-query#fictional-fragment';
+  const scenarios = [
+    ['refused', async () => new Response('', { status: 403, statusText: 'Forbidden' }), 'fail'],
+    ['empty', async () => new Response('BEGIN:VCALENDAR\r\nEND:VCALENDAR'), 'warn'],
+    ['unnamed calendar', async () => new Response(ICS.replace('X-WR-CALNAME:Team\r\n', '')), 'pass'],
+    ['network error', async () => { throw new Error(`could not fetch ${privateUrl}`); }, 'fail'],
+    ['redirect missing', async () => new Response('', { status: 302 }), 'fail'],
+    ['redirect chain', async () => new Response('', { status: 302, headers: { location: privateUrl } }), 'fail'],
+    ['credential in URL', async () => { throw new Error('must not fetch rejected URL'); }, 'fail',
+      'https://user:fictional-password@calendar.example/arbitrary-fictional-secret'],
+  ];
+  for (const [name, fetchImpl, status, url = privateUrl] of scenarios) {
+    await t.test(name, async () => {
+      freshHome({ config: { calendars: [{ id: 'c_private', kind: 'ics', enabled: true, label: '', url, user: '', keyRef: null }] } });
+      const result = byId(await diagnose({ deps: { ...SILENT_DEPS, fetchImpl } }), 'calendar.c_private');
+      assert.equal(result.status, status);
+      const output = JSON.stringify(result);
+      for (const secret of ['arbitrary-fictional-secret', 'fictional-query', 'fictional-fragment', 'fictional-password']) {
+        assert.equal(output.includes(secret), false, 'subscription credential reached doctor output');
+      }
+      assert.match(output, /calendar\.example/);
+    });
+  }
+});
+
 /* ================================================================== *
  * 1. The database, actually opened
  * ================================================================== */
@@ -640,7 +666,7 @@ describe('the calendar probes that belong to a connector', () => {
       },
     }), 'calendar.c_1');
     assert.equal(ok.status, 'pass', ok.detail);
-    assert.match(ok.detail, /2 calendars at https:\/\/dav\.example\.com\//);
+    assert.equal(ok.detail, '2 calendars at https://dav.example.com');
     // The stored password is handed over, or this is a test of an anonymous
     // connection rather than of the user's account.
     assert.equal(asked[0].pass, 'hunter2');

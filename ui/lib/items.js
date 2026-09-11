@@ -24,18 +24,19 @@ import {
 /* Every deadline on a row goes through dueBit() below, which is the only place
  * in this module allowed to call dueLabel/isOverdue — see its own note. */
 
-/** A safe external link, or null. The server already screened it; so do we. */
+/** A web source link with its actual destination visible, or null. Mailto
+ * actions belong to the user's draft controls, not generated board links. */
 function linkFor(item) {
   const raw = item?.link;
   if (typeof raw !== 'string' || !raw) return null;
   let url;
   try {
-    url = new URL(raw, window.location.href);
+    url = new URL(raw);
   } catch {
     return null;
   }
-  if (url.protocol !== 'http:' && url.protocol !== 'https:' && url.protocol !== 'mailto:') return null;
-  return url.href;
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+  return { href: url.href, label: `Open ${url.host}` };
 }
 
 function tick(item, { label = null } = {}) {
@@ -299,11 +300,11 @@ export function itemRow(item, { tz, showBucket = true } = {}) {
             onClick: () => setItemState(item.id, 'open'),
           }) : null,
         link ? el('a', {
-          class: 'btn quiet',
-          href: link,
+          class: 'btn quiet source-link',
+          href: link.href,
           rel: 'noreferrer noopener',
           target: '_blank',
-          text: 'Open',
+          text: link.label,
         }) : null,
         toggle,
       ]),
@@ -344,11 +345,11 @@ export function itemHero(item, { tz } = {}) {
       button('Done', { class: 'btn solid', onClick: () => setItemState(item.id, 'done') }),
       snooze.toggle,
       link ? el('a', {
-        class: 'btn quiet',
-        href: link,
+        class: 'btn quiet source-link',
+        href: link.href,
         rel: 'noreferrer noopener',
         target: '_blank',
-        text: 'Open',
+        text: link.label,
       }) : null,
       more.toggle,
     ]),

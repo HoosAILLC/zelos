@@ -23,6 +23,7 @@ import {
   scrubForPrompt,
   wrapUntrusted,
   validateSweep,
+  safeUrl,
 } from './safety.mjs';
 import {
   nowISO,
@@ -259,6 +260,12 @@ sourceRefs
 Cite ids exactly as printed: msg:6d1f2a, evt:0a3c91, cap:7b20de. Never invent one, never edit
 one, never cite something you were not shown. A ref that does not resolve is dropped and the
 item loses its receipts.
+
+link
+Use an exact http or https URL from a source you cite, or null. Never construct a destination,
+add a query parameter or fragment, or put information from another source into a URL. A link
+that does not occur in a cited source is cleared in code. Drafts have their own review control;
+do not create mailto links.
 
 dueAt
 Copy the offset exactly as written (2026-08-11T14:00:00-04:00). Do not convert to UTC, do not
@@ -650,12 +657,16 @@ function clean(text, limit) {
   return cap(scrubForPrompt(str(text)), limit);
 }
 
+function cleanLine(text, limit) {
+  return clean(text, limit).replace(/\s+/g, ' ');
+}
+
 function addrLine(list, limit = 4) {
   const parts = list
     .slice(0, limit)
     .map((a) => {
-      const name = clean(a?.name, 60);
-      const email = clean(a?.email, 120);
+      const name = cleanLine(a?.name, 60);
+      const email = cleanLine(a?.email, 120);
       if (name && email) return `${name} <${email}>`;
       return email || name;
     })
@@ -665,13 +676,15 @@ function addrLine(list, limit = 4) {
 }
 
 function shortThread(key) {
-  const s = str(key);
+  // Thread ids come from sender-controlled headers or imported task metadata,
+  // just like subjects. Keep their template tokens/newlines out of the header.
+  const s = scrubForPrompt(str(key)).replace(/\s+/g, ' ');
   return s.length <= 44 ? s : `${s.slice(0, 41)}...`;
 }
 
 function messageHeader(msg, ctx) {
-  const ref = msg.id ? `[msg:${msg.id}]` : '[msg:none — no stored id, do not cite]';
-  const when = msg.sentAt || 'unknown time';
+  const ref = msg.id ? `[msg:${cleanLine(msg.id, 100)}]` : '[msg:none — no stored id, do not cite]';
+  const when = cleanLine(msg.sentAt, 100) || 'unknown time';
   const delta = msg.sentAt ? ` (${humanDelta(msg.sentAt, ctx.nowMs)})` : '';
   const flags = msg.flags.map((f) => f.toLowerCase());
   const marks = [];
@@ -703,7 +716,7 @@ function messageHeader(msg, ctx) {
   if (to) lines.push(`  to: ${to}`);
   const cc = addrLine(msg.cc, 3);
   if (cc) lines.push(`  cc: ${cc}`);
-  lines.push(`  subject: ${clean(msg.subject, 200) || '(none)'}`);
+  lines.push(`  subject: ${cleanLine(msg.subject, 200) || '(none)'}`);
   return lines.join('\n');
 }
 
@@ -727,7 +740,7 @@ function renderMessage(msg, ctx, level, bodyChars) {
 }
 
 function renderEvent(ev, ctx, level, descriptionChars) {
-  const ref = ev.id ? `[evt:${ev.id}]` : '[evt:none — no stored id, do not cite]';
+  const ref = ev.id ? `[evt:${cleanLine(ev.id, 100)}]` : '[evt:none — no stored id, do not cite]';
   const when = ev.allDay
     ? `${formatDay(ev.startsAt)} (all day)`
     : `${formatDay(ev.startsAt)} ${formatTime(ev.startsAt)}-${formatTime(ev.endsAt)}`;
@@ -737,19 +750,19 @@ function renderEvent(ev, ctx, level, descriptionChars) {
     rel === 0 ? 'TODAY' : rel === 1 ? 'tomorrow' : rel !== null && rel < 0 ? `${-rel}d ago` : rel !== null ? `in ${rel}d` : '';
 
   const lines = [
-    `${ref} ${when}${relWord ? ` — ${relWord}` : ''} · start=${ev.startsAt} end=${ev.endsAt} uid=${clean(ev.uid, 60) || '(none)'}`,
-    `  title: ${clean(ev.title, 160) || '(untitled)'}`,
+    `${ref} ${when}${relWord ? ` — ${relWord}` : ''} · start=${cleanLine(ev.startsAt, 100)} end=${cleanLine(ev.endsAt, 100)} uid=${cleanLine(ev.uid, 60) || '(none)'}`,
+    `  title: ${cleanLine(ev.title, 160) || '(untitled)'}`,
   ];
-  if (ev.location) lines.push(`  where: ${clean(ev.location, 120)}`);
+  if (ev.location) lines.push(`  where: ${cleanLine(ev.location, 120)}`);
   const people = [];
-  if (ev.organizer) people.push(`organizer ${clean(ev.organizer, 120)}`);
+  if (ev.organizer) people.push(`organizer ${cleanLine(ev.organizer, 120)}`);
   if (ev.attendees.length) {
     people.push(
       `${ev.attendees.length} attendee${ev.attendees.length === 1 ? '' : 's'}: ${addrLine(ev.attendees, 5)}`,
     );
   }
-  if (ev.rsvp) people.push(`your RSVP: ${clean(ev.rsvp, 24)}`);
-  if (ev.status && ev.status.toUpperCase() !== 'CONFIRMED') people.push(`status ${clean(ev.status, 24)}`);
+  if (ev.rsvp) people.push(`your RSVP: ${cleanLine(ev.rsvp, 24)}`);
+  if (ev.status && ev.status.toUpperCase() !== 'CONFIRMED') people.push(`status ${cleanLine(ev.status, 24)}`);
   if (people.length) lines.push(`  ${people.join(' · ')}`);
   // A DESCRIPTION is free text somebody wrote, so it is body content: with
   // privacy.sendBodies off it does not travel at all.
@@ -761,7 +774,7 @@ function renderEvent(ev, ctx, level, descriptionChars) {
 
 function renderCapture(capture, ctx) {
   const when = capture.createdAt ? humanDelta(capture.createdAt, ctx.nowMs) : 'unknown';
-  return `[cap:${capture.id}] typed ${when} (${capture.createdAt})\n  ${clean(capture.text, CAPTURE_CHARS).replace(/\n/g, '\n  ')}`;
+  return `[cap:${cleanLine(capture.id, 100)}] typed ${when} (${cleanLine(capture.createdAt, 100)})\n  ${clean(capture.text, CAPTURE_CHARS).replace(/\n/g, '\n  ')}`;
 }
 
 function renderPriorItem(item, ctx) {
@@ -769,12 +782,12 @@ function renderPriorItem(item, ctx) {
   const carried = age === null ? '' : age <= 0 ? 'first seen today' : `carried ${age}d`;
   const bits = [
     `key=${clean(item.key, 120) || '(missing)'}`,
-    `bucket=${item.bucket}`,
-    `state=${item.state}`,
+    `bucket=${cleanLine(item.bucket, 24)}`,
+    `state=${cleanLine(item.state, 24)}`,
     `seen in ${item.seenRuns} run${item.seenRuns === 1 ? '' : 's'}`,
   ];
   if (carried) bits.push(carried);
-  if (item.dueAt) bits.push(`due=${item.dueAt}`);
+  if (item.dueAt) bits.push(`due=${cleanLine(item.dueAt, 100)}`);
   return `- ${clean(item.headline, 90)}\n    ${bits.join(' · ')}`;
 }
 
@@ -934,7 +947,7 @@ function applyItemCap(counts, maxItems) {
  *
  * `privacy.sendBodies:false` is honoured literally: no message body text is
  * placed in the prompt at all, only headers and the stored ≤240-character
- * snippet, and event descriptions are held to the same length.
+ * snippet, and event descriptions are omitted.
  */
 export function buildSweepPrompt({
   identity = {},
@@ -1340,6 +1353,46 @@ export function buildSweepPrompt({
 
 const REF_KIND = { msg: 'mail', evt: 'calendar', cap: 'capture' };
 
+/**
+ * Extract candidate source links without fetching them. These are provenance,
+ * not a reputation check: even an exact URL in an email may be phishing.
+ * Scans are bounded and a token cut off at the boundary is never accepted as
+ * a shorter URL. Only source text is inspected, never earlier model output.
+ */
+function sourceLinks(ref, row) {
+  const links = new Set();
+  const add = value => {
+    const url = safeUrl(value);
+    if (url && /^https?:\/\//i.test(url)) links.add(url);
+  };
+  const kind = ref.slice(0, 3);
+  if (kind === 'evt') add(row.url);
+  const fields = kind === 'msg' ? [row.subject, row.snippet, row.body]
+    : kind === 'evt' ? [row.title, row.location, row.description]
+      : kind === 'cap' ? [row.text] : [];
+  for (const field of fields) {
+    if (typeof field !== 'string') continue;
+    const text = field.slice(0, 65_536);
+    let examined = 0;
+    for (const match of text.matchAll(/\bhttps?:\/\/[^\s<>"'\x00-\x1f]+/gi)) {
+      if (++examined > 256) break;
+      if (field.length > text.length && match.index + match[0].length === text.length) continue;
+      if (match[0].length > 2048) continue;
+      // URLs written in prose/Markdown commonly end before a sentence's full
+      // stop or an unmatched closing parenthesis. Balanced URL parentheses stay.
+      let value = match[0].replace(/[.,;!?]+$/, '');
+      const opens = value.match(/\(/g)?.length || 0;
+      let closes = value.match(/\)/g)?.length || 0;
+      while (value.endsWith(')') && closes > opens) {
+        value = value.slice(0, -1);
+        closes--;
+      }
+      add(value);
+    }
+  }
+  return links;
+}
+
 function kindFor(refs) {
   const kinds = new Set(refs.map((r) => REF_KIND[r.slice(0, 3)]).filter(Boolean));
   if (kinds.size === 0) return 'derived';
@@ -1377,12 +1430,15 @@ export function mergeSweep(db, parsed, { runId = null, now = nowISO() } = {}) {
   };
   const merged = [];
   const firstId = value.first ? itemRowId(value.first) : null;
+  const sourceRows = new Map();
+  const linksByRef = new Map();
 
   withTransaction(db, () => {
     for (const item of value.items) {
       const refs = [];
       for (const ref of item.sourceRefs) {
-        if (resolveRef(db, ref)) {
+        if (!sourceRows.has(ref)) sourceRows.set(ref, resolveRef(db, ref));
+        if (sourceRows.get(ref)) {
           refs.push(ref);
         } else {
           stats.droppedRefs += 1;
@@ -1391,6 +1447,18 @@ export function mergeSweep(db, parsed, { runId = null, now = nowISO() } = {}) {
             message: `"${ref}" names no stored message, event or note; dropped`,
           });
         }
+      }
+
+      let link = null;
+      if (item.link) {
+        for (const ref of refs) {
+          if (!linksByRef.has(ref)) linksByRef.set(ref, sourceLinks(ref, sourceRows.get(ref)));
+          if (linksByRef.get(ref).has(item.link)) { link = item.link; break; }
+        }
+        if (!link) errors.push({
+          path: `items[key=${item.key}].link`,
+          message: 'link is not an exact HTTP(S) URL in a cited source; cleared',
+        });
       }
 
       const prior = getItemByKey(db, item.key);
@@ -1406,7 +1474,7 @@ export function mergeSweep(db, parsed, { runId = null, now = nowISO() } = {}) {
           personEmail: item.personEmail,
           dueAt: item.dueAt,
           severity: item.severity,
-          link: item.link,
+          link,
           sourceRefs: refs,
           // The schema has no `key` column — the row id is its hash — so the key
           // is carried in the payload, where the UI and the next run can read it.

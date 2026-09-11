@@ -1050,12 +1050,13 @@ test('a model result that is not usable still leaves the database consistent', (
 
 test('unsafe strings from the model never reach a row', () => {
   const db = fresh();
+  const source = insertCapture(db, 'Review https://example.com/x');
   mergeSweep(db, {
     first: null,
     items: [
       { key: 'k-script', bucket: 'now', headline: 'Open <script>alert(1)</script>', why: '', severity: 3, sourceRefs: [] },
       { key: 'k-link', bucket: 'note', headline: 'A note with a bad link', why: '', severity: 0, sourceRefs: [], link: 'javascript:alert(1)' },
-      { key: 'k-ok', bucket: 'note', headline: 'A note with a good link', why: '', severity: 0, sourceRefs: [], link: 'https://example.com/x' },
+      { key: 'k-ok', bucket: 'note', headline: 'A note with a good link', why: '', severity: 0, sourceRefs: [`cap:${source.id}`], link: 'https://example.com/x' },
     ],
     notes: [],
   }, { runId: 'run_m', now: NOW });

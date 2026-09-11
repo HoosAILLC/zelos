@@ -472,7 +472,7 @@ server some stray web page can be pointed at.
    `secrets.backend.json`.
 
 **Settings → Your data** inside the app shows the exact path and offers a board
-snapshot containing the current board and settings without passwords. The desktop
+snapshot containing private board content, excluding connection settings and diagnostics. The desktop
 app also offers backup and restore; a board snapshot alone cannot restore the full archive. The
 `Board → Show data folder` and `Board → Show logs` menu items open these
 directly.

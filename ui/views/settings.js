@@ -3142,16 +3142,16 @@ function privacyPanel() {
   const maxInput = input({ type: 'number', value: String(cfg.maxItemsPerSweep), min: '10', max: '1000' });
 
   return el('div', { class: 'panel' }, [
-    el('p', { class: 'panel-lede', text: 'Zelos only talks to the AI service you chose. It sends nothing to us and nothing to anyone else.' }),
-    checkbox('Let the AI read the full text of your emails (recommended — it does a better job)', {
+    el('p', { class: 'panel-lede', text: 'AI reviews and Ask send selected board content to your chosen AI service. With Claude, that content goes to Anthropic. Your connected accounts also contact their own services when Zelos checks for updates.' }),
+    checkbox('Include full message text and calendar descriptions in AI reviews', {
       checked: sendBodies,
       onChange: (v) => { sendBodies = v; },
-      hint: 'Switched off, the AI sees only who wrote, the subject, and the first couple of lines. It will be worse at judging what matters, and it will say less about why.',
+      hint: 'Switched off, email and text previews, sender names, subjects and basic calendar details can still be shared. Your questions, notes and existing board summaries can also contain private information. This reduces sharing; it does not make hosted AI local.',
     }),
     fold('Advanced', [
       el('p', { class: 'quiet-note', text: 'There is no telemetry, analytics or remote font. Reading and AI use your configured services; Check for updates contacts GitHub only when you press it. These two numbers cap what each AI request carries.' }),
       el('div', { class: 'grid-2' }, [
-        field('Characters of each email sent to the AI', charsInput),
+        field('Characters from each message or calendar description', charsInput),
         field('Most items per check', maxInput),
       ]),
     ]),
@@ -3258,12 +3258,24 @@ function dataPanel() {
   async function exportSnapshot() {
     status.working('Gathering…');
     try {
-      const [board, config] = await Promise.all([api.state(), api.config()]);
+      const board = await api.state();
+      // Export board content deliberately, not connection settings or transport
+      // diagnostics. Private feed URLs can themselves be bearer credentials.
+      const pick = (record, fields) => Object.fromEntries(fields
+        .filter(key => Object.hasOwn(record, key)).map(key => [key, record[key]]));
+      const exportedBoard = pick(board, [
+        'items', 'counts', 'finished', 'events', 'drafts', 'notes', 'first', 'eventWindow', 'now',
+      ]);
+      // Older or extended event records may carry raw calendar blobs. Keep only
+      // the event's content fields, which are still private and not safe to share.
+      exportedBoard.events = (board.events || []).map(event => pick(event, [
+        'id', 'calendar_id', 'uid', 'recurrence_id', 'title', 'description', 'location',
+        'starts_at', 'ends_at', 'all_day', 'organizer', 'attendees', 'rsvp', 'status', 'url',
+      ]));
       const payload = JSON.stringify({
         exportedAt: new Date().toISOString(),
         version: state.health?.version || null,
-        config: config.config,
-        board,
+        board: exportedBoard,
       }, null, 2);
       const blob = new Blob([payload], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
@@ -3272,7 +3284,7 @@ function dataPanel() {
       a.click();
       a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 10_000);
-      status.good('Board snapshot saved. It contains no passwords and is not a full backup.');
+      status.good('Board snapshot download started. It contains private board content and excludes connection settings. Keep it private; it is not a full backup.');
     } catch (err) {
       status.bad(err.message);
     }
@@ -3303,7 +3315,7 @@ function dataPanel() {
         : button('Copy the folder path', { class: 'btn solid', onClick: copyPath }),
       button('Save board snapshot', { class: 'btn quiet', onClick: exportSnapshot }),
     ]),
-    el('p', { class: 'quiet-note', text: 'The snapshot includes the current board and settings, without passwords. It does not include your full mail archive, captures or complete item history. Use a backup to restore your data.' }),
+    el('p', { class: 'quiet-note', text: 'The snapshot contains private board content and excludes connection settings. Keep it private. It does not include your full mail archive, captures or complete item history. Use a backup to restore your data.' }),
     canShowFolder() ? null : el('p', { class: 'quiet-note', text: folderHint(platform) }),
     section('Erasing everything', {}, [
       el('p', { class: 'quiet-note', text: 'To erase everything: quit Zelos, then drag this folder to the Trash and empty the Trash.' }),
