@@ -422,7 +422,7 @@ function armShowcase() {
   const buttons = [...document.querySelectorAll('[data-shot]')];
   const select = (button) => {
     if (!button) return;
-    const src = `/img/current/${button.dataset.shot}.png`;
+    const src = `/img/workspace/${button.dataset.shot}.png`;
     shot.src = src;
     shot.alt = `Zelos ${button.textContent} screen. ${button.dataset.description} Actual current app with sample records.`;
     document.querySelector('[data-full-shot]').href = src;
