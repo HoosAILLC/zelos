@@ -45,13 +45,14 @@ function syncRoute() {
 
 function build() {
   const bar = el('div', { class: 'demo-bar', role: 'note', 'aria-label': 'Demo notice' }, [
-    el('span', { class: 'demo-bar-tag', text: 'Demo' }),
+    el('span', { class: 'demo-bar-tag', text: 'Earlier release demo' }),
     el('p', { class: 'demo-bar-text' }, [
       el('span', { class: 'demo-bar-em', text: 'This is a demo. The data is invented and nothing is saved' }),
-      el('span', { text: ' — reload and the board starts over. ' }),
+      el('span', { text: ' — this is the earlier interface. Reload and the board starts over. ' }),
       warn,
     ]),
     el('div', { class: 'demo-bar-actions' }, [
+      el('a', { class: 'demo-bar-link', href: '/#walkthrough', text: 'See the new app' }),
       el('button', {
         type: 'button',
         class: 'demo-bar-btn',
