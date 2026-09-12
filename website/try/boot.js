@@ -8,6 +8,8 @@
  * no 'unsafe-inline' for scripts — deliberately.
  */
 (function () {
+  // Each page load starts a fresh in-memory demo; discard a vanished temporary chat.
+  try { sessionStorage.removeItem('zelos.demo.ask.active'); } catch {}
   try {
     var stored = localStorage.getItem('zelos.demo.accent');
     if (typeof stored === 'string' && /^#[0-9a-fA-F]{6}$/.test(stored)) {
