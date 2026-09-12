@@ -393,7 +393,7 @@ function armHelp() {
 
 const boot = () => {
   bootBackdrop(); bootPollen(); bootScopes();
-  armVeil(); armReveals(); armNav(); armMenu(); markPlatform(); realSize(); armHelp();
+  armVeil(); armReveals(); armNav(); armMenu(); armShowcase(); markPlatform(); realSize(); armHelp();
 };
 if (document.readyState === 'loading') addEventListener('DOMContentLoaded', boot);
 else boot();
@@ -414,4 +414,24 @@ function armMenu() {
     if (event.key === 'Escape' && button.getAttribute('aria-expanded') === 'true') { close(); button.focus(); }
   });
   matchMedia('(min-width: 761px)').addEventListener('change', close);
+}
+
+function armShowcase() {
+  const shot = document.querySelector('[data-product-shot]');
+  if (!shot) return;
+  const buttons = [...document.querySelectorAll('[data-shot]')];
+  const select = (button) => {
+    if (!button) return;
+    const src = `/img/current/${button.dataset.shot}.png`;
+    shot.src = src;
+    shot.alt = `Zelos ${button.textContent} screen. ${button.dataset.description} Actual current app with sample records.`;
+    document.querySelector('[data-full-shot]').href = src;
+    document.querySelector('[data-shot-title]').textContent = button.dataset.title;
+    document.querySelector('[data-shot-description]').textContent = button.dataset.description;
+    buttons.forEach(item => item.setAttribute('aria-pressed', String(item === button)));
+  };
+  buttons.forEach(button => button.addEventListener('click', () => select(button)));
+  document.querySelectorAll('[data-show-shot]').forEach(link => link.addEventListener('click', () => {
+    select(buttons.find(button => button.dataset.shot === link.dataset.showShot));
+  }));
 }
