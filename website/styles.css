@@ -809,3 +809,7 @@ section[id],header[id]{scroll-margin-top:90px}
  .nav:not(.menu-ready) .menu-toggle{display:none}
  .nav:not(.menu-ready) .nav-links{display:flex;flex-direction:row;flex-wrap:wrap;gap:.25rem 1.1rem}
 }
+
+/* Supplied Zelos wing and lowercase wordmark. */
+.wordmark{display:flex;align-items:center}.brand-wordmark{display:block;width:132px;height:auto;filter:invert(1);mix-blend-mode:screen}.wordmark .brand-wordmark{max-height:56px;object-fit:contain}.foot-mark .brand-wordmark{width:190px}.wordmark::after{display:none}
+@media(max-width:760px){.wordmark .brand-wordmark{width:112px;max-height:46px}}
