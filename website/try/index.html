@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Try Zelos — interactive sample workspace</title>
+  <meta name="description" content="A local-first second brain. What needs you now, what you owe, what owes you, what is coming.">
+  <!-- There is exactly one theme here, and it is black. Claiming "light dark"
+       made the UA draw scrollbars, form controls and the caret in its light
+       style whenever the OS was in light mode — pale furniture on a pure black
+       page, which is the only part of the app the stylesheet cannot reach. -->
+  <meta name="color-scheme" content="dark">
+  <link rel="icon" href="./assets/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="./app.css">
+  <link rel="stylesheet" href="./mail.css">
+  <link rel="stylesheet" href="./life.css">
+  <link rel="stylesheet" href="./documents.css">
+  <link rel="stylesheet" href="./booking.css">
+  <link rel="stylesheet" href="./shopping.css">
+  <link rel="stylesheet" href="./progress.css">
+  <link rel="stylesheet" href="./finance.css">
+  <link rel="stylesheet" href="./health.css">
+  <link rel="stylesheet" href="./workspace.css">
+  <script src="./boot.js"></script>
+<meta name="robots" content="noindex">
+<link rel="stylesheet" href="./demo.css">
+</head>
+<body>
+  <div id="app">
+    <div class="screen">
+      <p class="screen-mark">Zelos</p>
+      <div class="meander" aria-hidden="true"></div>
+      <p class="screen-line">Opening your workspace…</p>
+    </div>
+  </div>
+  <noscript>
+    <div class="screen">
+      <p class="screen-mark">Zelos</p>
+      <h1 class="screen-title">Zelos needs JavaScript</h1>
+      <p class="screen-line">The board is built in the page from your own local database. There is no server-rendered fallback, and no CDN to load it from.</p>
+    </div>
+  </noscript>
+  <script type="module" src="./app.js"></script>
+<script type="module" src="./demo.js"></script>
+</body>
+</html>

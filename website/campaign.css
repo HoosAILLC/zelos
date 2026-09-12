@@ -235,3 +235,92 @@ h1{font-size:clamp(72px,14vw,105px)}
 *{transition:none!important}
 }
 
+/* Softer campaign surfaces and a real, navigable product workspace. */
+.hero-image img,.editorial,.editorial>img,.ownership>img{border-radius:28px}
+.button,.nav-download,.menu,.product-picker button,.tour-controls button,.close-dialog,.demo-routes button{border-radius:999px}
+.nav-download{border:1px solid var(--line);padding:11px 20px;gap:22px}
+.hero-image{overflow:hidden}
+.editorial{overflow:hidden}
+.editorial>img{border-top-left-radius:0;border-bottom-left-radius:0}
+.details{border:1px solid var(--line);border-radius:22px;padding-inline:24px}
+.details summary{min-height:68px}
+.details-copy{padding-bottom:25px}
+.feature-groups article,.download-options article{border:1px solid var(--line);border-radius:24px;padding:27px}
+.feature-groups a{border-top:0}
+.feature-number{display:block}
+.demo-guide{display:flex;align-items:center;justify-content:space-between;gap:30px;margin-bottom:24px}
+.demo-guide strong{font-size:18px;font-weight:500}
+.demo-guide p{color:var(--muted);font-size:14px;margin-top:6px}
+.demo-guide .text-link{flex-shrink:0}
+.demo-routes{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:18px}
+.demo-routes button{border:1px solid var(--line);background:transparent;padding:11px 19px;font-size:13px;min-height:44px}
+.demo-routes button[aria-pressed=true]{background:var(--ink);color:white;border-color:var(--ink)}
+.demo-routes button:hover{border-color:var(--ink)}
+.live-demo{overflow:hidden;border-radius:28px;border:1px solid #484848;background:#202020;box-shadow:0 20px 50px #24231a12}
+.live-demo iframe{display:block;border:0;width:100%;height:900px}
+.demo-checklist{display:grid;grid-template-columns:1fr 1fr;gap:25px 45px;padding:0 0 24px}
+.demo-checklist p{font-size:14px;color:var(--muted)}
+.demo-checklist strong{display:block;color:var(--ink);font-weight:500;margin-bottom:6px}
+.value-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:24px}
+.value-grid article,.example-grid article,.ai-options article,.ai-note{border:1px solid var(--line);border-radius:28px;padding:35px}
+.value-grid h3{font-size:30px;letter-spacing:-.045em;line-height:1.13;margin-bottom:22px}
+.value-grid p,.example-grid p,.ai-options p,.ai-note p{font-size:15px;color:var(--muted);line-height:1.65}
+.how-steps{list-style:none;padding:0;margin:0;display:grid;gap:18px}
+.how-steps li{display:flex;gap:36px;padding:34px;border:1px solid var(--line);border-radius:26px}
+.how-steps li>span{font-size:12px;color:var(--muted);padding-top:7px}
+.how-steps h3{font-size:29px;letter-spacing:-.035em;margin-bottom:12px}
+.how-steps p{font-size:16px;max-width:880px;color:var(--muted)}
+.context-flow{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:28px 0 0}
+.context-flow span{font-size:12px;border:1px solid var(--line);border-radius:999px;padding:15px 19px;text-align:center}
+.context-flow b{font-weight:400;color:var(--muted)}
+.example-grid{display:grid;grid-template-columns:1fr 1fr;gap:24px}
+.example-grid .eyebrow{font-size:10px;margin-bottom:28px}
+.example-grid h3{font-size:36px;line-height:1.12;letter-spacing:-.045em;margin-bottom:25px}
+.example-grid p{margin-bottom:18px}
+.example-grid p strong{font-weight:500;color:var(--ink)}
+.example-grid a{display:inline-block;font-size:13px;margin-top:10px}
+.ai-options{display:grid;grid-template-columns:1fr 1fr;gap:24px}
+.ai-options h3,.ai-note h3{font-size:28px;letter-spacing:-.035em;margin-bottom:22px}
+.ai-options p+p,.ai-note p+p{margin-top:18px}
+.ai-note{background:#e9e8e1;margin-top:24px}
+.ai-note p{max-width:1080px}
+.faq .details{margin-top:14px}
+.connection-rows>div:first-child{border-top:0}
+.ownership-note{border-top:0}
+.source-download{flex-wrap:wrap}
+.site-header nav{gap:22px}
+@media(max-width:1100px){.value-grid{gap:16px}
+.value-grid article,.example-grid article,.ai-options article,.ai-note{padding:26px}
+.value-grid h3{font-size:26px}
+.site-header nav{gap:16px;font-size:12px}
+.live-demo iframe{height:840px}
+.context-flow{gap:10px}
+.context-flow span{padding:13px;font-size:11px}
+}
+@media(max-width:760px){.hero-image img,.editorial,.ownership>img,.live-demo{border-radius:22px}
+.editorial>img{border-radius:0 0 22px 22px}
+.demo-guide{display:block}
+.demo-guide .text-link{margin-top:16px}
+.demo-routes{gap:7px}
+.demo-routes button{font-size:12px;padding:10px 14px}
+.live-demo iframe{height:800px}
+.demo-checklist,.value-grid,.example-grid,.ai-options{grid-template-columns:1fr}
+.value-grid article,.example-grid article,.ai-options article,.ai-note{padding:26px;border-radius:24px}
+.value-grid h3{font-size:29px}
+.feature-groups article,.download-options article{padding:22px}
+.download-options{grid-template-columns:1fr}
+.download-options .button{max-width:none}
+.download-help{grid-column:auto}
+.how-steps li{padding:25px 22px;gap:18px}
+.how-steps h3{font-size:26px}
+.how-steps p{font-size:15px}
+.context-flow{flex-direction:column;gap:10px}
+.context-flow span{min-width:230px}
+.context-flow b{transform:rotate(90deg)}
+.example-grid h3{font-size:32px}
+.details{padding-inline:20px}
+.demo-guide strong{font-size:17px}
+.nav-download{padding:10px 18px}
+.ownership-note{flex-wrap:wrap}
+.site-header nav{font-size:13px}
+}
