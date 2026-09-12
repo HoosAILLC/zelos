@@ -3,29 +3,28 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Zelos — a second brain that runs on your own computer</title>
-<meta name="description" content="Meet the new Zelos: a clean workspace for conversations, assigned tasks, your day, money and health. See real app screenshots and a feature walkthrough.">
+<title>Zelos — make room for life</title>
+<meta name="description" content="Meet the new Zelos: a clean workspace for conversations, assigned tasks, your day, money and health. Explore the new workspace through real app screens.">
 <link rel="canonical" href="https://zelos-app.netlify.app/">
-<meta name="theme-color" content="#000000">
-<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#f4f3ef">
+<meta name="color-scheme" content="light">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://zelos-app.netlify.app/">
 <meta property="og:title" content="Zelos — do less busy work, live more life">
 <meta property="og:description" content="A local-first second brain. Reads your mail and calendar, decides what needs you, and hands you one page. Any model, including one on your own machine.">
 <!-- A new filename each time the card is re-rendered: an unfurler that cached
      the previous one has no reason to look again at the same URL. -->
-<meta property="og:image" content="https://zelos-app.netlify.app/img/brand/zelos-wordmark.png">
+<meta property="og:image" content="https://zelos-app.netlify.app/img/campaign/room-to-breathe.png">
 <meta property="og:image:width" content="1774">
 <meta property="og:image:height" content="887">
-<meta property="og:image:alt" content="Zelos wing symbol and lowercase wordmark in black and white.">
+<meta property="og:image:alt" content="A quiet Greek stone room with a Zelos laptop and a view of the sea.">
 <meta name="twitter:card" content="summary_large_image">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <!-- iOS ignores the SVG and ignores alpha, and masks whatever it gets to a
      rounded square, so the touch icon is a raster that keeps its black plate. -->
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
-<link rel="preload" href="/fonts/cinzel.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="preload" href="/fonts/hankengrotesk.woff2" as="font" type="font/woff2" crossorigin>
-<link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/campaign.css">
 <script type="application/ld+json">
 {"@context":"https://schema.org","@type":"SoftwareApplication","name":"Zelos",
 "applicationCategory":"ProductivityApplication","operatingSystem":"macOS, Windows, Linux",
@@ -36,31 +35,56 @@
 </head>
 <body>
 <a class="skip" href="#main">Skip to content</a>
-<div class="backdrop" aria-hidden="true"><video id="backdrop" src="/video/threshold.mp4" poster="/video/threshold.jpg" width="832" height="464" muted playsinline preload="none"></video></div>
-<canvas class="motes" aria-hidden="true"></canvas>
-<nav class="nav" aria-label="Primary">
-  <a class="wordmark" href="#top" aria-label="Zelos, home"><img class="brand-wordmark" src="/img/brand/zelos-wordmark.svg" width="1460" height="600" alt="Zelos"></a>
-  <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="nav-links">Menu <span aria-hidden="true">+</span></button>
-  <ul class="nav-links" id="nav-links">
-    <li><a href="#does">Features</a></li><li><a href="#sources">Connections</a></li>
-    <li><a href="#privacy">Privacy</a></li><li><a href="#walkthrough">Watch tour</a></li>
-    <li><a href="/help">Help</a></li><li><a href="#download" class="nav-cta">Download <span aria-hidden="true">↗</span></a></li>
-  </ul>
+<header class="site-header" id="top">
+<a class="brand" href="/" aria-label="Zelos home">
+<img src="/img/brand/zelos-wordmark.svg" alt="Zelos" width="1460" height="600">
+</a>
+<button class="menu" aria-expanded="false" aria-controls="navigation" type="button">Menu +</button>
+<nav id="navigation" aria-label="Primary">
+<a href="#see">Inside Zelos</a>
+<a href="#does">Features</a>
+<a href="#privacy">Our approach</a>
+<a href="/help">Help</a>
+<a class="nav-download" href="#download">Get Zelos <span aria-hidden="true">↗</span>
+</a>
 </nav>
-<main id="main">
-<header class="hero" id="top">
-  <div class="hero-inner"><div class="hero-copy">
-    <p class="eyebrow"><span class="hero-line" aria-hidden="true"></span> Your attention belongs to you</p>
-    <h1>Do less busy&nbsp;work.<br><em>Live more life.</em></h1>
-    <p class="lede">Your work. Your plans. Your life.<br class="desktop-break"> Zelos brings it together, finds what needs you, and gives you the space to get on with your day.</p>
-    <div class="cta-row"><a class="btn btn-primary" href="#download">Download Zelos <span aria-hidden="true">↗</span></a><a class="btn btn-ghost" href="#walkthrough">Watch the app tour <span aria-hidden="true">→</span></a></div>
-    <p class="fine">On your computer. With your choice of AI. Free &amp; open source.</p>
-  </div></div>
-  <div class="hero-bottom"><span lang="grc">Ζῆλος · The spirit of devotion</span><a href="#see">A little less noise. See how <span aria-hidden="true">↓</span></a></div>
 </header>
-<section class="band product-section" id="see" aria-labelledby="see-h">
-  <div class="section-intro"><div><p class="eyebrow">01 / Inside Zelos</p><h2 id="see-h">A clearer space.<br>For all of life.</h2></div><p>Meet the new Zelos. Quiet surfaces, simple navigation, and room to focus. These are actual screens from the current app, filled with months of fictional studio projects, conversations, plans and personal records.</p></div>
-  <div class="showcase-picker" aria-label="Choose an app screenshot"><button type="button" data-shot="01-ask" data-title="A little space to think." data-description="Ask questions, think through an idea, or assign work from one clean conversation." aria-pressed="true">Ask</button>
+<main id="main">
+<section class="hero" aria-labelledby="hero-title">
+<div class="hero-heading">
+<p class="eyebrow">Your attention belongs to you</p>
+<h1 id="hero-title">Make room<br>for life.</h1>
+<div class="hero-bottom">
+<p>Your mail, your plans, your loose ends.<br>Zelos brings them together, so you can<br class="wide-only"> get on with what matters.</p>
+<a class="button" href="#see">Explore Zelos <span aria-hidden="true">↗</span>
+</a>
+</div>
+</div>
+<figure class="hero-image">
+<img src="/img/campaign/room-to-breathe.png" width="1774" height="887" alt="Sunlight across Greek stone columns, a quiet desk, and a Zelos wing on a closed laptop overlooking the sea." fetchpriority="high">
+<figcaption>
+<span>A little less noise. A little more possibility.</span>
+<span>01 / Room to breathe</span>
+</figcaption>
+</figure>
+</section>
+<div class="principles">
+<span>On your computer</span>
+<span>Your choice of AI</span>
+<span>Free &amp; open source</span>
+</div>
+<section class="section product" id="see" aria-labelledby="product-title">
+<span id="walkthrough" class="anchor">
+</span>
+<div class="section-heading">
+<div>
+<p class="eyebrow">02 / Inside Zelos</p>
+<h2 id="product-title">Everything in view.<br>Space to think.</h2>
+</div>
+<p>Go from a conversation to a clearer day. Explore real screens from the new Zelos, filled with projects, plans, and everyday life.</p>
+</div>
+<div class="product-picker" aria-label="Choose a feature">
+<button type="button" data-shot="01-ask" data-title="A little space to think." data-description="Ask questions, think through an idea, or assign work from one clean conversation." aria-pressed="true">Ask</button>
 <button type="button" data-shot="02-conversation" data-title="Keep the context close." data-description="Return to saved conversations and work through questions about your private records." aria-pressed="false">Conversations</button>
 <button type="button" data-shot="08-tasks" data-title="Give Zelos something to do." data-description="Follow assigned tasks, inspect completed steps, and review the result." aria-pressed="false">Assigned work</button>
 <button type="button" data-shot="03-now" data-title="Know where to begin." data-description="See your daily briefing, overlapping appointments, and the next thing that needs you." aria-pressed="false">Now</button>
@@ -71,260 +95,239 @@
 <button type="button" data-shot="06-groceries" data-title="From a plan to a list." data-description="Review ingredients, quantities, estimated costs, and what you already have." aria-pressed="false">Groceries</button>
 <button type="button" data-shot="09-progress" data-title="See what you finished." data-description="Look back at completed work, daily activity, and weekly reports." aria-pressed="false">Progress</button>
 <button type="button" data-shot="11-imports" data-title="Turn paperwork into records." data-description="Choose a statement, invoice, or lab report. Review extracted records before saving." aria-pressed="false">Imports</button>
-<button type="button" data-shot="10-booking" data-title="Give your time a place." data-description="Set meeting availability and keep upcoming bookings in view." aria-pressed="false">Booking</button></div>
-  <figure class="showcase" data-showcase>
-    <div class="product-window"><div class="window-bar"><span>ZELOS / CURRENT APP PREVIEW</span><a data-full-shot href="/img/workspace/01-ask.png" target="_blank" rel="noopener">Open full size ↗</a></div>
-    <img class="product-shot" data-product-shot src="/img/workspace/01-ask.png" width="1600" height="900" alt="Zelos Ask screen showing a weekly planning conversation in a sample workspace with 392 messages, 154 appointments and 94 items." loading="lazy"></div>
-    <figcaption aria-live="polite"><h3 data-shot-title>A little space to think.</h3><p data-shot-description>Ask questions, think through an idea, or assign work from one clean conversation.</p></figcaption>
-  </figure>
-  <p class="preview-note">Current development build · fictional records and example answers. The public download below is version {{VERSION}} and has an earlier interface.</p>
-  <div class="walkthrough" id="walkthrough"><div class="tour-heading"><div><p class="eyebrow">A minute inside Zelos</p><h3>See how it fits together.</h3></div><p>A captioned walkthrough of the actual app screens.<br>No sound needed.</p></div>
-  <video class="tour-video" controls playsinline preload="none" poster="/img/workspace/01-ask.png" width="1600" height="1080" aria-label="Zelos current app feature walkthrough"><source src="/video/zelos-workspace-tour.mp4" type="video/mp4"><track kind="captions" src="/video/zelos-workspace-tour.vtt" srclang="en" label="English">Your browser does not support embedded video. <a href="/video/zelos-workspace-tour.mp4">Download the walkthrough</a>.</video>
-  <details class="fold tour-transcript"><summary>Read the walkthrough</summary><ol><li><strong>Ask.</strong> Ask questions, think through an idea, or assign work from one clean conversation.</li><li><strong>Conversations.</strong> Return to saved conversations and work through questions about your private records.</li><li><strong>Assigned work.</strong> Follow assigned tasks, inspect completed steps, and review the result.</li><li><strong>Now.</strong> See your daily briefing, overlapping appointments, and the next thing that needs you.</li><li><strong>Promises.</strong> Track promises in both directions and review a suggested reply before sending.</li><li><strong>Calendar.</strong> See your schedule in day, week, or month views and spot conflicts.</li><li><strong>Money.</strong> Bring recorded transactions, spending categories, cash flow, and invoices into view.</li><li><strong>Health.</strong> Keep activity, measurements, lab records, and weekly meal and exercise plans together.</li><li><strong>Groceries.</strong> Review ingredients, quantities, estimated costs, and what you already have.</li><li><strong>Progress.</strong> Look back at completed work, daily activity, and weekly reports.</li><li><strong>Imports.</strong> Choose a statement, invoice, or lab report. Review extracted records before saving.</li><li><strong>Booking.</strong> Set meeting availability and keep upcoming bookings in view.</li></ol></details></div>
-  <div class="trust-strip"><span>Clean, familiar navigation</span><span>Your private records</span><span>Your choice of AI</span><span>One place to return to</span></div>
+<button type="button" data-shot="10-booking" data-title="Give your time a place." data-description="Set meeting availability and keep upcoming bookings in view." aria-pressed="false">Booking</button>
+</div>
+<figure class="product-figure">
+<div class="product-frame">
+<div class="frame-bar">
+<span>
+<i aria-hidden="true">
+</i> The Zelos workspace</span>
+<button type="button" class="enlarge" aria-haspopup="dialog">Enlarge screen <span aria-hidden="true">↗</span>
+</button>
+</div>
+<img id="product-image" src="/img/workspace/01-ask.png" width="1600" height="900" alt="Zelos Ask: a weekly planning conversation in a populated sample workspace." loading="lazy">
+</div>
+<figcaption class="product-caption">
+<div aria-live="polite" aria-atomic="true">
+<p class="eyebrow" id="chapter">01 / Ask</p>
+<h3 id="shot-title">A little space to think.</h3>
+<p id="shot-description">Ask questions, think through an idea, or assign work from one clean conversation.</p>
+</div>
+<div class="tour-controls">
+<button type="button" data-direction="-1" aria-label="Previous feature">←</button>
+<span id="shot-count">01 / 12</span>
+<button type="button" data-direction="1" aria-label="Next feature">→</button>
+</div>
+</figcaption>
+</figure>
+<p class="preview-note">Actual app captures · fictional sample records and example answers · current development build.<br>The public download is version {{VERSION}} and has an earlier interface.</p>
+<noscript>
+<p>Open the <a href="/img/workspace/01-ask.png">full-size app screen</a>. Enable JavaScript to explore all twelve screens.</p>
+</noscript>
 </section>
-<section class="band" id="does" aria-labelledby="does-h">
-  <div class="section-intro"><div><p class="eyebrow">02 / Find your focus</p><h2 id="does-h">A second brain.<br>A clearer day.</h2></div><p>A look at the current build: everyday planning alongside conversations, delegated work, money and health. Explore each screen above.</p></div>
-  <ol class="cards">
-    <li class="glass card"><span class="card-num" lang="grc" aria-hidden="true">Α</span><h3>Now</h3><p>At most four priorities, with a clear first thing and an explanation of why it matters. Give your attention a starting point.</p></li>
-    <li class="glass card"><span class="card-num" lang="grc" aria-hidden="true">Β</span><h3>Today &amp; Soon</h3><p>See what is due today and what is approaching. Deadlines stay in order, and the rest of your day stays within reach.</p></li>
-    <li class="glass card"><span class="card-num" lang="grc" aria-hidden="true">Γ</span><h3>Promises, both ways</h3><p>Keep track of what you owe and what you are waiting for. Review suggested replies, edit the words, and choose when to send.</p></li>
-    <li class="glass card"><span class="card-num" lang="grc" aria-hidden="true">Δ</span><h3>Calendar &amp; meeting prep</h3><p>Move between day, week and month. See overlapping meetings and AI prep notes drawn from your history with the people involved.</p></li>
-  </ol>
-  <div class="feature-grid">
-    <article class="feature" id="ask"><span class="feature-mark" aria-hidden="true">↗</span><h3>Ask Zelos</h3><p>“What did I promise last week?” Ask your archive a question and get an answer with references you can follow back to the source.</p><a href="#see" data-show-shot="02-conversation">See conversations →</a></article>
-    <article class="feature"><span class="feature-mark" aria-hidden="true">⌕</span><h3>Search your whole archive</h3><p>Find mail, events, board items and your own notes in one search. Browse matching excerpts without needing an AI call.</p></article>
-    <article class="feature"><span class="feature-mark" aria-hidden="true">+</span><h3>Capture a thought</h3><p>Drop a reminder or loose thought into Zelos before it disappears. Your notes join the context it uses to understand your day.</p></article>
-    <article class="feature"><span class="feature-mark" aria-hidden="true">◷</span><h3>Snooze, finish, revisit</h3><p>Put an item aside until a time you choose, mark it done, or bring it back. See recorded deadline, priority and status changes with “What changed?”</p></article>
-    <article class="feature"><span class="feature-mark" aria-hidden="true">⌘</span><h3>Get there in a keystroke</h3><p>Open Commands to jump between views, capture a note or start a check. Use the visible button or ⌘/Ctrl + Shift + P.</p></article>
-    <article class="feature"><span class="feature-mark" aria-hidden="true">◇</span><h3>Make the space yours</h3><p>A clean charcoal workspace, clear navigation, and your choice of accent. Keep the things you use every day close at hand.</p></article>
-  </div>
-  <div class="feature-grid"><article class="feature"><span class="feature-mark" aria-hidden="true">◇</span><h3>Assigned work</h3><p>Ask Zelos to research saved records, save notes, prepare an unsent reply, or create a weekly PDF. Follow each step from the Zelos view.</p><a href="#see" data-show-shot="08-tasks">See the screen →</a></article><article class="feature"><span class="feature-mark" aria-hidden="true">◇</span><h3>Money</h3><p>Track recorded income and expenses across personal and company workspaces, review invoices, and export a month of transactions.</p><a href="#see" data-show-shot="04-money">See the screen →</a></article><article class="feature"><span class="feature-mark" aria-hidden="true">◇</span><h3>Health</h3><p>Keep goals, walking, measurements and lab results in one place. Build and review weekly meal and exercise plans.</p><a href="#see" data-show-shot="05-health">See the screen →</a></article><article class="feature"><span class="feature-mark" aria-hidden="true">◇</span><h3>Groceries</h3><p>Turn ingredients into a shopping list. Track what you need, already have, or bought. Review an optional store handoff; checkout happens with the store.</p><a href="#see" data-show-shot="06-groceries">See the screen →</a></article><article class="feature"><span class="feature-mark" aria-hidden="true">◇</span><h3>Progress & reports</h3><p>See what you completed and when. Choose the work to include in a weekly report and create a PDF to keep or share.</p><a href="#see" data-show-shot="09-progress">See the screen →</a></article><article class="feature"><span class="feature-mark" aria-hidden="true">◇</span><h3>Imports</h3><p>Bring in statements, invoices and lab reports as PDFs or images. Review the extracted records before you save them.</p><a href="#see" data-show-shot="11-imports">See the screen →</a></article><article class="feature"><span class="feature-mark" aria-hidden="true">◇</span><h3>Booking</h3><p>Set meeting lengths, notice, buffers and available hours. Publishing a guest booking page requires separate setup.</p><a href="#see" data-show-shot="10-booking">See the screen →</a></article><article class="feature"><span class="feature-mark" aria-hidden="true">◇</span><h3>Email</h3><p>Read your connected mail and prepare replies in context. In the current build, review the message and choose Send reply yourself.</p><a href="#see" data-show-shot="12-promises">See the screen →</a></article></div>
+<section class="section features" id="does" aria-labelledby="features-title">
+<div class="section-heading">
+<div>
+<p class="eyebrow">03 / A second brain for everyday life</p>
+<h2 id="features-title">Less to keep<br>in your head.</h2>
+</div>
+<p>Work and life rarely stay in separate boxes. Your workspace shouldn't need them to. Here's what the current build brings together.</p>
+</div>
+<div class="feature-groups">
+<article>
+<span class="feature-number">01</span>
+<h3>Find your next move.</h3>
+<p>A daily briefing and a short list of priorities. Your meetings, deadlines, and promises, with the context to act.</p>
+<ul>
+<li>Now, Today &amp; Soon</li>
+<li>Day, week &amp; month calendars</li>
+<li>Meeting prep &amp; conflict checks</li>
+<li>Promises owed &amp; waiting on</li>
+<li>Email and reviewed replies</li>
+<li>Booking availability &amp; buffers</li>
+</ul>
+<a href="#see" data-show-shot="03-now">Explore your day <span aria-hidden="true">↗</span>
+</a>
+</article>
+<article>
+<span class="feature-number">02</span>
+<h3>Think it through.</h3>
+<p>Ask your private archive a question. Return to a conversation, find a source, or hand Zelos a task and review the result.</p>
+<ul>
+<li>Ask &amp; saved conversations</li>
+<li>Answers with source references</li>
+<li>Search mail, events &amp; notes</li>
+<li>Assigned work &amp; step history</li>
+<li>Weekly progress &amp; PDF reports</li>
+<li>Notes, reminders &amp; snoozing</li>
+</ul>
+<a href="#see" data-show-shot="08-tasks">Explore assigned work <span aria-hidden="true">↗</span>
+</a>
+</article>
+<article>
+<span class="feature-number">03</span>
+<h3>Take care of the rest.</h3>
+<p>See the bigger picture of your money and health. Turn scattered paperwork and plans into records you can return to.</p>
+<ul>
+<li>Income, expenses &amp; invoices</li>
+<li>Cash flow &amp; transaction exports</li>
+<li>Activity, measurements &amp; labs</li>
+<li>Weekly meal &amp; exercise plans</li>
+<li>Groceries &amp; optional store handoff</li>
+<li>PDF &amp; image imports to review</li>
+</ul>
+<a href="#see" data-show-shot="04-money">Explore everyday life <span aria-hidden="true">↗</span>
+</a>
+</article>
+</div>
+<details class="details">
+<summary>A few details about how these features work <span aria-hidden="true">+</span>
+</summary>
+<div class="details-copy">
+<p>Assigned work can search saved records, save notes, prepare an unsent reply, or create a weekly PDF. You can inspect each step and review the result. Email sending in the current build requires your review and a configured sending connection.</p>
+<p>Document imports are reviewed before saving. Grocery checkout takes place with the store. Publishing a guest booking page requires separate setup. Capture notes and navigate with Commands, or use ⌘/Ctrl + Shift + P.</p>
+</div>
+</details>
 </section>
-<section class="band" id="sources" aria-labelledby="sources-h">
-  <div class="section-intro"><div><p class="eyebrow">03 / Bring your world together</p><h2 id="sources-h">More than<br>an inbox.</h2></div><p>Connect the places your commitments arrive. Zelos reads your sources and keeps its own archive on your computer.</p></div>
-  <div class="connection-grid">
-    <article class="glass connection"><p class="eyebrow">Correspondence</p><h3>Your mail &amp; messages</h3><p>Bring multiple mail accounts together and import a WhatsApp chat you exported. The current build also imports iPhone text available in Messages on your Mac.</p><ul class="service-list"><li>Gmail</li><li>iCloud Mail</li><li>Outlook*</li><li>Yahoo</li><li>Fastmail</li><li>IMAP</li><li>Messages on Mac · preview</li><li>WhatsApp exports</li></ul></article>
-    <article class="glass connection"><p class="eyebrow">Your time</p><h3>Calendars &amp; meetings</h3><p>Read subscribed calendars, CalDAV accounts and calendar files. Add Fireflies meeting recaps so the follow-up has its context.</p><ul class="service-list"><li>Calendar links</li><li>CalDAV</li><li>.ics files</li><li>Fireflies</li></ul></article>
-    <article class="glass connection"><p class="eyebrow">The rest of your work</p><h3>Projects &amp; knowledge</h3><p>Bring in team conversations, issues, tasks, feeds and local files. Choose each connection in Settings → Sources.</p><ul class="service-list"><li>Slack</li><li>GitHub</li><li>Linear</li><li>Todoist</li><li>RSS &amp; Atom</li><li>Local folders</li></ul></article>
-  </div>
-  <details class="fold fold-wide"><summary>Connection requirements</summary><p>Email setup depends on your provider. Gmail, iCloud, Yahoo and Fastmail support app passwords when your account allows them. Google and Microsoft OAuth sign-in require your own client registration; Outlook.com requires this additional setup. Other connected services use credentials you supply.</p><p>Messages import is available in the current preview. It is Mac-only and reads text already synced to that Mac. It requires macOS Full Disk Access for Zelos; it does not import attachments or phone-only messages. WhatsApp uses an exported chat file. The current build can send a reviewed email reply when you explicitly choose Send reply and configure sending. Assigned AI tasks prepare unsent drafts.</p></details>
+<section class="editorial" aria-labelledby="life-title">
+<div class="editorial-copy">
+<p class="eyebrow">04 / Attention, reclaimed</p>
+<h2 id="life-title">Do less busy work.<br>Live more life.</h2>
+<p>Close the laptop. Open the book.<br>Make the call. Take the long way home.</p>
+<p>Zelos is built around a simple belief: your attention belongs to you.</p>
+<a class="text-link" href="#download">A little more room starts here <span aria-hidden="true">↗</span>
+</a>
+</div>
+<img src="/img/campaign/live-more-life.png" width="1536" height="1024" alt="A woman reading on a sunlit Greek terrace above the sea, beside a closed Zelos laptop." loading="lazy">
 </section>
-<section class="band" id="control" aria-labelledby="control-h">
-  <div class="section-intro"><div><p class="eyebrow">04 / Your pace. Your rules.</p><h2 id="control-h">You stay<br>in command.</h2></div><p>Decide when Zelos reads, when it asks AI, and where your data goes. Useful controls, right where you need them.</p></div>
-  <div class="control-grid">
-    <article class="glass pane"><span class="mini-label">01</span><h3>Read now. Review when ready.</h3><p>Choose when to check for changes, or configure automatic checks in Schedule. Checks run while Zelos is open. In the current preview, Read sources now imports fresh material without an AI call, ready for a separate review when you choose.</p></article>
-    <article class="glass pane"><span class="mini-label">02</span><h3>A backup you can hold.</h3><p>Create and restore backups from Settings → Your data in the desktop app. Keep your archive, drafts, notes, history and settings together. Restore previews the contents and keeps a recovery copy.</p><p class="small-copy">Backups are not password protected and may contain credentials. Store them privately.</p></article>
-    <article class="glass pane"><span class="mini-label">03</span><h3>Know what is working.</h3><p>See when a connection last read successfully. A warning takes you to the account that needs attention. Check for updates when you choose and review the release before installing.</p></article>
-  </div>
+<section class="section connections" id="sources" aria-labelledby="sources-title">
+<div class="section-heading">
+<div>
+<p class="eyebrow">05 / Bring your world together</p>
+<h2 id="sources-title">All the places<br>life comes in.</h2>
+</div>
+<p>Connect the sources you use. Zelos keeps its own archive on your computer, so the next question starts with context.</p>
+</div>
+<div class="connection-rows">
+<div>
+<h3>Mail &amp; messages</h3>
+<p>Gmail · iCloud · Outlook · Yahoo · Fastmail · IMAP<br>Messages on Mac (preview) · WhatsApp exports</p>
+</div>
+<div>
+<h3>Time &amp; meetings</h3>
+<p>Calendar links · CalDAV · .ics files · Fireflies</p>
+</div>
+<div>
+<h3>Projects &amp; knowledge</h3>
+<p>Slack · GitHub · Linear · Todoist · RSS &amp; Atom · Local folders</p>
+</div>
+</div>
+<details class="details">
+<summary>What you need to connect <span aria-hidden="true">+</span>
+</summary>
+<div class="details-copy">
+<p>Email providers may require an app password. Google and Microsoft OAuth require your own client registration; Outlook.com needs that additional setup. Other services use credentials you supply. <a href="/help#email">Read the setup guide →</a>
+</p>
+<p>Messages import reads text already synced to your Mac, requires macOS Full Disk Access, and is available in the current development build. WhatsApp import uses an exported chat file. Zelos checks connected sources while it is open.</p>
+</div>
+</details>
 </section>
-<section class="band" id="models" aria-labelledby="models-h">
-  <div class="section-intro"><div><p class="eyebrow">05 / Choose your intelligence</p><h2 id="models-h">Bring your<br>own brain.</h2></div><p>Use Claude, another supported AI provider, or a model running on your own computer. Switch your model while keeping your archive.</p></div>
-  <div class="model-grid"><article class="glass pane"><p class="eyebrow">Online</p><h3>Your preferred AI service</h3><p>Connect with your own API key. Zelos guides the setup and lets you choose the model. The current preview adds a configurable response limit for longer reviews.</p><ul class="service-list"><li>Claude</li><li>OpenAI</li><li>Gemini</li><li>Grok</li><li>Mistral</li><li>DeepSeek</li><li>Groq</li><li>Together</li><li>OpenRouter</li><li>Fireworks</li></ul><p class="small-copy">Provider usage is billed separately. A chat subscription may not include API usage.</p></article><article class="glass pane"><p class="eyebrow">On your computer</p><h3>Keep the thinking local</h3><p>Zelos looks for supported local AI services and offers what it finds. Use a suitable local model to assess your archive without sending that content to an online AI provider.</p><ul class="service-list"><li>Ollama</li><li>LM Studio</li><li>llama.cpp</li><li>vLLM</li><li>LocalAI</li></ul><p class="small-copy">Local models use your computer’s hardware. Setup and performance depend on the model you choose.</p></article></div>
+<section class="ownership" id="privacy" aria-labelledby="privacy-title">
+<span id="models" class="anchor"></span><span id="ai" class="anchor"></span><span id="control" class="anchor"></span>
+<img src="/img/campaign/wing-in-stone.png" width="1254" height="1254" alt="The Zelos wing and lowercase wordmark carved into pale stone beside a Greek column." loading="lazy">
+<div class="ownership-copy">
+<p class="eyebrow">06 / Yours, by design</p>
+<h2 id="privacy-title">Your world.<br>Your computer.<br>Your choice.</h2>
+<p>Your archive stays on your machine. No Zelos cloud account. No advertising. No analytics in the app.</p>
+<p>Choose the AI you want to use, including a model running locally. With an online provider, the content needed for your request goes to that provider.</p>
+<a class="text-link" href="/privacy">Read our approach to privacy <span aria-hidden="true">↗</span>
+</a>
+<div class="ownership-note">
+<span lang="grc">Ζῆλος</span>
+<p>Named for the Greek spirit of zeal and devotion.<br>Ancient inspiration. Space for modern life.</p>
+</div>
+</div>
 </section>
-<section class="band" id="privacy" aria-labelledby="privacy-h">
-  <div class="privacy-grid"><div><p class="eyebrow">06 / Built around your trust</p><h2 id="privacy-h">Your life.<br>Your machine.</h2><p class="privacy-lede">Your archive lives on your computer. There is no Zelos cloud account, no analytics and no crash reporting.</p><a class="text-link" href="/privacy">Read the privacy policy →</a></div><div class="privacy-points"><article><h3>You choose the connections</h3><p>Zelos contacts the mail, calendar and other services you add. Provider sign-in uses that provider’s services. Manual update checks contact GitHub for public release information.</p></article><article><h3>You choose what AI can read</h3><p>Online AI reviews and questions send selected archive content to your configured provider. Sharing controls can limit message text; subjects, addresses and snippets may still be included. A local model keeps the AI processing on your computer.</p></article><article><h3>You make the final move</h3><p>Zelos suggests priorities and prepares drafts. In the current build, sending a reply is a separate action you choose after reviewing it. Assigned AI tasks cannot send email or place a grocery order.</p></article></div></div>
+<section class="section download" id="download" aria-labelledby="download-title">
+<div class="section-heading">
+<div>
+<p class="eyebrow">07 / Begin with a little less noise</p>
+<h2 id="download-title">Make yourself<br>some room.</h2>
+</div>
+<div>
+<p>Free to download. Open source.<br>Bring your own AI, or run a local model.</p>
+<p class="release-note">Version {{VERSION}} · public release<br>The new interface and features shown above are a preview of the development build.</p>
+</div>
+</div>
+<div class="download-options">
+<article>
+<h3>For Mac</h3>
+<a class="button" href="/downloads/Zelos-mac-apple-silicon.dmg">Apple silicon <span aria-hidden="true">↓</span>
+</a>
+<a class="secondary-download" href="/downloads/Zelos-mac-intel.dmg">Download for Intel Mac ↗</a>
+</article>
+<article>
+<h3>For Windows</h3>
+<a class="button" href="/downloads/Zelos-windows-x64.exe">Windows PC <span aria-hidden="true">↓</span>
+</a>
+<a class="secondary-download" href="/downloads/Zelos-windows-arm64.exe">Download for Windows on ARM ↗</a>
+</article>
+<article class="download-help">
+<h3>A hand getting started.</h3>
+<p>From your first launch to your first connection, the setup guide walks you through it.</p>
+<a class="text-link" href="/help">Open the guide ↗</a>
+</article>
+</div>
+<span id="limits"></span>
+<details class="details" id="safe">
+<summary>Before your first launch <span aria-hidden="true">+</span>
+</summary>
+<div class="details-copy">
+<p>These are community builds. The Mac app is not notarized by Apple, and Windows does not recognize a verified publisher. Your computer may display a warning when you open it. Read the <a href="/help#open">installation guide</a> before deciding to continue.</p>
+<p>Zelos is a desktop app and checks sources while open. Online AI providers may charge for usage. A local model can process your requests on your computer. You can inspect the <a href="https://github.com/HoosAILLC/zelos">source code</a> and <a href="/downloads/SHA256SUMS.txt">release checksums</a>.</p>
+</div>
+</details>
+<p class="source-download">
+<a href="/downloads/zelos-source.zip">Download source code ↗</a>
+<span>macOS, Windows &amp; Linux · Node 22.16+ or 24+; Node 23 unsupported</span>
+</p>
 </section>
-<section class="band" id="ai" aria-labelledby="ai-h">
-  <div class="band-head">
-    <p class="eyebrow">07 / Connect your assistant</p><h2 id="ai-h">Open only<br>the doors you choose.</h2>
-    <p class="band-note">This is an optional extra for people who already use another AI program,
-      such as Claude. It is off unless you switch it on — and then the other AI sees only the
-      boxes you tick. Try the permission preview below. These sample switches do not change your installed app.</p>
-  </div>
-
-  <div class="glass scopes" data-scopes>
-    <div class="scopes-head">
-      <label class="master">
-        <input type="checkbox" id="ai-enabled">
-        <span class="master-track" aria-hidden="true"></span>
-        <span class="master-label">AI access <b data-master-state>off</b></span>
-      </label>
-      <p class="scopes-hint" data-hint>Nothing is shared. The other AI cannot see a thing, and
-        would be refused if it asked.</p>
-    </div>
-
-    <div class="scopes-body">
-      <ul class="scope-list" data-scope-list></ul>
-
-      <div class="scope-view">
-        <p class="scope-view-head">What the other AI can see <span data-tool-count>0 of 7</span></p>
-        <canvas class="gate-canvas" data-gate role="img"
-          aria-label="A diagram: six streams, one per scope, run toward a wall. The streams whose
-            scope is ticked pass through and reach the assistant; the rest stop at the wall and
-            fade."></canvas>
-        <ul class="tools" data-tools></ul>
-        <p class="scope-view-head">What comes back</p>
-        <pre class="payload-view" data-payload aria-live="polite"></pre>
-        <p class="scope-foot" data-foot></p>
-      </div>
-    </div>
-  </div>
-
-  <!-- "Not one of them writes" was false, and false in the one field that buys
-       an auto-approval. `zelos_board` calls holdNowBar (core/mcp.mjs), which
-       wakes snoozes that have come due and demotes the overflow out of `now`,
-       and it is the only one of the seven that ships
-       `readOnlyHint: false` (BOARD_ANNOTATIONS); the other six get
-       READ_ONLY_ANNOTATIONS with `readOnlyHint: true`. The paragraph says
-       that in plain words — six only look, the seventh wakes a snooze — and
-       no longer names the field, `tools/list` or the 401, because a reader
-       who does not know what those are was taking "every message end to end"
-       away as the whole message. A reader who does know can check the source;
-       the sentence is still exactly as strong. -->
-  <p class="coda">
-    Seven things it can show, and six of them only look. The seventh — the board — does the one
-    thing opening Zelos does: a reminder you put off wakes up when its time comes, and <em>Now</em>
-    is held to four items. That is the whole of it. Nothing sends, nothing deletes, nothing changes
-    a setting, nothing can make Zelos go and check your mail. Every request is written down on your
-    computer — what was asked, never what was read. And the key you hand out opens only the doors
-    you chose; the other AI cannot widen them.
-  </p>
-</section><section class="band band-payoff" aria-labelledby="payoff-h"><p class="eyebrow">Devoted to what matters</p><h2 id="payoff-h">Make room<br>for your life.</h2><p>A quieter workspace. A clearer next step. The rest of the day is yours.</p><a class="btn btn-primary" href="#download">Get Zelos <span aria-hidden="true">↗</span></a></section>
-<section class="band" id="download" aria-labelledby="download-h">
-  <div class="band-head band-head-centre">
-    <h2 id="download-h">Take it home.</h2>
-    <p class="band-note">Free. No account. Pick the one for your computer.</p>
-  </div>
-  <!-- The source zip used to be the first plate, and it was the only one that
-       said "macOS" in large type — so a Mac owner clicked it, got a folder of
-       files and an instruction to run `node zelos.mjs`, and stopped. The two
-       apps come first now and main.js promotes whichever one matches the
-       visitor's platform to a single full-width plate labelled for them. The
-       zip is the last thing in the section, as a link, with every command and
-       every Node version inside the fold beneath it; no command line appears
-       on this page outside a fold.
-
-       The Mac plate is a div, not an anchor: the Intel link and the
-       About-This-Mac line live inside it, and an <a> nested in an <a> is
-       hoisted out by the parser. The primary Download stretches over the whole
-       plate instead; everything clickable inside sits above it in the stacking
-       order. -->
-  <p class="note">Public release {{VERSION}} · earlier interface. The screenshots and walkthrough above show the newer development build.</p>
-  <p class="note">Version {{VERSION}} · <a href="https://github.com/HoosAILLC/zelos/releases/tag/v{{VERSION}}">What’s new and checksums</a></p>
-  <div class="plates" data-plates>
-    <div class="glass plate plate-live" data-dl="mac" data-yours-label="For your Mac">
-      <span class="plate-os">Mac app</span>
-      <span class="plate-meta">Apple silicon</span>
-      <a class="plate-act plate-link" href="/downloads/Zelos-mac-apple-silicon.dmg" download
-         aria-label="Download Zelos for a Mac with an Apple silicon chip">Download</a>
-      <span class="plate-alt">Intel Mac? <a href="/downloads/Zelos-mac-intel.dmg" download>take this one</a></span>
-      <p class="plate-help">Not sure which? Click the Apple logo (top-left) → About This Mac. If it
-        says Apple silicon: <a href="/downloads/Zelos-mac-apple-silicon.dmg" download>this
-        one</a>. If it says Intel: <a href="/downloads/Zelos-mac-intel.dmg" download>take this
-        one</a>.</p>
-    </div>
-    <div class="glass plate plate-live" data-dl="win" data-yours-label="For your Windows PC">
-      <span class="plate-os">Windows app</span>
-      <span class="plate-meta">Windows 10 and 11</span>
-      <a class="plate-act plate-link" href="/downloads/Zelos-windows-x64.exe" download
-         aria-label="Download Zelos for Windows">Download</a>
-      <span class="plate-alt">Arm PC? <a href="/downloads/Zelos-windows-arm64.exe" download>take this one</a></span>
-    </div>
-  </div>
-
-  <!-- Once the download is on their disk, the next thing a person meets is a
-       screen — a warning, a key page, an app-password page — and /help has a
-       message written for every one of them that Claude can walk through.
-       Said here, under the plates, because this is the moment they have just
-       become someone who will need it. -->
-  <p class="note">Stuck at any step after this? <a href="/help">Ask Claude to walk you through
-    it</a> — every setup step has a message already written for it.</p>
-
-  <!-- There was no "Is it safe?" anywhere on the page, and the nearest thing
-       was a paragraph explaining that the Mac would say it could not check the
-       app for malware and that you should click past — which is word for word
-       what a scam caller says. The answer comes first now, in the words a
-       person would use, and the reason the warning exists (ad-hoc signature,
-       no notarisation, no Authenticode) is under "Why does this happen?".
-       Parsed off the artifacts rather than guessed, as before: the .app's main
-       Mach-O carries LC_CODE_SIGNATURE with CodeDirectory flags 0x2 — the
-       ADHOC bit, nothing else — and the .exe files carry no signature at all. -->
-  <div class="glass pane safe" id="safe" aria-labelledby="safe-h">
-    <h3 id="safe-h">Before your first launch</h3>
-    <p>These community builds are not signed by a verified publisher. macOS builds are
-      ad-hoc signed and have not been notarised by Apple; Windows installers are unsigned.
-      Your computer may show a warning. Download only from the links here or the
-      <a href="https://github.com/HoosAILLC/zelos/releases/tag/v{{VERSION}}">matching GitHub release</a>,
-      where the source code and file checksums are available. Continue only if you trust this release.</p>
-    <p>Here is what to click, once. When the warning appears, press <em>Done</em> — not
-      <em>Move to Trash</em>. Then:</p>
-    <ol class="safe-steps">
-      <li>Open <em>System Settings</em>.</li>
-      <li><em>Privacy &amp; Security</em>.</li>
-      <li>Scroll to the bottom and press <em>Open Anyway</em>.</li>
-    </ol>
-    <p><strong>On Windows</strong>, a blue box says <em>Windows protected your PC</em>. Click
-      <em>More info</em>, then <em>Run anyway</em>.</p>
-    <p class="safe-cta"><a class="btn btn-ghost" href="/help">Ask Claude to help you set up</a></p>
-    <details class="fold">
-      <summary>Why does this happen?</summary>
-      <p>The Mac build's ad-hoc signature checks the app's internal consistency but does not
-        verify who made it. Windows has no publisher signature on these installers. Neither a
-        warning nor its absence guarantees that an app is safe. Published SHA-256 checksums let
-        you compare your download with this release's files; they are not an independent security review.</p>
-      <p>Two more things worth knowing. The Apple silicon build is single-architecture: an Intel
-        Mac refuses it outright with a different message that has no <em>Open Anyway</em> in it,
-        and Rosetta does not translate in that direction — take the Intel build from the plate
-        above. And on macOS and Linux, Zelos locks its own files down to your account; Windows has
-        no equivalent to set, so there the protection is the one your user profile already carries
-        — which means an administrator on that machine can read it.</p>
-    </details>
-  </div>
-
-  <!-- Sizes measured, not estimated: 120,842,053 and 125,868,562 bytes for the
-       two DMGs, 100,857,945 and 97,217,057 for the two .exe files; `du -sh` on
-       the built .app reads 276 MB. The Windows shape comes from
-       desktop/package.json — target "nsis", createStartMenuShortcut,
-       createDesktopShortcut, allowToChangeInstallationDirectory — and the
-       macOS target is "dmg". The zip's size is not written down: main.js
-       rewrites it from a live HEAD on the file, because a number in the copy
-       goes stale the moment the bundle is rebuilt. -->
-  <p class="source-link">
-    <a href="/downloads/zelos-source.zip" download>For programmers: the source code (needs Node)</a>
-    <span class="source-meta" data-size-src>macOS, Windows, Linux</span>
-  </p>
-  <details class="fold fold-wide fold-centre">
-    <summary>For experts: running from source</summary>
-    <p><strong>The zip is the whole program, and it is small enough to read.</strong> No bundled
-      runtime, no packages, nothing to install. Unzip it, then run <code>node zelos.mjs</code> —
-      Node <strong>22.16 or newer, or 24 or newer</strong>. Not simply "22 or newer": Zelos
-      searches with the SQLite that comes built into Node, and that build has no full-text search
-      before 22.16 or anywhere in the Node 23 line. On one of those, Zelos says so and stops rather
-      than half-starting. Then it opens in your browser at <code>127.0.0.1</code> and stays
-      there.</p>
-    <p><strong>The two apps above are a different trade: around 100 MB, and Electron.</strong> The
-      same Zelos core, wrapped in a Chromium window so that it has a tray icon and does not live in
-      a browser tab — 97 to 126 MB to download depending on which one you take, and roughly 300 MB
-      once it is unpacked on disk. The Windows plates are installers: they ask where to put it,
-      then add a Start-menu entry and a desktop shortcut. The Mac plates are disk images you drag
-      across. If a supply chain is the thing you are weighing, take the zip — it is the one with
-      nothing in it but Zelos.</p>
-  </details>
-</section><section class="band" id="limits" aria-labelledby="limits-h">
-  <h2 id="limits-h" class="limits-h">What it doesn't do yet</h2>
-  <!-- The Google entry used to say "works today" and "only accounts on the
-       test list" in the same breath, and the Microsoft entry promised a code
-       with no registration while the app asked for an Entra client id. Both
-       now say what a person will actually meet, until the shipped clients
-       exist — DEFAULT_OAUTH_CLIENTS in core/sources/oauth.mjs is blank for
-       both. The first-open warning is no longer restated here: "Is it safe?"
-       above is the one place that says it, because two places saying it two
-       ways is what produced the last contradiction. -->
-  <dl class="limits">
-    <dt>Gmail uses a special password, for now.</dt>
-    <dd>For now, Gmail users connect with an "app password" — a special password Google makes
-      just for Zelos. It takes about two minutes and the app shows you every step. Google sign-in requires your own client registration. iCloud, Yahoo and Fastmail use an
-      app password too.</dd>
-    <dt>Hotmail and Outlook.com take a one-time setup.</dt>
-    <dd>Hotmail and Outlook.com need a one-time, ten-minute setup at Microsoft's website first —
-      the app shows you every step. A work or school account can also be blocked by your
-      company's own settings; if it is, ask your IT department.</dd>
-    <dt>There's no phone app.</dt>
-    <dd>Zelos is a desktop tool.</dd>
-    <dt>It only checks your mail while it's open.</dt>
-    <dd>Nothing reads your mail while the app is closed.</dd>
-    <dt>Your computer warns you the first time you open it.</dt>
-    <dd><a href="#safe">Before your first launch</a> above explains the warning and your options.</dd>
-  </dl>
-</section></main><footer class="foot"><div class="foot-inner"><p class="foot-mark"><img class="brand-wordmark" src="/img/brand/zelos-wordmark.svg" width="1460" height="600" alt="Zelos"></p><p class="foot-line">A local-first second brain. Free and open source.<br><a href="https://github.com/HoosAILLC/zelos">GitHub</a> · <a href="/help">Help</a> · <a href="/privacy">Privacy</a> · <a href="#walkthrough">Watch tour</a></p><p class="foot-greek">Named for <span lang="grc">Ζῆλος</span>, the Greek spirit of zeal and devotion.<br>Ancient inspiration. Space for modern life.</p></div></footer><script type="module" src="/main.js"></script></body></html>
+</main>
+<footer class="site-footer">
+<div class="footer-top">
+<a class="brand" href="#top" aria-label="Zelos home">
+<img src="/img/brand/zelos-wordmark.svg" width="1460" height="600" alt="Zelos">
+</a>
+<p>A little less noise.<br>A little more room for life.</p>
+<nav aria-label="Footer">
+<a href="https://github.com/HoosAILLC/zelos">GitHub ↗</a>
+<a href="/help">Help</a>
+<a href="/privacy">Privacy</a>
+<a href="#see">Explore the app</a>
+</nav>
+</div>
+<div class="footer-bottom">
+<span>© 2026 Zelos · Free &amp; open source</span>
+<span>Campaign scenes are illustrative. Product screens are actual app captures.</span>
+</div>
+</footer>
+<dialog id="screen-dialog" aria-labelledby="dialog-title">
+<div class="dialog-bar">
+<h2 id="dialog-title">Zelos — Ask</h2>
+<a id="original-image" href="/img/workspace/01-ask.png" target="_blank" rel="noopener">Original image ↗</a>
+<button type="button" class="close-dialog" autofocus>Close ×</button>
+</div>
+<div class="dialog-image">
+<img id="large-image" src="/img/workspace/01-ask.png" width="1600" height="900" alt="Zelos Ask sample workspace">
+</div>
+<div class="dialog-controls">
+<button type="button" data-direction="-1" aria-label="Previous enlarged feature">← Previous</button>
+<p>Actual app screen · sample data</p>
+<button type="button" data-direction="1" aria-label="Next enlarged feature">Next →</button>
+</div>
+</dialog>
+<script src="/campaign.js" defer>
+</script>
+</body>
+</html>

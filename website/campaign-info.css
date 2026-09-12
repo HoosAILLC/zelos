@@ -1,0 +1,28 @@
+/* Carry the campaign's paper, type and wing identity through the help and policy pages. */
+:root{--void:#f4f3ef;--bone:#191919;--bone-dim:#55564f;--bone-faint:#686960;--ff-display:'Hanken Grotesk',Arial,sans-serif;--ff-body:'Hanken Grotesk',Arial,sans-serif;color-scheme:light}
+
+html,body{background:#f4f3ef;color:#191919}
+.backdrop,.motes{display:none!important}
+body::before,body::after,.band::before,.band::after,.glass::before,.glass::after,h2::after{display:none!important}
+.nav,.nav.scrolled{background:#f4f3eff5!important;border-color:#d5d4cd!important;backdrop-filter:none}
+.nav a,.nav-links a,.menu-toggle{color:#191919}
+.brand-wordmark{filter:none!important;mix-blend-mode:multiply!important}
+.nav-cta,.btn-primary{background:#191919!important;color:#fff!important;border-color:#191919!important;box-shadow:none!important}
+.menu-toggle{background:transparent;border-color:#a6a79e}
+.nav-links{background:transparent}
+.band{border-color:#d5d4cd}
+.glass,.pane,.help-card,.fold,.boundary{background:#eeede7!important;color:#191919;border-color:#d5d4cd!important;box-shadow:none!important}
+h1,h2,h3,.help-title,.help-card h3{color:#191919!important;font-family:var(--ff-body)!important;letter-spacing:-.04em}
+h1,h2{-webkit-text-fill-color:currentColor;background:none}
+.band p,.help-card p,.pane p,.fold p,.limits dd,.help-card li{color:#55564f}
+.eyebrow,.note,.band-note,.boundary-head,.boundary-foot,.zero-deps{color:#606159!important}
+.btn-ghost{background:transparent;color:#191919;border-color:#9c9d92}
+.help-card textarea,.help-message,textarea,pre,code{background:#e3e2da!important;color:#292a24!important;border-color:#aaa!important}
+.foot{background:#e8e7e0;color:#191919;border-color:#d5d4cd}
+.foot p,.foot a{color:#55564f}
+.foot-mark{color:#191919}
+.dot{background:#666}
+.help-nav a{color:#292a24;background:transparent;border-color:#aaa}
+.help-note{background:#e8e7e0;border-color:#ccc}
+.help-copy-status{color:#34352d}
+
