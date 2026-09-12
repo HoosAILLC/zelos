@@ -80,7 +80,7 @@
       "auto": true
     },
     "ui": {
-      "accent": "#5b8cff"
+      "accent": "#dedede"
     },
     "privacy": {
       "maxItemsPerSweep": 150,

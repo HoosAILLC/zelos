@@ -22,7 +22,7 @@
 /* Warm, and never white: a white speck on this page reads as a dead pixel. The
    three are the top of the fall — core, gold, honey — so the motes are lit by
    the same light as everything else. */
-const TINTS = ['240,233,174', '232,208,138', '217,169,106'];
+const TINTS = ['240,240,240', '208,208,208', '175,175,175'];
 
 const AREA_PER_MOTE = 15000;   // px² of viewport
 const MAX_MOTES = 90;

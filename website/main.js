@@ -6,11 +6,9 @@
    stylesheet. The header is fixed now, but a cache that was poisoned under the
    old rule only lets go if the URL changes. Bump this whenever this file
    changes in a way a returning visitor must see. */
-import { createFlow } from './js/flow.js?v=4';
-import { createScopes, LANES } from './js/scopes.js?v=3';
-import { createGate } from './js/gate.js?v=2';
-import { createWires } from './js/wires.js?v=2';
-import { createPollen } from './js/pollen.js?v=1';
+import { createScopes, LANES } from './js/scopes.js?v=8';
+import { createGate } from './js/gate.js?v=8';
+import { createPollen } from './js/pollen.js?v=8';
 
 const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
 
@@ -277,20 +275,6 @@ async function realSize() {
 /* The winnowing diagram. Only runs while it is actually on screen — it is a
    continuously animating canvas and there is no reason to burn a phone battery
    on one that is three screens away. */
-function bootFlow() {
-  const canvas = document.getElementById('flow');
-  if (!canvas) return;
-  let flow;
-  try { flow = createFlow(canvas); } catch { canvas.remove(); return; }
-  if (!flow) { canvas.remove(); return; }
-  if ('IntersectionObserver' in window) {
-    new IntersectionObserver((entries) => {
-      for (const e of entries) e.isIntersecting ? flow.start() : flow.stop();
-    }, { threshold: 0.08 }).observe(canvas);
-  } else {
-    flow.start();
-  }
-}
 
 /* Only run a canvas while it is actually on screen. Each of these is a
    continuously animating loop and there is no reason to burn a phone battery on
@@ -308,14 +292,6 @@ function whileVisible(canvas, anim, threshold = 0.08) {
 /* The two runs of the egress diagram. Atmosphere with a job: the copy beside
    each one says the same thing in words, so a canvas that cannot start is
    removed rather than left as an empty box. */
-function bootWires() {
-  for (const canvas of document.querySelectorAll('[data-wires]')) {
-    let anim;
-    try { anim = createWires(canvas, { mode: canvas.dataset.wires }); } catch { anim = null; }
-    if (!anim) { canvas.remove(); continue; }
-    whileVisible(canvas, anim);
-  }
-}
 
 /* The AI-access picker, and the wall it drives. It is a real control rather
    than a picture of one, so a failure here must not take the section down with
@@ -416,8 +392,26 @@ function armHelp() {
 }
 
 const boot = () => {
-  bootBackdrop(); bootPollen(); bootFlow(); bootWires(); bootScopes();
-  armVeil(); armReveals(); armNav(); markPlatform(); realSize(); armHelp();
+  bootBackdrop(); bootPollen(); bootScopes();
+  armVeil(); armReveals(); armNav(); armMenu(); markPlatform(); realSize(); armHelp();
 };
 if (document.readyState === 'loading') addEventListener('DOMContentLoaded', boot);
 else boot();
+
+function armMenu() {
+  const button = document.querySelector('.menu-toggle');
+  const links = document.getElementById('nav-links');
+  if (!button || !links) return;
+  button.closest('.nav').classList.add('menu-ready');
+  const close = () => { button.setAttribute('aria-expanded', 'false'); links.classList.remove('is-open'); };
+  button.addEventListener('click', () => {
+    const open = button.getAttribute('aria-expanded') !== 'true';
+    button.setAttribute('aria-expanded', String(open));
+    links.classList.toggle('is-open', open);
+  });
+  links.addEventListener('click', (event) => { if (event.target.closest('a')) close(); });
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && button.getAttribute('aria-expanded') === 'true') { close(); button.focus(); }
+  });
+  matchMedia('(min-width: 761px)').addEventListener('change', close);
+}
