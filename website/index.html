@@ -4,9 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Zelos — a second brain that runs on your own computer</title>
-<meta name="description" content="Zelos reads your mail and calendar, works out what actually needs you, and hands you one page. Runs locally with any AI model you choose — Claude, ChatGPT, or one on your own machine. Free, open, no account.">
+<meta name="description" content="Your mail, calendar, messages and commitments, in one quiet workspace. Priorities, reply drafts, search, AI answers and private backups. Runs on your computer. Free and open source.">
 <link rel="canonical" href="https://zelos-app.netlify.app/">
-<meta name="theme-color" content="#060A07">
+<meta name="theme-color" content="#000000">
 <meta name="color-scheme" content="dark">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://zelos-app.netlify.app/">
@@ -14,10 +14,10 @@
 <meta property="og:description" content="A local-first second brain. Reads your mail and calendar, decides what needs you, and hands you one page. Any model, including one on your own machine.">
 <!-- A new filename each time the card is re-rendered: an unfurler that cached
      the previous one has no reason to look again at the same URL. -->
-<meta property="og:image" content="https://zelos-app.netlify.app/img/og-7.jpg">
+<meta property="og:image" content="https://zelos-app.netlify.app/img/og-monochrome.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
-<meta property="og:image:alt" content="A lit doorway in an overgrown Greek temple wall, seen across a meadow of pale wildflowers, with the words Do less busy work, live more life.">
+<meta property="og:image:alt" content="Zelos in black and white: Do less busy work. Live more life.">
 <meta name="twitter:card" content="summary_large_image">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <!-- iOS ignores the SVG and ignores alpha, and masks whatever it gets to a
@@ -36,406 +36,84 @@
 </head>
 <body>
 <a class="skip" href="#main">Skip to content</a>
-
-<!-- The backdrop. It is never played — scroll position drives currentTime, so
-     the camera walks toward the threshold exactly as far as you have read. The
-     poster carries the first frame before the file is seekable and is the whole
-     of it under prefers-reduced-motion. -->
-<div class="backdrop" aria-hidden="true">
-  <!-- preload="none" in the markup and raised to "auto" by the script. The
-       preloader starts on the parsed attribute, long before DOMContentLoaded,
-       so a reduced-motion visitor would otherwise have fetched the whole film
-       before anything had a chance to decide they should not. -->
-  <video id="backdrop" src="/video/threshold.mp4" poster="/video/threshold.jpg"
-         width="832" height="464" muted playsinline preload="none"></video>
-</div>
-
-<!-- Pollen. The motes in the film stop at the edge of the video, which is what
-     makes a photographic backdrop read as a picture the page is standing in
-     front of; this carries them across the whole viewport instead. Sized and
-     driven entirely by js/pollen.js — under prefers-reduced-motion it settles
-     to a single frame rather than looping. -->
+<div class="backdrop" aria-hidden="true"><video id="backdrop" src="/video/threshold.mp4" poster="/video/threshold.jpg" width="832" height="464" muted playsinline preload="none"></video></div>
 <canvas class="motes" aria-hidden="true"></canvas>
-
 <nav class="nav" aria-label="Primary">
-  <a class="wordmark" href="#top" aria-label="Zelos, home">Zelos</a>
-  <ul class="nav-links">
-    <li><a href="#does">What it does</a></li>
-    <li><a href="#models">Any AI</a></li>
-    <li><a href="#privacy">Privacy</a></li>
-    <li><a href="#ai">AI access</a></li>
-    <li><a href="/help">Help</a></li>
-    <li><a href="#download" class="nav-cta">Download</a></li>
+  <a class="wordmark" href="#top" aria-label="Zelos, home">Zelos <span lang="grc" aria-hidden="true">Ζ</span></a>
+  <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="nav-links">Menu <span aria-hidden="true">+</span></button>
+  <ul class="nav-links" id="nav-links">
+    <li><a href="#does">Features</a></li><li><a href="#sources">Connections</a></li>
+    <li><a href="#privacy">Privacy</a></li><li><a href="/demo/">Live demo</a></li>
+    <li><a href="/help">Help</a></li><li><a href="#download" class="nav-cta">Download <span aria-hidden="true">↗</span></a></li>
   </ul>
 </nav>
-
 <main id="main">
-
 <header class="hero" id="top">
-  <div class="hero-inner">
-    <div class="hero-copy">
-      <p class="eyebrow">A second brain that runs on your own computer</p>
-      <h1>Do less busy&nbsp;work.<br><em>Live more life.</em></h1>
-      <p class="lede">
-        Zelos reads your mail and your calendar, works out what actually needs you, and hands you
-        one page. It runs on your own computer, with whatever AI you choose — including one
-        that never leaves your desk.
-      </p>
-      <div class="cta-row">
-        <a class="btn btn-primary" href="#download">Download Zelos</a>
-        <a class="btn btn-ghost" href="/demo/">Try the live demo</a>
-      </div>
-      <p class="fine">Free and open source — <a href="https://github.com/HoosAILLC/zelos">read every line on GitHub</a>. No account, no server, nothing to sign up for.</p>
-    </div>
-  </div>
-  <p class="scroll-hint" aria-hidden="true">scroll</p>
+  <div class="hero-inner"><div class="hero-copy">
+    <p class="eyebrow"><span class="hero-line" aria-hidden="true"></span> Your attention belongs to you</p>
+    <h1>Do less busy&nbsp;work.<br><em>Live more life.</em></h1>
+    <p class="lede">Your mail. Your calendar. Everything you promised.<br class="desktop-break"> Zelos brings it together, finds what needs you, and gives you the space to get on with your day.</p>
+    <div class="cta-row"><a class="btn btn-primary" href="#download">Download Zelos <span aria-hidden="true">↗</span></a><a class="btn btn-ghost" href="/demo/">Explore the live demo <span aria-hidden="true">→</span></a></div>
+    <p class="fine">On your computer. With your choice of AI. Free &amp; open source.</p>
+  </div></div>
+  <div class="hero-bottom"><span lang="grc">Ζῆλος · The spirit of devotion</span><a href="#see">A little less noise. See how <span aria-hidden="true">↓</span></a></div>
 </header>
-
-<!-- ─────────────────────────────────────────── the problem -->
-<section class="band" id="problem" aria-labelledby="problem-h">
-  <div class="glass pane pane-tight">
-    <h2 id="problem-h">Most of it doesn't need you.</h2>
-    <p>
-      The trouble is that you can't tell which parts do without reading all of it. So the tax
-      isn't the work — it's the sorting. It runs every morning, it never finishes, and it produces
-      nothing.
-    </p>
-    <p class="claim">That's the job Zelos takes.</p>
+<section class="band product-section" id="see" aria-labelledby="see-h">
+  <div class="section-intro"><div><p class="eyebrow">01 / A place to think</p><h2 id="see-h">Everything in view.<br>Room to breathe.</h2></div><p>The same quiet, black glass workspace as the app. A clear first step, your commitments close by, and the context behind every decision.</p></div>
+  <div class="product-window glass">
+    <div class="window-bar"><span class="window-dots" aria-hidden="true">● ● ●</span><span>ZELOS / YOUR WORKSPACE</span><a href="/demo/">Try it yourself ↗</a></div>
+    <img class="product-shot" src="/img/workspace-now.png" width="1280" height="720" alt="Zelos Now view with sample priorities, and navigation to Today, Promises, Calendar, Ask and Search." loading="eager">
   </div>
+  <p class="preview-note">Real app interface. Invented sample data. <a href="/demo/">Explore the interactive demo →</a></p>
+  <div class="trust-strip"><span>Mac &amp; Windows</span><span>Stored on your computer</span><span>Your choice of AI</span><span>No Zelos account</span></div>
 </section>
-
-<!-- ─────────────────────────────────────────── the winnowing -->
-<section class="band band-flow" aria-labelledby="flow-h">
-  <div class="band-head">
-    <h2 id="flow-h">Everything in.<br>Four things out.</h2>
-    <p class="band-note">Every message and every event crosses the same gate. Nothing has a colour
-      until Zelos has ruled on it, and roughly seven in ten never get one. It starts with your
-      email and your calendar. Technical users can add other tools later (Slack, GitHub and
-      more).</p>
-    <!-- The full list used to sit in the paragraph above, and a reader who
-         recognised only WhatsApp stopped reading at CalDAV. Nothing is gone:
-         the same sentences, behind a control that says who they are for. -->
-    <details class="fold">
-      <summary>For technical users: everything else it can read</summary>
-      <p>Calendars arrive as a subscribed link, a CalDAV account, or a file on your disk. From
-        Settings it also reads Slack, GitHub, Linear, Todoist, Fireflies meeting recaps, any RSS
-        or Atom feed, a folder that your scripts drop files into, and a WhatsApp chat you exported.
-        Each is a token you mint in your own account or a file you own, and all of them are
-        read-only.</p>
-    </details>
-  </div>
-  <div class="glass flow-frame">
-    <canvas id="flow" role="img"
-      aria-label="A diagram: dots stream in from Mail and Calendar as grey, cross a central gate, and most fall away. The few that survive take on a colour and sort into four lanes — Now, Today, Owed and Soon."></canvas>
-  </div>
-  <p class="flow-legend">
-    <span class="key key-grey" aria-hidden="true"></span>arrived, undecided
-    <span class="key key-acc" aria-hidden="true"></span>survived the gate — this needs you
-  </p>
-</section>
-
-<!-- ─────────────────────────────────────────── what it does -->
 <section class="band" id="does" aria-labelledby="does-h">
-  <div class="band-head">
-    <h2 id="does-h">It reads everything.<br>It gives you four things.</h2>
-  </div>
+  <div class="section-intro"><div><p class="eyebrow">02 / Find your focus</p><h2 id="does-h">A second brain.<br>A clearer day.</h2></div><p>Start with what matters. Follow a promise, prepare for a meeting, or find the message behind it. It all lives in one place.</p></div>
   <ol class="cards">
-    <li class="glass card">
-      <span class="card-num" lang="grc" aria-hidden="true">Α</span>
-      <h3>Now</h3>
-      <p>At most four items. Ever. A board where everything is urgent tells you nothing, so Zelos
-      is forced to choose — and forced to say why it chose.</p>
-    </li>
-    <li class="glass card">
-      <span class="card-num" lang="grc" aria-hidden="true">Β</span>
-      <h3>Owed</h3>
-      <p>Both directions. What you promised someone and haven't done, and what you're still
-      waiting on — including the thread where somebody offered you three dates two weeks ago and
-      you never answered.</p>
-    </li>
-    <li class="glass card">
-      <span class="card-num" lang="grc" aria-hidden="true">Γ</span>
-      <h3>Today</h3>
-      <p>Everything with a clock on it, in the order it will bite you. Eight on screen, the rest
-      folded underneath — nothing is ever quietly dropped.</p>
-    </li>
-    <li class="glass card">
-      <span class="card-num" lang="grc" aria-hidden="true">Δ</span>
-      <h3>Your calendar</h3>
-      <p>A real week grid, with a short prep note for the next meeting built from your own history
-      with the people who'll be in the room.</p>
-    </li>
+    <li class="glass card"><span class="card-num" lang="grc" aria-hidden="true">Α</span><h3>Now</h3><p>At most four priorities, with a clear first thing and an explanation of why it matters. Give your attention a starting point.</p></li>
+    <li class="glass card"><span class="card-num" lang="grc" aria-hidden="true">Β</span><h3>Today &amp; Soon</h3><p>See what is due today and what is approaching. Deadlines stay in order, and the rest of your day stays within reach.</p></li>
+    <li class="glass card"><span class="card-num" lang="grc" aria-hidden="true">Γ</span><h3>Promises, both ways</h3><p>Keep track of what you owe and what you are waiting for. Review suggested replies, edit the words, and open them in your mail app to send.</p></li>
+    <li class="glass card"><span class="card-num" lang="grc" aria-hidden="true">Δ</span><h3>Calendar &amp; meeting prep</h3><p>Move between day, week and month. See overlapping meetings and AI prep notes drawn from your history with the people involved.</p></li>
   </ol>
-  <p class="coda">
-    And where a reply is obviously owed, it writes one — ready to send, with no blanks to fill in.
-    <strong>Nothing is ever sent without you clicking send.</strong>
-  </p>
-</section>
-
-<!-- ─────────────────────────────────────────── see it -->
-<section class="band" id="see" aria-labelledby="see-h">
-  <div class="band-head">
-    <h2 id="see-h">See it — or use it</h2>
-    <p class="band-note">These are real screenshots, and the demo below them is the real
-      interface — a copy of the app's UI at release {{VERSION}}, running in your browser against an
-      invented week. Click around. Nothing is saved and nothing is sent anywhere.</p>
-    <p class="see-cta"><a class="btn btn-primary" href="/demo/">Open the live demo</a></p>
-  </div>
-  <div class="shots" data-shots>
-    <figure class="glass shot">
-      <img src="/img/shot-now.webp" width="1200" height="750" loading="lazy" decoding="async"
-           alt="The Now view: one ranked item at the top, then two more, over a dark glass interface.">
-      <figcaption>Now — one ranked first thing, then at most four. Never more.</figcaption>
-    </figure>
-    <figure class="glass shot">
-      <img src="/img/shot-calendar.webp" width="1200" height="750" loading="lazy" decoding="async"
-           alt="A week calendar grid with meetings placed by time and two overlapping at 2pm shown side by side.">
-      <figcaption>A real week grid. The 2pm double-book is packed side by side, not hidden.</figcaption>
-    </figure>
-    <figure class="glass shot">
-      <img src="/img/shot-owed.webp" width="1200" height="750" loading="lazy" decoding="async"
-           alt="The Promises view: a reply Zelos wrote, in an editable box, beside a rail counting They owe you and You owe them.">
-      <figcaption>A written reply, and both directions of owing. Nothing sends itself.</figcaption>
-    </figure>
-    <figure class="glass shot">
-      <img src="/img/shot-settings.webp" width="1200" height="750" loading="lazy" decoding="async"
-           alt="Settings on the AI tab: an AI program found on this computer offered first, then Claude and OpenAI, in plain words.">
-      <figcaption>Pick your AI — one already on your computer is found for you, and offered first.</figcaption>
-    </figure>
+  <div class="feature-grid">
+    <article class="feature" id="ask"><span class="feature-mark" aria-hidden="true">↗</span><h3>Ask Zelos</h3><p>“What did I promise last week?” Ask your archive a question and get an answer with references you can follow back to the source.</p><a href="/demo/#/ask">Try asking →</a></article>
+    <article class="feature"><span class="feature-mark" aria-hidden="true">⌕</span><h3>Search your whole archive</h3><p>Find mail, events, board items and your own notes in one search. Browse matching excerpts without needing an AI call.</p><a href="/demo/#/search">Explore search →</a></article>
+    <article class="feature"><span class="feature-mark" aria-hidden="true">+</span><h3>Capture a thought</h3><p>Drop a reminder or loose thought into Zelos before it disappears. Your notes join the context it uses to understand your day.</p></article>
+    <article class="feature"><span class="feature-mark" aria-hidden="true">◷</span><h3>Snooze, finish, revisit</h3><p>Put an item aside until a time you choose, mark it done, or bring it back. See recorded deadline, priority and status changes with “What changed?”</p></article>
+    <article class="feature"><span class="feature-mark" aria-hidden="true">⌘</span><h3>Get there in a keystroke</h3><p>Open Commands to jump between views, capture a note or start a check. Use the visible button or ⌘/Ctrl + Shift + P.</p></article>
+    <article class="feature"><span class="feature-mark" aria-hidden="true">◇</span><h3>Make the space yours</h3><p>Black glass, Greek details and an accent you choose. Keep the desktop app close in your menu bar or system tray.</p></article>
   </div>
 </section>
-
-<!-- ─────────────────────────────────────────── any model -->
+<section class="band" id="sources" aria-labelledby="sources-h">
+  <div class="section-intro"><div><p class="eyebrow">03 / Bring your world together</p><h2 id="sources-h">More than<br>an inbox.</h2></div><p>Connect the places your commitments arrive. Zelos reads your sources and keeps its own archive on your computer.</p></div>
+  <div class="connection-grid">
+    <article class="glass connection"><p class="eyebrow">Correspondence</p><h3>Your mail &amp; messages</h3><p>Bring multiple mail accounts together and import a WhatsApp chat you exported. Next release: import iPhone text available in Messages on your Mac.</p><ul class="service-list"><li>Gmail</li><li>iCloud Mail</li><li>Outlook*</li><li>Yahoo</li><li>Fastmail</li><li>IMAP</li><li>Messages on Mac · next release</li><li>WhatsApp exports</li></ul></article>
+    <article class="glass connection"><p class="eyebrow">Your time</p><h3>Calendars &amp; meetings</h3><p>Read subscribed calendars, CalDAV accounts and calendar files. Add Fireflies meeting recaps so the follow-up has its context.</p><ul class="service-list"><li>Calendar links</li><li>CalDAV</li><li>.ics files</li><li>Fireflies</li></ul></article>
+    <article class="glass connection"><p class="eyebrow">The rest of your work</p><h3>Projects &amp; knowledge</h3><p>Bring in team conversations, issues, tasks, feeds and local files. Choose each connection in Settings → Sources.</p><ul class="service-list"><li>Slack</li><li>GitHub</li><li>Linear</li><li>Todoist</li><li>RSS &amp; Atom</li><li>Local folders</li></ul></article>
+  </div>
+  <details class="fold fold-wide"><summary>Connection requirements</summary><p>Email setup depends on your provider. Gmail, iCloud, Yahoo and Fastmail support app passwords when your account allows them. Google and Microsoft OAuth sign-in require your own client registration; Outlook.com requires this additional setup. Other connected services use credentials you supply.</p><p>Messages import is coming in the next release. It is Mac-only and reads text already synced to that Mac. It requires macOS Full Disk Access for Zelos; it does not import attachments or phone-only messages. WhatsApp uses an exported chat file. Zelos never sends messages or changes your connected mail, calendars or tasks.</p></details>
+</section>
+<section class="band" id="control" aria-labelledby="control-h">
+  <div class="section-intro"><div><p class="eyebrow">04 / Your pace. Your rules.</p><h2 id="control-h">You stay<br>in command.</h2></div><p>Decide when Zelos reads, when it asks AI, and where your data goes. Useful controls, right where you need them.</p></div>
+  <div class="control-grid">
+    <article class="glass pane"><span class="mini-label">01</span><h3>Read now. Review when ready.</h3><p>Choose when to check for changes, or configure automatic checks in Schedule. Checks run while Zelos is open. Coming next: Read sources now imports fresh material without an AI call, ready for a separate review when you choose.</p></article>
+    <article class="glass pane"><span class="mini-label">02</span><h3>A backup you can hold.</h3><p>Create and restore backups from Settings → Your data in the desktop app. Keep your archive, drafts, notes, history and settings together. Restore previews the contents and keeps a recovery copy.</p><p class="small-copy">Backups are not password protected and may contain credentials. Store them privately.</p></article>
+    <article class="glass pane"><span class="mini-label">03</span><h3>Know what is working.</h3><p>See when a connection last read successfully. A warning takes you to the account that needs attention. Check for updates when you choose and review the release before installing.</p></article>
+  </div>
+</section>
 <section class="band" id="models" aria-labelledby="models-h">
-  <div class="band-head">
-    <h2 id="models-h">Bring your own brain.</h2>
-    <p class="band-note">Zelos needs an AI service to do the reading — the same kind of thing as
-      ChatGPT. Pick one inside the app; it shows you every step of getting a key. Pay-as-you-go,
-      with a spending cap you set on their site.</p>
-  </div>
-  <!-- The right-hand column used to list the local runtimes by port number, and
-       every row named its wire protocol rather than the company. Both are
-       exactly the kind of thing an expert should be able to find and a
-       newcomer should never have to read past, so the local column is a fold
-       now and the hosted rows say who makes the thing. Nothing was deleted:
-       the ports, the two protocols and the first-run scan are all inside the
-       fold. -->
-  <div class="index-grid">
-    <div class="glass pane">
-      <p class="index-head">Services it works with <span>online</span></p>
-      <ul class="index">
-        <li><span>Claude</span><em>by Anthropic</em></li>
-        <li><span>ChatGPT</span><em>by OpenAI</em></li>
-        <li><span>Gemini</span><em>by Google</em></li>
-        <li><span>Grok</span><em>by xAI</em></li>
-        <li><span>Mistral</span></li>
-        <li><span>DeepSeek</span></li>
-        <li><span>Groq</span></li>
-        <li><span>Together</span></li>
-        <li><span>OpenRouter</span></li>
-        <li><span>Fireworks</span></li>
-      </ul>
-      <p class="index-note">Pick any one of them. Zelos itself never charges you, and you can
-        change your mind later without losing anything.</p>
-    </div>
-    <details class="glass pane fold fold-pane">
-      <summary>For technical users: run the AI on your own computer</summary>
-      <p class="index-head">Run it yourself <span>local</span></p>
-      <ul class="index">
-        <li><span>Ollama</span><em>:11434</em></li>
-        <li><span>LM Studio</span><em>:1234</em></li>
-        <li><span>llama.cpp</span><em>:8080</em></li>
-        <li><span>vLLM</span><em>:8000</em></li>
-        <li><span>LocalAI</span><em>openai</em></li>
-      </ul>
-      <p class="index-note">Zelos scans these ports on first run and offers whatever is already
-        running. Local models need no key at all, and nothing Zelos reads ever leaves your
-        machine.</p>
-      <p class="index-note">Two wire protocols — <code>openai</code> and <code>anthropic</code> —
-        cover every hosted provider and every local runtime, because the protocol is what
-        matters, not the company. Switch whenever you like — your data never moves.</p>
-    </details>
-  </div>
+  <div class="section-intro"><div><p class="eyebrow">05 / Choose your intelligence</p><h2 id="models-h">Bring your<br>own brain.</h2></div><p>Use Claude, another supported AI provider, or a model running on your own computer. Switch your model while keeping your archive.</p></div>
+  <div class="model-grid"><article class="glass pane"><p class="eyebrow">Online</p><h3>Your preferred AI service</h3><p>Connect with your own API key. Zelos guides the setup and lets you choose the model. The next release adds a configurable response limit for longer reviews.</p><ul class="service-list"><li>Claude</li><li>OpenAI</li><li>Gemini</li><li>Grok</li><li>Mistral</li><li>DeepSeek</li><li>Groq</li><li>Together</li><li>OpenRouter</li><li>Fireworks</li></ul><p class="small-copy">Provider usage is billed separately. A chat subscription may not include API usage.</p></article><article class="glass pane"><p class="eyebrow">On your computer</p><h3>Keep the thinking local</h3><p>Zelos looks for supported local AI services and offers what it finds. Use a suitable local model to assess your archive without sending that content to an online AI provider.</p><ul class="service-list"><li>Ollama</li><li>LM Studio</li><li>llama.cpp</li><li>vLLM</li><li>LocalAI</li></ul><p class="small-copy">Local models use your computer’s hardware. Setup and performance depend on the model you choose.</p></article></div>
 </section>
-
-<!-- ─────────────────────────────────────────── privacy -->
 <section class="band" id="privacy" aria-labelledby="privacy-h">
-  <div class="privacy-grid">
-    <div class="glass pane">
-      <h2 id="privacy-h">It runs in your house.</h2>
-      <p>There is no Zelos server and no Zelos account. Your mail, your calendar, and everything
-        Zelos concludes about them stay in one folder on your own computer. Your passwords are
-        locked away on that computer too, the same way your Mac or PC keeps its other
-        passwords.</p>
-      <p>Reading and AI checks contact your email provider, your calendar, and the AI service
-        you picked. Add another tool in Settings and Zelos contacts that service too. Only the
-        AI is told what Zelos read, and if the AI runs
-        on your own computer, nothing it read leaves at all.</p>
-      <p>Google or Microsoft sign-in also contacts their sign-in services while signing in and
-        refreshing your sign-in. Pressing <em>Check for updates</em> contacts GitHub for public
-        release details, without your archived content or credentials. Still no server of ours.
-        <a href="/privacy">The privacy policy</a> is the whole list,
-        in plain words.</p>
-    </div>
-    <div class="glass pane boundary">
-      <p class="boundary-head">What leaves this machine</p>
-      <ul>
-        <li><span class="dot"></span>Your email provider <em>you chose it</em></li>
-        <li><span class="dot"></span>Your calendar <em>you chose it</em></li>
-        <li><span class="dot"></span>The AI service <em>you chose it — or your own computer</em></li>
-        <li><span class="dot"></span>Any tool you add <em>you chose it</em></li>
-        <li><span class="dot"></span>Google or Microsoft sign-in <em>only while signing in and refreshing</em></li>
-        <li><span class="dot"></span>GitHub releases <em>only when you press Check for updates</em></li>
-      </ul>
-      <p class="boundary-foot">Nothing is ever sent to us. No tracking. No statistics. No crash reports.</p>
-    </div>
-  </div>
-
-  <!-- The same machine twice, with one setting changed. Every label here is a
-       real value from docs/SECURITY.md §5 — the three destinations, the
-       sendBodies switch and its 4,000-character truncation — because a security
-       diagram that rounds the facts off is worse than no diagram.
-
-       Which is why the local column no longer reads "message bodies, in full".
-       It never got them. `buildSweepPrompt` in core/triage.mjs has no local
-       branch at all — `grep -nE "isLocal|127\.0\.0\.1|localhost" core/triage.mjs`
-       returns nothing — so one cap runs for both, and it is model-agnostic by
-       construction: `perMessage = Math.min(bodyChars, floor(room / count))`
-       inside a fixed 32,000-character budget. Measured against the real
-       function: one 12,000-character inbound message comes back cut to 4,000,
-       and twenty of them drop the section to `plain`, where the model is handed
-       no body text whatever — only the stored 240-character snippets. Both
-       columns carry the identical line now, and that is the argument rather
-       than a concession: the heading right above says the only difference is
-       where the model runs, and a payload list that differed would be
-       contradicting it.
-
-       The sentences that make that argument in the prompt builder's own terms
-       — the missing local branch, the sendBodies switch, the 240-character
-       snippet, the lsof recipe — live in the "For the technically minded" fold
-       at the foot of this section. The notes beside the diagram say the same
-       thing in the words the switch actually wears in Settings. -->
-
-  <div class="egress" aria-labelledby="egress-h">
-    <h3 id="egress-h" class="egress-h">The only difference is where the AI runs.</h3>
-    <div class="egress-pair">
-
-      <figure class="glass egress-card">
-        <figcaption>
-          <span class="egress-tag egress-tag-safe">An AI on your own computer</span>
-          <span class="egress-sum">Two connections by default</span>
-        </figcaption>
-        <canvas class="wires-canvas" data-wires="local" role="img"
-          aria-label="A diagram: mail and calendar data arrives from two outside servers into a
-            dashed box marked ‘your machine’ — any tool you add arrives the same way. Inside the
-            box it travels to the AI on the same machine and back. Nothing crosses the boundary on
-            its way out."></canvas>
-        <p class="payload-head">The AI reads all of this</p>
-        <ul class="payload payload-cool">
-          <li>subjects</li>
-          <li>sender and recipient addresses</li>
-          <li>dates</li>
-          <li>message bodies, cut at 4,000 characters</li>
-          <li>calendar events — titles, times, places, who is invited, and their notes</li>
-          <li>your reminders, and the board it built last time</li>
-        </ul>
-        <p class="egress-note"><strong>The same list — and it goes nowhere.</strong> The AI is a
-          program on your own computer, so nothing about a message is ever sent out to think
-          about it. No key. No service. No bill.</p>
-      </figure>
-
-      <figure class="glass egress-card">
-        <figcaption>
-          <span class="egress-tag egress-tag-warn">An AI service online</span>
-          <span class="egress-sum">Three connections by default</span>
-        </figcaption>
-        <canvas class="wires-canvas" data-wires="hosted" role="img"
-          aria-label="The same diagram, with the AI outside the box. A third stream leaves
-            through the right-hand wall to the AI service and returns, carrying subjects, sender
-            and recipient addresses, dates, message bodies cut at 4,000 characters, calendar
-            events with the people invited, and your reminders and board. It is the only stream
-            that leaves through that wall."></canvas>
-        <p class="payload-head">The wire carries all of this</p>
-        <ul class="payload">
-          <li>subjects</li>
-          <li>sender and recipient addresses</li>
-          <li>dates</li>
-          <li>message bodies, cut at 4,000 characters</li>
-          <li>calendar events — titles, times, places, who is invited, and their notes</li>
-          <li>your reminders, and the board it built last time</li>
-        </ul>
-        <p class="egress-note"><strong>You can keep the full text at home.</strong> Switch off
-          <em>Send message bodies</em> in Settings and only a short snippet of each message goes —
-          but subjects and addresses still do, because without them there is nothing to reason
-          about. If the fact that a lawyer wrote to you is itself the secret, only an AI on your
-          own computer keeps it.</p>
-      </figure>
-
-    </div>
-    <p class="egress-foot">Nothing here grows a line you did not choose. A tool you add in
-      Settings arrives the way mail does — on the left, read-only, from the one place it lives —
-      and the information shown here goes out through the right-hand wall only in the request to
-      the AI. Nothing is sent to us: no tracking, no statistics, no crash reports. Update checks
-      are manual: press <em>Check for updates</em> in Settings to ask GitHub for public release
-      details, without your mail, calendar or keys. No update downloads or installs itself.</p>
-  </div>
-
-  <div class="privacy-grid privacy-grid-tail">
-    <div class="glass pane">
-      <!-- The scope of this claim is the whole point of it, and it had none. The
-           two desktop plates below hand you a 97–126 MB Electron bundle and the
-           word "Electron" appeared in exactly zero files on this site, under a
-           product-wide "nothing to audit but the code itself". The program is
-           genuinely dependency-free — package.json carries no `dependencies` key
-           at all, and nothing under core/, ui/ or cli/ imports anything but
-           `node:` builtins and its own relative paths — and naming the one
-           exception is what makes that checkable rather than glib.
-           docs/INSTALL.md has always had the right words: "Electron (the
-           window), and only in the shell".
-
-           The plain sentence here is scoped the same way — "the part of Zelos
-           that reads your mail" — and the Electron qualifier, in full, is in
-           the fold below it. -->
-      <p class="zero-deps"><strong>Nobody else's code.</strong> The part of Zelos that reads your
-        mail and talks to the AI is written from scratch and borrows no packages from anyone, so
-        there is nothing hidden inside it to take on trust. It is small enough to read in an
-        afternoon, and anyone can.</p>
-      <p class="honest">One thing said plainly: your mail is written by other people, so a message
-        can contain text aimed at the AI. Zelos never acts on what the AI says — it shows you, and
-        you click. That is a stronger promise than claiming an AI can't be fooled.</p>
-    </div>
-  </div>
-
-  <details class="fold fold-wide">
-    <summary>For the technically minded</summary>
-    <p>Your keys live in your operating system's keychain — macOS Keychain, Windows DPAPI, Linux
-      libsecret. On a machine with none of those they go to an encrypted file in the Zelos home,
-      and the app says so.</p>
-    <p>Every outbound host is named by the connector that reads it, and the one transport they all
-      share refuses any other. Signing in with Google or Microsoft talks to that provider's sign-in
-      service only while you sign in and while it refreshes the token.</p>
-    <p>The payload list is the same in both columns because there is no local branch in the prompt
-      builder: one cap — 4,000 characters per body inside a fixed 32,000-character budget — runs
-      for a hosted model and a local one alike, and a crowded sweep shrinks it for both. Turning
-      off <code>sendBodies</code> drops each body to the stored 240-character snippet.</p>
-    <p><strong>Zero dependencies.</strong> Not "few" — zero. Zelos installs no packages: no supply
-      chain to trust, no postinstall script, nothing to audit but the code itself. One qualifier,
-      and it is the only one: the two desktop apps bundle Electron — Chromium and Node — because
-      that is what gives them a window and a tray icon. It sits in the shell, not in the program;
-      the code that reads your mail and talks to a model is the same dependency-free code either
-      way, and the source download has no Electron in it at all. That is what makes the claim
-      checkable rather than merely stated — point <code>lsof -i</code> at it and count the
-      conversations against your own settings.</p>
-  </details>
+  <div class="privacy-grid"><div><p class="eyebrow">06 / Built around your trust</p><h2 id="privacy-h">Your life.<br>Your machine.</h2><p class="privacy-lede">Your archive lives on your computer. There is no Zelos cloud account, no analytics and no crash reporting.</p><a class="text-link" href="/privacy">Read the privacy policy →</a></div><div class="privacy-points"><article><h3>You choose the connections</h3><p>Zelos contacts the mail, calendar and other services you add. Provider sign-in uses that provider’s services. Manual update checks contact GitHub for public release information.</p></article><article><h3>You choose what AI can read</h3><p>Online AI reviews and questions send selected archive content to your configured provider. Sharing controls can limit message text; subjects, addresses and snippets may still be included. A local model keeps the AI processing on your computer.</p></article><article><h3>You make the final move</h3><p>Zelos suggests priorities and drafts. It does not send mail, delete messages or change connected tasks. Review a reply and send it yourself in your mail app.</p></article></div></div>
 </section>
-
-<!-- ─────────────────────────────────────────── AI access -->
 <section class="band" id="ai" aria-labelledby="ai-h">
   <div class="band-head">
-    <h2 id="ai-h">Hand your assistant a key.<br>Choose which doors it opens.</h2>
+    <p class="eyebrow">07 / Connect your assistant</p><h2 id="ai-h">Open only<br>the doors you choose.</h2>
     <p class="band-note">This is an optional extra for people who already use another AI program,
       such as Claude. It is off unless you switch it on — and then the other AI sees only the
-      boxes you tick. Try it: everything below is the real set of switches.</p>
+      boxes you tick. Try the permission preview below. These sample switches do not change your installed app.</p>
   </div>
 
   <div class="glass scopes" data-scopes>
@@ -485,31 +163,7 @@
     computer — what was asked, never what was read. And the key you hand out opens only the doors
     you chose; the other AI cannot widen them.
   </p>
-</section>
-
-<!-- ─────────────────────────────────────────── ask -->
-<section class="band" id="ask" aria-labelledby="ask-h">
-  <div class="glass pane pane-tight">
-    <h2 id="ask-h">Ask your own history a question.</h2>
-    <ul class="questions">
-      <li>What did I promise Marcus in March?</li>
-      <li>When did this contract last actually move?</li>
-      <li>Who have I gone quiet on?</li>
-    </ul>
-    <p>Zelos searches everything it has already read and answers from it, showing you which
-      messages it used. Your archive stops being a place you search and starts being something you
-      can ask.</p>
-  </div>
-</section>
-
-<!-- ─────────────────────────────────────────── payoff -->
-<section class="band band-payoff" aria-labelledby="payoff-h">
-  <h2 id="payoff-h">The point was never the inbox.</h2>
-  <p>An hour a day is a fortnight a year. Zelos is not trying to make you a faster administrator
-    of your own life. It is trying to get you out of the job.</p>
-</section>
-
-<!-- ─────────────────────────────────────────── download -->
+</section><section class="band band-payoff" aria-labelledby="payoff-h"><p class="eyebrow">Devoted to what matters</p><h2 id="payoff-h">Make room<br>for your life.</h2><p>A quieter workspace. A clearer next step. The rest of the day is yours.</p><a class="btn btn-primary" href="#download">Get Zelos <span aria-hidden="true">↗</span></a></section>
 <section class="band" id="download" aria-labelledby="download-h">
   <div class="band-head band-head-centre">
     <h2 id="download-h">Take it home.</h2>
@@ -629,10 +283,7 @@
       across. If a supply chain is the thing you are weighing, take the zip — it is the one with
       nothing in it but Zelos.</p>
   </details>
-</section>
-
-<!-- ─────────────────────────────────────────── limits -->
-<section class="band" id="limits" aria-labelledby="limits-h">
+</section><section class="band" id="limits" aria-labelledby="limits-h">
   <h2 id="limits-h" class="limits-h">What it doesn't do yet</h2>
   <!-- The Google entry used to say "works today" and "only accounts on the
        test list" in the same breath, and the Microsoft entry promised a code
@@ -645,8 +296,7 @@
   <dl class="limits">
     <dt>Gmail uses a special password, for now.</dt>
     <dd>For now, Gmail users connect with an "app password" — a special password Google makes
-      just for Zelos. It takes about two minutes and the app shows you every step. One-click
-      Google sign-in is built and waiting on Google's review. iCloud, Yahoo and Fastmail use an
+      just for Zelos. It takes about two minutes and the app shows you every step. Google sign-in requires your own client registration. iCloud, Yahoo and Fastmail use an
       app password too.</dd>
     <dt>Hotmail and Outlook.com take a one-time setup.</dt>
     <dd>Hotmail and Outlook.com need a one-time, ten-minute setup at Microsoft's website first —
@@ -657,23 +307,6 @@
     <dt>It only checks your mail while it's open.</dt>
     <dd>Nothing reads your mail while the app is closed.</dd>
     <dt>Your computer warns you the first time you open it.</dt>
-    <dd>Once. <a href="#safe">Is it safe?</a> above says what to click, and why it happens.</dd>
+    <dd><a href="#safe">Before your first launch</a> above explains the warning and your options.</dd>
   </dl>
-</section>
-
-</main>
-
-<footer class="foot">
-  <div class="foot-inner">
-    <p class="foot-mark">Zelos</p>
-    <p class="foot-line">A local-first second brain. MIT licensed —
-      <a href="https://github.com/HoosAILLC/zelos">the source is on GitHub</a>, all of it, including the tests.
-      · <a href="/help">Help</a> · <a href="/privacy">Privacy</a></p>
-    <p class="foot-greek">Named for <span lang="grc" title="Zelos, in Greek">Ζῆλος</span> — Zelos — who in Greek myth stood
-      beside Zeus as the spirit of devotion: the one who did the work so the god could rule.</p>
-  </div>
-</footer>
-
-<script type="module" src="/main.js"></script>
-</body>
-</html>
+</section></main><footer class="foot"><div class="foot-inner"><p class="foot-mark">Zelos</p><p class="foot-line">A local-first second brain. Free and open source.<br><a href="https://github.com/HoosAILLC/zelos">GitHub</a> · <a href="/help">Help</a> · <a href="/privacy">Privacy</a> · <a href="/demo/">Live demo</a></p><p class="foot-greek">Named for <span lang="grc">Ζῆλος</span>, the Greek spirit of zeal and devotion.<br>Ancient inspiration. Space for modern life.</p></div></footer><script type="module" src="/main.js"></script></body></html>

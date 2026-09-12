@@ -6,7 +6,7 @@
 <title>Privacy — Zelos</title>
 <meta name="description" content="Zelos has no server and collects nothing. What the app reads, where it keeps it, what it sends to the providers and the model you chose, and how to delete all of it.">
 <link rel="canonical" href="https://zelos-app.netlify.app/privacy">
-<meta name="theme-color" content="#060A07">
+<meta name="theme-color" content="#000000">
 <meta name="color-scheme" content="dark">
 <meta name="robots" content="index,follow">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
@@ -40,7 +40,8 @@
 
 <nav class="nav" aria-label="Primary">
   <a class="wordmark" href="/" aria-label="Zelos, home">Zelos</a>
-  <ul class="nav-links">
+  <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="nav-links">Menu <span aria-hidden="true">+</span></button>
+  <ul class="nav-links" id="nav-links">
     <li><a href="/#does">What it does</a></li>
     <li><a href="/#models">Any AI</a></li>
     <li><a href="/#privacy">Privacy</a></li>

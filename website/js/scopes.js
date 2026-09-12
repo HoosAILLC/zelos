@@ -85,16 +85,16 @@ const ALL_TOOLS = ['zelos_board', 'zelos_item', 'zelos_calendar', 'zelos_search'
 /* One lane per scope in the wall animation, in the same order as the list, so a
    tick and the stream it opens are on the same line of sight. */
 const LANES = [
-  { id: 'board', short: 'BOARD', colour: '#7FA24A' },
-  { id: 'calendar', short: 'CAL', colour: '#A8C25A' },
-  { id: 'mail.metadata', short: 'MAIL', colour: '#D2DE7C' },
+  { id: 'board', short: 'BOARD', colour: '#949494' },
+  { id: 'calendar', short: 'CAL', colour: '#b5b5b5' },
+  { id: 'mail.metadata', short: 'MAIL', colour: '#d4d4d4' },
   /* The one scope the page calls most exposing takes the one warm colour on
      the site — the same --ember its tick and its label already carry, so the
      stream you watch cross the wall is the colour of the thing that crosses a
      boundary everywhere else here. */
-  { id: 'mail.bodies', short: 'BODIES', colour: '#C87A4E' },
-  { id: 'drafts', short: 'DRAFTS', colour: '#E8D08A' },
-  { id: 'people', short: 'PEOPLE', colour: '#D9A96A' },
+  { id: 'mail.bodies', short: 'BODIES', colour: '#878787' },
+  { id: 'drafts', short: 'DRAFTS', colour: '#d0d0d0' },
+  { id: 'people', short: 'PEOPLE', colour: '#afafaf' },
 ];
 
 /* Invented, deliberately. A sample payload on a public page should never be a

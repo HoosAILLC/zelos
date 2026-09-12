@@ -81,7 +81,7 @@ export function createGate(canvas, lanes) {
     // lane labels
     for (let i = 0; i < lanes.length; i++) {
       const on = enabled && live.has(lanes[i].id);
-      ctx.fillStyle = on ? lanes[i].colour : 'rgba(156,160,142,.45)';
+      ctx.fillStyle = on ? lanes[i].colour : 'rgba(158,158,158,.45)';
       ctx.globalAlpha = on ? 0.9 : 0.55;
       ctx.fillText(lanes[i].short, 4, laneY(i));
     }
@@ -99,11 +99,11 @@ export function createGate(canvas, lanes) {
     ctx.beginPath();
     ctx.arc(outX(), h * 0.5, 3.6, 0, 6.283);
     const anyLive = enabled && live.size > 0;
-    ctx.fillStyle = anyLive ? 'rgba(235,238,222,.95)' : 'rgba(156,160,142,.45)';
+    ctx.fillStyle = anyLive ? 'rgba(236,236,236,.95)' : 'rgba(158,158,158,.45)';
     if (anyLive) { ctx.shadowBlur = 12; ctx.shadowColor = 'rgba(255,255,255,.7)'; }
     ctx.fill();
     ctx.shadowBlur = 0;
-    ctx.fillStyle = anyLive ? 'rgba(219,222,206,.85)' : 'rgba(156,160,142,.5)';
+    ctx.fillStyle = anyLive ? 'rgba(220,220,220,.85)' : 'rgba(158,158,158,.5)';
     const t = 'YOUR AI';
     ctx.fillText(t, Math.min(w - ctx.measureText(t).width - 2, outX() - ctx.measureText(t).width / 2),
       h * 0.5 - 16);
@@ -144,7 +144,7 @@ export function createGate(canvas, lanes) {
       } else {
         ctx.shadowBlur = 0;
         const a = p.t < 1 ? 0.5 : Math.max(0, 0.5 - p.stopped * 0.9);
-        ctx.fillStyle = `rgba(156,160,142,${a})`;
+        ctx.fillStyle = `rgba(158,158,158,${a})`;
       }
       ctx.beginPath();
       ctx.arc(q.x, q.y, p.r, 0, 6.283);
@@ -173,7 +173,7 @@ export function createGate(canvas, lanes) {
     drawChrome();
     for (const p of parts) {
       const q = place(p);
-      ctx.fillStyle = p.pass ? lanes[p.lane].colour : 'rgba(156,160,142,.4)';
+      ctx.fillStyle = p.pass ? lanes[p.lane].colour : 'rgba(158,158,158,.4)';
       ctx.beginPath();
       ctx.arc(q.x, q.y, p.r, 0, 6.283);
       ctx.fill();
