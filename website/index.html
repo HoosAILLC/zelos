@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Zelos — make room for life</title>
-<meta name="description" content="Meet the new Zelos: a clean workspace for conversations, assigned tasks, your day, money and health. Explore the new workspace through real app screens.">
+<meta name="description" content="Meet the new Zelos: a clean workspace for conversations, assigned tasks, your day, money and health. Try the interactive sample workspace and learn how Zelos uses your chosen AI to turn context into useful work.">
 <link rel="canonical" href="https://zelos-app.netlify.app/">
 <meta name="theme-color" content="#f4f3ef">
 <meta name="color-scheme" content="light">
@@ -43,6 +43,7 @@
 <nav id="navigation" aria-label="Primary">
 <a href="#see">Inside Zelos</a>
 <a href="#does">Features</a>
+<a href="#how">How AI helps</a>
 <a href="#privacy">Our approach</a>
 <a href="/help">Help</a>
 <a class="nav-download" href="#download">Get Zelos <span aria-hidden="true">↗</span>
@@ -78,53 +79,188 @@
 </span>
 <div class="section-heading">
 <div>
-<p class="eyebrow">02 / Inside Zelos</p>
-<h2 id="product-title">Everything in view.<br>Space to think.</h2>
+<p class="eyebrow">02 / Try the workspace</p>
+<h2 id="product-title">Get a feel for<br>a clearer day.</h2>
 </div>
-<p>Go from a conversation to a clearer day. Explore real screens from the new Zelos, filled with projects, plans, and everyday life.</p>
+<p>This is the app interface, ready to explore. Open a project, search a conversation, complete a task, or plan the week. A fictional studio gives you plenty to work with.</p>
 </div>
-<div class="product-picker" aria-label="Choose a feature">
-<button type="button" data-shot="01-ask" data-title="A little space to think." data-description="Ask questions, think through an idea, or assign work from one clean conversation." aria-pressed="true">Ask</button>
-<button type="button" data-shot="02-conversation" data-title="Keep the context close." data-description="Return to saved conversations and work through questions about your private records." aria-pressed="false">Conversations</button>
-<button type="button" data-shot="08-tasks" data-title="Give Zelos something to do." data-description="Follow assigned tasks, inspect completed steps, and review the result." aria-pressed="false">Assigned work</button>
-<button type="button" data-shot="03-now" data-title="Know where to begin." data-description="See your daily briefing, overlapping appointments, and the next thing that needs you." aria-pressed="false">Now</button>
-<button type="button" data-shot="12-promises" data-title="Keep your word." data-description="Track promises in both directions and review a suggested reply before sending." aria-pressed="false">Promises</button>
-<button type="button" data-shot="07-calendar" data-title="Make room in your day." data-description="See your schedule in day, week, or month views and spot conflicts." aria-pressed="false">Calendar</button>
-<button type="button" data-shot="04-money" data-title="See the bigger picture." data-description="Bring recorded transactions, spending categories, cash flow, and invoices into view." aria-pressed="false">Money</button>
-<button type="button" data-shot="05-health" data-title="Make time for yourself." data-description="Keep activity, measurements, lab records, and weekly meal and exercise plans together." aria-pressed="false">Health</button>
-<button type="button" data-shot="06-groceries" data-title="From a plan to a list." data-description="Review ingredients, quantities, estimated costs, and what you already have." aria-pressed="false">Groceries</button>
-<button type="button" data-shot="09-progress" data-title="See what you finished." data-description="Look back at completed work, daily activity, and weekly reports." aria-pressed="false">Progress</button>
-<button type="button" data-shot="11-imports" data-title="Turn paperwork into records." data-description="Choose a statement, invoice, or lab report. Review extracted records before saving." aria-pressed="false">Imports</button>
-<button type="button" data-shot="10-booking" data-title="Give your time a place." data-description="Set meeting availability and keep upcoming bookings in view." aria-pressed="false">Booking</button>
+<div class="demo-guide">
+<div>
+<strong>Start anywhere.</strong>
+<p>Try a daily briefing, ask about Northstar, or mark an ingredient as bought.</p>
 </div>
-<figure class="product-figure">
-<div class="product-frame">
-<div class="frame-bar">
-<span>
-<i aria-hidden="true">
-</i> The Zelos workspace</span>
-<button type="button" class="enlarge" aria-haspopup="dialog">Enlarge screen <span aria-hidden="true">↗</span>
-</button>
+<a class="text-link" href="/try/" target="_blank" rel="noopener">Open demo in its own tab ↗</a>
 </div>
-<img id="product-image" src="/img/workspace/01-ask.png" width="1600" height="900" alt="Zelos Ask: a weekly planning conversation in a populated sample workspace." loading="lazy">
+<div class="demo-routes" aria-label="Jump to a demo feature">
+<button type="button" data-demo-route="now" aria-pressed="true">Your day</button>
+<button type="button" data-demo-route="ask" aria-pressed="false">Ask Zelos</button>
+<button type="button" data-demo-route="search" aria-pressed="false">Search</button>
+<button type="button" data-demo-route="calendar" aria-pressed="false">Calendar</button>
+<button type="button" data-demo-route="finance" aria-pressed="false">Money</button>
+<button type="button" data-demo-route="health" aria-pressed="false">Health</button>
+<button type="button" data-demo-route="shopping" aria-pressed="false">Groceries</button>
+<button type="button" data-demo-route="jobs" aria-pressed="false">Assigned work</button>
 </div>
-<figcaption class="product-caption">
-<div aria-live="polite" aria-atomic="true">
-<p class="eyebrow" id="chapter">01 / Ask</p>
-<h3 id="shot-title">A little space to think.</h3>
-<p id="shot-description">Ask questions, think through an idea, or assign work from one clean conversation.</p>
+<div class="live-demo">
+<iframe id="zelos-demo" src="/try/#/now" title="Interactive Zelos demo with fictional sample records" loading="lazy" allow="clipboard-write" referrerpolicy="same-origin">
+</iframe>
 </div>
-<div class="tour-controls">
-<button type="button" data-direction="-1" aria-label="Previous feature">←</button>
-<span id="shot-count">01 / 12</span>
-<button type="button" data-direction="1" aria-label="Next feature">→</button>
+<p class="preview-note">Current development interface · fictional records · prepared example answers, not live AI.<br>Changes stay in this tab and reset when you reload. Connecting accounts, sending email, uploading files, and checkout require the installed app. The public download is version {{VERSION}} and has an earlier interface.</p>
+<details class="details">
+<summary>Things you can try in the demo <span aria-hidden="true">+</span>
+</summary>
+<div class="demo-checklist">
+<p>
+<strong>Find a forgotten decision.</strong> Open Search and type “Northstar.” Read the matching emails, events, and notes.</p>
+<p>
+<strong>Ask for a starting point.</strong> In Ask, try “What needs my attention this week?” Or open a saved conversation from the menu.</p>
+<p>
+<strong>Make a little progress.</strong> In Today, finish an item. In Groceries, change an ingredient to “Have” or “Bought.”</p>
+<p>
+<strong>See the bigger picture.</strong> Explore Money, Health, Progress, Imports, and Booking from the app sidebar.</p>
 </div>
-</figcaption>
-</figure>
-<p class="preview-note">Actual app captures · fictional sample records and example answers · current development build.<br>The public download is version {{VERSION}} and has an earlier interface.</p>
-<noscript>
-<p>Open the <a href="/img/workspace/01-ask.png">full-size app screen</a>. Enable JavaScript to explore all twelve screens.</p>
-</noscript>
+</details>
+</section>
+<section class="section why-zelos" id="why" aria-labelledby="why-title">
+<div class="section-heading">
+<div>
+<p class="eyebrow">Why Zelos</p>
+<h2 id="why-title">You have the information.<br>Now put it to work.</h2>
+</div>
+<p>The hard part is often remembering where something landed, what you agreed to, and what to do next. Zelos connects those pieces into a workspace you can act from.</p>
+</div>
+<div class="value-grid">
+<article>
+<span class="feature-number">01 / Less hunting</span>
+<h3>Find the decision,<br>not just the thread.</h3>
+<p>Search across mail, events, tasks, and notes. Ask a question about the archive and follow references back to the source. The context stays within reach when you need to make a decision.</p>
+</article>
+<article>
+<span class="feature-number">02 / Less remembering</span>
+<h3>Give loose ends<br>a place to land.</h3>
+<p>Deadlines, promises, and follow-ups can be easy to lose inside a busy inbox. Zelos brings them into a daily view, so you can decide what deserves your attention first.</p>
+</article>
+<article>
+<span class="feature-number">03 / Less starting over</span>
+<h3>Begin with a draft,<br>a brief, or a plan.</h3>
+<p>Use saved context to prepare for a meeting, draft a reply, or summarize completed work. You get a starting point to review instead of rebuilding the same background every time.</p>
+</article>
+</div>
+</section>
+<section class="section how-it-works" id="how" aria-labelledby="how-title">
+<div class="section-heading">
+<div>
+<p class="eyebrow">How it works</p>
+<h2 id="how-title">Your context.<br>AI that can use it.</h2>
+</div>
+<p>Zelos is the workspace around the AI. It brings in records, finds relevant context, gives that context to your chosen model, and puts useful results where you can review them.</p>
+</div>
+<ol class="how-steps">
+<li>
+<span>01</span>
+<div>
+<h3>Connect what matters.</h3>
+<p>Add the mail accounts, calendars, project sources, and local files you want Zelos to read. It keeps an archive on your computer. You choose the sources; Zelos checks them while it is open.</p>
+</div>
+</li>
+<li>
+<span>02</span>
+<div>
+<h3>Give AI the relevant background.</h3>
+<p>For a question or check, Zelos gathers context from your records and asks the model you configured to interpret it. Instead of manually copying a thread into a chat, you can ask in the place that already holds the context.</p>
+</div>
+</li>
+<li>
+<span>03</span>
+<div>
+<h3>Turn the answer into a next step.</h3>
+<p>See priorities, review meeting prep, follow source references, or inspect an assigned task’s result. Edit a draft, correct a detail, snooze an item, or mark it done. AI helps prepare the work; you decide what to trust and act on.</p>
+</div>
+</li>
+</ol>
+<div class="context-flow" aria-label="How context becomes useful work">
+<span>Your mail, calendar &amp; notes</span>
+<b aria-hidden="true">→</b>
+<span>Zelos finds the context</span>
+<b aria-hidden="true">→</b>
+<span>Your chosen AI</span>
+<b aria-hidden="true">→</b>
+<span>A result to review</span>
+</div>
+</section>
+<section class="section examples" aria-labelledby="examples-title">
+<div class="section-heading">
+<div>
+<p class="eyebrow">What that looks like</p>
+<h2 id="examples-title">Useful in the middle<br>of a real day.</h2>
+</div>
+<p>A question is only the beginning. The value is the work you can do with the answer.</p>
+</div>
+<div class="example-grid">
+<article>
+<p class="eyebrow">Before the meeting</p>
+<h3>“Prepare me for<br>the client review.”</h3>
+<p>
+<strong>Zelos can bring together</strong> the meeting, earlier correspondence, and saved project notes to prepare a brief with open questions and decisions.</p>
+<p>
+<strong>You can walk in</strong> with context, then check the sources and add your own judgment.</p>
+<a href="#see" data-demo-route="ask">Try a sample question ↗</a>
+</article>
+<article>
+<p class="eyebrow">When the inbox gets busy</p>
+<h3>“What did I promise<br>to send this week?”</h3>
+<p>
+<strong>Zelos can surface</strong> commitments and deadlines from connected records, and keep what you owe beside what you are waiting for.</p>
+<p>
+<strong>You can follow through</strong> without holding every conversation in your head.</p>
+<a href="#see" data-demo-route="owed">Explore Promises ↗</a>
+</article>
+<article>
+<p class="eyebrow">At the end of the week</p>
+<h3>“Summarize what<br>I actually finished.”</h3>
+<p>
+<strong>Zelos can organize</strong> completion history into a weekly report, with work you select and a PDF you can keep or share.</p>
+<p>
+<strong>You can explain your progress</strong> from recorded work instead of trying to reconstruct the week.</p>
+<a href="#see" data-demo-route="progress">Explore Progress ↗</a>
+</article>
+<article>
+<p class="eyebrow">Beyond work</p>
+<h3>“Help me plan<br>the week’s meals.”</h3>
+<p>
+<strong>Zelos can use</strong> your saved preferences and goals to prepare a meal and exercise plan for review, with a grocery list alongside it.</p>
+<p>
+<strong>You can turn a plan into action</strong> by editing meals and tracking what you need, have, or bought.</p>
+<a href="#see" data-demo-route="health">Explore Health ↗</a>
+</article>
+</div>
+</section>
+<section class="section ai-explained" id="models" aria-labelledby="ai-title">
+<div class="section-heading">
+<div>
+<p class="eyebrow">Your AI, on your terms</p>
+<h2 id="ai-title">Choose the model.<br>Keep the workspace.</h2>
+</div>
+<p>Zelos does not lock your records to one AI provider. Configure a compatible online model, or run one locally, and keep working in the same place.</p>
+</div>
+<div class="ai-options">
+<article>
+<h3>An online model</h3>
+<p>Use a compatible provider with your own API key and configuration. Zelos sends the context needed for a request to that provider.</p>
+<p>This gives you access to hosted models without running one on your own hardware. Provider charges, capabilities, and data policies apply.</p>
+</article>
+<article>
+<h3>A model on your computer</h3>
+<p>Use a compatible local model endpoint, such as a model served through Ollama or LM Studio. Model processing can stay on your machine.</p>
+<p>This gives you more control over where context is processed. Speed and answer quality depend on the model and your hardware; connected sources still contact their own services.</p>
+</article>
+</div>
+<div class="ai-note">
+<h3>What the AI does—and what you still control.</h3>
+<p>The model helps interpret, summarize, prioritize, and prepare work from the context Zelos provides. It can miss details or get an answer wrong. Check source references and review results before relying on them. The workspace also gives you direct search, calendars, records, and task controls that do not need an AI answer for every click.</p>
+<p>In the current build, email sending requires review and your explicit action. Imported records are reviewed before saving. Grocery checkout takes place with the store. Other AI clients can receive scoped, read-only access only when you enable and configure that sharing.</p>
+<a class="text-link" href="/privacy">How your data is handled ↗</a>
+</div>
 </section>
 <section class="section features" id="does" aria-labelledby="features-title">
 <div class="section-heading">
@@ -147,7 +283,7 @@
 <li>Email and reviewed replies</li>
 <li>Booking availability &amp; buffers</li>
 </ul>
-<a href="#see" data-show-shot="03-now">Explore your day <span aria-hidden="true">↗</span>
+<a href="#see" data-demo-route="now">Explore your day <span aria-hidden="true">↗</span>
 </a>
 </article>
 <article>
@@ -162,7 +298,7 @@
 <li>Weekly progress &amp; PDF reports</li>
 <li>Notes, reminders &amp; snoozing</li>
 </ul>
-<a href="#see" data-show-shot="08-tasks">Explore assigned work <span aria-hidden="true">↗</span>
+<a href="#see" data-demo-route="jobs">Explore assigned work <span aria-hidden="true">↗</span>
 </a>
 </article>
 <article>
@@ -177,7 +313,7 @@
 <li>Groceries &amp; optional store handoff</li>
 <li>PDF &amp; image imports to review</li>
 </ul>
-<a href="#see" data-show-shot="04-money">Explore everyday life <span aria-hidden="true">↗</span>
+<a href="#see" data-demo-route="finance">Explore everyday life <span aria-hidden="true">↗</span>
 </a>
 </article>
 </div>
@@ -234,7 +370,10 @@
 </details>
 </section>
 <section class="ownership" id="privacy" aria-labelledby="privacy-title">
-<span id="models" class="anchor"></span><span id="ai" class="anchor"></span><span id="control" class="anchor"></span>
+<span id="ai" class="anchor">
+</span>
+<span id="control" class="anchor">
+</span>
 <img src="/img/campaign/wing-in-stone.png" width="1254" height="1254" alt="The Zelos wing and lowercase wordmark carved into pale stone beside a Greek column." loading="lazy">
 <div class="ownership-copy">
 <p class="eyebrow">06 / Yours, by design</p>
@@ -249,6 +388,54 @@
 </div>
 </div>
 </section>
+<section class="section faq" aria-labelledby="faq-title">
+<div class="section-heading">
+<div>
+<p class="eyebrow">A few good questions</p>
+<h2 id="faq-title">Know what<br>you’re bringing home.</h2>
+</div>
+</div>
+<details class="details">
+<summary>How is Zelos different from opening a chat with an AI? <span aria-hidden="true">+</span>
+</summary>
+<div class="details-copy">
+<p>Zelos combines a local archive, connected sources, and everyday views with an AI model you choose. You can ask about saved records without rebuilding all the background in each conversation, then keep working with tasks, calendars, drafts, and plans in the same workspace.</p>
+<p>The AI model supplies language and reasoning capabilities. Zelos supplies the context, the workflow, and the controls around the result.</p>
+</div>
+</details>
+<details class="details">
+<summary>Does Zelos include an AI subscription? <span aria-hidden="true">+</span>
+</summary>
+<div class="details-copy">
+<p>No. Zelos is free and open source. For an online model, you configure a compatible provider and may pay that provider for API usage. A chat subscription does not necessarily include API usage.</p>
+<p>You can instead configure a local model. It needs suitable hardware and a compatible local endpoint. The website demo uses prepared examples and has no AI usage charge.</p>
+</div>
+</details>
+<details class="details">
+<summary>Does it automatically do things on my behalf? <span aria-hidden="true">+</span>
+</summary>
+<div class="details-copy">
+<p>You can assign supported work, such as researching saved records, preparing an unsent reply, saving a note, or creating a weekly report. Zelos records the steps so you can inspect the result.</p>
+<p>Sending email is a reviewed action in the current build. It does not silently complete a grocery checkout. Booking publication and external connections require their own setup.</p>
+</div>
+</details>
+<details class="details">
+<summary>Where do my records and AI requests go? <span aria-hidden="true">+</span>
+</summary>
+<div class="details-copy">
+<p>The archive lives on your computer. Connected sources contact their own services. When you choose an online AI, the relevant content for the request goes to that provider.</p>
+<p>A local model can keep model processing on your machine. Read the privacy page for the public release and the preview’s additional connection requirements.</p>
+</div>
+</details>
+<details class="details">
+<summary>Can I use the new interface shown in the demo today? <span aria-hidden="true">+</span>
+</summary>
+<div class="details-copy">
+<p>The website previews the current development interface with fictional records. The public installer below is version {{VERSION}}, with an earlier interface and a smaller feature set.</p>
+<p>The demo lets you explore without connecting real accounts. Changes reset on reload, and its prepared answers illustrate the experience rather than running a live model.</p>
+</div>
+</details>
+</section>
 <section class="section download" id="download" aria-labelledby="download-title">
 <div class="section-heading">
 <div>
@@ -257,7 +444,7 @@
 </div>
 <div>
 <p>Free to download. Open source.<br>Bring your own AI, or run a local model.</p>
-<p class="release-note">Version {{VERSION}} · public release<br>The new interface and features shown above are a preview of the development build.</p>
+<p class="release-note">Version {{VERSION}} · public release<br>The interactive workspace above previews the newer development build.</p>
 </div>
 </div>
 <div class="download-options">
@@ -279,7 +466,8 @@
 <a class="text-link" href="/help">Open the guide ↗</a>
 </article>
 </div>
-<span id="limits"></span>
+<span id="limits">
+</span>
 <details class="details" id="safe">
 <summary>Before your first launch <span aria-hidden="true">+</span>
 </summary>
@@ -309,24 +497,9 @@
 </div>
 <div class="footer-bottom">
 <span>© 2026 Zelos · Free &amp; open source</span>
-<span>Campaign scenes are illustrative. Product screens are actual app captures.</span>
+<span>Campaign scenes are illustrative. The interactive demo uses fictional data.</span>
 </div>
 </footer>
-<dialog id="screen-dialog" aria-labelledby="dialog-title">
-<div class="dialog-bar">
-<h2 id="dialog-title">Zelos — Ask</h2>
-<a id="original-image" href="/img/workspace/01-ask.png" target="_blank" rel="noopener">Original image ↗</a>
-<button type="button" class="close-dialog" autofocus>Close ×</button>
-</div>
-<div class="dialog-image">
-<img id="large-image" src="/img/workspace/01-ask.png" width="1600" height="900" alt="Zelos Ask sample workspace">
-</div>
-<div class="dialog-controls">
-<button type="button" data-direction="-1" aria-label="Previous enlarged feature">← Previous</button>
-<p>Actual app screen · sample data</p>
-<button type="button" data-direction="1" aria-label="Next enlarged feature">Next →</button>
-</div>
-</dialog>
 <script src="/campaign.js" defer>
 </script>
 </body>
