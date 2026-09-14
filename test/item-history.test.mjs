@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { restoreLegacySchema } from './helpers/legacy-schema.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -28,11 +29,13 @@ test('schema 4 preserves v3 user data without inventing earlier item history', (
   dbm.upsertDraft(db, { itemId: id, body: 'Preserve my draft' });
   dbm.setKV(db, 'user-preference', JSON.stringify({ keep: true }));
   dbm.indexDoc(db, { ref: `item:${id}`, kind: 'item', title: ITEM.headline });
-  db.exec('DROP TABLE IF EXISTS item_history; PRAGMA user_version = 3');
+  // Recreate the complete v3 layout: lowering user_version alone would leave
+  // the later reply columns in place and is not an actual legacy database.
+  restoreLegacySchema(db, 3);
   dbm.deleteKV(db, 'itemHistory.startedAt');
   const tables = ['items', 'drafts', 'captures', 'search', 'task_activity'];
   const before = tables.map((table) => db.prepare(`SELECT * FROM ${table}`).all());
-  assert.deepEqual(dbm.migrate(db), { version: 4, applied: 1 });
+  assert.deepEqual(dbm.migrate(db), { version: dbm.SCHEMA_VERSION, applied: dbm.SCHEMA_VERSION - 3 });
   assert.deepEqual(tables.map((table) => db.prepare(`SELECT * FROM ${table}`).all()), before);
   assert.deepEqual(JSON.parse(dbm.getKV(db, 'user-preference')), { keep: true });
   assert.deepEqual(entries(db, id), []);

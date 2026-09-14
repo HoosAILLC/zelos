@@ -7,14 +7,23 @@ import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { open, close, migrate, upsertMessage, upsertItem, upsertDraft, insertCapture, setKV, getKV, indexDoc, search } from '../core/db.mjs';
-import { DEFAULTS } from '../core/config.mjs';
+import { DEFAULTS, loadConfig, saveConfig } from '../core/config.mjs';
+import { mintToken, revokeToken, verifyToken } from '../core/ai-access.mjs';
 import { setSecret, getSecret, resetBackendCache } from '../core/secrets.mjs';
 import { createBackup, stageBackup, applyRestore, recoverRestore, recoveryDestination, BACKUP_MAGIC, BACKUP_LIMITS } from '../core/backup.mjs';
 import { acquireMaintenance, registerDataConnection, MAINTENANCE_FILE } from '../core/data-lease.mjs';
-import { startCore, requestBarrier } from '../desktop/runtime.js';
+// npm deployments do not ship Electron's native runtime. Never substitute a
+// different runtime to make its packaging tests appear exercised.
+const desktopAvailable = fs.existsSync(new URL('../desktop/runtime.js', import.meta.url));
+const { startCore, requestBarrier } = desktopAvailable ? await import('../desktop/runtime.js') : {};
 import { EventEmitter } from 'node:events';
 import { diagnose } from '../core/doctor.mjs';
 import { recordAccess } from '../core/mcp.mjs';
+import * as family from '../core/family.mjs';
+import { totpCode } from '../core/family-mfa.mjs';
+import { createPlaidService } from '../core/finance-plaid.mjs';
+import { migrateFinanceReviews } from '../core/finance-review.mjs';
+import { runAutomaticBackup, stageEncryptedBackup } from '../core/automatic-backup.mjs';
 
 let dir;
 let priorHome;
@@ -72,6 +81,64 @@ afterEach(() => {
 });
 
 describe('portable backup and restore', () => {
+  it('reads legacy bank backups and current review/pending schemas without admitting partial upgrades', () => {
+    for (const mode of ['none','legacy','current']) for (const reviews of [false,true]) {
+      const fx=fixture(`accuracy-${mode}-${reviews}`);
+      if(mode!=='none')createPlaidService(fx.db,{vault:{},fetcher(){assert.fail('no bank call');}});
+      if(mode==='legacy')fx.db.exec('DROP TABLE finance_plaid_pending; DROP TABLE finance_plaid_sync_state;');
+      if(reviews)migrateFinanceReviews(fx.db);
+      const {file}=save(fx),staged=stageBackup({home:fx.home,source:file});staged.cleanup();
+    }
+    const partial=fixture('partial-accuracy');createPlaidService(partial.db,{vault:{}});
+    partial.db.exec('DROP TABLE finance_plaid_pending');
+    assert.throws(()=>save(partial),/not a recognized Zelos schema/);
+    const altered=fixture('altered-review');migrateFinanceReviews(altered.db);
+    altered.db.exec('ALTER TABLE finance_review_decisions ADD COLUMN unexpected TEXT');
+    assert.throws(()=>save(altered),/not a recognized Zelos schema/);
+  });
+
+  it('backs up and validates the exact lazy Plaid schema with or without MCP audit history', () => {
+    for (const audit of [false, true]) {
+      const fx = fixture(`plaid-${audit}`);
+      createPlaidService(fx.db, { vault: {}, fetcher() { assert.fail('backup must not contact Plaid'); } });
+      fx.db.prepare('INSERT INTO finance_plaid_items(id,institution,accounts) VALUES(?,?,?)').run('item-fixture','Synthetic Bank','[]');
+      fx.db.prepare('INSERT INTO finance_plaid_sessions(id,item_id,expires) VALUES(?,?,?)').run('session-fixture','item-fixture','2026-10-01T00:00:00Z');
+      fx.db.prepare('INSERT INTO finance_plaid_accounts VALUES(?,?,?,?)').run('remote-account','item-fixture','local-account','2026-09-01');
+      fx.db.prepare('INSERT INTO finance_plaid_transactions VALUES(?,?,?)').run('remote-transaction','item-fixture','local-transaction');
+      if (audit) recordAccess(fx.db, { tool: 'zelos_board', rows: 1 });
+      const {file} = save(fx);
+      const staged = stageBackup({home:fx.home,source:file});
+      const restored = open(path.join(staged.directory,'new','zelos.db'));live.add(restored);
+      for (const table of ['finance_plaid_items','finance_plaid_sessions','finance_plaid_accounts','finance_plaid_transactions']) {
+        assert.deepEqual(restored.prepare(`SELECT * FROM ${table}`).all(),fx.db.prepare(`SELECT * FROM ${table}`).all());
+      }
+      assert.equal(!!restored.prepare("SELECT 1 FROM sqlite_schema WHERE name='ai_access_log'").get(),audit);
+      shut(restored);staged.cleanup();
+      const encrypted=runAutomaticBackup({...fx,appVersion:version,force:true});
+      assert.equal(encrypted.last.ok,true);assert.equal(encrypted.last.verified,true);
+      const verified=stageEncryptedBackup({home:fx.home,source:path.join(fx.home,'backups','automatic',encrypted.last.filename)});
+      verified.cleanup();
+    }
+  });
+
+  it('the optional Plaid schema does not admit extra tables, indexes, triggers, or changed definitions', () => {
+    const mutations = [
+      'CREATE TABLE unexpected(payload TEXT)',
+      'CREATE INDEX unexpected ON finance_plaid_items(institution)',
+      'CREATE TRIGGER unexpected AFTER INSERT ON finance_plaid_items BEGIN DELETE FROM finance_plaid_sessions; END',
+      'ALTER TABLE finance_plaid_items ADD COLUMN unexpected TEXT',
+      'ALTER TABLE messages ADD COLUMN unexpected TEXT',
+      'DROP TABLE finance_plaid_transactions',
+    ];
+    for (const [index,sql] of mutations.entries()) {
+      const fx=fixture(`plaid-invalid-${index}`);
+      createPlaidService(fx.db,{vault:{},fetcher(){assert.fail('must not contact Plaid');}});
+      fx.db.exec(sql);
+      assert.throws(()=>save(fx),/database structure is not a recognized Zelos schema/);
+      assert.ok(!fs.readdirSync(fx.home).some(name=>name.startsWith('.backup-')));
+    }
+  });
+
   it('flushes copied files through writable handles without truncating backup or rollback data', (t) => {
     const source = fixture('source', 'Original'); const target = fixture('target', 'Current');
     const handles = new Map(); const copied = new Set(); const synced = new Set();
@@ -137,6 +204,91 @@ describe('portable backup and restore', () => {
     const rollback = stageBackup({ home: source.home, source: prepared.recoveryFile });
     assert.equal(JSON.parse(fs.readFileSync(path.join(rollback.directory, 'new', 'config.json'))).identity.name, 'Current');
     rollback.cleanup();
+  });
+
+  it('restoring a pre-revocation backup cannot resurrect an AI bearer token, even when AI is reenabled', async () => {
+    const fx = fixture('ai-restore'); process.env.ZELOS_HOME = fx.home;
+    saveConfig({ ai: { enabled: true, tokens: [], scopes: { 'board.read': true } } });
+    const minted = await mintToken({ label: 'Synthetic client' });
+    const ref = `ai.${minted.token.id}`;
+    await setSecret('model.default', 'unrelated-fixture-secret');
+    // Orphaned credentials and legacy indexes are invalidated too, not only
+    // whichever token happened to be listed in config at backup time.
+    await setSecret('ai.orphan', 'orphaned-synthetic-token');
+    fs.writeFileSync(path.join(fx.home, 'secrets.index.json'), JSON.stringify({ refs: [ref, 'ai.orphan', 'model.default'] }));
+    fs.writeFileSync(path.join(fx.home, 'secrets.namespace.json'), JSON.stringify({ version: 1, id: 'a'.repeat(32), legacyRefs: [ref, 'model.default'] }));
+    assert.equal((await verifyToken(minted.value)).ok, true, 'the archived credential must actually work before revocation');
+    const archive = save(fx).file;
+    await revokeToken(minted.token.id);
+    assert.equal((await verifyToken(minted.value)).ok, false);
+    const prepared = restorePreparation(fx, archive);
+    const result = applyRestore(prepared); resetBackendCache();
+    assert.equal((await verifyToken(minted.value)).ok, false, 'a previously revoked bearer token must remain rejected after restore');
+    assert.equal(loadConfig().ai.enabled, false);
+    assert.equal(result.aiReconnectRequired, true);
+    assert.deepEqual(loadConfig().ai.tokens, []);
+    assert.equal(await getSecret(ref), null);
+    assert.equal(await getSecret('ai.orphan'), null);
+    assert.equal(await getSecret('model.default'), 'unrelated-fixture-secret');
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(fx.home, 'secrets.index.json'))).refs, ['model.default']);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(fx.home, 'secrets.namespace.json'))).legacyRefs, ['model.default']);
+    saveConfig({ ai: { ...loadConfig().ai, enabled: true } });
+    assert.equal((await verifyToken(minted.value)).ok, false, 'enabling AI must not restore old credentials');
+    const fresh = await mintToken({ label: 'Reconnected synthetic client' });
+    assert.equal((await verifyToken(fresh.value)).ok, true, 'explicit fresh reconnection still works');
+    assert.equal((await verifyToken(minted.value)).ok, false);
+  });
+
+  it('failed restore preserves current AI tokens and does not change the archived credentials', async () => {
+    const source = fixture('ai-old'); process.env.ZELOS_HOME = source.home;
+    saveConfig({ ai: { enabled: true, tokens: [] } });
+    const old = await mintToken({ label: 'Old client' });
+    const archive = save(source).file, archiveBytes = fs.readFileSync(archive);
+    const target = fixture('ai-current'); process.env.ZELOS_HOME = target.home; resetBackendCache();
+    saveConfig({ ai: { enabled: true, tokens: [] } });
+    const current = await mintToken({ label: 'Current client' });
+    const prepared = restorePreparation(target, archive);
+    assert.throws(() => applyRestore({ ...prepared, onStep: step => { if (step === 'installed:config.json') throw Error('synthetic interruption'); } }), /synthetic interruption/);
+    resetBackendCache();
+    assert.equal((await verifyToken(current.value)).ok, true);
+    assert.equal((await verifyToken(old.value)).ok, false);
+    assert.deepEqual(fs.readFileSync(archive), archiveBytes, 'staged sanitation never rewrites the original archive');
+  });
+
+  it('restored external-keychain token references require reconnecting without touching an OS store', () => {
+    const source = fixture('ai-external'), target = fixture('ai-target');
+    const cfg = JSON.parse(fs.readFileSync(path.join(source.home, 'config.json')));
+    cfg.ai = { enabled: true, tokens: [{ id: 't_external', ref: 'ai.t_external', label: 'Synthetic external client' }] };
+    fs.writeFileSync(path.join(source.home, 'config.json'), JSON.stringify(cfg));
+    fs.writeFileSync(path.join(source.home, 'secrets.backend.json'), JSON.stringify({ backend: 'macos-keychain' }));
+    fs.writeFileSync(path.join(source.home, 'secrets.index.json'), JSON.stringify({ refs: ['ai.t_external', 'model.default'] }));
+    fs.writeFileSync(path.join(source.home, 'secrets.namespace.json'), JSON.stringify({ version: 1, id: 'b'.repeat(32), legacyRefs: ['ai.t_external', 'model.default'] }));
+    const result = applyRestore(restorePreparation(target, save(source).file));
+    const restored = JSON.parse(fs.readFileSync(path.join(target.home, 'config.json')));
+    assert.equal(result.aiReconnectRequired, true);
+    assert.equal(restored.ai.enabled, false); assert.deepEqual(restored.ai.tokens, []);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(target.home, 'secrets.index.json'))).refs, ['model.default']);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(target.home, 'secrets.namespace.json'))).legacyRefs, ['model.default']);
+  });
+
+  it('restoring still suspends family access and discards spent recovery-code material', async () => {
+    const source = fixture('family-source'), target = fixture('family-target');
+    process.env.ZELOS_HOME = source.home;
+    const owner = { accountId: 'owner' };
+    const invitation = await family.familyAction(source.db, owner, 'member.invite', {
+      name: 'Synthetic relative', email: 'relative@example.test', role: 'parent',
+    });
+    const setup = await family.acceptFamilyInvite(source.db, { token: invitation.inviteToken, password: 'Synthetic family password 7!' });
+    const accepted = await family.completeFamilyMfa(source.db, { challenge: setup.challenge, code: totpCode(setup.enrollment.secret) });
+    assert.ok(family.authenticateFamily(source.db, accepted.token));
+    const result = applyRestore(restorePreparation(target, save(source).file));
+    const restored = open(path.join(target.home, 'zelos.db')); live.add(restored);
+    assert.equal(result.familyReconnectRequired, true);
+    assert.throws(() => family.authenticateFamily(restored, accepted.token), /sign in|sign-in|access|session|credential/i);
+    assert.equal(restored.prepare("SELECT count(*) AS n FROM family_accounts WHERE id<>'owner' AND status<>'revoked'").get().n, 0);
+    assert.equal(restored.prepare('SELECT count(*) AS n FROM family_credentials WHERE revoked_at IS NULL').get().n, 0);
+    assert.equal(restored.prepare('SELECT count(*) AS n FROM family_invitations WHERE revoked_at IS NULL').get().n, 0);
+    assert.ok(restored.prepare('SELECT recovery_json FROM family_mfa').all().every(row => row.recovery_json === '[]'));
   });
 
   it('snapshots committed WAL content without copying a live WAL or SHM', () => {
@@ -358,7 +510,7 @@ describe('maintenance leases', () => {
   });
 });
 
-describe('native runtime maintenance', () => {
+describe('native runtime maintenance', { skip: !desktopAvailable && 'Desktop runtime is absent from this deployed npm layout; portable backup and lease tests still run.' }, () => {
   it('runs backup workers when the native runtime is launched through a module-evaluation harness', () => {
     const fx = fixture('eval-runtime'); shut(fx.db);
     const destination = path.join(dir, 'eval-runtime.zelos-backup');

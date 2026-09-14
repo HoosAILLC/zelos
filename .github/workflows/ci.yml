@@ -1,8 +1,6 @@
 name: tests
 
-# The whole suite, on every platform Zelos claims to run on. It needs no
-# install step: Zelos has no dependencies, so `actions/checkout` plus a Node
-# runtime is the entire setup.
+# The whole suite, with the same pinned runtime packages shipped in the app.
 on:
   push:
     branches: [main]
@@ -25,16 +23,19 @@ jobs:
         # it. 23 is excluded on purpose — the whole line lacks FTS5, and this
         # matrix is what found that.
         node: ['22.16', '22', '24', 'latest']
+        include:
+          - os: macos-15-intel
+            node: '24'
+          - os: windows-11-arm
+            node: '24'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
 
-      - name: No dependencies, by design
-        shell: bash
-        run: |
-          test ! -d node_modules || { echo "node_modules exists — the zero-dependency claim is broken"; exit 1; }
+      - name: Install pinned runtime dependencies
+        run: npm ci --omit=dev --ignore-scripts
 
       # Node's test runner has no glob of its own, so the files are listed.
       # Shell globbing does the expansion, which is why this is bash on every OS.
@@ -64,7 +65,7 @@ jobs:
       # to the encrypted file, that test is what turns it red.
       - name: Run the suite
         shell: bash
-        run: node --test --test-timeout=180000 test/*.test.mjs
+        run: node --test --test-concurrency=4 --test-timeout=180000 test/*.test.mjs
 
       # The macOS legs let detection run for real, which is the point of them:
       # `CI` is set, so the two "this machine's real backend" tests use the
@@ -86,6 +87,12 @@ jobs:
           if security find-generic-password -s com.zelos.app; then
             echo "the suite left a credential in the runner's login keychain"
             exit 1
+          else
+            status=$?
+            if [ "$status" -ne 44 ]; then
+              echo "the login keychain could not be checked (exit $status)"
+              exit "$status"
+            fi
           fi
 
   # --------------------------------------------------------------------
@@ -114,6 +121,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+
+      - name: Install pinned runtime dependencies
+        run: npm ci --omit=dev --ignore-scripts
 
       # Deliberately without --no-install-recommends. The keyring daemon's
       # secrets component pulls in pieces through recommends on some images, and

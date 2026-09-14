@@ -25,7 +25,7 @@ export function backupPanel() {
       else if (!result?.ok) status.textContent = result?.error || 'The backup operation could not finish. Try again.';
       else status.textContent = action === 'createBackup'
         ? 'Backup saved. Keep it private: it contains your archive and may include account credentials.'
-        : 'Backup restored. Zelos will restart with the restored data.';
+        : 'Backup restored. Zelos will restart. Family members need fresh invitations, and AI clients need newly issued access tokens.';
     } catch {
       status.textContent = 'The backup operation could not finish. Try again.';
     } finally {
@@ -39,7 +39,7 @@ export function backupPanel() {
     el('h3', { text: 'Back up and restore' }),
     el('p', { class: 'quiet-note', text: 'Save your archive, captures, drafts, item history, settings and portable credentials in one backup file. Treat this file like your private data folder; it is not password protected.' }),
     el('div', { class: 'row-inline' }, [save, restore]),
-    el('p', { class: 'quiet-note', text: 'Restore checks the file before you confirm, saves a recovery copy of your current data, then restarts Zelos. Close other Zelos sessions and connected AI clients first. Passwords held by your computer’s password storage may need reconnecting on another computer.' }),
+    el('p', { class: 'quiet-note', text: 'Restore checks the file before you confirm, saves a recovery copy of your current data, then restarts Zelos. Close other Zelos sessions and connected AI clients first. Restored family access is suspended and AI access is turned off; reconnect family members with fresh invitations and issue new AI client tokens. Passwords held by your computer’s password storage may need reconnecting on another computer.' }),
     status,
   ]);
 }

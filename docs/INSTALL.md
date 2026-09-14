@@ -116,20 +116,18 @@ node --version
 
 ```
 cd zelos
+npm ci --omit=dev --ignore-scripts
 node zelos.mjs
 ```
 
-That is the whole installation. There is **no `npm install`** step, because the
-app has no dependencies — the entire thing is written against what Node ships
-with. If instructions anywhere ever tell you to `npm install` in the Zelos
-folder, something is wrong. (The one exception is the `desktop/` folder, which
-is a separate package that exists only to put this same app in a window. See
-Path 3.)
+The install command uses the exact runtime dependency versions in the lockfile.
+It works in Terminal on macOS and PowerShell on Windows. Desktop installers
+already include these dependencies; they do not need this step.
 
 You will see a banner like this, and your browser will open:
 
 ```
-  ZELOS 1.8.1
+  ZELOS 1.8.2
   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   Open   http://127.0.0.1:7777/?t=9c1f…
@@ -201,61 +199,62 @@ Press `Ctrl-C` in the terminal to stop it.
 - No second copy of anything. The shell runs the Zelos core **inside its own
   process** — it does not launch a background Node.
 
+### Optional: read iPhone texts already on your Mac
+
+The Messages source needs texts to be available in Messages on this Mac and
+**Full Disk Access for the installed Zelos app**, granted by you in macOS
+System Settings → Privacy & Security. Quit and reopen Zelos after granting it.
+No Apple password is entered in Zelos. Follow the
+[Messages setup guide](SOURCES.md#iphone-texts-from-messages-on-this-mac) for
+iPhone syncing, permissions and import limits.
+
+Use **Read sources now** inside Zelos to import without asking AI. Keep
+automatic checks off in **Settings → Schedule** for local-only import; a later
+AI review or question can send selected imported text to your configured AI.
+This imports text only; it does not send messages or read attachments, calls or
+voicemail.
+
 ### Where a build comes from
 
-There is no download page in this repository, and no release binary committed to
-it. Builds come from one of two places.
+Published installers and source archives are available on the
+[GitHub Releases page](https://github.com/HoosAILLC/zelos/releases).
+Choose the release version and architecture that match your computer:
 
-**A GitHub Actions run.** `.github/workflows/desktop.yml` builds the installers
-on a real Windows runner and a real macOS runner, either when a `v*` tag is
-pushed or when somebody starts the workflow by hand. It runs the whole test
-suite *before* it packages anything and fails the job rather than shipping an
-installer built from a failing tree. What comes out is attached to that run as
-an artifact:
+| Computer | Installer filename pattern |
+| --- | --- |
+| Apple Silicon Mac | `Zelos-VERSION-arm64.dmg` |
+| Intel Mac | `Zelos-VERSION-x64.dmg` |
+| Windows x64 PC | `Zelos-VERSION-setup-x64.exe` |
+| Windows ARM64 PC | `Zelos-VERSION-setup-arm64.exe` |
 
-```
-Zelos-1.8.1-arm64.dmg          Apple Silicon
-Zelos-1.8.1-x64.dmg            Intel Macs
-Zelos-1.8.1-setup-x64.exe      Windows, 64-bit — ordinary PCs
-Zelos-1.8.1-setup-arm64.exe    Windows on ARM
-```
+On a Mac, Apple menu → About This Mac shows the chip. On Windows,
+Settings → System → About → System type shows the processor architecture.
 
-Windows also gets a third installer from the same run, carrying both
-architectures in one larger file; take it if you are not sure which machine you
-are on. (That is why the workflow collects `*setup*.exe` rather than two fixed
-names.)
-
-A run artifact is not a public download link. GitHub hands artifacts only to
-signed-in users, and deletes them once the repository's retention window is up —
-90 days unless someone has changed it. If that does not suit you, build it
-yourself; it is the same code and the same configuration the runner uses.
+The desktop workflow builds and checks each architecture on a matching runner.
+Manual QA runs keep their installers as temporary GitHub Actions artifacts;
+a successful version-tagged release publishes installers, exact source and
+checksums to Releases. A QA artifact is not itself a published release.
 
 ### Building it yourself
 
-Building needs one `npm install`, and it is the only one in the project:
+From the source root, install the pinned runtime and desktop build dependencies:
 
 ```
+npm ci --omit=dev --ignore-scripts
 cd desktop
-npm install          # downloads Electron (~120 MB) and electron-builder
-npm start            # run it now, unpackaged, to see if you like it
-npm run dist:mac     # build the macOS .dmg files  (must be run on a Mac)
-npm run dist:win     # build the Windows installers (run it on Windows)
+npm ci
+npm start            # run the desktop app without packaging
+npm run dist:mac     # build macOS disk images on a Mac
+npm run dist:win     # build Windows installers on Windows
 ```
 
-Finished installers land in `desktop/dist/`, named as above.
+Finished installers land in `desktop/dist/`. Packaging stages the production
+runtime dependencies from the root lockfile and keeps Electron's build tools
+out of the core's dependency folder.
 
-Two honest limits on cross-building, and they are the reason the workflow above
-exists at all:
-
-- **A macOS `.dmg` can only be built on a Mac.** It needs Apple's own tools.
-- **Building the Windows installers from a Mac or Linux needs Wine**, and it
-  frequently does not work. Build them on Windows, or let the Windows runner do
-  it.
-
-`npm install` here installs Electron and electron-builder as *development*
-dependencies of the shell only. Nothing from npm ends up in the Zelos core,
-and the core still has zero dependencies — you can confirm that by looking at
-the top-level `package.json`, which has no `dependencies` field at all.
+Build disk images on macOS and Windows installers on Windows. The GitHub
+workflow provides separate runners for Apple Silicon, Intel Macs, Windows x64
+and Windows ARM64, and runs packaged startup and backup checks on each.
 
 ---
 
@@ -356,7 +355,7 @@ reasonable to click past *this* one is that you can read the source and build
 the installer yourself.
 
 1. **Take the installer that matches your machine.**
-   `Zelos-1.8.1-setup-x64.exe` for an ordinary PC, `-arm64` for Windows on ARM,
+   `Zelos-1.8.2-setup-x64.exe` for an ordinary PC, `-arm64` for Windows on ARM,
    or the combined installer if you are not sure. The wrong one either runs
    slowly under emulation or does not run at all.
 2. **Your browser may refuse to keep the file.** Edge says *"…setup.exe was
@@ -394,7 +393,7 @@ can clear it first: right-click the `.exe` → **Properties** → tick **Unblock
 at the bottom of the **General** tab → **OK**. In PowerShell that is:
 
 ```
-Unblock-File .\Zelos-1.8.1-setup-x64.exe
+Unblock-File .\Zelos-1.8.2-setup-x64.exe
 ```
 
 That marker is a real safety mechanism — clear it only from something you built
@@ -457,7 +456,7 @@ server some stray web page can be pointed at.
    `secrets.backend.json`.
 
 **Settings → Your data** inside the app shows the exact path and offers a board
-snapshot containing the current board and settings without passwords. The desktop
+snapshot containing private board content, excluding connection settings and diagnostics. The desktop
 app also offers backup and restore; a board snapshot alone cannot restore the full archive. The
 `Board → Show data folder` and `Board → Show logs` menu items open these
 directly.
@@ -520,6 +519,19 @@ directly.
 to "here is the line to fix", and it names the specific next action rather than
 the exception it caught. From source that is `node zelos.mjs doctor`; in the
 desktop app, **Settings → About** shows the same findings.
+
+**Claude connects, but an inbox review reaches its response limit.**
+Open **Settings → AI → Advanced → Response limit (tokens)**. [Sonnet 5 uses this
+allowance for reasoning and the visible answer together](https://platform.claude.com/docs/en/models/sonnet-5/whats-new-sonnet-5). A starting allowance of
+32,768 can help a review that stops at 8,192; stay within your chosen model's
+supported output limit. The allowance is a ceiling, not a request to fill it,
+but a longer answer can use more paid tokens. Save and run the review again.
+
+**A long Claude review times out even though the connection test works.**
+Use Zelos 1.8.2 or later. Full Anthropic reviews receive the response as it is
+produced, so thinking and keepalive messages count as progress. The connection
+still fails after two minutes without progress, and an incomplete response is
+never saved as a finished board.
 
 **"Zelos could not start" on launch.**
 Almost always a port or a data folder problem. The dialog names the actual

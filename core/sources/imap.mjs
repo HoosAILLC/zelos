@@ -55,7 +55,7 @@ const CRLF_BYTES = Buffer.from(CRLF, 'latin1');
 const UID_CHUNK = 100;
 
 /** The cheap first pass: everything needed to decide, nothing that costs a body. */
-const HEADER_FIELDS = 'FROM TO CC SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES LIST-ID';
+const HEADER_FIELDS = 'FROM REPLY-TO TO CC SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES LIST-ID';
 
 /** Guard rails against a hostile or broken server exhausting memory. */
 const MAX_LITERAL_BYTES = 64 * 1024 * 1024;
@@ -2522,6 +2522,7 @@ function buildRecord(row, mailbox) {
     references,
     threadKey: threadKeyFor({ messageId, inReplyTo, references, subject }),
     from: parseAddressList(first('from'))[0] || { name: '', email: '' },
+    replyTo: parseAddressList(first('reply-to')),
     to: parseAddressList(first('to')),
     cc: parseAddressList(first('cc')),
     subject,

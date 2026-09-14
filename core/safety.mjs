@@ -643,6 +643,20 @@ function normalizeSourceRefs(raw, path, errors) {
   return out;
 }
 
+/** Evidence is carried without inventing or shortening a quote. Its provenance
+ * is checked against the presented source manifest by strict triage merging. */
+function validateEvidence(raw, path, errors) {
+  if (raw === null || raw === undefined) return null;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)
+    || typeof raw.ref !== 'string' || !SOURCE_REF_RE.test(raw.ref.trim())
+    || typeof raw.quote !== 'string' || raw.quote.trim().length < 8 || raw.quote.length > 600) {
+    errors.push({ path, message: 'evidence needs one source ref and an exact quote of 8–600 characters; dropped' });
+    return null;
+  }
+  const quote = safeString(raw.quote, 600, `${path}.quote`, errors, { collapse: false });
+  return quote === null ? null : { ref: raw.ref.trim(), quote: quote.trim() };
+}
+
 function validateDraft(raw, path, errors) {
   if (raw === null || raw === undefined) return null;
   if (typeof raw !== 'object' || Array.isArray(raw)) {
@@ -729,8 +743,8 @@ function validateItem(raw, index, errors) {
 
   const bucket = normalizeBucket(raw.bucket, `${path}.bucket`, errors);
   const draft = validateDraft(raw.draft, `${path}.draft`, errors);
-  if (draft && bucket !== 'waiting' && bucket !== 'promised') {
-    // The prompt asks for drafts only on waiting/promised. A ready draft is
+  if (draft && !['now', 'today', 'waiting', 'promised'].includes(bucket)) {
+    // The prompt asks for drafts on actionable reply and follow-up items. A ready draft is
     // worth more than that rule, so it is kept and the mismatch reported.
     errors.push({ path: `${path}.draft`, message: `draft attached to a "${bucket}" item` });
   }
@@ -745,6 +759,8 @@ function validateItem(raw, index, errors) {
     dueAt,
     severity: normalizeSeverity(raw.severity, `${path}.severity`, errors),
     sourceRefs: normalizeSourceRefs(raw.sourceRefs, `${path}.sourceRefs`, errors),
+    ...(raw.evidence !== undefined ? { evidence: validateEvidence(raw.evidence, `${path}.evidence`, errors) } : {}),
+    ...(raw.deadlineEvidence !== undefined ? { deadlineEvidence: validateEvidence(raw.deadlineEvidence, `${path}.deadlineEvidence`, errors) } : {}),
     link,
     draft,
   };

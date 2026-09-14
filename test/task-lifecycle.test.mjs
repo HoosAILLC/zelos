@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { restoreLegacySchema } from './helpers/legacy-schema.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -139,7 +140,9 @@ for (const type of ['todoist', 'linear']) {
   test(`${type}: the first complete read after upgrading retires legacy task evidence without deleting it`, async () => {
     const h = setup(type);
     const legacy = dbm.upsertMessage(h.db, { sourceId: type, messageId: `${type === 'todoist' ? 'todoist:task:' : 'linear:issue:'}legacy`, subject: 'Legacy obligation', date: new Date().toISOString(), text: 'Previously due today' });
-    h.db.exec('DROP TABLE task_activity; DROP TABLE item_history; PRAGMA user_version = 2');
+    // Remove all additions after v2, so this tests a real upgrade rather than
+    // asking migrations to recreate columns still present from the new schema.
+    restoreLegacySchema(h.db, 2);
     assert.deepEqual(dbm.migrate(h.db), { version: dbm.SCHEMA_VERSION, applied: dbm.SCHEMA_VERSION - 2 });
     assert.equal(dbm.getMessage(h.db, legacy.id).task_activity, null);
     assert.equal(dbm.listMessages(h.db).length, 1, 'migration alone does not infer activity');

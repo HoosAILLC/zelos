@@ -21,7 +21,8 @@
  */
 
 import { loadConfig } from './config.mjs';
-import { complete as llmComplete, extractJSON, LLMError, isLocalAddress } from './llm.mjs';
+import { prepareAutomaticDrafts } from './mail-autodrafts.mjs';
+import { complete as llmComplete, extractJSON, LLMError, isLocalAddress, localRuntimeOptions } from './llm.mjs';
 import { getSecret as realGetSecret } from './secrets.mjs';
 import {
   enabledSources,
@@ -590,7 +591,19 @@ export async function runSweep({
   };
 
   const abort = () => signal?.aborted === true;
-  const finish = (ok, error, extra = {}) => {
+  const finish = async (ok, error, extra = {}) => {
+    if (ok && mode !== 'light' && !signal?.aborted) {
+      try {
+        const drafts = await prepareAutomaticDrafts({ db,config,signal,
+          ...(deps.generateReply ? {generate:deps.generateReply} : {}),
+          onProgress:message=>emit('drafts',message) });
+        stats.automaticDrafts = drafts;
+        stats.tokensIn += drafts.tokensIn; stats.tokensOut += drafts.tokensOut;
+      } catch (draftError) {
+        // A draft failure never discards a successful source sync or board.
+        stats.automaticDrafts = { issue: signal?.aborted ? 'Reply preparation paused.' : 'Reply preparation could not finish.' };
+      }
+    }
     stats.ms = Date.now() - startedMs;
     const endedAt = nowISO(tz);
     recordSourceResults(db, sources, now);
@@ -628,20 +641,10 @@ export async function runSweep({
   const from = new Date(Date.now() - CALENDAR_BACK_DAYS * 86_400_000).toISOString();
   const to = new Date(Date.now() + CALENDAR_FORWARD_DAYS * 86_400_000).toISOString();
 
-  /**
-   * One loop, every source, whatever kind it is.
-   *
-   * This replaced two near-identical loops — one for mail, one for calendars —
-   * that between them held every string a user reads when a fetch goes wrong.
-   * The acceptance criterion for the replacement was that every one of those
-   * strings comes out byte-identical, so they are quoted here rather than
-   * rephrased: `label` falls through the same chain (`host` is undefined on a
-   * calendar and `url` is undefined on a mail account, so each lands where it
-   * always did — verified against both of the chains this replaced), and the
-   * no-password sentence is the sentence, not a description of one.
-   */
+  // Labels appear in progress, durable run history and logs. A subscribed
+  // calendar URL can itself be its bearer credential; never use it as a name.
   const sourceTasks = enabledSources(config).map(async ({ connector, source }) => {
-    const label = source.label || source.host || source.url || source.id;
+    const label = source.label || source.host || connector.label || source.id;
     const nothing = { sink: connector.sink, rows: [], cursor: undefined, sourceId: source.id };
     const state = readSourceState(db, source.id);
     const startedMs = Date.now();
@@ -891,7 +894,8 @@ export async function runSweep({
 
   const promptInput = gatherPromptInput(db, config, now);
   const prompt = buildSweepPrompt({
-    identity: config.identity ?? {},
+    identity: { ...config.identity, emails: [...new Set([config.identity?.email, ...(config.mail || []).map(account => account.user)].filter(Boolean))] },
+    sourceKinds: Object.fromEntries([...(config.mail || []).map(source => [source.id, 'mail']), ...(config.sources || []).map(source => [source.id, source.type])]),
     now,
     messages: promptInput.messages,
     events: promptInput.events,
@@ -899,6 +903,7 @@ export async function runSweep({
     priorItems: promptInput.priorItems,
     resolvedItems: promptInput.resolvedItems,
     privacy: config.privacy ?? {},
+    strictHistory: true,
   });
 
   emit('think', `Asking ${config?.model?.label || 'the model'} to read ${promptInput.messages.length} messages`,
@@ -923,6 +928,12 @@ export async function runSweep({
       maxTokens: config?.model?.maxTokens,
       temperature: config?.model?.temperature,
       json: true,
+      ...localRuntimeOptions(config?.model, { structured: true }),
+      // Reasoning can outlast a non-streaming request's total deadline. Read
+      // Claude and local OpenAI progress with an idle deadline, collecting only
+      // the finished answer; hosted OpenAI keeps its existing request behavior.
+      stream: config?.model?.protocol === 'anthropic'
+        || (config?.model?.protocol === 'openai' && isLocalAddress(config?.model?.baseUrl)),
       signal,
     });
   } catch (err) {
@@ -932,6 +943,16 @@ export async function runSweep({
 
   stats.tokensIn = Number(answer?.usage?.input) || 0;
   stats.tokensOut = Number(answer?.usage?.output) || 0;
+  if (abort()) return finish(false, 'Sweep cancelled');
+  // A balanced JSON fragment is still unsafe when the provider says it ran
+  // out of room. Reject before merging or consuming any pending source work.
+  if (answer?.stopReason === 'length') {
+    const sample = modelSample(answer?.text);
+    return finish(
+      false,
+      storedMessage(`The model's reply was cut off at its token limit before the board was complete${sample ? ` — it began "${sample}"` : ''}. Raise Response limit (tokens) in Settings → AI → Advanced and sweep again.`),
+    );
+  }
 
   const parsed = extractJSON(answer?.text ?? '');
   // extractJSON is deliberately forgiving, and one thing it forgives is a reply
@@ -946,14 +967,6 @@ export async function runSweep({
     ('items' in parsed || 'first' in parsed || 'notes' in parsed);
   if (!looksLikeBoard) {
     const sample = modelSample(answer?.text);
-    if (answer?.stopReason === 'length') {
-      // The reply was cut off at the token ceiling, so no model swap will fix
-      // it — the same model with more room will.
-      return finish(
-        false,
-        storedMessage(`The model's reply was cut off at its token limit before the board was complete${sample ? ` — it began "${sample}"` : ''}. Raise model.maxTokens in Settings and sweep again.`),
-      );
-    }
     return finish(
       false,
       parsed
@@ -967,7 +980,7 @@ export async function runSweep({
   emit('merge', 'Building the board', 0, 1);
   let merged;
   try {
-    merged = mergeSweep(db, parsed, { runId, now });
+    merged = mergeSweep(db, parsed, { runId, now, strictGrounding: true, grounding: prompt.grounding });
   } catch (err) {
     slog.error('could not merge the sweep', { error: storedError(err) });
     return finish(false, storedMessage(`Could not store the board: ${errorText(err)}`));
@@ -987,12 +1000,6 @@ export async function runSweep({
     const why = merged.errors.slice(0, 2)
       .map((e) => (e.path ? `${e.path}: ${e.message}` : e.message))
       .join('; ') || 'the reply was not a usable board';
-    if (answer?.stopReason === 'length') {
-      return finish(
-        false,
-        storedMessage(`The model's reply was cut off at its token limit before the board was usable (${why}). Raise model.maxTokens in Settings and sweep again.`),
-      );
-    }
     return finish(
       false,
       storedMessage(`The model's reply was not a usable board (${why}). Try a larger model, or one that follows a format instruction.`),
@@ -1060,7 +1067,7 @@ function setRunKind(db, runId, kind) {
  * the one that fell off the end would be the most recent decision the user made.
  */
 const RECENTLY_RESOLVED_SQL = `
-SELECT id, bucket, headline, state, state_at, payload_json FROM items
+SELECT id, bucket, headline, state, state_at, payload_json, last_seen_run FROM items
 WHERE state IN ('done', 'dismissed') AND state_at IS NOT NULL
   AND datetime(state_at) >= datetime(:since)
 ORDER BY datetime(state_at) DESC
@@ -1073,15 +1080,18 @@ function recentlyResolved(db, now) {
   const out = [];
   for (const row of rows) {
     let key = '';
+    let payload = {};
     try {
-      key = String(JSON.parse(row.payload_json || '{}')?.key ?? '');
+      payload = JSON.parse(row.payload_json || '{}');
+      key = String(payload?.key ?? '');
     } catch {
       // A row whose payload will not parse has no key to reuse, so it has
       // nothing to contribute here and is simply left out.
       key = '';
     }
     if (!key) continue;
-    out.push({ key, headline: row.headline, state: row.state, resolvedAt: row.state_at });
+    out.push({ key, headline: row.headline, state: row.state, resolvedAt: row.state_at,
+      payload, last_seen_run: row.last_seen_run });
   }
   return out;
 }

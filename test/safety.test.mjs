@@ -631,15 +631,15 @@ test('validateSweep: a paragraph-long bracket is still a placeholder', () => {
   assert.ok(res.errors.some((e) => /placeholder/.test(e.message)));
 });
 
-test('validateSweep: a draft outside waiting/promised is kept but reported', () => {
+test('validateSweep: a draft outside actionable reply buckets is kept but reported', () => {
   const res = validateSweep({
     items: [item({
-      key: 'x', bucket: 'now',
+      key: 'x', bucket: 'note',
       draft: { to: 'dana@example.com', subject: 'Re', body: 'Sending it now.' },
     })],
   });
   assert.ok(res.value.items[0].draft);
-  assert.ok(res.errors.some((e) => /draft attached to a "now" item/.test(e.message)));
+  assert.ok(res.errors.some((e) => /draft attached to a "note" item/.test(e.message)));
 });
 
 test('validateSweep: emails, dueAt and sourceRefs are validated', () => {

@@ -85,7 +85,7 @@ node zelos.mjs
 You will see something like this:
 
 ```
-  ZELOS 1.8.1
+  ZELOS 1.8.2
   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   Open   http://127.0.0.1:7777/?t=fb52ad7d…a43da8be
@@ -368,7 +368,7 @@ it. Useful for exports and for calendars that only publish downloads.
 
 ## Connecting everything else
 
-Mail and calendar are the two Zelos needs. Beyond them it can read eight more
+Mail and calendar are the two Zelos needs. Beyond them it can read nine more
 things, all of them from **Settings → Sources**:
 
 | | |
@@ -379,11 +379,12 @@ things, all of them from **Settings → Sources**:
 | **Linear** | The issues assigned to you that are due |
 | **Todoist** | Tasks due today or overdue |
 | **A feed** | Any RSS or Atom address |
+| **iPhone texts** | Text already synced to Messages on this Mac, with your permission |
 | **A folder** | Anything a script drops into a directory on this machine |
 | **A WhatsApp export** | A chat you exported yourself |
 
 Every one of them is a credential **you** mint in your own account, or a file on
-your own disk. For these eight, Zelos publishes no OAuth app — no client id, no
+your own disk. For these additional sources, Zelos publishes no OAuth app — no client id, no
 consent screen, no "Connect with…" button. The two built for mail — Google and
 Microsoft sign-in, [OAUTH.md](OAUTH.md), whose own registrations are not
 shipped yet — need no server either: the Google one comes back to the Zelos
@@ -400,6 +401,16 @@ you go looking for them:
   can write into buys the same thing with no public URL and no token to leak.
 - **The WhatsApp source is an archive, not a connection.** It shows nothing new
   until you export the chat again.
+- **iPhone texts come from the Mac's Messages app.** Sign in with the same Apple
+  Account, make sure the texts are already on the Mac, and grant the installed
+  Zelos app Full Disk Access yourself. It imports text only, with no sending,
+  attachments, calls or voicemail. See the [Messages setup guide](SOURCES.md#iphone-texts-from-messages-on-this-mac).
+
+**Read sources now** in Sources imports all enabled connections without asking
+AI. Keep automatic checks off in **Settings → Schedule** for local-only import.
+**Check now**, a full review, automatic checks, or a question to the AI can use
+the imported text with your configured AI. Saving a source changes neither the
+schedule nor the AI settings.
 
 And one whole category needs no source at all. **[NOTETAKERS.md](NOTETAKERS.md)**
 covers the AI notetakers — Fireflies, Otter, Grain, Fathom, tl;dv, Read.ai,
@@ -516,128 +527,130 @@ server.
 Don't take the promise on trust. Here are four checks, from easiest to most
 convincing.
 
-### 1. Look for the packages that aren't there
+### 1. Inspect the dependencies
 
-Open `package.json`. There is no `dependencies` section and no
-`devDependencies` section, and there is no `node_modules` folder at the top
-level. Everything Zelos does — reading IMAP, parsing calendars, the database,
-the web server — is written against what Node itself ships with. Nobody else's
-code runs.
+`package.json` declares two pinned runtime dependencies: Nodemailer 10.0.9 for
+reviewed SMTP replies and PDFKit 0.19.1 for local PDF reports. `package-lock.json`
+records their transitive packages and integrity hashes. The import audit permits
+Nodemailer only in `core/mail-send.mjs`, PDFKit only in `core/progress.mjs`, and
+specific offline tests. A dependency list is part of the audit, not proof that a
+package cannot open a connection.
 
-**One exception, and it is a real one:** if you have built the desktop app,
-`desktop/node_modules` exists and is large. Electron and electron-builder are
-`devDependencies` of the shell, used to *build* a window; they are not imported
-by anything in `core/`, `ui/` or `zelos.mjs`, and none of them is in the
-published package. The claim is "the program that reads your mail has no
-dependencies", not "there is no npm anywhere on your disk" — and if you run
-Zelos from source or from npm, `desktop/` never gets installed at all.
+The desktop shell separately uses Electron and electron-builder. Those build
+and run the window; they are not imports of the core application or browser UI.
+The document importer also invokes installed Poppler and Tesseract binaries,
+as described below. Reports use bundled fonts, and the UI loads its scripts,
+styles, icons and fonts locally.
 
 ### 2. Count the places it *could* phone home
 
-A program can only send data through code that opens a network connection, and
-this one opens them with three primitives: `fetch()`, `tls.connect` and
-`net.connect` — plus one question asked through a fourth, `node:dns`, which the
-end of this section counts. So you can list every one of them in the whole
-program. In the `zelos` folder:
+Start with the built-in fetch calls and direct IMAP socket sites. This first
+pass does not include SMTP inside Nodemailer, public-web HTTP requests, or DNS;
+the second pass accounts for those. In the `zelos` folder:
 
 ```
 grep -rn "fetch\s*(\|globalThis\.fetch\|tls\.connect\|net\.connect" core/ zelos.mjs
 ```
 
-Two things about that pattern are deliberate, because an earlier version of
-this page got both wrong. The dots are escaped: `net.connect` with a bare dot
-also matched the word *internet connection* in an error message, and a recipe
-that turns up prose as a false positive is tolerable, but it was a sign the
-pattern had not been thought about. And `globalThis\.fetch` is in it because
-Zelos's connectors never write `fetch(` at all — the transport they all share
-does `const doFetch = fetchImpl || globalThis.fetch;` once, and a grep for
-`fetch(` walked straight past every one of them. That is the shape this
-pattern can still miss — a bare alias like `const go = fetch` — and
-`grep -rnw fetch core/ zelos.mjs` is the noisier superset that cannot. Run
-it after this one if you want to be sure.
+The escaped dots avoid matching unrelated prose. `globalThis\.fetch` includes
+the shared connector transport and injected fetch implementations, which a
+search for `fetch(` alone misses. Aliases can hide a primitive's later call, so
+also inspect `grep -rnw fetch core/ zelos.mjs` and follow the imports rather
+than treating a grep count as proof of completeness.
 
-The command above returns **23 lines** today. Eleven of them are not network
-calls, and you can throw them out by two rules:
+The command above returns **24 lines** today. Eleven are discarded:
 
-- **Comments.** Eight of the twenty-three are prose inside `/* */` or `//`
-  blocks that happen to mention `fetch(`.
-- **Zelos's own IMAP object.** Three lines in `core/sources/imap.mjs` say
-  `async fetch(` or `client.fetch(`. That is Zelos's IMAP client having a
-  method named after the IMAP `FETCH` command. It talks on a socket that is
-  already open; it does not open one.
+- **Comments.** Eight of the 24 lines are prose in comments.
+- **Zelos's own IMAP object.** Three lines use `async fetch(` or `client.fetch(`
+  for an IMAP command on a socket that is already open.
 
-So: **twelve real outbound calls**, and this is all of them. They are named by
-function rather than by line, because the line numbers in the last version of
-this table went stale within a week and nobody noticed; a function name is
-something you can `grep` for, and the test named below checks that each of
-these still exists in the file this table says it is in.
+The remaining **thirteen outbound entries** are connection calls or fetch
+implementation selections. The table names their owning functions; the first
+row contains two socket-opening alternatives. Counts describe code locations,
+not how often requests happen.
 
 | Where | Function | What it connects to |
 | --- | --- | --- |
-| `core/sources/imap.mjs` | `#openSocket` | your mail server — the address you typed in Settings. Two lines: one opens with TLS, the other in the clear for a server that upgrades with `STARTTLS` |
-| `core/sources/imap.mjs` | `#startTls` | the same server, upgrading that plain socket to TLS before a password is sent |
-| `core/sources/imap.mjs` | `postForm` | `login.microsoftonline.com`, and only for a mailbox you set to **Sign in with Microsoft** |
-| `core/sources/caldav.mjs` | `request` | your CalDAV calendar — the address you typed |
-| `core/connectors/ics.mjs` | `fetchIcsText` | your `.ics` calendar link — the address you typed |
-| `core/server.mjs` | `fetchIcsOnce` | the calendar address you typed, when you press **Test** |
-| `core/llm.mjs` | `requestWithRetry` | the model — the address you chose |
-| `core/doctor.mjs` | `DEFAULT_DEPS.fetchImpl` | the one `fetch` `zelos doctor` uses, to try your model endpoint and your calendar address — both from your settings |
-| `core/connectors/http.mjs` | `createHttp` | **every source in Settings → Sources**, through one transport: GitHub, Slack, Linear, Todoist, Fireflies and a feed each reach the host their connector declares in `origins` (`core/connectors/*.mjs`), plus any address you typed into that source's own fields. Anything else is refused before a socket exists |
-| `core/sources/oauth.mjs` | `postForm` | `oauth2.googleapis.com`, and only for a mailbox you set to **Sign in with Google** — the code exchange when you sign in, and the token refresh before a sweep; see [OAUTH.md](OAUTH.md) |
-| `core/updates.mjs` | `createUpdateChecker` | the official Zelos latest-release endpoint on `api.github.com`, only when you press **Check for updates**, with no account content or credentials |
+| `core/sources/imap.mjs` | `#openSocket` | Your configured mail server: TLS, or a plain socket that must meet the account's STARTTLS policy before authentication |
+| `core/sources/imap.mjs` | `#startTls` | The same mail socket, upgraded to TLS |
+| `core/sources/imap.mjs` | `postForm` | `login.microsoftonline.com` for Microsoft sign-in and token refresh |
+| `core/sources/caldav.mjs` | `request` | Your configured CalDAV calendar |
+| `core/connectors/ics.mjs` | `fetchIcsText` | Your configured `.ics` feed |
+| `core/server.mjs` | `fetchIcsOnce` | The calendar address entered for a connection test |
+| `core/llm.mjs` | `requestWithRetry` | The selected model endpoint; local model endpoints keep inference on your machine |
+| `core/doctor.mjs` | `DEFAULT_DEPS.fetchImpl` | Your configured model and calendar endpoints during diagnostics |
+| `core/connectors/http.mjs` | `createHttp` | Source origins declared by each connector, widened only by its configured address fields |
+| `core/sources/oauth.mjs` | `postForm` | `oauth2.googleapis.com` for Google sign-in and token refresh |
+| `core/updates.mjs` | `createUpdateChecker` | `api.github.com` only for an explicit update check, without account content or credentials |
+| `core/shopping.mjs` | `requestProvider` | `connect.instacart.com`, or the explicitly selected development endpoint `connect.dev.instacart.tools`; retailer lookup sends a postal/country code, and an explicitly approved hosted list sends selected grocery names and quantities. Redirects are refused. Creating a list does not place an order |
 
-Reading and model calls go to configured services; the manual update check has
-one fixed official destination. There is no thirteenth through these three primitives — the one question that leaves
-another way is counted below. The one directory in that table that grows is
-`core/connectors/`, and the test *no connector reaches the network except
-through ctx.http* in `test/repo.test.mjs` fails the build on a connector that
-calls `fetch` itself instead of going through `createHttp`; the test beside it
-runs the commands on this page and fails when the counts, the files or the
-function names here stop matching the tree.
+`test/repo.test.mjs` runs this recipe and compares the counts and table with
+the tree. Its connector audit separately refuses network primitives outside
+the shared `ctx.http` transport.
 
-**And "three primitives" is itself a claim you should check**, since a grep for
-three names proves nothing if a fourth is in use — and here a fourth is. The
-other ways Node can reach the network are `http.request`/`https.request`,
-`node:http2`, `node:dgram`, `node:dns` and running another program that does it
-for you. Grep for those too:
+Check the other network and process entry points too:
 
 ```
-grep -rn "http\.request\|https\.request\|node:dgram\|node:http2\|node:dns\|child_process" core/ zelos.mjs
+grep -rn "http\.request\|https\.request\|transport\.request\|node:http\|node:dgram\|node:http2\|node:dns\|child_process\|createTransport" core/ zelos.mjs
 ```
 
-Four lines come back. Two are `import { spawn } from 'node:child_process'` —
-`core/secrets.mjs`, which runs your keychain helper, and `zelos.mjs`, which
-opens your browser — and one is a comment in `core/server.mjs` that names the
-module. None of those three is a network call, and none takes an address from
-anything but this machine. The fourth, `import dns from 'node:dns'` in
-`core/sources/imap.mjs`, is real: when you type an address whose domain Zelos
-does not recognise, `discoverProvider` asks your system resolver who handles
-that domain's mail — its MX record, then the `_imaps._tcp` SRV record — once,
-during mail setup. The domain goes to the resolver your operating system
-already uses; the address does not.
-[SECURITY.md § 5](SECURITY.md#5-what-leaves-your-machine) counts it as its own
-item.
+**Fourteen lines come back.** They account for:
 
-If you want the survivors of the first grep without reading past the comments
-yourself:
+- `core/family-guest.mjs` creates the separate loopback family HTTP listener; its `node:net` import validates client address syntax and does not open a connection.
 
-```
-grep -rn "fetch(\|tls.connect\|net.connect" core/ zelos.mjs \
-  | grep -v "^\S*: *\*\|^\S*: *//" | grep -v "client\.fetch(\|async fetch("
-```
+- Four lines in `core/web-research.mjs`: the HTTP and HTTPS imports, public DNS
+  lookup, and `(deps.request || transport.request)` in `pinnedRequest`. A public
+  page lookup sends the requested URL to its host; keyed web search sends the
+  search query to the fixed Brave endpoint
+  `https://api.search.brave.com/res/v1/web/search`. The module reads no mail,
+  calendar, health records, browser cookies or history. Every resolved address
+  must be public, and one validated address is pinned into each request's
+  lookup while TLS hostname verification remains enabled. A dedicated agent
+  ignores ambient proxy settings. Page reads allow at most three revalidated
+  redirects and no HTTPS downgrade; Brave allows no redirect and receives its
+  key only at its exact endpoint. The total deadline is 15 seconds, with 1 MB
+  caps on both transferred and decompressed content. Linked resources and
+  search-result pages are not fetched automatically.
+- `core/mail-send.mjs` constructs the pinned Nodemailer SMTP transport. Only the
+  reviewed mail workspace can call it, with the frozen sender, recipient,
+  subject and body approved by the user. URL fetching, arbitrary attachments,
+  file reads and caller-selected transport endpoints are disabled.
+- `core/sources/imap.mjs` uses the system resolver for MX and SRV discovery
+  during mailbox setup. The typed domain, not the full email address, is sent.
+- Three local HTTP listeners: `core/server.mjs`, `core/sources/oauth.mjs` and
+  `core/booking-guest.mjs`. Their HTTP imports serve requests; they do not
+  establish an outbound connection. A `node:dns` comment in `core/server.mjs`
+  is the remaining prose match.
+- Three native-process imports: `core/secrets.mjs` runs the keychain helper,
+  `zelos.mjs` opens the browser, and `core/documents.mjs` runs only `pdfinfo`,
+  `pdftotext`, `pdftoppm` or `tesseract` on generated private temporary files.
+  Document commands use `execFile` with `shell:false`, bounded time/output and
+  cleanup on failure or cancellation. Uploaded filenames and model text do
+  not become executable names or shell commands.
 
-Then check for the usual suspects:
+The second recipe includes `transport.request` and `node:http` because the web
+reader aliases the selected HTTP(S) module. Searching only `http.request` and
+`https.request` would miss that call. The tests pin its owning file, the SMTP
+entry point and both DNS import locations. Native binaries and dependency
+internals still need inspection when their versions or configuration change.
+
+Opening the fixed WHO, CDC, FDA, Instacart-help, Brave-key or official release links is
+browser navigation after a click. Those URLs are not remote fonts, scripts,
+images or automatic page loads. The UI audits exempt exact declarations and
+anchors, not entire domains, and test that Health citations use the fixed URL
+allowlist. An Instacart result link is provided only after a reviewed list was
+created and its provider URL passed server validation.
+
+For possible analytics code, inspect the matches rather than assuming every
+word is a request:
 
 ```
 grep -rni "analytics\|telemetry\|sentry\|posthog\|mixpanel\|gtag\|amplitude" core/ ui/ zelos.mjs
 ```
 
-**Three lines come back, and all three are the same joke as the one above.**
-Two are `core/sources/mime.mjs`'s `findClosingTag` — `-i` makes `gtag` match
-"findClosin**gTag**". The third is `ui/views/settings.js`, the Privacy panel's
-own sentence saying there is no telemetry. There is no analytics code, no
-reporting endpoint and no third-party script; the matches are a function name
-and a denial.
+The current application has no analytics endpoint or third-party browser
+script. Function names such as `findClosingTag` and privacy copy can appear in
+this search; the network entry-point audit above is the check for actual traffic.
 
 ### 3. Watch the connections yourself
 

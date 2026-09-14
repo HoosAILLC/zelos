@@ -11,8 +11,8 @@
  * The rules that shape this file came from a build that got them wrong:
  *   - A missing key is only an error for a NON-local address. A keyless Ollama
  *     on 127.0.0.1 must just work.
- *   - Local endpoints reject `response_format`, so json:true prompts instead
- *     and leans on extractJSON.
+ *   - Unknown local endpoints may reject `response_format`, so json:true
+ *     prompts instead. Verified local Ollama supports native JSON mode.
  *   - Small local models wrap JSON in fences and prose no matter what the
  *     prompt says, so extractJSON is tolerant by design.
  *   - Every thrown error names the address, because "my key is wrong" and "my
@@ -63,6 +63,29 @@ function tryUrl(s) {
   } catch {
     return null;
   }
+}
+
+/** Only the installed, local Nemotron runtime gets Ollama-specific fields. */
+function isLoopbackOllamaNemotron(model = {}) {
+  if (!model || model.protocol !== 'openai' || typeof model.model !== 'string') return false;
+  const name = model.model.trim();
+  if (!/^nemotron-3-(?:nano|super|ultra)(?::[a-z0-9_.-]+)?$/i.test(name) || /cloud/i.test(name)) return false;
+  const url = tryUrl(typeof model.baseUrl === 'string' ? model.baseUrl.trim() : '');
+  return !!url && ['http:', 'https:'].includes(url.protocol)
+    && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname.toLowerCase())
+    && url.port === '11434' && /^\/v1\/?$/.test(url.pathname)
+    && !url.username && !url.password && !url.search && !url.hash;
+}
+
+/**
+ * Nemotron's default reasoning can consume the whole output budget before
+ * producing an answer. Routine local work uses its supported non-thinking
+ * mode; structured callers additionally request Ollama's native JSON output.
+ * No network detection or provider settings are changed by this helper.
+ */
+export function localRuntimeOptions(model, { structured = false } = {}) {
+  if (!isLoopbackOllamaNemotron(model)) return {};
+  return { localRuntime: 'ollama', reasoningEffort: 'none', ...(structured ? { json: true } : {}) };
 }
 
 /** Hostname of a base URL, tolerating a missing scheme and IPv6 brackets. */
@@ -560,9 +583,10 @@ function buildChatRequest(opts, { stream }) {
   const apiKey = requireKey(opts.apiKey, address);
 
   const local = isLocalAddress(address);
-  // Local runtimes commonly reject response_format outright, so json:true
-  // degrades to an instruction the prompt carries and extractJSON cleans up.
-  const useResponseFormat = opts.json === true && protocol === 'openai' && !local;
+  const knownOllama = opts.localRuntime === 'ollama' && isLoopbackOllamaNemotron(opts);
+  // Preserve prompt-only JSON for unknown local runtimes. This installed
+  // Ollama path has native JSON support and can finish without hidden thinking.
+  const useResponseFormat = opts.json === true && protocol === 'openai' && (!local || knownOllama);
   const conversation = normalizeConversation(opts.system, opts.messages);
   let systemText = conversation.system;
   if (opts.json === true && !useResponseFormat) {
@@ -579,6 +603,7 @@ function buildChatRequest(opts, { stream }) {
 
   let url;
   const body = { model, max_tokens: maxTokens };
+  if (knownOllama && opts.reasoningEffort === 'none') body.reasoning_effort = 'none';
   // Sampling knobs go to the OpenAI protocol only. Anthropic's current models
   // (Sonnet 5, Opus 5, and the 4.7+ family) reject `temperature`, `top_p` and
   // `top_k` outright — a 400 reading "temperature is deprecated for this
@@ -599,10 +624,22 @@ function buildChatRequest(opts, { stream }) {
       ? [{ role: 'system', content: systemText }, ...conversation.turns]
       : conversation.turns;
     if (useResponseFormat) body.response_format = { type: 'json_object' };
+    // Trusted application schemas constrain this verified local runtime only.
+    // Other providers retain their existing request contract.
+    // https://docs.ollama.com/capabilities/structured-outputs
+    if(useResponseFormat && knownOllama && opts.jsonSchema!==undefined){
+      let schema;
+      try{
+        const serialized=JSON.stringify(opts.jsonSchema);
+        if(!opts.jsonSchema||typeof opts.jsonSchema!=='object'||Array.isArray(opts.jsonSchema)||serialized.length>64000)throw new Error('Invalid schema');
+        schema=JSON.parse(serialized);
+      }catch{throw new LLMError('The local response format is invalid or too large.',{address});}
+      body.response_format={type:'json_schema',json_schema:{name:'zelos_response',strict:true,schema}};
+    }
     if (stream) {
       body.stream = true;
       // stream_options is another provider-only parameter local servers may reject.
-      if (!local) body.stream_options = { include_usage: true };
+      if (!local || knownOllama) body.stream_options = { include_usage: true };
     }
   }
 
@@ -942,8 +979,21 @@ function errorInBody(raw) {
 
 /**
  * One round trip. -> {text, usage:{input,output}, model, stopReason, raw}
+ * `stream:true` collects a completed stream with an idle deadline instead of
+ * a total deadline. No partial result escapes; raw is null in this mode.
  */
 export async function complete(opts = {}) {
+  if (opts.stream === true) {
+    for await (const event of stream(opts)) {
+      if (event.type === 'done') {
+        const { text, usage, model, stopReason } = event;
+        return { text, usage, model, stopReason, raw: null };
+      }
+    }
+    throw new LLMError('The model stream ended without a completed response', {
+      address: normalizeBase(opts.baseUrl), retriable: true,
+    });
+  }
   const req = buildChatRequest(opts, { stream: false });
   llog.debug('complete', { address: req.address, protocol: req.protocol, model: req.model });
   const { res, release } = await requestWithRetry(req, opts);

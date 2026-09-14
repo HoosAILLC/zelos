@@ -8,9 +8,18 @@ export class TestNode {
     this.style = { setProperty() {} }; this.parentNode = null; this.open = false;
     this.classList = { add() {}, remove() {}, toggle() {} };
   }
+  get parentElement() { return this.parentNode?.tagName ? this.parentNode : null; }
+  get open() { return this.attributes.open !== undefined; }
+  set open(want) {
+    const changed = this.open !== Boolean(want);
+    if (want) this.attributes.open = ''; else delete this.attributes.open;
+    if (changed && this.tag === 'details' && this.isConnected) this.fire('toggle');
+  }
   get isConnected() { return this === this.ownerDocument.body || Boolean(this.parentNode?.isConnected); }
   get hidden() { return this.attributes.hidden !== undefined; }
   set hidden(want) { if (want) this.attributes.hidden = ''; else delete this.attributes.hidden; }
+  get disabled() { return this.attributes.disabled !== undefined; }
+  set disabled(want) { if (want) this.attributes.disabled = ''; else delete this.attributes.disabled; }
   get firstChild() { return this.children[0] || null; }
   setAttribute(key, value) { this.attributes[key] = String(value); if (key === 'value') this.value = String(value); }
   getAttribute(key) { return this.attributes[key] ?? null; }
@@ -51,20 +60,24 @@ function matches(node, selector) {
 }
 export function walk(node) { return [node, ...node.children.flatMap(walk)]; }
 export function text(node) { return walk(node).map(item => item.textContent).filter(Boolean).join(' '); }
-export function findButton(node, label) { return walk(node).find(item => item.tag === 'button' && text(item) === label); }
+export function findButton(node, label) {
+  return walk(node).find(item => item.tag === 'button' && (item.getAttribute('aria-label') || text(item)) === label);
+}
 export function installDom(t) {
   const keys = ['document', 'window', 'Node', 'sessionStorage', 'localStorage', 'requestAnimationFrame'];
   const previous = keys.map(key => Object.getOwnPropertyDescriptor(globalThis, key));
   const document = { activeElement: null, visibilityState: 'visible', listeners: new Map(),
-    documentElement: { style: { setProperty() {} } },
+    documentElement: { dataset: {}, style: { setProperty() {} } },
     createElement(tag) { return new TestNode(tag, document); },
+    createElementNS(namespace, tag) { const node = new TestNode(tag, document); node.namespaceURI = namespace; return node; },
     createTextNode(value) { const node = new TestNode('#text', document); node.textContent = String(value); return node; },
     addEventListener(type, fn) { this.listeners.set(type, [...(this.listeners.get(type) || []), fn]); },
     removeEventListener() {},
   };
   document.body = document.createElement('body');
   const values = { document, Node: TestNode,
-    window: { location: { href: 'http://127.0.0.1:7777/', hash: '#/now' }, history: { replaceState() {} }, addEventListener() {} },
+    window: { location: { href: 'http://127.0.0.1:7777/', hash: '#/now' }, history: { replaceState() {} }, addEventListener() {},
+      matchMedia: query => ({ media: query, matches: false, addEventListener() {}, removeEventListener() {} }) },
     sessionStorage: { getItem() { return ''; }, setItem() {}, removeItem() {} },
     localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
     requestAnimationFrame: fn => { fn(); return 0; },

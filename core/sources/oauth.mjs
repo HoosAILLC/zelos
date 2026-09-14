@@ -41,7 +41,7 @@
 import crypto from 'node:crypto';
 import http from 'node:http';
 
-import { log } from '../log.mjs';
+import { log, diagnosticAddress, diagnosticText } from '../log.mjs';
 import { getSecret, setSecret, deleteSecret } from '../secrets.mjs';
 
 /* ------------------------------------------------------------------ *
@@ -680,6 +680,25 @@ async function postForm(url, form, { fetchImpl, timeoutMs, signal, provider, cli
   body.delete('client_secret');
   if (typeof clientSecret === 'string' && clientSecret) body.set('client_secret', clientSecret);
 
+  // Providers can quote submitted grants in error_description, and fetch
+  // implementations can include a request in a transport error. Strip the
+  // exact sent values before an OAuthError reaches the UI, sweep record or log.
+  // Include common wire encodings; replace in one pass so overlapping secrets
+  // cannot alter the redaction marker or reveal another value's suffix.
+  const hidden = new Set();
+  for (const name of ['client_secret', 'refresh_token', 'code', 'code_verifier']) {
+    const value = body.get(name);
+    if (!value) continue;
+    hidden.add(value);
+    hidden.add(JSON.stringify(value).slice(1, -1));
+    try { hidden.add(encodeURIComponent(value)); } catch { /* malformed Unicode still has its literal form */ }
+    hidden.add(new URLSearchParams({ v: value }).toString().slice(2));
+  }
+  const hiddenPattern = hidden.size ? new RegExp([...hidden].sort((a, b) => b.length - a.length)
+    .map(value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|'), 'g') : null;
+  const safeError = value => diagnosticText(hiddenPattern
+    ? String(value ?? '').replace(hiddenPattern, '[credential withheld]') : value);
+
   let res;
   try {
     res = await doFetch(url, {
@@ -693,7 +712,7 @@ async function postForm(url, form, { fetchImpl, timeoutMs, signal, provider, cli
       redirect: 'error',
     });
   } catch (err) {
-    throw new OAuthError(`oauth: could not reach the token endpoint at ${url} (${err.message})`, {
+    throw new OAuthError(`oauth: could not reach the token endpoint at ${diagnosticAddress(url)} (${safeError(err.message)})`, {
       code: err?.name === 'TimeoutError' ? 'timeout' : 'network',
       provider,
     });
@@ -708,8 +727,8 @@ async function postForm(url, form, { fetchImpl, timeoutMs, signal, provider, cli
   }
 
   if (!res.ok) {
-    const code = String(payload?.error || `http_${res.status}`).slice(0, 80);
-    const description = String(payload?.error_description || '').slice(0, 300);
+    const code = safeError(payload?.error || `http_${res.status}`).slice(0, 80);
+    const description = safeError(payload?.error_description || '').slice(0, 300);
     throw new OAuthError(
       `oauth: the token endpoint refused the request (${code}${description ? `: ${description}` : ''})`,
       { code, provider, status: res.status, description },

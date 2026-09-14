@@ -3,9 +3,8 @@
  *
  * Drafts are the one place in Zelos where the model wrote something you might
  * put your name on, so the affordances are deliberate: the body is an editable
- * textarea that grows to fit, edits persist through PUT /api/drafts, and there
- * is no send button anywhere — Zelos never sends mail, by design. Copy, paste,
- * click send yourself.
+ * textarea that grows to fit and edits persist through PUT /api/drafts. The
+ * Email workspace shows the exact reply for review before an explicit Send.
  */
 
 import { el, button, section, autogrow, copyText } from '../lib/dom.js';
@@ -111,7 +110,7 @@ export function mailtoDraft(to, subject, body) {
  * the whole view under someone's cursor because a sweep finished would be worse
  * than a stale count.
  */
-function draftCard(draft, itemsById) {
+function draftCard(draft, itemsById, navigate) {
   const writer = writerFor(draft.id);
   const item = itemsById.get(draft.item_id) || null;
   const status = el('span', { class: 'draft-status mono', role: 'status', text: writer.pendingSaves.size ? 'Unsaved edits' : 'Saved' });
@@ -215,8 +214,25 @@ function draftCard(draft, itemsById) {
     item ? el('p', { class: 'draft-because', text: item.headline }) : null,
     area,
     el('div', { class: 'draft-actions' }, [
-      button('Copy the text', {
+      button('Review & send in Zelos', {
         class: 'btn solid',
+        onClick: async (e) => {
+          const reviewButton = e.currentTarget;
+          if (reviewButton.disabled || writer.discarding) return;
+          reviewButton.disabled = true;
+          try {
+            await flushDrafts();
+            if (!writer.discarding) navigate(`#/mail/draft/${encodeURIComponent(draft.id)}`);
+          } catch (error) {
+            status.textContent = `${error.message} Your text is still here.`;
+            status.classList.add('is-bad');
+          } finally {
+            reviewButton.disabled = false;
+          }
+        },
+      }),
+      button('Copy the text', {
+        class: 'btn quiet',
         onClick: async (e) => {
           const ok = await copyText(area.value);
           const btn = e.currentTarget;
@@ -284,7 +300,7 @@ function draftCard(draft, itemsById) {
 }
 
 export function renderOwed(ctx) {
-  const { tz } = ctx;
+  const { tz, navigate } = ctx;
   const drafts = openDrafts();
   const promised = itemsInBucket('promised').sort(byUrgency);
   const waiting = itemsInBucket('waiting').sort(byUrgency);
@@ -300,14 +316,11 @@ export function renderOwed(ctx) {
     return body;
   }
 
-  // "Ready to send" and "never sends mail" in one breath was the audit's
-  // complaint; the heading now says whose words these are and the note says
-  // where the sending happens.
   body.appendChild(section('Replies it wrote for you', {
     count: drafts.length,
-    note: 'Open one in your email program, check it, and press send there. Zelos never sends anything itself.',
+    note: 'Review a reply in Email, then choose Send reply when it is ready. You can also copy it or open it in your email program.',
   }, drafts.length
-    ? el('div', { class: 'stack' }, drafts.map((d) => draftCard(d, itemsById)))
+    ? el('div', { class: 'stack' }, drafts.map((d) => draftCard(d, itemsById, navigate)))
     : el('p', { class: 'quiet-note', text: 'No drafts waiting.' })));
 
   body.appendChild(section('You owe them', { count: promised.length },

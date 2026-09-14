@@ -76,7 +76,9 @@ test('reading-status and setup links target the failing account without claiming
   state.health.model.configured = true;
   state.board.sourceStatus = [{ id: 'failed', configKey: 'mail', ok: false, error: 'Sign in again' }];
   const paths = [];
-  findButton(source.readingStatus(path => paths.push(path)), 'Review connection').click();
+  const review = findButton(source.readingStatus(path => paths.push(path)), 'Review connection: Work');
+  assert.ok(review, 'the recovery action must name the account it will open');
+  review.click();
   assert.deepEqual(paths, ['#/settings/mail/failed']);
   const setup = text(source.setupStatus(() => {}));
   assert.match(setup, /AI chosen.*test it/);

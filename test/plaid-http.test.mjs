@@ -1,0 +1,20 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+const taskHome=fs.mkdtempSync(path.join(os.tmpdir(),'zelos-plaid-http-'));
+process.env.ZELOS_HOME=taskHome;process.env.ZELOS_SECRETS_BACKEND='encrypted-file';process.env.ZELOS_LOG_LEVEL='silent';
+const {createServer,listen}=await import('../core/server.mjs');
+const store=await import('../core/db.mjs');const {loadConfig}=await import('../core/config.mjs');
+test('Plaid routes require owner authentication, reject foreign origins, and never return saved keys',async t=>{
+ const db=store.open(':memory:');store.migrate(db);const server=createServer({db,config:loadConfig()});const {port}=await listen(server,{port:0});
+ t.after(async()=>{server.closeAllConnections();await new Promise(r=>server.close(r));store.close(db);fs.rmSync(taskHome,{recursive:true,force:true});});
+ const call=async(route,{token=server.sessionToken,body,origin}={})=>{const r=await fetch(`http://127.0.0.1:${port}/api/finance/plaid${route}`,{method:body?'POST':'GET',headers:{'Content-Type':'application/json',...(token?{'X-Zelos-Token':token}:{}),...(origin?{Origin:origin}:{})},body:body?JSON.stringify(body):undefined});return {status:r.status,text:await r.text()};};
+ for(const route of ['','/configure','/start','/complete','/map','/sync','/disconnect'])assert.equal((await call(route,{token:null,...(route?{body:{}}:{})})).status,401);
+ assert.equal((await call('/start',{body:{},origin:'https://evil.example'})).status,403);
+ assert.equal((await call('/start',{body:{}})).status,409);
+ const secret='b'.repeat(30);assert.equal((await call('/configure',{body:{clientId:'a'.repeat(24),secret}})).status,200);
+ const state=await call('');assert.equal(state.status,200);assert.equal(JSON.parse(state.text).configured,true);assert.ok(!state.text.includes(secret));
+ assert.ok(fs.existsSync(path.join(taskHome,'secrets.enc')));assert.ok(!fs.readFileSync(path.join(taskHome,'secrets.enc'),'utf8').includes(secret));
+});

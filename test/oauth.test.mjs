@@ -772,6 +772,43 @@ test('token endpoint failures surface the server’s own error code', async () =
   }
 });
 
+test('token endpoint errors withhold exact submitted grants before callers can store or log them', async (t) => {
+  const clientSecret = 'fictional-client/secret + with spaces';
+  const grant = 'fictional-grant/token + with spaces';
+  const verifier = 'fictional-verifier-that-is-only-a-test-value-123456789';
+  const variants = (value) => [value, encodeURIComponent(value), new URLSearchParams({ v: value }).toString().slice(2)];
+  for (const flow of ['refresh', 'exchange']) {
+    for (const failure of ['status', 'network']) {
+      await t.test(`${flow}: ${failure}`, async () => {
+        let calls = 0;
+        const fetchImpl = async (_url, request) => {
+          calls += 1;
+          const sent = new URLSearchParams(request.body);
+          assert.equal(sent.get('client_secret'), clientSecret);
+          assert.equal(sent.get(flow === 'refresh' ? 'refresh_token' : 'code'), grant);
+          const reflected = [clientSecret, grant, ...(flow === 'exchange' ? [verifier] : [])].flatMap(variants).join(' | ');
+          if (failure === 'network') throw new Error(`connection refused after ${reflected}`);
+          return new Response(JSON.stringify({ error: `invalid_grant ${grant}`, error_description: `refused ${reflected}` }), { status: 401 });
+        };
+        const common = { provider: 'google', clientId: 'fictional-client', clientSecret, fetchImpl };
+        const invoke = flow === 'refresh'
+          ? () => refreshTokens({ ...common, refreshToken: grant })
+          : () => exchangeCode({ ...common, code: grant, verifier, redirectUri: 'http://127.0.0.1:1234/callback' });
+        await assert.rejects(invoke, (err) => {
+          assert.ok(err instanceof OAuthError);
+          const visible = JSON.stringify({ message: err.message, code: err.code, description: err.description, stack: err.stack });
+          for (const value of [clientSecret, grant, ...(flow === 'exchange' ? [verifier] : [])].flatMap(variants)) {
+            assert.equal(visible.includes(value), false, 'an exact submitted OAuth secret reached the caller');
+          }
+          assert.match(err.message, /refused/);
+          return true;
+        });
+        assert.equal(calls, 1, 'redaction must not retry a failed grant');
+      });
+    }
+  }
+});
+
 test('a non-JSON answer is an error, not a token', async () => {
   const mock = await startAuthServer({ malformed: true });
   try {

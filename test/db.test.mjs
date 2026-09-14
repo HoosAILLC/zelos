@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { restoreLegacySchema } from './helpers/legacy-schema.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -150,6 +151,16 @@ test('migration 2 upgrades a version-1 database without touching its rows', () =
       first_seen TEXT, seen_runs INTEGER, last_seen_run TEXT,
       state TEXT, state_at TEXT, updated_at TEXT
     );
+    CREATE TABLE messages (
+      id TEXT PRIMARY KEY, source_id TEXT, uid INTEGER, message_id TEXT, thread_key TEXT,
+      folder TEXT, direction TEXT, from_name TEXT, from_email TEXT, to_json TEXT, cc_json TEXT,
+      subject TEXT, sent_at TEXT, snippet TEXT, body TEXT, has_attach INTEGER,
+      flags_json TEXT, fetched_at TEXT
+    );
+    CREATE TABLE drafts (
+      id TEXT PRIMARY KEY, item_id TEXT, to_email TEXT, subject TEXT, body TEXT,
+      state TEXT, created_at TEXT, updated_at TEXT
+    );
   `);
   db.prepare(`INSERT INTO items (id, bucket, headline, state, state_at, updated_at)
               VALUES ('legacy1', 'now', 'Carried over from v1', 'snoozed', '2026-08-01T10:00:00-04:00', '2026-08-01T10:00:00-04:00')`).run();
@@ -164,6 +175,47 @@ test('migration 2 upgrades a version-1 database without touching its rows', () =
   assert.equal(row.headline, 'Carried over from v1');
   assert.equal(row.state, 'snoozed');
   assert.equal(row.snoozed_until, null, 'an upgraded row behaves like the manual snooze it was');
+});
+
+test('migration 5 upgrades a real version-4 layout without changing cached messages or reviewed drafts', () => {
+  const db = fresh();
+  const message = upsertMessage(db, MSG);
+  const item = upsertItem(db, ITEM);
+  const draft = upsertDraft(db, { itemId: item.id, to: MSG.from.email, subject: 'Re: Invoice 4471', body: 'My reviewed reply.', state: 'edited' });
+  const oldMessage = db.prepare('SELECT id, source_id, message_id, subject, body, sent_at, flags_json FROM messages WHERE id = ?').get(message.id);
+  const oldDraft = getDraft(db, draft.id);
+  // Remove all later modules as well as v5's reply metadata, preserving legacy rows.
+  restoreLegacySchema(db, 4);
+  assert.deepEqual(migrate(db), { version: SCHEMA_VERSION, applied: SCHEMA_VERSION - 4 });
+  assert.deepEqual(db.prepare('SELECT id, source_id, message_id, subject, body, sent_at, flags_json FROM messages WHERE id = ?').get(message.id), oldMessage);
+  assert.deepEqual(getDraft(db, draft.id), oldDraft);
+  const upgraded = getMessage(db, message.id);
+  assert.deepEqual(upgraded.replyTo, []);
+  assert.deepEqual(upgraded.references, []);
+  assert.equal(upgraded.in_reply_to, null);
+  assert.equal(upgraded.reply_headers_known, 0, 'legacy headers remain explicitly unknown until re-fetched');
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM mail_outbox').get().n, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM mail_drafts').get().n, 0);
+  assert.deepEqual(migrate(db), { version: SCHEMA_VERSION, applied: 0 });
+});
+
+test('reply metadata round-trips, survives headerless refreshes, and records explicitly empty Reply-To', () => {
+  const db = fresh();
+  const headers = { replyTo: [{ name: 'Accounts', email: 'accounts@riverstone.example' }], references: ['<prior@riverstone.example>'], inReplyTo: '<prior@riverstone.example>' };
+  const { id } = upsertMessage(db, { ...MSG, ...headers });
+  upsertMessage(db, { ...MSG, text: '', snippet: '' });
+  const retained = getMessage(db, id);
+  assert.deepEqual(retained.replyTo, headers.replyTo);
+  assert.deepEqual(retained.references, headers.references);
+  assert.equal(retained.in_reply_to, headers.inReplyTo);
+  assert.equal(retained.reply_headers_known, 1);
+  assert.equal(retained.body, MSG.text);
+  upsertMessage(db, { ...MSG, replyTo: [], references: [], inReplyTo: '' });
+  const cleared = getMessage(db, id);
+  assert.deepEqual(cleared.replyTo, []);
+  assert.deepEqual(cleared.references, []);
+  assert.equal(cleared.in_reply_to, '');
+  assert.equal(cleared.reply_headers_known, 1, 'known-empty headers are distinct from legacy unknown headers');
 });
 
 test('withTransaction() rolls back on failure', () => {

@@ -1,0 +1,81 @@
+/* Email workspace: the shared shell owns navigation and base controls. */
+.view-mail { max-width: 1280px; gap: 22px; }
+.mail-heading { display: flex; align-items: start; justify-content: space-between; gap: 16px; }
+.mail-heading h1 { margin: 0 0 6px; font: 550 28px/1.2 var(--sans); letter-spacing: -.03em; }
+.mail-heading p { margin: 0; color: var(--ink-2); font-size: 13px; }
+.mail-filters { display: grid; grid-template-columns: minmax(140px, 175px) minmax(160px, 220px) minmax(0, 1fr) auto; align-items: end; gap: 12px; }
+.mail-field { display: grid; gap: 6px; min-width: 0; }
+.mail-field > span { color: var(--ink-2); font-size: 12px; }
+.mail-field .input { width: 100%; min-width: 0; font-size: 13px; }
+.mail-layout { display: grid; grid-template-columns: minmax(230px, 330px) minmax(0, 1fr); min-height: 480px; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+.mail-list-pane { min-width: 0; background: #222; border-right: 1px solid var(--line); }
+.mail-list-status { padding: 14px 16px; margin: 0; border-bottom: 1px solid var(--line); color: #aaa; font-size: 12px; }
+.mail-list { max-height: min(760px, 75vh); overflow-y: auto; }
+.mail-row { width: 100%; display: grid; gap: 6px; text-align: left; padding: 16px; background: transparent; border: 0; border-bottom: 1px solid #ffffff08; color: var(--ink); cursor: pointer; }
+.mail-row:hover { background: #292929; }
+.mail-row[aria-current="true"] { background: #303030; box-shadow: inset 2px 0 #aaa; }
+.mail-row-top { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+.mail-sender { font-size: 12px; font-weight: 550; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.mail-date { color: #929292; font-size: 10px; white-space: nowrap; }
+.mail-row-subject { font-size: 13px; font-weight: 500; line-height: 1.5; overflow-wrap: anywhere; }
+.mail-snippet { font-size: 12px; line-height: 1.5; color: #aaa; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
+.mail-more { width: calc(100% - 24px); margin: 12px; }
+.mail-message-pane { min-width: 0; padding: 24px; background: #202020; }
+.mail-empty { padding: 52px 20px; text-align: center; color: var(--ink-2); font-size: 13px; line-height: 1.7; }
+.mail-empty h2 { color: var(--ink); font-size: 18px; font-weight: 500; }
+.mail-empty-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-top: 16px; }
+.mail-back { display: none; margin: -8px 0 18px; }
+.mail-message-heading { margin-bottom: 24px; }
+.mail-message-subject { margin: 0 0 18px; font-size: 22px; font-weight: 550; line-height: 1.35; letter-spacing: -.02em; overflow-wrap: anywhere; }
+.mail-envelope { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 7px 12px; margin: 0; font-size: 12px; line-height: 1.5; }
+.mail-envelope dt { color: #929292; }
+.mail-envelope dd { margin: 0; color: #ccc; overflow-wrap: anywhere; }
+.mail-importance { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-top: 18px; }
+.mail-importance-reason, .mail-importance-status { margin: 0; color: var(--ink-2); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.mail-importance-reason { flex: 1 1 160px; }
+.mail-importance-status { flex-basis: 100%; }
+.mail-importance-status:empty { display: none; }
+.mail-importance-status.is-bad { color: #efb3a9; }
+.mail-message-body { white-space: pre-wrap; overflow-wrap: anywhere; font: 13px/1.8 var(--sans); color: #d3d3d3; margin: 0 0 28px; max-height: 65vh; overflow-y: auto; }
+.mail-reply { border-top: 1px solid var(--line); padding-top: 24px; display: grid; gap: 16px; }
+.mail-reply h2 { margin: 0; font-size: 17px; font-weight: 550; }
+.mail-reply-fields { display: grid; gap: 14px; }
+.mail-reply-addresses { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.mail-reply-body { min-height: 200px; resize: vertical; line-height: 1.7; }
+.mail-reply-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.mail-reply-status { margin: 0; color: #bbb; font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.mail-reply-status.is-bad { color: #efb3a9; }
+.mail-reply-status.is-good { color: #a9c8b0; }
+.mail-draft-note { margin: 0; color: #929292; font-size: 11px; line-height: 1.6; }
+.mail-generated, .mail-review { border: 1px solid #454545; background: #272727; border-radius: 10px; padding: 18px; display: grid; gap: 16px; }
+.mail-generated h3, .mail-review h3 { margin: 0; font-size: 15px; font-weight: 550; }
+.mail-review-body, .mail-generated-body { white-space: pre-wrap; overflow-wrap: anywhere; font: 13px/1.8 var(--sans); margin: 0; }
+.mail-review-intro { color: #aaa; margin: 0; font-size: 12px; line-height: 1.6; }
+.mail-review-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+@media (max-width: 1099px) {
+  .mail-filters { grid-template-columns: minmax(130px, 1fr) minmax(160px, 1.4fr) auto; }
+  .mail-filters > .mail-field:nth-child(3) { grid-column: 1 / 3; }
+  .mail-layout { grid-template-columns: minmax(215px, 285px) minmax(0, 1fr); }
+  .mail-message-pane { padding: 20px; }
+  .mail-reply-addresses { grid-template-columns: 1fr; }
+}
+@media (max-width: 759px) {
+  .mail-heading h1 { font-size: 24px; }
+  .mail-filters { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .mail-filters > .mail-field:nth-child(3) { grid-column: 1 / -1; }
+  .mail-filters > .btn { justify-self: start; }
+  .mail-layout { display: block; min-height: 320px; }
+  .mail-list-pane { border-right: 0; }
+  .mail-list { max-height: none; }
+  .view-mail[data-pane="list"] .mail-message-pane { display: none; }
+  .view-mail[data-pane="message"] .mail-list-pane { display: none; }
+  .view-mail[data-pane="message"] .mail-filters { display: none; }
+  .mail-message-pane { padding: 18px; }
+  .mail-message-subject { font-size: 20px; }
+  .mail-message-body { max-height: none; }
+  .mail-back { display: inline-flex; }
+  .mail-field .input { min-height: 44px; font-size: 16px; }
+  .mail-reply-actions .btn, .mail-review-actions .btn { min-height: 44px; }
+  .mail-importance .btn, .mail-empty-actions .btn { min-height: 44px; }
+  .mail-review, .mail-generated { padding: 14px; }
+}

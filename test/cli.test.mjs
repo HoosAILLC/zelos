@@ -140,8 +140,9 @@ describe('package.json is ready to publish as zelos-app', () => {
     assert.match(String(pkg.bugs?.url ?? ''), /github\.com\/[^/]+\/zelos\/issues$/);
   });
 
-  test('no dependencies, of any kind', () => {
-    for (const field of ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies', 'bundleDependencies']) {
+  test('only the pinned SMTP and PDF dependencies are present', () => {
+    assert.deepEqual(pkg.dependencies, { nodemailer: '10.0.9', pdfkit:'0.19.1' });
+    for (const field of [ 'devDependencies', 'peerDependencies', 'optionalDependencies', 'bundleDependencies']) {
       assert.ok(
         pkg[field] === undefined || Object.keys(pkg[field]).length === 0,
         `package.json.${field} is populated: ${JSON.stringify(pkg[field])}`,
@@ -564,6 +565,8 @@ describe('npm pack produces a tarball that runs', { skip: PACK_SKIP }, () => {
        home nothing else is using, and read the lock it should have written —
        the pid in it is the only proof that the writer (core/home-lock.mjs's
        publishLock) and the reader (zelos.mjs's holdHomeQuietly) met. */
+    // Install the already-audited local dependency fixture without network or scripts.
+    fs.cpSync(path.join(ROOT, 'node_modules'), path.join(extracted, 'node_modules'), { recursive: true });
     const home = freshHome();
     const child = spawn(process.execPath, ['zelos.mjs', '--no-open', '--port', '0'], {
       cwd: extracted,

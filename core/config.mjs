@@ -3,9 +3,10 @@
  *
  * Two rules govern this file:
  *
- *  1. config.json NEVER contains a secret. It carries `keyRef` strings that name
- *     an entry in the secret store (core/secrets.mjs) and nothing else. Anything
- *     that looks like a credential is stripped on the way in, loudly.
+ *  1. Passwords, API keys and OAuth grants use `keyRef` entries in the secret
+ *     store (core/secrets.mjs). Credential fields are stripped on the way in.
+ *     Subscription URLs remain in config and may contain bearer credentials;
+ *     the config is private and must not be included in board exports.
  *  2. A save is atomic. Config is written to a temp file in the same directory,
  *     fsync'd, chmod'd 0600, and then renamed over the target. rename(2) on the
  *     same filesystem is atomic, so a crash mid-save leaves the old config

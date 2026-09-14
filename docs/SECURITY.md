@@ -8,7 +8,8 @@ says so, and says where the hole is.
 
 ## 1. What Zelos is exposed to
 
-Zelos reads your mail and your calendar and hands both to a language model.
+Zelos reads your connected mail, calendar, text messages and other enabled
+sources. AI reviews and Ask send selected content to the configured model.
 
 **Anyone with your email address can put text in front of that model.** They do
 not need to compromise anything. They send you a message. That is the whole
@@ -40,27 +41,48 @@ Prompt injection has no known complete defence. Anyone who tells you their
 filter solves it is selling something. Zelos therefore does not rest on a
 filter. It rests on this:
 
-> **Zelos never acts on model output. It renders it, and a human clicks.**
+> **Model-driven work is restricted to explicitly implemented capabilities; sending and other external account changes require a separate authenticated user action.**
 
-Concretely, there is no code path anywhere in this program by which text
-produced by the model, or text extracted from a message, can cause the machine
-to do something. Specifically:
+The review-board model has no shell or account write operations. Its output
+can change local board content. The separately assigned assistant can call
+a bounded set of local tools across multiple model turns, as described below.
+Specifically:
 
 | The model can emit…            | What Zelos does with it                                                                 |
 | ------------------------------ | ----------------------------------------------------------------------------------------- |
 | a draft email                  | Stores it. Shows it in a textarea. **Sending requires you to press send.** There is no auto-send, no scheduled send, no "send if confident". |
-| a URL                          | Runs it through `safeUrl`. If it survives, it is rendered as a link. Nothing fetches it. Nothing previews it. You click it or you don't. |
-| a shell command, a file path   | It is a string. It is stored as a string and rendered as a string. Zelos never calls `eval`, `Function`, `child_process`, `vm`, or `import()` on anything derived from message content or model output. |
-| an instruction to delete, archive, mark read, or RSVP | Nothing. Zelos has no write path to your mail server at all. IMAP access uses `BODY.PEEK`, so reading your mail does not even mark it read. Calendar access is read-only. |
+| a URL                          | Newly assessed item links must be an exact canonical HTTP(S) URL in their cited source evidence. Invented destinations and added query data are cleared. The board shows the destination host; nothing fetches or previews the link automatically. |
+| a shell command, a file path   | It is a string. It is stored as a string and rendered as a string. Message and model strings are never evaluated with `eval`, `Function`, `vm`, or dynamic imports. Approved document uploads are read by fixed native tools through argument arrays with `shell:false`; their generated temporary paths are not executable commands. |
+| an instruction to delete, archive, mark read, or RSVP | Nothing. Zelos has no IMAP write path. IMAP access uses `BODY.PEEK`, so reading your mail does not even mark it read. Calendar access is read-only. |
 | an item claiming to be urgent  | Gets a bucket and a severity that **Zelos re-derives in code** (`validateSweep`), not the ones the model asked for. At most four things can be `now`, whatever the model says. |
-| a request to call a tool       | There are no tools. The model gets one text completion request and returns one JSON blob. It has no function-calling surface, no retrieval loop, no second turn. |
+| a request to call a tool       | Board-review output does not dispatch tool requests. Assigned assistant jobs accept only the fixed tool names in `core/assistant.mjs` and the server wiring, with at most eight tool steps and nine model turns. Unsupported tool names are rejected. |
 
-The worst outcome of a successful injection is therefore **a lie on your
-screen**: a fabricated item, a misleading summary, a draft that says something
-you didn't mean, or a link that points somewhere bad. That is a real harm —
-being lied to convincingly is how people get phished — but it is bounded by
-your judgement, and it stops at your click. It is not remote code execution, it
-is not silent exfiltration, and it is not your mailbox being modified.
+Assigned assistant jobs can search saved records, read bounded calendar entries,
+read saved progress, money and permitted health data, save a local note, create
+a local PDF report, and prepare an unsent reply. Model output therefore can
+cause local writes and additional reads/model requests. It cannot invoke a
+shell, send mail, make payments, book appointments, or change external accounts
+through this tool registry. Tool results remain untrusted, and their data can
+influence later steps. The step limit controls work, not semantic correctness.
+The health policy is checked before model turns and health reads; changing the
+model endpoint cannot silently grant permission to send protected health data.
+
+An injection can still produce a fabricated item, misleading summary, harmful
+draft or a phishing link already present in a source. Clicking a link or
+sending a draft can disclose information or cause harm. The deterministic
+controls restrict automatic actions; they do not establish that the model's
+advice or the original source is trustworthy. Tests exercise these controls
+with fictional source text and model replies, not a guarantee of model obedience.
+
+The private Spark Email view sends only a plain-text reply explicitly reviewed and submitted
+by the authenticated user. Drafting and automatic checks cannot call the sending transport.
+The server stores an immutable review with its sender account, one recipient, subject, body,
+and threading headers before delivery. Editing invalidates the review; duplicate submissions
+refer to the same delivery record. A process restart or uncertain SMTP result locks that reply
+instead of retrying. Only enabled Gmail app-password accounts can send, using fixed
+`smtp.gmail.com:465` with verified TLS. Credentials never reach the browser. The transport is
+Nodemailer 10.0.9, pinned in the package lock; file access, URL fetching, arbitrary headers,
+attachments and caller-selected SMTP endpoints are disabled.
 
 The layers described next exist to shrink that remaining surface. None of them
 is load-bearing on its own.
@@ -152,7 +174,8 @@ structure.
 
 ### `validateSweep(obj)` — the model's output is re-derived, not trusted
 
-Every rule the prompt asks for is enforced again in code afterwards:
+Structural output rules are enforced again in code afterwards. Factual accuracy
+and the meaning of source text cannot be established by these checks:
 
 - `bucket` must be one of `now, today, soon, waiting, promised, note, money`.
   Obvious synonyms are mapped; anything unrecognised becomes `note`, which is
@@ -167,7 +190,11 @@ Every rule the prompt asks for is enforced again in code afterwards:
 - Every string is screened (before capping, so truncation cannot chop `<script`
   into something that passes) and then capped. An unsafe **headline** drops the
   whole item; an unsafe `why` or `person` is blanked and the item survives.
-- Every `link` goes through `safeUrl`.
+- Every `link` goes through `safeUrl`. At merge time, an item link must also
+  match an exact canonical HTTP(S) URL found in a cited message, event or
+  capture. Generated mailto links and altered paths, queries or fragments are
+  cleared. Existing stored links are not bulk rewritten; reassessment applies
+  the new gate. Original-source phishing URLs and redirects remain possible.
 - `sourceRefs` must match `msg:`/`evt:`/`cap:` plus a safe id, and are capped at
   12. (Checking that they point at rows which actually exist is the database's
   job, in `core/triage.mjs`.)
@@ -261,16 +288,19 @@ wrong.
   previous instructions about the vendor" will be annotated, and the resulting
   summary may read slightly oddly. That is the cost, and it is paid on purpose.
 
-None of these misses is fatal, because of section 2: the worst a successful
-instruction achieves is a wrong or misleading item on your board. That is the
-entire reason this file is allowed to be a blocklist.
+These misses remain a risk. They can distort board results, drafts and local
+assistant artifacts, or influence which permitted records an assigned job
+reads. The capability and privacy checks in section 2 must hold even when the
+model follows hostile text; the blocklist is not the authorization boundary.
 
 ---
 
 ## 5. What leaves your machine
 
-Three outbound destinations exist by default, plus one for each source you add
-in **Settings → Sources**. All of them are ones you typed in yourself.
+Configured reading and inference use your mail, calendar, model and source
+endpoints. Explicit mail sending, shopping-list creation and public-web research
+have additional outbound paths described below; local inference does not make
+those requested network operations offline.
 
 1. **Your IMAP host**, on the port you configured, over TLS.
 
@@ -288,8 +318,8 @@ in **Settings → Sources**. All of them are ones you typed in yourself.
 2. **Your calendar URL** — an `.ics` feed or a CalDAV server.
 3. **Your model endpoint** — the `model.baseUrl` you chose. If you point that
    at Ollama, LM Studio, llama.cpp, vLLM or LocalAI on `127.0.0.1`, then
-   **nothing Zelos read leaves the machine at all**, and Zelos still works
-   with no API key.
+   **inference stays on that machine**, and the local model can work without
+   an API key. This does not prevent separately requested mail, web or shopping traffic.
 4. **One host per source you add** — `api.github.com` for GitHub, the feed's
    own host for a feed, and so on. Each connector names the host it may reach
    in its manifest (`origins` in `core/connectors/*.mjs`), and the only thing
@@ -302,18 +332,19 @@ Those are the configured reading and model destinations. A manual update check
 adds the official GitHub release API, as described below.
 There is no telemetry, no analytics, no crash reporting, no automatic update check, no
 CDN, no remote font, no remote image, no "anonymous usage statistics". The
-package has zero third-party runtime dependencies, which is what makes that
-claim checkable rather than merely stated: there is no transitive package that
-could phone home behind Zelos's back. You can verify it with `lsof -i` or
+runtime dependencies are pinned Nodemailer 10.0.9 for reviewed SMTP sending and
+PDFKit 0.19.1 for local reports, with transitive integrity hashes in the package
+lock. Native document extraction also uses installed Poppler and Tesseract.
+Their existence is part of the audit; a dependency list alone cannot prove an
+absence of network behavior. You can verify it with `lsof -i` or
 Little Snitch or `tcpdump` and count the conversations against your own
 settings.
 
-Seven footnotes, because "three destinations" is nearly true rather than exactly
-true.
+Additional network boundaries:
 
 1. **A server you configured can redirect, and Zelos follows one hop** — so a
-   fourth host can appear in `tcpdump`. One hop is the rule everywhere it can
-   happen and it is hand-rolled in each place, because `redirect: 'follow'` is
+   fourth host can appear in `tcpdump`. One hop is the rule for these configured
+   calendar and connector fetches, and it is hand-rolled in each place, because `redirect: 'follow'` is
    not a policy, it is undici's, and undici's is twenty: the `.ics` reader
    (`fetchIcsText` in `core/connectors/ics.mjs`), the Settings **Test** button
    (`fetchIcsOnce` in `core/server.mjs`), `zelos doctor` (`core/doctor.mjs`),
@@ -338,9 +369,9 @@ true.
    (`slack.mjs`), Linear `https://api.linear.app` (`linear.mjs`), Todoist
    `https://api.todoist.com` (`todoist.mjs`), Fireflies
    `https://api.fireflies.ai` (`fireflies.mjs`); a feed declares nothing and
-   may reach only the feed address you typed (`rss.mjs`); a folder and a
-   WhatsApp export declare nothing and contact nothing (`folder.mjs`,
-   `whatsapp.mjs`). One more that is not a source: a mailbox set to **Sign in
+   may reach only the feed address you typed (`rss.mjs`); a folder, a
+   WhatsApp export and iPhone texts declare nothing and contact nothing
+   (`folder.mjs`, `whatsapp.mjs`, `imessage.mjs`). One more that is not a source: a mailbox set to **Sign in
    with Microsoft** talks to `https://login.microsoftonline.com`
    (`MS_LOGIN_ORIGIN` in `core/sources/imap.mjs`) to get and refresh its
    token. A URL that arrived inside a payload — a feed's `<link>`, a
@@ -353,9 +384,9 @@ true.
    system resolver who handles that domain's mail — its MX record, then the
    `_imaps._tcp` SRV record — so a custom domain on Google Workspace or
    Microsoft 365 is recognised rather than guessed at. The domain goes to the
-   resolver; the address does not, and nothing is logged. Every other name
-   Zelos resolves is a host you typed (`discoverProvider` in
-   `core/sources/imap.mjs`, behind `POST /api/mail/guess`).
+   resolver; the address does not, and nothing is logged. This setup path is `discoverProvider` in
+   `core/sources/imap.mjs`, behind `POST /api/mail/guess`. Public-web lookup
+   resolves requested public hosts separately, as described below.
 
 6. **Two hosts while you sign in, and on each refresh.** A mailbox connected
    with **Sign in with Google** talks to `accounts.google.com` — in your
@@ -383,27 +414,78 @@ true.
    results are cached for five minutes. Only exact official release destinations
    are offered; the check downloads and installs nothing. No check runs at startup.
 
+8. **Reviewed email submission.** `core/mail-send.mjs` uses Nodemailer only for
+   the fixed SMTP transport supported by the selected account. The authenticated
+   workspace freezes sender, recipient, subject and text before the user's Send
+   action. Generation and review alone do not send. Transport options disable
+   file and URL reads, arbitrary headers and attachments.
+
+9. **Shopping lists, not checkout.** Explicit store lookup sends the configured
+   postal/country code to Instacart; explicit creation sends the reviewed grocery
+   list. `core/shopping.mjs` uses only `connect.instacart.com`, or the selected
+   development endpoint `connect.dev.instacart.tools`, and refuses redirects.
+   The API key stays on the server. A hosted-list link is not an order receipt;
+   Zelos does not place an order through this integration.
+
+10. **Requested public-web research.** `core/web-research.mjs` uses Node HTTP(S),
+   separate from the fetch transport. It sends a requested public URL to its
+   host, or a search query and dedicated key to the exact Brave search endpoint
+   `https://api.search.brave.com/res/v1/web/search`. It does not read app records,
+   cookies or browser history. DNS answers must all be public; one address is
+   pinned per request, with TLS hostname checking and a proxy-independent agent.
+   Public reads allow at most three validated redirects, never an HTTPS
+   downgrade; search credentials never follow redirects. A 15-second total
+   deadline and 1 MB wire/decompression limits apply. Linked resources and search
+   result pages are not loaded automatically. HTML tokenization advances only
+   forward with tag, token and nesting caps, and production parsing runs in
+   at most two memory-limited workers that are terminated on cancellation or
+   timeout. See `test/web-research.test.mjs`.
+
+The [network audit](README.md#checking-zeloss-network-requests) counts fetch,
+IMAP sockets, direct HTTP(S), DNS, SMTP transport construction and native process
+imports separately. Fixed official guidance/help links in the UI are click-only
+browser navigation; they are not remote application resources.
+
+
 ### `privacy.sendBodies`
 
 This is a real switch, not a label.
 
-- `sendBodies: true` (default) — the model receives message bodies, truncated
-  to `privacy.bodyChars` characters (default 4000).
+- `sendBodies: true` (default) — the model can receive message bodies and
+  calendar descriptions, capped by `privacy.bodyChars` (default 4000) and
+  tighter per-feature context budgets.
 - `sendBodies: false` — the model receives **headers and the snippet only**:
   sender, recipients, subject, date, and the short plain-text preview stored in
-  the database. Full bodies are never placed in the prompt.
+  the database. Full message bodies and calendar descriptions are omitted
+  from both reviews and Ask.
 
 What it does **not** change: subjects, sender names and recipient addresses are
 sent either way, because without them there is nothing to reason about. If you
 consider the mere fact that `lawyer@example.com` wrote to you to be sensitive,
 `sendBodies: false` does not hide that from your model provider. Point the app
-at a local model instead — that is the only setting that makes the question go
-away entirely.
+at a local model to keep those requests on the machine. Questions, user notes,
+existing board summaries and draft context can still contain private details;
+the body switch does not erase past summaries or provider-side copies.
 
-Everything read from your mail and calendar is stored **on your machine**, in
+Everything read from your mail, calendar and other sources, including iPhone
+texts, is stored **on your machine**, in
 `~/.zelos/zelos.db` (or `$ZELOS_HOME`), in plain SQLite. That file is not
 encrypted. Anyone who can read your home directory can read your mail cache —
 the same as with any local mail client.
+
+**iPhone texts** are read from the Messages database on your Mac through a
+read-only SQLite connection. Zelos does not send messages, change read receipts,
+download attachments or alter Messages records. SQLite may update the shared
+memory sidecar used to coordinate concurrent readers; the database and its
+write-ahead log are not changed by the import. Full Disk Access belongs to the
+installed Zelos app, not to Terminal or a development tool.
+
+Imported texts use the same untrusted-message boundary and body privacy settings
+as mail. **Read sources now** performs a local import without calling the model;
+an AI review can include the imported texts in its context. Automatic reviews
+must remain off if you want local imports only. The cached texts are also subject
+to the existing MCP message-body permission. Deleting or retracting a message in
+Apple Messages does not remove a copy already stored in Zelos.
 
 What it does have, **on macOS and Linux**, is permissions. The Zelos home is
 `0700` and every file Zelos writes in it is `0600`, including the database and
@@ -423,6 +505,7 @@ does not currently set an explicit ACL, so if you are on a Windows machine you
 do not solely control, treat the Zelos home as readable by whoever administers
 it — and note that the same caveat applies to the encrypted secrets fallback
 file, whose protection is its encryption rather than its mode.
+
 
 ---
 
@@ -678,8 +761,8 @@ without them a single well-formed request could take the app out:
   which is the thing Zelos otherwise exists to avoid. Reread section 5 and
   decide deliberately.
 - **Injection reaching your AI rather than Zelos.** Section 2 still holds:
-  Zelos never acts on content, and tool output cannot break the JSON-RPC
-  envelope — it is serialised, so an injected `"}\n{"jsonrpc"…` arrives as
+  MCP responses do not dispatch instructions contained in records, and their
+  text cannot break the JSON-RPC envelope — it is serialised, so an injected `"}\n{"jsonrpc"…` arrives as
   characters in a string. But the message you were sent is now being read by an
   assistant that *does* have tools, possibly ones that send mail. Zelos cannot
   see that assistant's other tools and cannot stop it acting on what it read.
@@ -703,10 +786,12 @@ Implementation lives in `core/mcp.mjs` (the protocol and the tools) and
 
 ## 7. Secrets
 
-Passwords and API keys are stored by reference. The config file
-(`~/.zelos/config.json`, mode `0600`) holds only strings like
-`"mail.m_9f3a1c"` — never a credential; anything credential-shaped offered to it
-is stripped on the way in and reported, not stored.
+Passwords, API keys and OAuth grants are stored by reference, using strings
+like `"mail.m_9f3a1c"` in `~/.zelos/config.json` (mode `0600`). Explicit
+credential fields are stripped and reported. Private calendar subscription
+URLs remain in that file and can themselves grant access. Treat config and
+full backups as private. Board snapshots exclude connection settings,
+diagnostics and raw calendar imports, but still contain private board content.
 
 Credentials never appear in `argv`, where `ps` would show them to every user on
 the machine. That is structural rather than careful: `describeCommand()` in
@@ -714,8 +799,12 @@ the machine. That is structural rather than careful: `describeCommand()` in
 a backend, an action and a ref — **there is no value parameter**, so it is
 incapable of receiving one. Values travel on stdin.
 
-Credentials do not appear in logs either: `core/log.mjs` redacts by key name
-*and* by value shape on every line it writes. (Note that the CLI writes to
+`core/log.mjs` redacts known credential keys, serialized assignments, known key
+shapes and private subscription URLs. Calendar diagnostics and blocked desktop
+requests expose only the destination origin or host. OAuth errors scrub the
+exact submitted grant and client secret before leaving the connector. Arbitrary
+private prose cannot be recognized reliably, so logs are still private files.
+(Note that the CLI writes to
 stderr only — the one file logger in the tree belongs to the desktop shell and
 writes `~/.zelos/logs/desktop.log`. There is no `zelos.log`; `paths()` creates
 and chmods `logs/` on every launch, which is what made the wrong answer look
@@ -762,11 +851,21 @@ including the encrypted-file seed where present, in an owner-only archive.
 They are not password protected. Native file dialogs select paths; no HTTP route
 or renderer-supplied path can export credentials or replace the data folder.
 Restore verifies a bounded manifest, fixed portable paths, file hashes, database
-schema and integrity before confirmation. The runtime pauses requests and checks,
-cancels and drains sign-ins, refuses other active database clients, and keeps a
+schema and integrity before confirmation. Schema validation includes the exact
+optional first-party Plaid and MCP audit schemas; unknown objects and changed
+definitions are rejected. The runtime pauses requests and checks, cancels and
+drains sign-ins, refuses other active database clients, and keeps a
 recovery archive plus a replacement journal. Startup recovers an interrupted
 replacement before opening SQLite. External OS keychain values are not exported,
-and may require reconnecting on another machine. SHA-256 detects corruption; it
+and may require reconnecting on another machine. Every successful restore
+disables MCP AI access and discards its restored token records, AI entries in
+the portable encrypted store, and token index/legacy references. Reenabling AI
+requires issuing fresh client tokens. External OS keychain values are left
+untouched, but no longer have authorizing config records. Family accounts,
+invitations, credentials and grants are suspended and saved recovery codes are
+cleared. These changes affect only the incoming staged copy; failed replacement
+rolls back to the current state. The restore result reports
+`aiReconnectRequired` and `familyReconnectRequired`. SHA-256 detects corruption; it
 does not make an untrusted backup safe or authenticate its author.
 
 `backend()` returns that limitation as a `note`, and the UI is required to
@@ -876,8 +975,9 @@ Stated plainly, so nobody discovers these the hard way:
   receives the message content described in section 5, subject to their
   retention policy, not this program's. Use a local model if that matters.
 - **An AI client you connected.** Same shape as the point above, and worse in
-  one respect: a model call sends what Zelos chose to send, once, while an MCP
-  client reads whenever it likes, whatever the scopes allow. It is off by
+  one respect: an inference request sends the selected context for that turn,
+  while an MCP client can make repeated reads whenever its scopes allow.
+  Assigned assistant jobs also make bounded repeated model/tool calls. It is off by
   default for that reason. Section 6a is the long version.
 - **A malicious or backdoored IMAP or CalDAV server.** Zelos parses whatever
   it is sent. The parsers are written defensively — byte-exact IMAP literal
@@ -904,12 +1004,14 @@ Stated plainly, so nobody discovers these the hard way:
   password by redirecting you or by naming another host in an `href` (section 7),
   and it cannot make Zelos echo your password back into a response, a log line
   or the run history by quoting the command it rejected.
-- **Supply chain.** There is nothing to compromise at runtime: zero
-  dependencies, and no `postinstall` hook in either `package.json`. The Electron
-  shell in `desktop/` has its own `package.json`, and its Electron and
-  electron-builder entries are `devDependencies` used to build the app — it
-  ships no runtime dependency of its own. That is the one place the "nothing to
-  compromise" claim needs a second look.
+- **Supply chain.** The core uses pinned Nodemailer 10.0.9 and PDFKit 0.19.1,
+  with PDFKit transitive packages recorded in the integrity lock. The desktop
+  app also ships Electron, Chromium and Node. Their vulnerabilities and the
+  build toolchain remain relevant regardless of npm dependency labels. Keep
+  the bundled runtime current. The current macOS packaging uses ad-hoc signing,
+  without Developer ID notarization or hardened runtime; it is not a verified
+  publisher distribution. File permissions do not protect against malware
+  running as the same user. The local message database is not app-encrypted.
 
 ---
 
@@ -934,21 +1036,18 @@ model output pushed through the real merge path with `fetch` replaced by a
 tripwire, `privacy.sendBodies:false` on both the sweep and the ask path, and the
 supply-chain claims.
 
-**"Every route" now means every route, and that is a recent repair.** The list
-used to be typed out by hand next to the test, and it restated 19 of the
-router's 27 routes — the eight it omitted, including all three
-`/api/sample-data` handlers, arrived exempt from the adversarial pass the day
-they were written. Measured: gutting both sample-data write handlers, and
-separately adding an unauthenticated carve-out that returned the whole config,
-each left the suite green (1022 pass / 0 fail as it stood then; the whole suite
-is past 1,500 tests today — `node --test test/*.test.mjs` prints the exact
-count — of which this file is 37 and `test/ai-security.test.mjs` is 54). The
-table is now **parsed out of `core/server.mjs`'s `ROUTES` array**, a route the
-parser cannot read is a failure rather than a silent omission, and a separate
-test proves every path the parser produced really reaches the router (with
-`OPTIONS`, which matches no route and runs no handler). The one path
-deliberately outside `ROUTES` is `/api/mcp`, which takes the AI token instead —
-`test/ai-security.test.mjs` is where that one is attacked.
+The API test cases are parsed from `core/server.mjs`'s `ROUTES` array. Flat
+alternatives, including every Plaid action, expand into separate probes; unknown
+regex syntax fails instead of silently skipping a route. Authenticated `OPTIONS`
+checks first prove each generated path is real, then anonymous and foreign-origin
+requests test its gate. `/api/mcp` is outside that table and receives separate
+AI-token tests. Exact protected Plaid setup links are checked as first-party UI
+code; there is no domain or file exemption. Static imports are parsed without
+executing code, so quoted UI prose cannot masquerade as an import.
+
+Desktop packaging and native-runtime tests explicitly skip when those files
+are absent from an npm deployment. Core backup, authorization and dependency
+checks still run. A skipped desktop test is not evidence about a desktop build.
 
 Six of its assertions are regressions for holes that were open in an earlier
 revision of this program: the two CalDAV credential leaks, the `.ics` credential

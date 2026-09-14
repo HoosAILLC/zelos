@@ -1,8 +1,8 @@
 {
   "name": "zelos-desktop",
   "productName": "Zelos",
-  "version": "1.8.1",
-  "description": "The Electron shell for Zelos \u2014 a local-first second brain. The core it runs is dependency-free; Electron lives only in this package.",
+  "version": "1.8.4",
+  "description": "The Electron shell for Zelos — a local-first second brain. The core and its locked runtime dependencies are bundled for offline startup.",
   "author": {
     "name": "Zelos"
   },
@@ -15,9 +15,13 @@
   },
   "scripts": {
     "start": "electron .",
+    "prepack": "node prepare-runtime.js",
     "pack": "electron-builder --dir",
+    "predist": "node prepare-runtime.js",
     "dist": "electron-builder --mac --win",
+    "predist:mac": "node prepare-runtime.js",
     "dist:mac": "electron-builder --mac",
+    "predist:win": "node prepare-runtime.js",
     "dist:win": "electron-builder --win"
   },
   "devDependencies": {
@@ -45,6 +49,13 @@
       {
         "from": "../core",
         "to": "core",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": ".runtime-node-modules",
+        "to": "node_modules",
         "filter": [
           "**/*"
         ]

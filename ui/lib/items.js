@@ -14,6 +14,7 @@
 import { el, button, meander, replace } from './dom.js';
 import { setItemState, state, timezone } from './store.js';
 import { itemHistory } from './item-history.js';
+import { evidenceControls } from './item-evidence.js';
 import {
   todayKey, addDaysToKey, weekdayOfKey, dayKey, offsetFor, toZonedISO, formatTime, formatDay,
 } from './time.js';
@@ -24,18 +25,19 @@ import {
 /* Every deadline on a row goes through dueBit() below, which is the only place
  * in this module allowed to call dueLabel/isOverdue — see its own note. */
 
-/** A safe external link, or null. The server already screened it; so do we. */
+/** A web source link with its actual destination visible, or null. Mailto
+ * actions belong to the user's draft controls, not generated board links. */
 function linkFor(item) {
   const raw = item?.link;
   if (typeof raw !== 'string' || !raw) return null;
   let url;
   try {
-    url = new URL(raw, window.location.href);
+    url = new URL(raw);
   } catch {
     return null;
   }
-  if (url.protocol !== 'http:' && url.protocol !== 'https:' && url.protocol !== 'mailto:') return null;
-  return url.href;
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+  return { href: url.href, label: `Open ${url.host}` };
 }
 
 function tick(item, { label = null } = {}) {
@@ -236,6 +238,7 @@ function snoozeControl(item) {
 function moreControls(item) {
   const snooze = item.sourceInactive ? null : snoozeControl(item);
   const history = itemHistory(item);
+  const evidence = evidenceControls(item);
   const panel = el('div', { class: 'row-more', hidden: true }, [
     snooze?.toggle,
     !item.sourceInactive ? button('Not a thing', {
@@ -246,8 +249,10 @@ function moreControls(item) {
     !item.sourceInactive && item.state === 'snoozed'
       ? button('Wake', { class: 'btn quiet', onClick: () => setItemState(item.id, 'open') })
       : null,
+    evidence.toggle,
     history.toggle,
     snooze?.panel,
+    evidence.panel,
     history.panel,
   ]);
 
@@ -299,11 +304,11 @@ export function itemRow(item, { tz, showBucket = true } = {}) {
             onClick: () => setItemState(item.id, 'open'),
           }) : null,
         link ? el('a', {
-          class: 'btn quiet',
-          href: link,
+          class: 'btn quiet source-link',
+          href: link.href,
           rel: 'noreferrer noopener',
           target: '_blank',
-          text: 'Open',
+          text: link.label,
         }) : null,
         toggle,
       ]),
@@ -344,11 +349,11 @@ export function itemHero(item, { tz } = {}) {
       button('Done', { class: 'btn solid', onClick: () => setItemState(item.id, 'done') }),
       snooze.toggle,
       link ? el('a', {
-        class: 'btn quiet',
-        href: link,
+        class: 'btn quiet source-link',
+        href: link.href,
         rel: 'noreferrer noopener',
         target: '_blank',
-        text: 'Open',
+        text: link.label,
       }) : null,
       more.toggle,
     ]),

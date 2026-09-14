@@ -18,13 +18,37 @@ const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'zelos-packaged-smoke-'));
 const moduleURL = (name) => pathToFileURL(path.join(resources, 'core', name)).href;
 const program = `
   import assert from 'node:assert/strict';
+  import fs from 'node:fs';
   import path from 'node:path';
+  import { createRequire } from 'node:module';
   import { createServer, listen } from ${JSON.stringify(moduleURL('server.mjs'))};
   import { open, migrate, close, setKV, getKV } from ${JSON.stringify(moduleURL('db.mjs'))};
   import { loadConfig } from ${JSON.stringify(moduleURL('config.mjs'))};
   import { createBackup, stageBackup, applyRestore, recoveryDestination } from ${JSON.stringify(moduleURL('backup.mjs'))};
   import { acquireMaintenance } from ${JSON.stringify(moduleURL('data-lease.mjs'))};
   import { startCore } from ${JSON.stringify(pathToFileURL(path.join(resources, 'app', 'runtime.js')).href)};
+  const resources = fs.realpathSync(${JSON.stringify(resources)});
+  const require = createRequire(path.join(resources, 'package.json'));
+  const packaged = JSON.parse(fs.readFileSync(path.join(resources, 'package.json'), 'utf8'));
+  for (const [name, expectedVersion] of Object.entries(packaged.dependencies || {})) {
+    const resolved = require.resolve(name);
+    assert.ok(resolved.startsWith(path.join(resources, 'node_modules') + path.sep), name + ' resolved outside the packaged runtime');
+    assert.equal(require(name + '/package.json').version, expectedVersion, name + ' version differs from the pinned runtime');
+  }
+  // Build a PDF and serialize a mail message entirely in memory. This catches
+  // missing PDF fonts/transitive modules without sending anything or using accounts.
+  const PDFDocument = require('pdfkit');
+  const pdf = new PDFDocument();
+  const pdfBytes = new Promise((resolve, reject) => {
+    const parts = []; pdf.on('data', part => parts.push(part));
+    pdf.on('end', () => resolve(Buffer.concat(parts))); pdf.on('error', reject);
+  });
+  pdf.font('Helvetica').text('Zelos packaged runtime check'); pdf.end();
+  assert.equal((await pdfBytes).subarray(0, 5).toString(), '%PDF-');
+  const transport = require('nodemailer').createTransport({streamTransport: true, buffer: true});
+  const message = await transport.sendMail({from: 'qa@example.test', to: 'recipient@example.test', subject: 'Offline package check', text: 'No message is sent.'});
+  assert.ok(message.message.includes(Buffer.from('Offline package check')));
+  transport.close();
   const home = process.env.ZELOS_HOME;
   const databasePath = path.join(home, 'zelos.db');
   const db = open(databasePath);
@@ -78,7 +102,7 @@ const program = `
   const workerRestored = open(databasePath);
   try { assert.equal(getKV(workerRestored, 'smoke.worker'), 'original'); }
   finally { close(workerRestored); }
-  console.log(JSON.stringify({ version: ${JSON.stringify(version)}, node: process.versions.node, electron: process.versions.electron, platform: process.platform, arch: process.arch, packagedCore: 'passed', backupRoundtrip: 'passed', nativeWorkerRoundtrip: 'passed' }));
+  console.log(JSON.stringify({ version: ${JSON.stringify(version)}, node: process.versions.node, electron: process.versions.electron, platform: process.platform, arch: process.arch, packagedDependencies: 'passed', pdfAndMailSerialization: 'passed', packagedCore: 'passed', backupRoundtrip: 'passed', nativeWorkerRoundtrip: 'passed' }));
 `;
 try {
   const result = spawnSync(executable, ['--input-type=module', '-e', program], {

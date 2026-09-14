@@ -117,7 +117,105 @@ export function isMissingRoute(err) {
 
 /* --------------------------------------------------------------- endpoints */
 
+function queryString(values = {}) {
+  const params = new URLSearchParams();
+  for (const [key,value] of Object.entries(values)) if (key !== 'signal' && value !== undefined && value !== null && value !== '') params.set(key,String(value));
+  return params.toString();
+}
+async function download(path, {body,signal} = {}) {
+  const res=await fetch(path,{method:body===undefined?'GET':'POST',headers:headers(body===undefined?{}:{'Content-Type':'application/json'}),body:body===undefined?undefined:JSON.stringify(body),signal});
+  if(!res.ok){let data;try{data=await res.json();}catch{}throw new ApiError(data?.error||'The download could not be created.',{status:res.status,path});}
+  return res.blob();
+}
+
+export async function requestFamilyDownload(id) {
+  const path=`/api/family/documents/${encodeURIComponent(id)}`;
+  const res=await fetch(path,{headers:headers()});
+  if(!res.ok){let value;try{value=await res.json();}catch{}throw new ApiError(value?.error||'The shared document could not be downloaded.',{status:res.status,path});}
+  const filename=/filename="([^"]+)"/.exec(res.headers.get('content-disposition')||'')?.[1]||'document';
+  return {blob:await res.blob(),filename};
+}
+
 export const api = {
+  webSettings: () => request('/api/web/settings'),
+  saveWebSettings: body => request('/api/web/settings', {method:'POST',body}),
+  shopping: weekStart => request('/api/shopping' + (weekStart ? `?weekStart=${encodeURIComponent(weekStart)}` : '')),
+  groceryStores: () => request('/api/shopping/store-preferences'),
+  saveGroceryStores: body => request('/api/shopping/store-preferences', { method: 'POST', body }),
+  mealLibrary: weekStart => request('/api/shopping/meals?weekStart=' + encodeURIComponent(weekStart)),
+  saveMealTaste: body => request('/api/shopping/meals/taste', { method: 'POST', body }),
+  addMealFromLibrary: body => request('/api/shopping/meals/add', { method: 'POST', body }),
+  mealWeek: weekStart => request(`/api/shopping/week?weekStart=${encodeURIComponent(weekStart)}`),
+  generateMealWeek: body => request('/api/shopping/week/generate', { method: 'POST', body }),
+  cancelMealWeek: weekStart => request('/api/shopping/week/cancel', { method: 'POST', body: { weekStart } }),
+  buildMealGroceries: body => request('/api/shopping/week/build', { method: 'POST', body }),
+  saveShoppingSettings: body => request('/api/shopping/settings',{method:'POST',body}),
+  shoppingStores: body => request('/api/shopping/stores',{method:'POST',body}),
+  reviewShoppingList: body => request('/api/shopping/review',{method:'POST',body}),
+  createShoppingList: body => request('/api/shopping/list',{method:'POST',body}),
+  setShoppingItemState: body => request('/api/shopping/item',{method:'POST',body}),
+  previewDocument: (body,{signal}={}) => request('/api/documents/preview',{method:'POST',body,signal}),
+  commitDocument: body => request('/api/documents/commit',{method:'POST',body}),
+  documentReceipts: () => request('/api/documents/receipts'),
+  documentReview: id => request(`/api/documents/reviews/${encodeURIComponent(id)}`),
+  generateHealthPlan: (body,{signal}={}) => request('/api/health-tracking/plan-preview',{method:'POST',body,signal}),
+  saveHealthPlanPreview: body => request('/api/health-tracking/plan-save',{method:'POST',body}),
+  booking: () => request('/api/booking'),
+  saveBookingSettings: body => request('/api/booking/settings',{method:'POST',body}),
+  bookingSlots: (options={}) => request(`/api/booking/slots?${queryString(options)}`),
+  reserveBooking: body => request('/api/booking/reserve',{method:'POST',body}),
+  cancelBooking: id => request('/api/booking/cancel',{method:'POST',body:{id}}),
+  bookingCalendar: body => download('/api/booking/calendar',{method:'POST',body}),
+  progress: (options={}) => request(`/api/progress?${queryString(options)}`,{signal:options.signal}),
+  progressPdf: body => download('/api/progress/pdf',{method:'POST',body}),
+  conversations: () => request('/api/conversations'),
+  conversation: id => request(`/api/conversations/${encodeURIComponent(id)}`),
+  jobs: () => request('/api/assistant/jobs'),
+  assignJob: prompt => request('/api/assistant/jobs',{method:'POST',body:{prompt}}),
+  cancelJob: id => request(`/api/assistant/jobs/${encodeURIComponent(id)}/cancel`,{method:'POST',body:{}}),
+  jobReport: id => download(`/api/assistant/jobs/${encodeURIComponent(id)}/report.pdf`),
+  finance: (options={}) => request(`/api/finance?${queryString(options)}`,{signal:options.signal}),
+  financeReviews: () => request('/api/finance/review'),
+  reviewFinance: body => request('/api/finance/review',{method:'POST',body}),
+  addFinanceEntity: body => request('/api/finance/entities',{method:'POST',body}),
+  saveFinanceAccount: body => request('/api/finance/accounts',{method:'POST',body}),
+  importFinanceStatement: body => request('/api/finance/import',{method:'POST',body}),
+  saveFinanceTransaction: body => request('/api/finance/transactions',{method:'POST',body}),
+  saveFinanceInvoice: body => request('/api/finance/invoices',{method:'POST',body}),
+  exportFinanceCsv: (options={}) => download(`/api/finance/export?${queryString(options)}`),
+  healthTracking: () => request('/api/health-tracking'),
+  saveHealthProfile: body => request('/api/health-tracking/profile',{method:'POST',body}),
+  saveHealthWalking: body => request('/api/health-tracking/walking',{method:'POST',body}),
+  importHealthWalking: body => request('/api/health-tracking/walking/import',{method:'POST',body}),
+  saveHealthLab: body => request('/api/health-tracking/labs',{method:'POST',body}),
+  saveHealthMetric: body => request('/api/health-tracking/metrics',{method:'POST',body}),
+  saveHealthPlan: body => request('/api/health-tracking/plans',{method:'POST',body}),
+  setHealthPlanEntryState: body => request('/api/health-tracking/plan-state',{method:'POST',body}),
+  saveHealthGrocery: body => request('/api/health-tracking/groceries',{method:'POST',body}),
+  deleteHealthRecord: body => request('/api/health-tracking/delete',{method:'POST',body}),
+  mailMessages: ({ scope, accountId, q, cursor, limit, signal } = {}) => {
+    const params = new URLSearchParams();
+    for (const [key, value] of Object.entries({ scope, accountId, q, cursor, limit })) if (value !== undefined && value !== null && value !== '') params.set(key, String(value));
+    return request(`/api/mail/messages?${params}`, { signal });
+  },
+  mailMessage: (id, { signal } = {}) => request(`/api/mail/messages/${encodeURIComponent(id)}`, { signal }),
+  setMailImportance: body => request('/api/mail/importance', { method: 'POST', body }),
+  mailPreferences: () => request('/api/mail/preferences'),
+  saveMailPreferences: body => request('/api/mail/preferences',{method:'POST',body}),
+  forgetMailRule: id => request(`/api/mail/rules/${encodeURIComponent(id)}`,{method:'DELETE'}),
+  itemEvidence: id => request(`/api/items/${encodeURIComponent(id)}/evidence`),
+  correctItem: (id,body) => request(`/api/items/${encodeURIComponent(id)}/correction`,{method:'POST',body}),
+  askRequest: id => request(`/api/ask/requests/${encodeURIComponent(id)}`),
+  stopAnswer: id => request(`/api/ask/answers/${encodeURIComponent(id)}/stop`,{method:'POST',body:{}}),
+  automaticBackup: () => request('/api/backups/automatic'),
+  saveAutomaticBackup: body => request('/api/backups/automatic',{method:'POST',body}),
+  runAutomaticBackup: () => request('/api/backups/automatic/run',{method:'POST',body:{}}),
+  mailDraft: (id, { signal } = {}) => request(`/api/mail/drafts/${encodeURIComponent(id)}`, { signal }),
+  draftMailReply: (body, { signal } = {}) => request('/api/mail/draft', { method: 'POST', body, signal }),
+  saveMailReply: (body, { signal } = {}) => request('/api/mail/save', { method: 'POST', body, signal }),
+  prepareMailReply: body => request('/api/mail/prepare', { method: 'POST', body }),
+  sendMailReply: body => request('/api/mail/send', { method: 'POST', body }),
+  mailDelivery: id => request(`/api/mail/delivery/${encodeURIComponent(id)}`),
   health: () => request('/api/health'),
   state: () => request('/api/state'),
   config: () => request('/api/config'),

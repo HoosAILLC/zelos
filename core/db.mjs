@@ -34,7 +34,15 @@ import { nowISO, instant, dayKey, toZonedISO } from './time.mjs';
 import { log, redact } from './log.mjs';
 import { registerDataConnection, attachDataConnection, releaseDataConnection } from './data-lease.mjs';
 
-export const SCHEMA_VERSION = 4;
+import { migrateAssistant } from './assistant.mjs';
+import { migrateBooking } from './booking.mjs';
+import { migrateDocuments } from './documents.mjs';
+import { migrateBookingGuest } from './booking-guest.mjs';
+import { migrateFinance } from './finance.mjs';
+import { migrateHealth } from './health.mjs';
+import { migrateFamily } from './family.mjs';
+
+export const SCHEMA_VERSION = 11;
 
 /** Closed set, in board order: the rail reads top to bottom. */
 export const BUCKETS = Object.freeze(['now', 'today', 'soon', 'waiting', 'promised', 'note', 'money']);
@@ -249,6 +257,77 @@ const MIGRATIONS = [
         .run('itemHistory.startedAt', nowISO());
     },
   },
+  {
+    version: 5,
+    up(db) {
+      db.exec(`
+        ALTER TABLE messages ADD COLUMN reply_to_json TEXT;
+        ALTER TABLE messages ADD COLUMN references_json TEXT;
+        ALTER TABLE messages ADD COLUMN in_reply_to TEXT;
+        ALTER TABLE messages ADD COLUMN reply_headers_known INTEGER NOT NULL DEFAULT 0;
+        CREATE TABLE mail_drafts (
+          draft_id TEXT PRIMARY KEY REFERENCES drafts(id) ON DELETE CASCADE,
+          account_id TEXT NOT NULL,
+          parent_id TEXT,
+          updated_at TEXT NOT NULL
+        );
+        CREATE INDEX mail_drafts_parent ON mail_drafts(parent_id);
+        CREATE TABLE mail_outbox (
+          id TEXT PRIMARY KEY,
+          draft_id TEXT NOT NULL REFERENCES drafts(id) ON DELETE CASCADE,
+          parent_id TEXT,
+          fingerprint TEXT NOT NULL,
+          payload_json TEXT NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ('review','cancelled','sending','sent','failed','uncertain')),
+          created_at TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          sent_at TEXT,
+          error TEXT
+        );
+        CREATE INDEX mail_outbox_draft ON mail_outbox(draft_id, created_at DESC);
+        CREATE UNIQUE INDEX mail_outbox_draft_once ON mail_outbox(draft_id)
+          WHERE status IN ('sending','sent','uncertain');
+        CREATE UNIQUE INDEX mail_outbox_parent_once ON mail_outbox(parent_id)
+          WHERE parent_id IS NOT NULL AND status IN ('sending','sent','uncertain');
+      `);
+    },
+  },
+  { version: 6, up(db) { migrateAssistant(db); migrateFinance(db); migrateHealth(db); } },
+  { version: 7, up(db) { migrateBooking(db); migrateDocuments(db); migrateBookingGuest(db); } },
+  { version: 8, up(db) {
+    db.exec(`CREATE TABLE mail_importance (
+      message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+      important INTEGER NOT NULL CHECK(important IN (0,1)), updated_at TEXT NOT NULL
+    );`);
+  } },
+  { version: 9, up(db) {
+    db.exec(`CREATE TABLE mail_rules (
+      id TEXT PRIMARY KEY, account_id TEXT NOT NULL, sender TEXT NOT NULL,
+      category TEXT NOT NULL, important INTEGER NOT NULL CHECK(important IN (0,1)),
+      updated_at TEXT NOT NULL, UNIQUE(account_id,sender,category)
+    );
+    CREATE TABLE mail_autodrafts (
+      message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+      fingerprint TEXT NOT NULL, status TEXT NOT NULL, reason TEXT NOT NULL,
+      request_quote TEXT NOT NULL DEFAULT '', draft_id TEXT, attempts INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE item_corrections (
+      item_id TEXT PRIMARY KEY REFERENCES items(id) ON DELETE CASCADE,
+      decision TEXT NOT NULL CHECK(decision IN ('confirmed','corrected','dismissed')),
+      headline TEXT NOT NULL, due_at TEXT, note TEXT NOT NULL, updated_at TEXT NOT NULL
+    );`);
+  } },
+  { version: 10, up(db) { migrateFamily(db); } },
+  { version: 11, up(db) {
+    migrateFamily(db);
+    // Password-only sessions cannot cross the introduction of mandatory MFA.
+    // Machine credentials remain restricted to their existing access grants.
+    db.prepare("UPDATE family_credentials SET revoked_at=? WHERE kind='session' AND revoked_at IS NULL").run(new Date().toISOString());
+    // A legacy password alone must not let its holder register the first
+    // authenticator. Reconnecting also requires a fresh invitation.
+    db.prepare("UPDATE family_accounts SET status='invited',updated_at=? WHERE id<>'owner' AND status='active' AND NOT EXISTS (SELECT 1 FROM family_mfa WHERE account_id=family_accounts.id)").run(new Date().toISOString());
+  } },
 ];
 
 /** Idempotent. Running it twice is a no-op; running it on an old file upgrades. */
@@ -292,14 +371,16 @@ function prep(db, sql) {
 }
 
 /** Runs `fn` in a transaction; rolls back and rethrows on any error. */
+let transactionSequence = 0;
 export function withTransaction(db, fn) {
-  db.exec('BEGIN');
+  const name = `zelos_write_${++transactionSequence}`;
+  db.exec(`SAVEPOINT ${name}`);
   try {
     const out = fn();
-    db.exec('COMMIT');
+    db.exec(`RELEASE ${name}`);
     return out;
   } catch (err) {
-    try { db.exec('ROLLBACK'); } catch { /* the failure below is the real one */ }
+    try { db.exec(`ROLLBACK TO ${name}; RELEASE ${name}`); } catch { /* the failure below is the real one */ }
     throw err;
   }
 }
@@ -362,11 +443,13 @@ function assertBucket(bucket) {
 
 function hydrateMessage(row) {
   if (!row) return null;
-  const { to_json, cc_json, flags_json, has_attach, ...rest } = row;
+  const { to_json, cc_json, flags_json, reply_to_json, references_json, has_attach, ...rest } = row;
   return {
     ...rest,
     to: parseJson(to_json, []),
     cc: parseJson(cc_json, []),
+    replyTo: parseJson(reply_to_json, []),
+    references: parseJson(references_json, []),
     flags: parseJson(flags_json, []),
     has_attach: !!has_attach,
   };
@@ -395,10 +478,10 @@ function hydrateRun(row) {
 const MESSAGE_UPSERT = `
 INSERT INTO messages (id, source_id, uid, message_id, thread_key, folder, direction,
   from_name, from_email, to_json, cc_json, subject, sent_at, snippet, body, has_attach,
-  flags_json, fetched_at)
+  flags_json, fetched_at, reply_to_json, references_json, in_reply_to, reply_headers_known)
 VALUES (:id, :source_id, :uid, :message_id, :thread_key, :folder, :direction,
   :from_name, :from_email, :to_json, :cc_json, :subject, :sent_at, :snippet, :body, :has_attach,
-  :flags_json, :fetched_at)
+  :flags_json, :fetched_at, :reply_to_json, :references_json, :in_reply_to, :reply_headers_known)
 ON CONFLICT(id) DO UPDATE SET
   thread_key = excluded.thread_key,
   folder     = excluded.folder,
@@ -413,7 +496,11 @@ ON CONFLICT(id) DO UPDATE SET
   body       = COALESCE(NULLIF(excluded.body, ''), messages.body),
   has_attach = excluded.has_attach,
   flags_json = excluded.flags_json,
-  fetched_at = excluded.fetched_at`;
+  fetched_at = excluded.fetched_at,
+  reply_to_json = CASE WHEN excluded.reply_headers_known = 1 THEN excluded.reply_to_json ELSE messages.reply_to_json END,
+  references_json = COALESCE(excluded.references_json, messages.references_json),
+  in_reply_to = COALESCE(excluded.in_reply_to, messages.in_reply_to),
+  reply_headers_known = MAX(messages.reply_headers_known, excluded.reply_headers_known)`;
 
 const MESSAGE_CHANGE_IGNORED = new Set(['id', 'source_id', 'uid', 'message_id', 'sent_at', 'fetched_at']);
 const EVENT_CHANGE_IGNORED = new Set(['id', 'calendar_id', 'uid', 'recurrence_id', 'fetched_at']);
@@ -473,6 +560,10 @@ function saveMessage(db, msg, { now = nowISO() } = {}, unindexedRefs = null) {
     body: str(msg.text ?? msg.body),
     has_attach: bit(msg.hasAttachments ?? msg.has_attach),
     flags_json: json(msg.flags || []),
+    reply_to_json: msg.replyTo === undefined ? null : json((msg.replyTo || []).map(addr)),
+    references_json: msg.references === undefined ? null : json(msg.references || []),
+    in_reply_to: msg.inReplyTo === undefined ? null : str(msg.inReplyTo),
+    reply_headers_known: msg.replyTo === undefined ? 0 : 1,
     fetched_at: str(msg.fetchedAt ?? msg.fetched_at ?? now),
   };
   prep(db, MESSAGE_UPSERT).run(record);
@@ -818,19 +909,20 @@ export function upsertItem(db, item, { runId = null, now = nowISO(), origin = nu
   const id = itemRowId(key);
   return withHistoryWrite(db, () => {
     const before = itemHistorySnapshot(db, id);
+    const correction = prep(db,'SELECT * FROM item_corrections WHERE item_id=?').get(id);
     prep(db, ITEM_UPSERT).run({
       id,
       kind: str(item.kind),
       bucket: assertBucket(item.bucket),
-      headline: str(item.headline),
-      why: str(item.why),
+      headline: correction?.headline ?? str(item.headline),
+      why: correction?.note || str(item.why),
       person: str(item.person),
       person_email: str(item.personEmail ?? item.person_email),
-      due_at: strOrNull(item.dueAt ?? item.due_at),
+      due_at: correction ? correction.due_at : strOrNull(item.dueAt ?? item.due_at),
       severity: clampSeverity(item.severity),
       link: strOrNull(item.link),
       source_refs_json: json(item.sourceRefs ?? item.source_refs ?? []),
-      payload_json: json(item.payload ?? {}),
+      payload_json: json({...(item.payload ?? {}),...(correction ? {userCorrection:correction,accuracyReviewRequired:false} : {})}),
       state: ITEM_STATES.includes(item.state) ? item.state : 'open',
       run_id: strOrNull(runId),
       now,
@@ -846,6 +938,7 @@ export function upsertItem(db, item, { runId = null, now = nowISO(), origin = nu
 // Missing/mixed/non-task evidence is never enough to hide an obligation. Only
 // a nonempty list whose every reference is a proven inactive task qualifies.
 const ITEM_REFS_SQL = "CASE WHEN json_valid(items.source_refs_json) THEN items.source_refs_json ELSE '[]' END";
+const REVIEW_REQUIRED_ITEM_SQL = "COALESCE(json_extract(CASE WHEN json_valid(items.payload_json) THEN items.payload_json ELSE '{}' END, '$.accuracyReviewRequired'), 0) = 1";
 const INACTIVE_ITEM_SQL = `(json_type(${ITEM_REFS_SQL}) = 'array' AND json_array_length(${ITEM_REFS_SQL}) > 0
   AND NOT EXISTS (SELECT 1 FROM json_each(${ITEM_REFS_SQL}) AS refs
     WHERE NOT EXISTS (SELECT 1 FROM task_activity AS task
@@ -965,6 +1058,31 @@ export function setItemState(db, id, state, { now = nowISO(), snoozedUntil = nul
   });
 }
 
+/** Explicit user corrections are recorded once and retained by later triage. */
+export function correctItem(db,id,input,{now=nowISO()}={}) {
+  if (!['confirmed','corrected','dismissed'].includes(input?.decision)) throw new TypeError('Choose confirm, correct, or dismiss.');
+  const current=getItem(db,id);if(!current)return null;
+  const headline=input.decision==='corrected' ? input.headline : current.headline;
+  const note=input.note ?? current.payload?.userCorrection?.note ?? '';
+  if (typeof headline!=='string'||!headline.trim()||headline.length>300||typeof note!=='string'||note.length>1200)throw new TypeError('Enter a short title and correction note.');
+  const due=input.decision==='corrected' ? (input.dueAt || null) : current.due_at;
+  if (due!==null && (typeof due!=='string'||!/^\d{4}-\d{2}-\d{2}(?:T[^\s]{1,40})?$/.test(due)||!Number.isFinite(Date.parse(due))
+      || new Date(`${due.slice(0,10)}T12:00:00Z`).toISOString().slice(0,10)!==due.slice(0,10)))throw new TypeError('Choose a valid deadline or leave it empty.');
+  return withHistoryWrite(db,()=>{
+    const before=itemHistorySnapshot(db,id);
+    const correction={item_id:id,decision:input.decision,headline:headline.trim(),due_at:due,note:note.trim(),updated_at:now};
+    prep(db,`INSERT INTO item_corrections VALUES(?,?,?,?,?,?) ON CONFLICT(item_id) DO UPDATE SET decision=excluded.decision,
+      headline=excluded.headline,due_at=excluded.due_at,note=excluded.note,updated_at=excluded.updated_at`)
+      .run(id,correction.decision,correction.headline,due,correction.note,now);
+    const payload={...current.payload,userCorrection:correction,accuracyReviewRequired:false};
+    prep(db,'UPDATE items SET headline=?,due_at=?,why=?,payload_json=?,state=?,state_at=?,updated_at=? WHERE id=?')
+      .run(correction.headline,due,correction.note||current.why,json(payload),input.decision==='dismissed'?'dismissed':current.state,
+        input.decision==='dismissed'?now:current.state_at,now,id);
+    recordItemRevision(db,before,itemHistorySnapshot(db,id),{now,origin:'user'});
+    return getItem(db,id);
+  });
+}
+
 const BUCKET_RANK_SQL = `CASE bucket ${BUCKETS.map((b, i) => `WHEN '${b}' THEN ${i}`).join(' ')} ELSE ${BUCKETS.length} END`;
 
 const WAKE_DUE_SNOOZES = `
@@ -1000,7 +1118,7 @@ export function listBoard(db, { states = ['open'], buckets = null, limit = 500, 
   });
   const args = [];
   const where = [];
-  if (!includeInactive) where.push(`NOT ${INACTIVE_ITEM_SQL}`);
+  if (!includeInactive) where.push(`NOT (${INACTIVE_ITEM_SQL} OR ${REVIEW_REQUIRED_ITEM_SQL})`);
   const stateList = (states || []).filter((s) => ITEM_STATES.includes(s));
   if (stateList.length) {
     where.push(`state IN (${stateList.map(() => '?').join(',')})`);
@@ -1031,7 +1149,7 @@ export function bucketCounts(db, { states = ['open'], includeInactive = false } 
   const counts = Object.fromEntries(BUCKETS.map((b) => [b, 0]));
   const where = [];
   if (stateList.length) where.push(`state IN (${stateList.map(() => '?').join(',')})`);
-  if (!includeInactive) where.push(`NOT ${INACTIVE_ITEM_SQL}`);
+  if (!includeInactive) where.push(`NOT (${INACTIVE_ITEM_SQL} OR ${REVIEW_REQUIRED_ITEM_SQL})`);
   const sql = `SELECT bucket, COUNT(*) AS n FROM items ${where.length ? `WHERE ${where.join(' AND ')}` : ''} GROUP BY bucket`;
   for (const row of prep(db, sql).all(...stateList)) {
     if (Object.hasOwn(counts, row.bucket)) counts[row.bucket] = Number(row.n);
@@ -1058,7 +1176,7 @@ export function listFinished(db, { limit = 20 } = {}) {
 
 /* ---------------------------------------------------------------- drafts */
 
-/** A draft is never sent by Zelos; this only records what was prepared. */
+/** Model-generated drafts remain inert until the user reviews and sends one. */
 export function upsertDraft(db, draft, { now = nowISO() } = {}) {
   if (!draft || typeof draft !== 'object') throw new TypeError('db: upsertDraft needs a draft object');
   const itemId = str(draft.itemId ?? draft.item_id);
@@ -1097,6 +1215,7 @@ export function listDrafts(db, { states = null, itemId = null, limit = 200, incl
   }
   if (itemId) { where.push('item_id = ?'); args.push(str(itemId)); }
   if (!includeInactive && !itemId) where.push(`NOT EXISTS (SELECT 1 FROM items WHERE items.id = drafts.item_id AND ${INACTIVE_ITEM_SQL})`);
+  if (!includeInactive) where.push(`NOT (drafts.state = 'pending' AND EXISTS (SELECT 1 FROM items WHERE items.id = drafts.item_id AND (items.state IN ('done','dismissed') OR ${REVIEW_REQUIRED_ITEM_SQL})))`);
   const sql = `SELECT * FROM drafts ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY updated_at DESC LIMIT ?`;
   return prep(db, sql).all(...args, Math.max(1, Number(limit) || 200));
 }
@@ -1316,7 +1435,7 @@ export function search(db, query, { limit = 20, kinds = null, columns = null, in
   }
   const kindList = (kinds || []).filter((k) => typeof k === 'string' && k);
   const inactive = `(EXISTS (SELECT 1 FROM task_activity WHERE substr(search.ref, 1, 4) = 'msg:' AND task_activity.message_id = substr(search.ref, 5) AND task_activity.activity = 'inactive')
-    OR EXISTS (SELECT 1 FROM items WHERE substr(search.ref, 1, 5) = 'item:' AND items.id = substr(search.ref, 6) AND ${INACTIVE_ITEM_SQL}))`;
+    OR EXISTS (SELECT 1 FROM items WHERE substr(search.ref, 1, 5) = 'item:' AND items.id = substr(search.ref, 6) AND (${INACTIVE_ITEM_SQL} OR ${REVIEW_REQUIRED_ITEM_SQL})))`;
   const sql = `
     SELECT ref, kind, title,
            snippet(search, 1, '', '', '…', 12) AS excerpt,

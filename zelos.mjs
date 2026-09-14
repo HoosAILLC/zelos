@@ -52,6 +52,11 @@ Options:
   --version       Print the version and exit.
   --help          Print this and exit.
 
+Optional private browser access through Tailscale Serve:
+  ZELOS_TAILSCALE_ORIGIN  Exact HTTPS .ts.net origin, without a trailing slash.
+  ZELOS_TAILSCALE_LOGIN   The single Tailscale owner allowed to open the board.
+Set both together. Serve must proxy to Zelos on 127.0.0.1; do not use Funnel.
+
 Zelos listens on 127.0.0.1 only, and every request to its API needs the
 session token printed in the launch URL. That token is new on every launch,
 so the previous URL stops working when you restart.
@@ -68,6 +73,17 @@ outlive a restart, and it lasts until you turn AI access off or revoke it.
 
 /** The closed set. `run` is what a bare invocation means. */
 export const COMMANDS = Object.freeze(['run', 'sweep', 'doctor', 'mcp']);
+
+/** Deployment settings are separate from the browser-editable configuration. */
+export function trustedServeFromEnv(env = process.env) {
+  const origin = env.ZELOS_TAILSCALE_ORIGIN;
+  const login = env.ZELOS_TAILSCALE_LOGIN;
+  if (origin === undefined && login === undefined) return null;
+  if (typeof origin !== 'string' || !origin || typeof login !== 'string' || !login) {
+    throw new TypeError('Set both ZELOS_TAILSCALE_ORIGIN and ZELOS_TAILSCALE_LOGIN for private browser access.');
+  }
+  return { origin, login };
+}
 
 /** Which command each option is meaningful for. A flag that silently does
  *  nothing is a lie, so using one anywhere else is an error, not a shrug. */
@@ -341,7 +357,7 @@ export function openBrowser(plan, { spawn: spawnFn = spawn } = {}) {
 
 const RULE = '━'.repeat(58);
 
-function banner({ url, home, version, model, mailAccounts, calendars, auto, pasteNeeded = false }) {
+function banner({ url, home, version, model, mailAccounts, calendars, auto, pasteNeeded = false, privateAccess = false }) {
   const lines = [
     '',
     `  ZELOS ${version}`,
@@ -356,7 +372,9 @@ function banner({ url, home, version, model, mailAccounts, calendars, auto, past
     `  Sweep  ${auto}`,
     '',
     `  ${RULE}`,
-    '  Listening on 127.0.0.1 only. The token in that URL is new every launch.',
+    privateAccess
+      ? '  Private Tailscale access. Zelos still listens on 127.0.0.1 only.'
+      : '  Listening on 127.0.0.1 only. The token in that URL is new every launch.',
     '  Ctrl-C to stop.',
     '',
   ];
@@ -670,10 +688,12 @@ async function runWithData(flags) {
 
   const { loadConfig, paths } = await import('./core/config.mjs');
   const { open: openDb, migrate, close: closeDb } = await import('./core/db.mjs');
-  const { createServer, listen } = await import('./core/server.mjs');
+  const { createServer, listen, normalizeTrustedServe } = await import('./core/server.mjs');
   const { isLocalAddress } = await import('./core/llm.mjs');
   const { log } = await import('./core/log.mjs');
 
+  const trustedServe = trustedServeFromEnv();
+  normalizeTrustedServe(trustedServe); // Fail before opening the database or taking its lock.
   const config = loadConfig();
   const where = paths();
 
@@ -684,7 +704,13 @@ async function runWithData(flags) {
   const db = openDb(where.db);
   migrate(db);
 
-  const server = createServer({ db, config });
+  const server = createServer({ db, config, trustedServe,
+    bookingGuestOrigin:process.env.ZELOS_BOOKING_ORIGIN||null,
+    bookingPublished:process.env.ZELOS_BOOKING_PUBLISHED==='true',
+    familyGuestOrigin:process.env.ZELOS_FAMILY_ORIGIN||null,
+    familyPublished:process.env.ZELOS_FAMILY_PUBLISHED==='true',
+    familyTrustedProxy:process.env.ZELOS_FAMILY_TRUSTED_PROXY||'none',
+  });
 
   /* The scheduler is optional: if the sweep engine cannot be loaded, the board
      is still worth looking at and sweeps can still be run by hand. Its progress
@@ -713,6 +739,13 @@ async function runWithData(flags) {
   }
 
   const { url: origin, tokenUrl } = await listen(server, { port: flags.port ?? undefined });
+  try {
+    await server.zelos.startGuest({port:7780});
+    const familyPort=Number(process.env.ZELOS_FAMILY_PORT||7781);
+    if(!Number.isInteger(familyPort)||familyPort<1||familyPort>65535)throw new Error('ZELOS_FAMILY_PORT must be a port between 1 and 65535.');
+    await server.zelos.startFamily({port:familyPort});
+  }
+  catch(error){await server.zelos.stopBackgroundWork();server.closeAllConnections?.();await new Promise(resolve=>server.close(resolve));closeDb(db);throw error;}
 
   // Now that a port exists, put it in the lock, so the next process to find
   // this home busy can name the board rather than only a process number.
@@ -731,7 +764,12 @@ async function runWithData(flags) {
       log.warn('zelos: could not mint a browser handoff; opening without one', { error: err.message });
     }
   }
-  const plan = flags.open ? browserLaunchPlan({ url: tokenUrl, handoffUrl }) : null;
+  // Service output must not put a usable API session token into the journal.
+  // /open authenticates through Serve and mints the current launch's handoff.
+  const launchUrl = trustedServe ? `${trustedServe.origin}/open` : tokenUrl;
+  const plan = flags.open ? browserLaunchPlan({
+    url: launchUrl, handoffUrl: trustedServe ? launchUrl : handoffUrl,
+  }) : null;
 
   const modelLine = config.model.model
     ? `${config.model.label || config.model.protocol} · ${config.model.model}${isLocalAddress(config.model.baseUrl) ? ' (on this machine)' : ''}`
@@ -740,7 +778,7 @@ async function runWithData(flags) {
   const enabledCals = config.calendars.filter((c) => c.enabled).length;
 
   banner({
-    url: tokenUrl,
+    url: launchUrl,
     home: where.home,
     version: packageVersion(),
     model: modelLine,
@@ -748,6 +786,7 @@ async function runWithData(flags) {
     calendars: enabledCals ? `${enabledCals} calendar${enabledCals === 1 ? '' : 's'}` : 'none yet',
     auto: scheduler ? `every ${config.sweep.intervalMinutes}m between ${config.sweep.activeHours[0]}:00 and ${config.sweep.activeHours[1]}:00` : 'manual',
     pasteNeeded: Boolean(plan) && !plan.handsOverToken,
+    privateAccess: Boolean(trustedServe),
   });
 
   if (plan) openBrowser(plan);
@@ -762,28 +801,40 @@ async function runWithData(flags) {
   }
 
   let shuttingDown = false;
+  let finishShutdown;
+  const shutdownDone = new Promise(resolve => { finishShutdown = resolve; });
   const shutdown = (signal) => {
     if (shuttingDown) return;
     shuttingDown = true;
     process.stdout.write(`\n  Stopping (${signal}).\n`);
     try { scheduler?.stop(); } catch { /* it was already stopping */ }
     server.zelos.sweeps.abort();
+    const forceExit = setTimeout(() => {
+      log.error('zelos: shutdown did not finish within 30 seconds');
+      process.exit(1);
+    }, 30_000).unref();
     server.closeAllConnections?.(); // SSE clients hold the socket open forever
-    server.close(() => {
-      closeDb(db);
-      process.exit(0);
+    server.close(async () => {
+      try {
+        await server.zelos.stopBackgroundWork();
+        closeDb(db);
+        clearTimeout(forceExit);
+        finishShutdown();
+      } catch (error) {
+        log.error('zelos: background work could not finish during shutdown', { error: error.message });
+        process.exit(1);
+      }
     });
-    // If a connection refuses to let go, leave anyway rather than hang a terminal.
-    setTimeout(() => {
-      closeDb(db);
-      process.exit(0);
-    }, 3_000).unref();
   };
-  process.on('SIGINT', () => shutdown('SIGINT'));
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  const interrupt = () => shutdown('SIGINT'), terminate = () => shutdown('SIGTERM');
+  process.on('SIGINT', interrupt);
+  process.on('SIGTERM', terminate);
 
-  // Resolves only when the server closes, so `await main()` holds the process.
-  await new Promise((resolve) => server.on('close', resolve));
+  // The close event precedes async cleanup. Keep the data lease and launcher
+  // alive until guest authentication and other background writes have drained.
+  await shutdownDone;
+  process.removeListener('SIGINT', interrupt);
+  process.removeListener('SIGTERM', terminate);
   return 0;
 }
 

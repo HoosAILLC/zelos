@@ -5,10 +5,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { CASES, CORPUS_VERSION } from '../evals/triage-cases.mjs';
+const evaluationsAvailable = fs.existsSync(new URL('../evals', import.meta.url));
+const { CASES, CORPUS_VERSION } = evaluationsAvailable ? await import('../evals/triage-cases.mjs') : {};
 import { SWEEP_JSON_SHAPE } from '../core/triage.mjs';
-import { exportPrompts, responseTemplate, scoreResponses, LIMITATION } from '../scripts/evaluate-triage.mjs';
+const { exportPrompts, responseTemplate, scoreResponses, LIMITATION } = evaluationsAvailable ? await import('../scripts/evaluate-triage.mjs') : {};
 
+if (!evaluationsAvailable) { test('evaluation corpus is available', { skip: 'Evaluation corpus is excluded from this npm deployment.' }, () => {}); } else {
 const item = (key, ref, extra = {}) => ({ key, bucket: 'soon', headline: 'Send Mira the requested document',
   why: 'Mira asked for this document.', person: 'Mira Chen', personEmail: 'mira@example.invalid',
   dueAt: null, severity: 1, sourceRefs: [ref], link: null, ...extra });
@@ -109,3 +111,5 @@ test('CLI exports and scores local files without creating a data home, and refus
   fs.writeFileSync(responses, JSON.stringify(responseTemplate()));
   assert.equal(run(['score', responses]).status, 1);
 });
+
+}

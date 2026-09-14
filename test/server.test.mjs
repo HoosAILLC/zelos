@@ -917,7 +917,7 @@ test('/api/ask streams a grounded answer and names its sources', async (t) => {
   assert.match(prompt, /Question: When is the budget review\?/);
 });
 
-test('/api/ask says so plainly when nothing is indexed', async (t) => {
+test('/api/ask answers general questions with no private matches and persists its conversation', async (t) => {
   const upstream = await startMockUpstream(t);
   const ctx = await startServer(t, {
     config: baseConfig({
@@ -934,8 +934,20 @@ test('/api/ask says so plainly when nothing is indexed', async (t) => {
     .filter((f) => f.event);
   assert.deepEqual(frames.find((f) => f.event === 'sources').data, []);
   assert.equal(frames.at(-1).data.grounded, false);
-  // Nothing was asked of the model, because there was nothing to ground on.
-  assert.equal(upstream.received.length, 0);
+  assert.equal(upstream.received.length, 1);
+  assert.match(upstream.received[0].body.messages.at(-1).content,/No matching mail, calendar entries or notes/);
+  const threadId=frames.find(f=>f.event==='conversation').data.id;
+  await delay(10);
+  const saved=await call(ctx,'GET',`/api/conversations/${threadId}`);
+  assert.equal(saved.status,200);
+  assert.equal(saved.json.messages.length,2);
+  assert.equal(saved.json.messages[0].content,'anything at all');
+  assert.equal(saved.json.messages[1].content,'Budget review is on Tuesday.');
+  const second=await call(ctx,'POST','/api/ask',{body:{question:'Explain more',threadId}});
+  assert.equal(second.status,200);
+  const history=upstream.received[1].body.messages;
+  assert.ok(history.some(m=>m.role==='user'&&m.content==='anything at all'));
+  assert.ok(history.some(m=>m.role==='assistant'&&m.content==='Budget review is on Tuesday.'));
 });
 
 test('inactive task history is opt-in for Search and explicitly historical in Ask', async (t) => {
@@ -1652,10 +1664,18 @@ test('a capture is stored and immediately searchable', async (t) => {
 });
 
 test('a draft can be edited, and markup in one is refused', async (t) => {
-  const ctx = await startServer(t);
-  const { id } = db.upsertDraft(ctx.db, {
-    itemId: 'i_1', to: 'ada@example.com', subject: 'Budget review', body: 'Tuesday works.',
+  const ctx = await startServer(t, { config: baseConfig({ mail: [{ id: 'mail-edit-fixture',
+    enabled: true, host: 'imap.gmail.com', user: 'alex@example.invalid', auth: 'password' }] }) });
+  const message = db.upsertMessage(ctx.db, { sourceId: 'mail-edit-fixture', messageId: 'budget-review@example.invalid',
+    direction: 'in', from: { name: 'Ada', email: 'ada@example.invalid' }, to: [{ email: 'alex@example.invalid' }],
+    subject: 'Budget review', text: 'Would Tuesday work for the budget review?', date: new Date().toISOString() });
+  const saved = await call(ctx, 'POST', '/api/mail/save', {
+    headers: { Origin: ctx.base },
+    body: { messageId: message.id, accountId: 'mail-edit-fixture', to: 'ada@example.invalid',
+      subject: 'Re: Budget review', body: 'Tuesday works.' },
   });
+  assert.equal(saved.status, 200);
+  const id = saved.json.draft.id;
 
   const edited = await call(ctx, 'PUT', `/api/drafts/${id}`, {
     body: { body: 'Tuesday at 2 works for me.', state: 'edited' },
@@ -1668,6 +1688,7 @@ test('a draft can be edited, and markup in one is refused', async (t) => {
     body: { body: 'Hi <script>fetch("http://evil.example")</script>' },
   });
   assert.equal(hostile.status, 400);
+  assert.equal(db.getDraft(ctx.db, id).body, 'Tuesday at 2 works for me.', 'rejected markup leaves the saved reply intact');
 
   const missing = await call(ctx, 'PUT', '/api/drafts/nope', { body: { body: 'hello' } });
   assert.equal(missing.status, 404);

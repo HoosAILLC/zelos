@@ -19,19 +19,28 @@ export function supportsLoginItem(platform = process.platform) {
 }
 
 /** The board's views, in the order the UI lists them (ui/app.js VIEWS — the
- * test holds the two lists together). Used for ⌘1…⌘7, except Search. */
+ * test holds the two lists together). The first nine positions have digit shortcuts. */
 export const VIEWS = Object.freeze([
   { id: 'now', label: 'Now' },
   { id: 'today', label: 'Today' },
   // 'Promises', as the board says it — the id 'owed' is the route, not a name
   // anyone sees.
   { id: 'owed', label: 'Promises' },
+  { id: 'mail', label: 'Email' },
   { id: 'calendar', label: 'Calendar' },
   // Search answers to ⌘F, the shortcut every find field answers to. It still
   // counts as a position, so Ask and Settings keep the numbers of the places
   // they are seen in.
   { id: 'search', label: 'Search', accelerator: 'CmdOrCtrl+F' },
   { id: 'ask', label: 'Ask' },
+  { id: 'progress', label: 'Progress' },
+  { id: 'finance', label: 'Money' },
+  { id: 'health', label: 'Health' },
+  { id: 'jobs', label: 'Zelos' },
+  { id: 'documents', label: 'Imports' },
+  { id: 'booking', label: 'Booking' },
+  { id: 'shopping', label: 'Groceries' },
+  { id: 'family', label: 'Family' },
   { id: 'settings', label: 'Settings' },
 ]);
 
@@ -101,7 +110,7 @@ export function buildAppMenuTemplate({ platform = process.platform, appName = 'Z
     label: 'Go',
     submenu: VIEWS.map((view, i) => ({
       label: view.label,
-      accelerator: view.accelerator ?? `CmdOrCtrl+${i + 1}`,
+      ...(view.accelerator || i < 9 ? { accelerator: view.accelerator ?? `CmdOrCtrl+${i + 1}` } : {}),
       click: () => actions.showView?.(view.id),
     })),
   });

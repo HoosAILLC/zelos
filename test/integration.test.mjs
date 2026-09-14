@@ -35,7 +35,7 @@ process.env.ZELOS_LOG_LEVEL = 'silent';
 // database inside it is closed, and node:test runs root `after` hooks in the
 // order they were registered.
 
-const { open: openDb, migrate, close: closeDb, listMessages, getItemByKey, itemRowId, getKV, insertCapture } =
+const { open: openDb, migrate, close: closeDb, listMessages, getItemByKey, itemRowId, upsertItem, getKV, insertCapture } =
   await import('../core/db.mjs');
 const { todayKey, localTimezone } = await import('../core/time.mjs');
 const { runSweep } = await import('../core/sweep.mjs');
@@ -67,7 +67,7 @@ const { openStream } = await import('../ui/lib/api.js');
  * ================================================================== */
 
 const HEADER_SECTION =
-  'HEADER.FIELDS (FROM TO CC SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES LIST-ID)';
+  'HEADER.FIELDS (FROM REPLY-TO TO CC SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES LIST-ID)';
 const PLAIN_STRUCTURE = '("TEXT" "PLAIN" ("CHARSET" "UTF-8") NIL NIL "7BIT" 120 4 NIL NIL NIL NIL)';
 
 function fetchLine({ seq, uid, items = '', section, payload }) {
@@ -253,14 +253,18 @@ function startMockModel(replyFor) {
       const body = JSON.parse(raw || '{}');
       seen.push({ url: req.url, headers: req.headers, body });
 
-      // `stream:true` is a different wire format, not a different answer: the
-      // Ask view depends on it, so the mock has to speak it for real.
+      // Both local sweeps and Ask stream. Distinguish the requested response
+      // by the prompt contract, never by transport, so a sweep still receives
+      // its queued board and Ask receives prose.
       if (body.stream) {
+        const sweep = body.messages.some(message => message.role === 'system' && message.content.includes('OUTPUT'));
+        const answer = sweep ? replyFor(seen.length, body) : 'You owe Riverstone $18,400, due Friday.';
+        const usage = sweep ? { prompt_tokens: 1234, completion_tokens: 567 } : { prompt_tokens: 20, completion_tokens: 9 };
         res.writeHead(200, { 'Content-Type': 'text/event-stream' });
-        for (const chunk of ['You owe Riverstone ', '$18,400', ', due Friday.']) {
+        for (const chunk of answer.match(/.{1,80}/gs) || []) {
           res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: chunk } }] })}\n\n`);
         }
-        res.write(`data: ${JSON.stringify({ usage: { prompt_tokens: 20, completion_tokens: 9 } })}\n\n`);
+        res.write(`data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }], usage })}\n\n`);
         res.write('data: [DONE]\n\n');
         res.end();
         return;
@@ -340,7 +344,7 @@ const INBOX = [
       WALK_ASKED.header,
       'Message-ID: <walk-2@aldervance.example>',
     ]),
-    body: 'Can we move the site walk to Thursday?\r\n',
+    body: 'Can you confirm the site walk for Thursday?\r\n',
   },
 ];
 
@@ -384,25 +388,29 @@ const ICS = [
 ].join('\r\n');
 
 /**
- * A deliberately badly-behaved model answer: fenced in prose, six `now` items
- * where the spec allows four, an out-of-range severity, an illegal bucket, a
- * `sourceRefs` entry pointing at a message that does not exist, a draft with a
- * bracketed placeholder, and a `javascript:` link.
+ * A mixed model answer, fenced in prose: exact evidence supports an invoice,
+ * an incoming request and an authored commitment. Unsupported urgency, missing
+ * or mixed source references, free-form drafts and unsafe links must not gain
+ * authority from those otherwise valid candidates.
  */
-function boardReply(msgRef) {
+function boardReply(msgRef, requestRef, sentRef) {
+  const invoiceQuote = 'The final number is $18,400. Wire by Friday.';
+  const requestQuote = 'Can you confirm the site walk for Thursday?';
+  const commitmentQuote = "I'll send the revised schedule Monday.";
   return `Sure! Here is the board you asked for.
 
 \`\`\`json
 ${JSON.stringify({
     first: 'wire-riverstone',
     items: [
-      { key: 'wire-riverstone', bucket: 'now', headline: 'Wire $18,400 to Riverstone before Friday', why: 'Marcus sent final numbers and the wire window closes Friday.', person: 'Marcus Reyes', personEmail: 'marcus@riverstone.example', dueAt: null, severity: 3, sourceRefs: [msgRef, 'msg:ffffffffffffffff'], link: 'https://riverstone.example/invoice/9', draft: null },
-      { key: 'confirm-site-walk', bucket: 'now', headline: 'Confirm Thursday for the Alder Vance site walk', why: 'Jane asked to move it and has not heard back.', person: 'Jane Roe', personEmail: 'jane@aldervance.example', dueAt: null, severity: 2, sourceRefs: [], link: null, draft: { to: 'jane@aldervance.example', subject: 'Re: site walk', body: 'Thursday works. I will be on site at 2pm.' } },
-      { key: 'send-revised-schedule', bucket: 'promised', headline: 'Send Jane the revised schedule you promised Monday', why: 'You told her Monday; it is not sent.', person: 'Jane Roe', personEmail: 'jane@aldervance.example', dueAt: null, severity: 2, sourceRefs: [], link: null, draft: { to: 'jane@aldervance.example', subject: 'Revised schedule', body: 'Hi [NAME], attached is the revised schedule.' } },
+      { key: 'wire-riverstone', bucket: 'money', headline: 'Wire $18,400 to Riverstone before Friday', why: 'Marcus sent final numbers and the wire window closes Friday.', person: 'Marcus Reyes', personEmail: 'marcus@riverstone.example', dueAt: null, severity: 3, sourceRefs: [msgRef], evidence: { ref: msgRef, quote: invoiceQuote }, link: 'https://riverstone.example/invoice/9', draft: null },
+      { key: 'confirm-site-walk', bucket: 'now', headline: 'Confirm Thursday for the Alder Vance site walk', why: 'Jane asked to move it and has not heard back.', person: 'Jane Roe', personEmail: 'jane@aldervance.example', dueAt: null, severity: 2, sourceRefs: [requestRef], evidence: { ref: requestRef, quote: requestQuote }, link: null, draft: { to: 'jane@aldervance.example', subject: 'Re: site walk', body: 'Thursday works. I will be on site at 2pm.' } },
+      { key: 'send-revised-schedule', bucket: 'promised', headline: 'Send Jane the revised schedule you promised Monday', why: 'You told her Monday; it is not sent.', person: 'Jane Roe', personEmail: 'jane@aldervance.example', dueAt: null, severity: 2, sourceRefs: [sentRef], evidence: { ref: sentRef, quote: commitmentQuote }, link: null, draft: { to: 'jane@aldervance.example', subject: 'Revised schedule', body: 'Hi [NAME], attached is the revised schedule.' } },
+      { key: 'mixed-sources', bucket: 'money', headline: 'A claim citing a nonexistent source', why: '', person: '', personEmail: '', dueAt: null, severity: 3, sourceRefs: [msgRef, 'msg:ffffffffffffffff'], evidence: { ref: msgRef, quote: invoiceQuote }, link: null, draft: null },
       { key: 'now-four', bucket: 'now', headline: 'Fourth thing the model thought was urgent', why: 'Filler with a real severity.', person: '', personEmail: '', dueAt: null, severity: 2, sourceRefs: [], link: null, draft: null },
       { key: 'now-five', bucket: 'now', headline: 'Fifth thing the model thought was urgent', why: 'Should be demoted out of now.', person: '', personEmail: '', dueAt: null, severity: 1, sourceRefs: [], link: null, draft: null },
       { key: 'now-six', bucket: 'now', headline: 'Sixth thing the model thought was urgent', why: 'Should be demoted out of now.', person: '', personEmail: '', dueAt: null, severity: 0, sourceRefs: [], link: null, draft: null },
-      { key: 'bad-bucket', bucket: 'URGENT!!', headline: 'Bucket the model invented', why: 'Must be clamped to something legal.', person: '', personEmail: '', dueAt: null, severity: 99, sourceRefs: [], link: 'javascript:alert(1)', draft: null },
+      { key: 'bad-bucket', bucket: 'URGENT!!', headline: 'Bucket the model invented', why: 'Must be clamped to something legal.', person: '', personEmail: '', dueAt: null, severity: 99, sourceRefs: [msgRef], evidence: { ref: msgRef, quote: invoiceQuote }, link: 'javascript:alert(1)', draft: null },
     ],
     notes: ['Two threads with Alder Vance are really one conversation.'],
   }, null, 0)}
@@ -457,7 +465,19 @@ before(async () => {
   // far from it; 400 days keeps IMAP finding it. It does nothing for the sweep's
   // 21-day prompt window, which is why the fixtures above are dated off the real
   // clock rather than the day this file was written.
-  model = await startMockModel(() => boardReply(`msg:${inboxMessageId}`));
+  model = await startMockModel((_call, body) => {
+    const messages = listMessages(db, { limit: 50 });
+    const invoiceRef = `msg:${messages.find(message => message.uid === 101)?.id}`;
+    const requestRef = `msg:${messages.find(message => message.uid === 102)?.id}`;
+    const sentRef = `msg:${messages.find(message => message.uid === 201)?.id}`;
+    const shown = body.messages.map(message => message.content).join('\n');
+    // The same wire server also receives isolated calendar/privacy runs. Their
+    // prompts cannot support claims about this stack's three fixture messages.
+    if (![invoiceRef, requestRef, sentRef].every(ref => shown.includes(`[${ref}]`))) {
+      return JSON.stringify({ first: null, items: [], notes: [] });
+    }
+    return boardReply(invoiceRef, requestRef, sentRef);
+  });
   config.model = {
     ...config.model,
     protocol: 'openai',
@@ -706,20 +726,25 @@ describe('prompt: db.mjs -> triage.mjs -> llm.mjs', () => {
 });
 
 describe('board: triage clamps hold all the way to /api/state', () => {
-  test('six now items from the model become at most four on the board', async () => {
+  test('unsupported model urgency does not become immediate work', async () => {
     const { body } = await apiGet('/api/state');
     const nowItems = body.items.filter((i) => i.bucket === 'now');
-    assert.ok(nowItems.length <= 4, `now must be capped at 4, got ${nowItems.length}`);
+    assert.equal(nowItems.length, 0, 'source facts do not authorize model-assigned now urgency');
+    assert.equal(getItemByKey(db, 'confirm-site-walk').bucket, 'soon');
+    assert.equal(getItemByKey(db, 'wire-riverstone').bucket, 'money');
+    assert.equal(getItemByKey(db, 'send-revised-schedule').bucket, 'promised');
     assert.equal(body.counts.now, nowItems.length, 'the rail count must match the rows');
   });
 
-  test('the demoted items are carried, not dropped', async () => {
+  test('candidates without source evidence are rejected while grounded work remains', async () => {
     const { body } = await apiGet('/api/state');
-    const keys = new Set(body.items.map((i) => i.id));
-    for (const key of ['now-five', 'now-six']) {
-      assert.ok(getItemByKey(db, key), `${key} must still exist after demotion`);
+    const ids = new Set(body.items.map((i) => i.id));
+    for (const key of ['now-four', 'now-five', 'now-six']) {
+      assert.equal(getItemByKey(db, key), null, `${key} has no evidence and must not be stored`);
     }
-    assert.ok(keys.size >= 6, 'every legal item the model returned should be on the board');
+    for (const key of ['wire-riverstone', 'confirm-site-walk', 'send-revised-schedule']) {
+      assert.ok(ids.has(itemRowId(key)), `${key} is supported by a source actually sent to the model`);
+    }
   });
 
   test('an illegal bucket and an out-of-range severity are clamped, not stored raw', async () => {
@@ -736,14 +761,15 @@ describe('board: triage clamps hold all the way to /api/state', () => {
     for (const item of body.items) {
       if (item.link) assert.match(item.link, /^(https?:|mailto:)/, `unsafe link: ${item.link}`);
     }
-    const invented = body.items.find((i) => i.id === 'bad-bucket');
+    const invented = body.items.find((i) => i.id === itemRowId('bad-bucket'));
     if (invented) assert.equal(invented.link, null);
   });
 
-  test('a sourceRef pointing at nothing is dropped and the real one kept', async () => {
+  test('mixed missing source evidence rejects the whole candidate', async () => {
     const item = getItemByKey(db, 'wire-riverstone');
     assert.ok(item, 'the hero item should exist');
     assert.deepEqual(item.sourceRefs, [`msg:${inboxMessageId}`]);
+    assert.equal(getItemByKey(db, 'mixed-sources'), null, 'a valid quote does not excuse an unshown reference');
   });
 });
 
@@ -755,15 +781,22 @@ describe('drafts: triage -> db -> /api/state -> PUT', () => {
     }
   });
 
-  test('a finished draft reaches the board addressed to a real person', async () => {
+  test('even a finished inline model draft is withheld from the board', async () => {
     const { body } = await apiGet('/api/state');
-    const draft = body.drafts.find((d) => d.to_email === 'jane@aldervance.example');
-    assert.ok(draft, 'the ready draft should be on the board');
-    assert.match(draft.body, /Thursday works/);
+    assert.deepEqual(body.drafts, [], 'reply generation requires the original email and an explicit reply flow');
   });
 
   test('an edit to a draft persists', async () => {
-    const before = (await apiGet('/api/state')).body.drafts[0];
+    const parent = listMessages(db).find(message => message.uid === 102);
+    const saved = await fetch(`${base}/api/mail/save`, {
+      method: 'POST',
+      headers: { 'X-Zelos-Token': token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messageId: parent.id, accountId: 'm_test01',
+        to: 'jane@aldervance.example', subject: 'Re: site walk', body: 'Thursday works.' }),
+    });
+    assert.equal(saved.status, 200);
+    const before = (await saved.json()).draft;
+    assert.equal(before.to_email, 'jane@aldervance.example');
     const res = await fetch(`${base}/api/drafts/${encodeURIComponent(before.id)}`, {
       method: 'PUT',
       headers: { 'X-Zelos-Token': token, 'Content-Type': 'application/json' },
@@ -1346,17 +1379,21 @@ describe('the board over several runs: sweep.mjs -> db.mjs -> /api/state', () =>
     boardDb = openDb(path.join(home, 'board-over-runs.db'));
     migrate(boardDb);
 
-    // No mail and no calendars: the subject here is what the board does with
-    // model replies over time, and an empty inbox keeps that the only variable.
+    // No mail and no calendars: user-created priorities can accumulate between
+    // reviews even when the model correctly proposes no unsupported new work.
     boardConfig = structuredClone(config);
     boardConfig.mail = [];
     boardConfig.calendars = [];
     boardConfig.model = { ...config.model, baseUrl: `${boardModel.origin}/v1`, keyRef: null };
 
-    queued.push({ first: null, notes: [], items: [0, 1, 2, 3].map((i) => nowItem(`older-${i}`, 1)) });
-    await sweepOnce();
-    queued.push({ first: null, notes: [], items: [0, 1, 2, 3].map((i) => nowItem(`newer-${i}`, 3)) });
-    await sweepOnce();
+    for (const [prefix, severity] of [['older', 1], ['newer', 3]]) {
+      for (const i of [0, 1, 2, 3]) {
+        const value = nowItem(`${prefix}-${i}`, severity);
+        upsertItem(boardDb, { ...value, payload: { key: value.key } }, { origin: 'user' });
+      }
+      const result = await sweepOnce();
+      assert.equal(result.ok, true, result.error);
+    }
 
     boardServer = createServer({ db: boardDb, config: boardConfig, token: FIXED_TOKEN, heartbeatMs: 50 });
     boardBase = (await listen(boardServer, { port: 0 })).url.replace(/\/$/, '');
@@ -1374,7 +1411,7 @@ describe('the board over several runs: sweep.mjs -> db.mjs -> /api/state', () =>
     return { status: res.status, body: await res.json() };
   };
 
-  test('two legal replies of four now items each leave four on the board, not eight', async () => {
+  test('priorities added between two reviews leave four now items on the board', async () => {
     const { body } = await boardGet('/api/state');
     const inNow = body.items.filter((i) => i.bucket === 'now');
     assert.equal(inNow.length, 4, `the page must never show more than four, got ${inNow.length}`);
@@ -1388,7 +1425,7 @@ describe('the board over several runs: sweep.mjs -> db.mjs -> /api/state', () =>
 
   test('the four that lost their place are carried as today, not dropped', async () => {
     const { body } = await boardGet('/api/state');
-    assert.equal(body.items.length, 8, 'every item the model produced is still on the board');
+    assert.equal(body.items.length, 8, 'every user-created item is still on the board');
     for (const key of ['older-0', 'older-1', 'older-2', 'older-3']) {
       const row = getItemByKey(boardDb, key);
       assert.equal(row.bucket, 'today', `${key} should have been demoted, not deleted`);

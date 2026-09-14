@@ -22,6 +22,7 @@ import { byUrgency, sweepSummary, plural } from '../lib/format.js';
 import { state, startSweep, itemsInBucket, snoozedItems, finishedItems, boardNotes } from '../lib/store.js';
 import { humanDelta, instant } from '../lib/time.js';
 import { readingStatus } from '../lib/source-status.js';
+import { briefingPanel } from '../lib/briefing.js';
 
 const MAX_NOW_ROWS = 4;
 
@@ -86,6 +87,7 @@ function emptyForContext(navigate) {
       action: button('Try again', { class: 'btn solid', onClick: () => startSweep('full') }),
     });
   }
+  if(state.board.briefing && Object.values(state.board.briefing.counts).some(count=>count>0))return el('div',{hidden:true});
   return emptyState({
     title: 'Nothing needs you.',
     detail: `Last checked ${humanDelta(last.ended_at || last.started_at)}. ${sweepSummary(last)}`.trim(),
@@ -174,7 +176,14 @@ export function renderNow(ctx) {
   const notes = boardNotes();
   const noteItems = itemsInBucket('note');
 
-  const body = el('div', { class: 'view view-now' });
+  const body = el('div', { class: 'view view-now' }, [
+    el('div', { class: 'workspace-heading' }, [
+      el('h1', { text: 'Your next move' }),
+      el('p', { text: 'Priorities from your mail, calendar and notes.' }),
+    ]),
+  ]);
+  const brief=briefingPanel(state.board.briefing,{tz,running:state.sweep.running});
+  if(brief)body.appendChild(brief);
   const trouble = sweepTrouble();
   const banner = trouble ? failureBanner(trouble, navigate) : null;
   if (banner) body.appendChild(banner);

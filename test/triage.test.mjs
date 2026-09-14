@@ -95,11 +95,12 @@ test('the prompt argues the rules it is judged on', () => {
   const { system } = buildSweepPrompt({ identity: IDENTITY, now: NOW, privacy: PRIVACY });
   // The hard bar, the headline example, and the two directions of debt.
   assert.match(system, /AT MOST FOUR now ITEMS/);
-  assert.match(system, /Answer Priya Raman on the Jul 28 dates/);
+  assert.match(system, /provide evidence:\{ref,quote\}/);
+  assert.match(system, /Never cite an unseen record/);
   assert.match(system, /90 characters or fewer/);
   assert.match(system, /waiting {2}= THEY owe YOU/);
   assert.match(system, /promised = YOU owe THEM/);
-  assert.match(system, /DROPPED SCHEDULING THREAD/);
+  assert.match(system, /Silence never establishes acceptance or a promise/);
   assert.match(system, /NO PLACEHOLDERS/);
   assert.match(system, /reuse that exact key/);
 });
@@ -115,16 +116,12 @@ test('the prompt argues the rules it is judged on', () => {
  * banned drops drafts for a reason the model was never given, so the two lists
  * have to be one list. This is the assertion that keeps them one.
  */
-test('the prompt bans exactly what the draft gate rejects', () => {
+test('board prompt prohibits drafts while the separate compatibility draft gate still rejects placeholders', () => {
   const { system } = buildSweepPrompt({ identity: IDENTITY, now: NOW, privacy: PRIVACY });
-  for (const banned of ['[name]', '[date]', '{{thing}}', 'TODO', 'TBD', 'insert...']) {
-    assert.ok(system.includes(banned), `the prompt does not ban ${banned}, but core/safety.mjs rejects it`);
-  }
-  // And it says the two things about brackets that the old regex got wrong, so
-  // a model reading this cannot conclude that a long aside or a wrapped one is
-  // somewhere the rule does not reach.
-  assert.match(system, /a note to the reader mid-paragraph counts,\s+however\s+long/);
-  assert.match(system, /opened on one line and closed on the next/);
+  assert.match(system, /Omit the draft property entirely/);
+  assert.match(system, /NO PLACEHOLDERS/);
+  // Detailed draft validation remains exercised by the merge tests below;
+  // the board model no longer receives instructions to compose reply bodies.
 });
 
 /**
@@ -320,7 +317,7 @@ test('the bare-overflow cut drops the lowest-ranked mail, not the oldest', () =>
   // direct question survives and newsletters are what give way.
   const tight = build(8000);
   const content = tight.messages[0].content;
-  assert.equal(tight.budget.levels.inbound, 'bare', 'the squeeze must reach the drop branch');
+  assert.ok(tight.budget.shown.inbound < tight.budget.available.inbound, 'the squeeze must reach the drop branch before unused space enriches the survivors');
   assert.ok(tight.budget.shown.inbound < 61, 'and actually cut');
   assert.ok(content.includes('[msg:client1]'),
     'the highest-ranked message must survive the bare-level cut');
@@ -1050,12 +1047,13 @@ test('a model result that is not usable still leaves the database consistent', (
 
 test('unsafe strings from the model never reach a row', () => {
   const db = fresh();
+  const source = insertCapture(db, 'Review https://example.com/x');
   mergeSweep(db, {
     first: null,
     items: [
       { key: 'k-script', bucket: 'now', headline: 'Open <script>alert(1)</script>', why: '', severity: 3, sourceRefs: [] },
       { key: 'k-link', bucket: 'note', headline: 'A note with a bad link', why: '', severity: 0, sourceRefs: [], link: 'javascript:alert(1)' },
-      { key: 'k-ok', bucket: 'note', headline: 'A note with a good link', why: '', severity: 0, sourceRefs: [], link: 'https://example.com/x' },
+      { key: 'k-ok', bucket: 'note', headline: 'A note with a good link', why: '', severity: 0, sourceRefs: [`cap:${source.id}`], link: 'https://example.com/x' },
     ],
     notes: [],
   }, { runId: 'run_m', now: NOW });

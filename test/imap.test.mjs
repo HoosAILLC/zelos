@@ -181,7 +181,7 @@ function fetchLine({ seq, uid, items = '', section, payload }) {
   ]);
 }
 
-const HEADER_SECTION = 'HEADER.FIELDS (FROM TO CC SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES LIST-ID)';
+const HEADER_SECTION = 'HEADER.FIELDS (FROM REPLY-TO TO CC SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES LIST-ID)';
 
 /**
  * Answers UID SEARCH and both UID FETCH passes from a list of fixtures.
@@ -688,7 +688,7 @@ test('the client only ever uses UID commands, BODY.PEEK, and read-only EXAMINE',
 
       assert.ok(
         sent.some((c) =>
-          /^UID FETCH [\d,]+ \(UID FLAGS INTERNALDATE BODYSTRUCTURE BODY\.PEEK\[HEADER\.FIELDS \(FROM TO CC SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES LIST-ID\)\]\)$/.test(c)),
+          /^UID FETCH [\d,]+ \(UID FLAGS INTERNALDATE BODYSTRUCTURE BODY\.PEEK\[HEADER\.FIELDS \(FROM REPLY-TO TO CC SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES LIST-ID\)\]\)$/.test(c)),
         `cheap first pass not as specified: ${sent.join(' | ')}`,
       );
       assert.ok(sent.some((c) => /^UID FETCH [\d,]+ \(UID BODY\.PEEK\[1\]\)$/.test(c)), 'second pass pulls one part');

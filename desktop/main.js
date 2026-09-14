@@ -45,7 +45,7 @@ import {
   app, BrowserWindow, Menu, Tray, dialog, ipcMain, nativeImage, nativeTheme, screen, session, shell,
 } from 'electron';
 
-import { classifyTarget, guardWebContents } from './guard.js';
+import { classifyTarget, guardWebContents, safeTarget } from './guard.js';
 import { buildAppMenuTemplate, buildTrayMenuTemplate, VIEWS } from './menus.js';
 import { startCore } from './runtime.js';
 import { clampToDisplays, WindowState } from './window-state.js';
@@ -489,7 +489,7 @@ function hardenSession(ses) {
   ses.webRequest.onBeforeRequest({ urls: ['<all_urls>'] }, (details, callback) => {
     const verdict = classifyTarget(details.url, { port: zelos?.port ?? 0 });
     if (verdict.action !== 'internal') {
-      zelos?.logger.warn('desktop: cancelled an outbound request from the board', { url: verdict.url });
+      zelos?.logger.warn('desktop: cancelled an outbound request from the board', safeTarget(verdict.url));
     }
     callback({ cancel: verdict.action !== 'internal' });
   });
@@ -633,6 +633,7 @@ export function backupHandlers({ isBoard, getCore, getWindow, dialogs, flush, ap
             info.credentials === 'encrypted-file-included'
               ? 'This backup includes the local encrypted credential file and its key. Treat the backup like a password. Credentials held in an operating-system keychain may still need reconnecting.'
               : 'Operating-system keychain credentials are not portable. You may need to reconnect mail, calendars, task sources, and your model after restoring.',
+            'Family and collaborator access will be paused. Reconnect existing accounts with a fresh invitation and their previous password, then recreate shared access and API keys. AI access will also be disabled until you issue fresh tokens.',
             'Restore only a backup you trust. Local calendar files outside the Zelos folder must be copied separately.',
           ].join('\n'),
           buttons: ['Cancel', 'Restore and reopen'], defaultId: 0, cancelId: 0, noLink: true,

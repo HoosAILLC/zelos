@@ -7,6 +7,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { describe } from '../core/connectors/index.mjs';
 import { installDom, text, findButton, walk, settle } from './helpers/ui-dom.mjs';
 
+if (!fs.existsSync(new URL('../website', import.meta.url))) { test('public website demo is available', { skip: 'Website demo is excluded from this npm deployment.' }, () => {}); } else {
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 async function adapter(t, prepare = () => {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zelos-demo-test-'));
@@ -147,6 +148,41 @@ test('demo timed wake-ups and simulated arrivals produce truthful new history', 
   assert.ok(added.entries[0].changes.some(change => change.field === 'headline' && change.before === null && change.after === arrival.headline));
 });
 
+test('demo light reads keep AI activity and sample decisions out, and preserve the next full review', async t => {
+  const { api, request, openStream, data } = await adapter(t);
+  const before = await api.state();
+  async function run(mode) {
+    const controller = new AbortController();
+    const events = [];
+    let finish;
+    const finished = new Promise(resolve => { finish = resolve; });
+    const stream = openStream('/api/sweep/stream', { signal: controller.signal, onEvent: (event, result) => {
+      events.push({ event, result });
+      if (event === 'done' || event === 'failed') finish({ event, result });
+    } });
+    try {
+      await api.sweep(mode);
+      const outcome = await finished;
+      assert.equal(outcome.event, 'done');
+      assert.equal(outcome.result.mode, mode);
+      return events;
+    } finally { controller.abort(); await stream; }
+  }
+  const events = await run('light');
+  const after = await api.state();
+  assert.equal(events.some(({ event, result }) => event === 'progress' && ['model', 'merge'].includes(result.phase)), false);
+  assert.deepEqual(after.items, before.items, 'reading must not create or reassess sample obligations');
+  assert.deepEqual(after.drafts, before.drafts, 'reading must not generate sample replies');
+  assert.deepEqual(after.first, before.first, 'reading must not change the sample AI pick');
+  assert.equal(after.runs.last.kind, 'light');
+  assert.equal(after.runs.last.tokens_in, 0); assert.equal(after.runs.last.tokens_out, 0);
+  assert.deepEqual((await request(`/api/items/${before.items[0].id}/history`)).entries, []);
+  await run('full');
+  const arrival = data.sweepArrivals[0].item;
+  assert.ok((await api.state()).items.some(item => item.id === arrival.id), 'light reads must not discard the next full demo arrival');
+  assert.equal((await request(`/api/items/${arrival.id}/history`)).entries[0].origin, 'sample');
+});
+
 test('release history and update views work against the demo without contacting a server or offering native backups', async t => {
   installDom(t);
   const { api, request, importUi } = await adapter(t);
@@ -201,3 +237,19 @@ test('demo setup status and exact-account recovery reflect configuration without
   await api.saveConfig({ model: { model: '' } });
   assert.equal((await api.health()).model.configured, false);
 });
+
+test('family release view loads in the public demo while private family actions and downloads remain unavailable',async t=>{
+  installDom(t);
+  const {request,requestFamilyDownload,importUi}=await adapter(t);
+  const {renderFamily}=await importUi('views/family.js');
+  assert.equal(typeof renderFamily,'function','the public demo must resolve the family adapter imports');
+  for(const [path,options] of [
+    ['/api/family',{}],
+    ['/api/family/action',{method:'POST',body:{action:'member.invite',input:{}}}],
+    ['/api/family/snapshot',{method:'POST',body:{}}],
+    ['/api/family/documents/example',{}],
+  ])await assert.rejects(request(path,options),{status:501});
+  await assert.rejects(requestFamilyDownload('example'),{status:501});
+});
+
+}

@@ -15,7 +15,7 @@ import { execFileSync } from 'node:child_process';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-test('the root and desktop manifests carry the same version', () => {
+test('the root and desktop manifests carry the same version', { skip: !fs.existsSync(path.join(ROOT,'desktop')) && 'Desktop packaging is absent in npm deployment.' }, () => {
   /* The release pipeline reads both, and never side by side: the staging
      script derives the artifact names it expects from the root package.json,
      while electron-builder stamps `${version}` from desktop/package.json into
@@ -32,7 +32,7 @@ test('the root and desktop manifests carry the same version', () => {
   assert.equal(lock.packages[''].version, root.version);
 });
 
-test('the website ships the current UI and versioned download routes together', () => {
+test('the website ships the current UI and versioned download routes together', { skip: !fs.existsSync(path.join(ROOT,'website')) && 'Website packaging is absent in npm deployment.' }, () => {
   execFileSync(process.execPath, ['scripts/build-website.mjs'], { cwd: ROOT, stdio: 'pipe' });
   const output = path.join(ROOT, '.site-dist');
   const version = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')).version;
@@ -56,7 +56,7 @@ test('the website ships the current UI and versioned download routes together', 
   assert.equal(JSON.parse(fs.readFileSync(path.join(output, 'release.json'), 'utf8')).version, version);
 });
 
-test('CI installs the shell\'s build tools from the lockfile, with no fallback', () => {
+test('CI installs the shell\'s build tools from the lockfile, with no fallback', { skip: !fs.existsSync(path.join(ROOT,'.github')) && 'CI workflow is absent in npm deployment.' }, () => {
   /* desktop/.gitignore keeps package-lock.json tracked on purpose: an app
      that asks people to trust an unsigned build should pin exactly what went
      into it. `npm ci` is that pin's enforcement, and `npm ci || npm install`

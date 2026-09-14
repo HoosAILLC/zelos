@@ -10,26 +10,13 @@ whatever model you choose — including one running on your own desk.
 
 ---
 
-## Zero dependencies
+## Runtime dependencies
 
-Not "few" — zero. There is no `dependencies` block, no top-level `node_modules`, no postinstall
-script, nothing to audit but the code itself. (`desktop/` has its own `package.json` with Electron
-and electron-builder as `devDependencies` — they build a window and never reach the core, and none
-of them ships in the published package.)
-
-That is not asceticism. It is the product's central claim: an app that reads your mail should not
-ask you to trust a supply chain you cannot see. Everything is Node built-ins — `node:sqlite`
-(with FTS5 compiled in), `node:tls`, `node:http`, `node:crypto`, `node:test`, and global `fetch`.
-
-The consequence is that the IMAP client, the MIME and RFC 2047 decoders, the RFC 5545 parser with
-RRULE expansion, the CalDAV client and the model adapter are all written here, from the RFCs.
-About **42,700 lines** of JavaScript in `core/`, `ui/` and `zelos.mjs`, and a test suite that is
-**larger than the code it tests** — about 44,400 lines in `test/`. Count them yourself:
-
-```bash
-{ find core ui -name '*.mjs' -o -name '*.js'; echo zelos.mjs; } | xargs wc -l | tail -1
-wc -l test/*.mjs | tail -1
-```
+Zelos uses Node's built-in SQLite, TLS, HTTP and cryptography support, plus two
+pinned runtime libraries: Nodemailer for sending mail and PDFKit for creating
+reports. Their transitive dependencies are recorded in `package-lock.json`.
+The desktop shell keeps Electron and electron-builder in its own package.
+Desktop installers include the required runtime libraries.
 
 ## Run it
 
@@ -40,6 +27,7 @@ step, [zelos-app.netlify.app/help](https://zelos-app.netlify.app/help) has a mes
 Claude that walks you through that step.
 
 ```bash
+npm ci --omit=dev --ignore-scripts
 node zelos.mjs
 ```
 
@@ -47,7 +35,7 @@ Node **22.16+ or 24+**. Not "22 or newer": Zelos's index needs SQLite's FTS5 ext
 bundled SQLite is built without it before 22.16 and throughout the whole Node 23 line. On a runtime
 that lacks it, Zelos refuses to start and names the versions that work.
 
-It opens in your browser at `127.0.0.1` and stays there. Nothing to install, no account, no server.
+It opens in your browser at `127.0.0.1` and stays there. No Zelos account or separate server is required.
 To connect a mailbox, type your email address. Gmail, iCloud, Yahoo, Fastmail and a server of your
 own get one button to the page where your provider makes an app password, and **Connect** does the
 rest. **Sign in with Google** and **Sign in with Microsoft** are built and wired — the Google one
@@ -66,7 +54,7 @@ node zelos.mjs doctor       # diagnose setup problems
 node zelos.mjs mcp          # expose the enabled MCP tools over standard input/output
 ```
 
-The source download runs without installing dependencies. Desktop installers include
+The source download needs the dependency installation above. Desktop installers include
 Node and need no terminal setup. The npm package is not part of this release.
 [Installation and updates](docs/INSTALL.md) · [Release notes](docs/RELEASE-NOTES.md).
 

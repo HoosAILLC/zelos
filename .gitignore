@@ -8,7 +8,7 @@ undefined/
 *.bak
 .DS_Store
 
-# Build output and dependencies (desktop shell only; the app itself has none)
+# Build output and dependencies
 node_modules/
 desktop/dist/
 
@@ -16,3 +16,7 @@ desktop/dist/
 .site-dist/
 release-assets/
 .netlify/
+
+# Filesystem metadata and deployment backups
+._*
+*.before-*

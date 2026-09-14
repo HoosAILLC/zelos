@@ -19,6 +19,8 @@ import { DatabaseSync } from 'node:sqlite';
 import { SCHEMA_VERSION, migrate } from './db.mjs';
 import { DEFAULTS, isValidRef, writeFileAtomic } from './config.mjs';
 import { listAccessLog } from './mcp.mjs';
+import { createPlaidService } from './finance-plaid.mjs';
+import { migrateFinanceReviews } from './finance-review.mjs';
 
 export const BACKUP_MAGIC = Buffer.from('ZELOS-BACKUP\r\n\x1a\n');
 export const BACKUP_LIMITS = Object.freeze({ manifest: 1024 * 1024, files: 10_000, metadata: 16 * 1024 * 1024, total: 64 * 1024 ** 3 });
@@ -130,15 +132,25 @@ function inspectDatabase(file) {
     const version = db.prepare('PRAGMA user_version').get().user_version;
     if (version !== SCHEMA_VERSION) throw failure('this database uses a different schema. Restore with the Zelos version that created this backup.');
     if (!expectedSchemas) {
-      const reference = new DatabaseSync(':memory:');
-      try {
-        migrate(reference);
-        expectedSchemas = new Set([JSON.stringify(schema(reference))]);
-        // MCP creates its audit table lazily outside migrations. Preserve that
-        // history while accepting only the exact schema its own code creates.
-        listAccessLog(reference);
-        expectedSchemas.add(JSON.stringify(schema(reference)));
-      } finally { reference.close(); }
+      const allowed = new Set();
+      // Each lazy feature has a complete first-party schema. Preserve legacy
+      // Plaid backups while rejecting partial schemas and unknown objects.
+      for (const plaid of ['none', 'legacy', 'current']) for (const reviews of [false, true]) {
+        const reference = new DatabaseSync(':memory:');
+        try {
+          migrate(reference);
+          if (plaid !== 'none') createPlaidService(reference, {
+            vault: { getSecret() { throw failure('schema inspection attempted credential access.'); }, setSecret() { throw failure('schema inspection attempted credential access.'); } },
+            fetcher() { throw failure('schema inspection attempted network access.'); },
+          });
+          if (plaid === 'legacy') reference.exec('DROP TABLE finance_plaid_pending; DROP TABLE finance_plaid_sync_state;');
+          if (reviews) migrateFinanceReviews(reference);
+          allowed.add(JSON.stringify(schema(reference)));
+          listAccessLog(reference);
+          allowed.add(JSON.stringify(schema(reference)));
+        } finally { reference.close(); }
+      }
+      expectedSchemas = allowed;
     }
     if (!expectedSchemas.has(JSON.stringify(schema(db)))) throw failure('the database structure is not a recognized Zelos schema.');
     const integrity = db.prepare('PRAGMA integrity_check').all();
@@ -380,6 +392,91 @@ export function recoverRestore({ home }) {
   return { recovered: journal.phase === 'replacing', recoveryFile: path.join(home, 'backups', journal.recoveryFile) };
 }
 
+function suspendRestoredFamily(file) {
+  regular(file);
+  const db = new DatabaseSync(file, { enableDoubleQuotedStringLiterals: false });
+  let accounts = 0;
+  try {
+    db.exec('PRAGMA trusted_schema = OFF; PRAGMA foreign_keys = ON; PRAGMA journal_mode = DELETE; BEGIN IMMEDIATE;');
+    try {
+      const now = new Date().toISOString();
+      accounts = db.prepare("SELECT count(*) AS n FROM family_accounts WHERE id<>'owner'").get().n;
+      // Preserve identities and prior password hashes. Reconnection requires a
+      // fresh invitation, previous password, and original authenticator.
+      db.prepare("UPDATE family_accounts SET status='revoked',updated_at=? WHERE id<>'owner'").run(now);
+      db.prepare('UPDATE family_credentials SET revoked_at=?').run(now);
+      db.prepare('UPDATE family_invitations SET revoked_at=?').run(now);
+      // Recovery codes spent since the backup must not become usable again.
+      // Keep the original sealed authenticator and replay counter unchanged.
+      db.exec("UPDATE family_mfa SET recovery_json='[]'");
+      for (const row of db.prepare('SELECT id,data_json FROM family_grants').all()) {
+        const grant = JSON.parse(row.data_json);
+        if (!plain(grant)) throw failure('a family access grant is malformed.');
+        db.prepare('UPDATE family_grants SET data_json=? WHERE id=?').run(JSON.stringify({ ...grant, status: 'revoked', revokedAt: now }), row.id);
+      }
+      db.exec('COMMIT;');
+    } catch (error) { db.exec('ROLLBACK;'); throw error; }
+  } finally { db.close(); }
+  const fd = fs.openSync(file, 'r+');
+  try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+  return accounts > 0;
+}
+
+/** Reconnecting AI clients always requires newly issued tokens after restore.
+ * Transform staged files only: no OS keychain call or live-home mutation may
+ * occur before the journal can roll back the replacement. External keychain
+ * values cannot authorize a client without its config record; they are left
+ * untouched, including in another installation sharing an old namespace.
+ */
+function suspendRestoredAi(home) {
+  const configFile = path.join(home, 'config.json');
+  const cfg = readJSON(configFile);
+  const isAiRef = ref => typeof ref === 'string' && ref.startsWith('ai.');
+  let reconnect = cfg.ai?.enabled === true || (Array.isArray(cfg.ai?.tokens) && cfg.ai.tokens.length > 0);
+  cfg.ai = { ...(cfg.ai || {}), enabled: false, tokens: [] };
+  writeFileAtomic(configFile, `${JSON.stringify(cfg)}\n`);
+  for (const [name, key] of [['secrets.index.json', 'refs'], ['secrets.namespace.json', 'legacyRefs']]) {
+    const file = path.join(home, name);
+    if (!exists(file)) continue;
+    const record = readJSON(file);
+    const refs = record[key];
+    if (Array.isArray(refs) && refs.some(isAiRef)) {
+      reconnect = true;
+      record[key] = refs.filter(ref => !isAiRef(ref));
+      writeFileAtomic(file, `${JSON.stringify(record)}\n`);
+    }
+  }
+  const storeFile = path.join(home, 'secrets.enc');
+  if (exists(storeFile)) {
+    // inspectData has already authenticated and bounded this envelope. Reuse
+    // its format with a fresh nonce; preserve every unrelated credential.
+    const encrypted = readJSON(storeFile);
+    const seed = Buffer.from(fs.readFileSync(path.join(home, '.seed'), 'utf8').trim(), 'hex');
+    let key, clear, replacement;
+    try {
+      key = crypto.scryptSync(seed, Buffer.from(encrypted.kdf.salt, 'hex'), 32,
+        { N: 32768, r: 8, p: 1, maxmem: 64 * 1024 * 1024 });
+      const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(encrypted.iv, 'hex'));
+      decipher.setAAD(Buffer.from('zelos.secrets.v1'));
+      decipher.setAuthTag(Buffer.from(encrypted.tag, 'hex'));
+      clear = Buffer.concat([decipher.update(Buffer.from(encrypted.ct, 'base64')), decipher.final()]);
+      const values = JSON.parse(clear.toString('utf8'));
+      const refs = Object.keys(values).filter(isAiRef);
+      if (refs.length) {
+        reconnect = true;
+        for (const ref of refs) delete values[ref];
+        const iv = crypto.randomBytes(12);
+        const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+        cipher.setAAD(Buffer.from('zelos.secrets.v1'));
+        replacement = Buffer.from(JSON.stringify(values));
+        const ct = Buffer.concat([cipher.update(replacement), cipher.final()]);
+        writeFileAtomic(storeFile, `${JSON.stringify({ ...encrypted, iv: iv.toString('hex'), tag: cipher.getAuthTag().toString('hex'), ct: ct.toString('base64') })}\n`);
+      }
+    } finally { seed.fill(0); key?.fill(0); clear?.fill(0); replacement?.fill(0); }
+  }
+  return reconnect;
+}
+
 /** The recovery archive MUST already exist, and all SQLite handles be closed. */
 export function applyRestore({ home, staged, recoveryFile, onStep = () => {} }) {
   home = dataHome(home);
@@ -403,6 +500,11 @@ export function applyRestore({ home, staged, recoveryFile, onStep = () => {} }) 
   if (!oldNames.includes('config.json')) { writeFileAtomic(path.join(old, 'config.json'), `${JSON.stringify(DEFAULTS)}\n`); oldNames.push('config.json'); }
   inspectData(old); syncDir(old); syncDir(transaction);
   const oldFiles = filesIn(old).map((name) => ({ path: name, ...digestFile(path.join(old, name)) }));
+  // Only the verified incoming copy is transformed. Rollback and recovery
+  // archives retain the current accounts and credential revocations unchanged.
+  const familyReconnectRequired = suspendRestoredFamily(path.join(data, 'zelos.db'));
+  const aiReconnectRequired = suspendRestoredAi(data);
+  inspectData(data); syncDir(data);
   const journal = { format: 1, id: staged.id, phase: 'replacing', old: oldNames, oldFiles, incoming, recoveryFile: recoveryName };
   writeFileAtomic(path.join(home, JOURNAL), JSON.stringify(journal));
   try {
@@ -417,7 +519,7 @@ export function applyRestore({ home, staged, recoveryFile, onStep = () => {} }) 
     journal.phase = 'committed'; writeFileAtomic(path.join(home, JOURNAL), JSON.stringify(journal));
     onStep('committed');
     recoverRestore({ home });
-    return { ok: true, recoveryFile };
+    return { ok: true, recoveryFile, familyReconnectRequired, aiReconnectRequired };
   } catch (err) {
     // Leave the journal and rollback files intact if recovery itself fails.
     try { recoverRestore({ home }); } catch { throw failure('restore stopped and automatic recovery could not finish. Keep the data folder intact; the recovery copy is in backups.'); }

@@ -1,7 +1,7 @@
 /**
  * test/repo.test.mjs — the promises the product makes about itself.
  *
- * "Zero third-party dependencies" and "it starts even with nothing configured"
+ * "One pinned mail dependency" and "it starts even with nothing configured"
  * are not implementation details a unit test can reach. They are properties of
  * the repository and of the built program, and the only honest way to check
  * them is to read every import in the tree and to actually run the thing.
@@ -15,6 +15,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { stripFixedNavigation } from './ui-navigation.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
@@ -170,7 +171,7 @@ describe('the test suite stays inside its sandbox', () => {
  * prove the job is green — only a push can — but it can prove the two halves
  * still refer to the same thing.
  */
-describe('the workflow runs what only it can run', () => {
+describe('the workflow runs what only it can run', { skip: !fs.existsSync(path.join(ROOT,'.github')) && 'CI workflow is absent in npm deployment.' }, () => {
   const workflowSource = fs.readFileSync(path.join(ROOT, '.github', 'workflows', 'ci.yml'), 'utf8');
   /* Comments are stripped before anything is looked for. That file explains
      itself at length, and this whole test would otherwise be satisfied by the
@@ -351,12 +352,13 @@ function classifyUnforce(lines, index, indent, text) {
 }
 
 /* ================================================================== *
- * Zero dependencies
+ * Audited runtime dependencies
  * ================================================================== */
 
 describe('the dependency claim', () => {
-  test('package.json declares no dependencies of any kind', () => {
-    for (const field of ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies', 'bundleDependencies']) {
+  test('package.json pins the mail transport and local PDF renderer', () => {
+    assert.deepEqual(pkg.dependencies, { nodemailer: '10.0.9', pdfkit:'0.19.1' });
+    for (const field of ['devDependencies', 'peerDependencies', 'optionalDependencies', 'bundleDependencies', 'bundledDependencies']) {
       assert.ok(
         pkg[field] === undefined || Object.keys(pkg[field]).length === 0,
         `package.json.${field} is populated: ${JSON.stringify(pkg[field])}`,
@@ -364,8 +366,24 @@ describe('the dependency claim', () => {
     }
   });
 
-  test('there is no lockfile and no node_modules at the root', () => {
-    for (const name of ['package-lock.json', 'npm-shrinkwrap.json', 'yarn.lock', 'pnpm-lock.yaml', 'node_modules']) {
+  test('the npm lockfile pins runtime dependencies with integrity and no install scripts', () => {
+    const lock = JSON.parse(fs.readFileSync(path.join(ROOT, 'package-lock.json'), 'utf8'));
+    assert.equal(lock.lockfileVersion, 3);
+    assert.equal(lock.version, pkg.version);
+    assert.deepEqual(lock.packages[''].dependencies, pkg.dependencies);
+    assert.equal(lock.packages['node_modules/pdfkit'].version,'0.19.1');
+    for(const [name,entry] of Object.entries(lock.packages)) {
+      if(!name)continue;
+      assert.match(entry.resolved,/^https:\/\/registry\.npmjs\.org\//);
+      assert.match(entry.integrity,/^sha512-/);
+      assert.ok(!entry.hasInstallScript,`${name} must not run install scripts`);
+    }
+    const mailer = lock.packages['node_modules/nodemailer'];
+    assert.equal(mailer.version, '10.0.9');
+    assert.equal(mailer.resolved, 'https://registry.npmjs.org/nodemailer/-/nodemailer-10.0.9.tgz');
+    assert.equal(mailer.integrity, 'sha512-BF0qcyplCwp+jMk6HCjFykBz/YhhZSsxrARhOldLwFWH+8kGjQsd2WIMIZhqEuyXRoGFi0ONbDeWDMDoL8MhLw==');
+    assert.ok(!mailer.hasInstallScript);
+    for (const name of ['npm-shrinkwrap.json', 'yarn.lock', 'pnpm-lock.yaml']) {
       assert.ok(!fs.existsSync(path.join(ROOT, name)), `${name} exists at the repository root`);
     }
   });
@@ -575,12 +593,15 @@ describe('every import in core/, ui/ and test/', () => {
     assert.ok(total >= 80, `expected to recover many specifiers, recovered ${total}`);
   });
 
-  test('resolves to a node: builtin or a relative path — nothing else', () => {
+  test('imports resolve locally, except the constrained mail/PDF modules and their offline tests', () => {
     const offenders = [];
     for (const file of SCANNED) {
       for (const spec of specifiersIn(file)) {
         const relative = spec.startsWith('./') || spec.startsWith('../');
         if (relative || BUILTINS.has(spec)) continue;
+        const where = path.relative(ROOT, file).split(path.sep).join('/');
+        if (spec === 'nodemailer' && ['core/mail-send.mjs', 'test/mail-send.test.mjs'].includes(where)) continue;
+        if (spec === 'pdfkit' && ['core/progress.mjs', 'test/documents.test.mjs'].includes(where)) continue;
         offenders.push(`${path.relative(ROOT, file)} -> ${spec}`);
       }
     }
@@ -609,7 +630,12 @@ describe('every import in core/, ui/ and test/', () => {
           || fs.existsSync(`${target}.mjs`)
           || fs.existsSync(`${target}.js`)
           || fs.existsSync(path.join(target, 'index.js'));
-        if (!ok) missing.push(`${path.relative(ROOT, file)} -> ${spec}`);
+        // Only the explicit absent-artifact tests may refer to omitted source
+        // distribution files. Core/UI runtime imports never get this exception.
+        const where=path.relative(ROOT,file).split(path.sep).join('/');
+        const unavailable=(['test/desktop.test.mjs','test/backup.test.mjs'].includes(where)&&spec.startsWith('../desktop/')&&!fs.existsSync(path.join(ROOT,'desktop')))
+          || (where==='test/triage-eval.test.mjs'&&['../evals/triage-cases.mjs','../scripts/evaluate-triage.mjs'].includes(spec)&&!fs.existsSync(path.join(ROOT,'evals')));
+        if (!ok && !unavailable) missing.push(`${path.relative(ROOT, file)} -> ${spec}`);
       }
     }
     assert.deepEqual(missing, [], `imports that do not resolve:\n  ${missing.join('\n  ')}`);
@@ -686,12 +712,25 @@ describe('every import in core/, ui/ and test/', () => {
     assert.deepEqual(drift, [], `imported names that do not exist:\n  ${drift.join('\n  ')}`);
   });
 
-  test('no UI file loads a remote resource; the verified release link is navigation only', () => {
+  test('no UI file loads a remote resource; reviewed official links are navigation only', () => {
     const offenders = [];
     for (const file of filesUnder('ui')) {
       const original = fs.readFileSync(file, 'utf8');
-      const src = file === path.join(ROOT, 'ui/lib/updates.js')
+      let src = file === path.join(ROOT, 'ui/lib/updates.js')
         ? original.replace('const official = `https://github.com/HoosAILLC/zelos/releases/tag/v${release.latestVersion}`;', '') : original;
+      src = stripFixedNavigation(path.relative(ROOT, file).split(path.sep).join('/'), src);
+      // An XML namespace identifies local SVG elements; it is not fetched.
+      // Remove only the known declaration in the local artwork module, not
+      // arbitrary URLs on www.w3.org or elsewhere in UI code.
+      if (file === path.join(ROOT, 'ui/lib/icons.js')) {
+        assert.match(original, /document\.createElementNS\(ns, 'svg'\)/);
+        src = src.replace("const ns = 'http://www.w3.org/2000/svg';", '');
+      }
+      if (['ui/lib/money-charts.js','ui/lib/money-ownership.js'].some(name=>file === path.join(ROOT,name))) {
+        const declaration=file === path.join(ROOT,'ui/lib/money-ownership.js') ? "document.createElementNS('http://www.w3.org/2000/svg', tag)" : "document.createElementNS('http://www.w3.org/2000/svg',tag)";
+        assert.equal(src.split(declaration).length-1,1,'Money chart namespace is one exact DOM declaration');
+        src=src.replace(declaration,'');
+      }
       for (const m of src.matchAll(/\b(?:https?:)?\/\/[a-z0-9.-]+\.[a-z]{2,}/gi)) {
         // A URL in a comment is prose; one in code would be a fetch.
         const line = src.slice(0, m.index).split('\n').pop();
@@ -910,6 +949,13 @@ describe('a first launch with nothing configured', () => {
         // The method, if this call names one before the next call begins.
         const tail = src.slice(m.index + m[0].length, m.index + m[0].length + 240);
         const verb = /^\s*,\s*\{[^}]*?\bmethod:\s*'([A-Z]+)'/.exec(tail);
+        if(literal==='/api/finance/plaid/' && file===path.join(ROOT,'ui/lib/bank-link.js')) {
+          assert.match(tail,/^\+action,\{method:'POST',body\}/,'Plaid dispatch must append only its explicit action argument');
+          const actions=[...src.matchAll(/bankApi\.action\('([a-z]+)'/g)].map(match=>match[1]);
+          assert.deepEqual([...new Set(actions)].sort(),['complete','configure','disconnect','map','start','sync']);
+          for(const action of actions){const entry=wanted.get(literal+action)||{methods:new Set(),where:new Set()};entry.methods.add('POST');entry.where.add(path.relative(ROOT,file));wanted.set(literal+action,entry);}
+          continue;
+        }
         const entry = wanted.get(literal) || { methods: new Set(), where: new Set() };
         entry.methods.add(verb ? verb[1] : 'GET');
         entry.where.add(path.relative(ROOT, file));
@@ -989,6 +1035,9 @@ test('no tracked source file carries a carriage return', () => {
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) {
         if (entry.name === 'node_modules' || entry.name === 'dist' || entry.name === 'shots') continue;
+        // The desktop build copies locked production dependencies here. Like
+        // node_modules, these are generated vendor files, not tracked source.
+        if (full === path.join(ROOT, 'desktop', '.runtime-node-modules')) continue;
         walk(full);
         continue;
       }
@@ -1233,7 +1282,7 @@ test('docs/README.md counts the outbound calls with a recipe that still matches 
     `${comments.length} of the matched lines are comments:\n  ${show(comments)}`);
   assert.equal(imap.length, stated(/\*\*Zelos's own IMAP object\.\*\* (\w+) lines/, 'how many lines are the IMAP object'),
     `${imap.length} of the matched lines are the IMAP client's own fetch:\n  ${show(imap)}`);
-  assert.equal(real.length, stated(/\*\*(\w+) real outbound calls\*\*/, 'how many real outbound calls survive'),
+  assert.equal(real.length, stated(/\*\*(\w+) outbound entries\*\*/, 'how many outbound entries survive'),
     `${real.length} real outbound calls survive the two rules:\n  ${show(real)}`);
 
   const rows = [...section.matchAll(/^\| `([^`]+)` \| `([^`]+)` \|/gm)].map((m) => ({ file: m[1], fn: m[2] }));
@@ -1256,6 +1305,8 @@ test('docs/README.md counts the outbound calls with a recipe that still matches 
      the import in core/sources/imap.mjs at the count the prose states. */
   const second = [...section.matchAll(/```\ngrep -rn "([^"\n]+)" core\/ zelos\.mjs\n```/g)][1];
   assert.ok(second, 'the section should print a second `grep -rn "…" core/ zelos.mjs` command — the completeness check');
+  assert.ok(second[1].includes('transport\\.request') && second[1].includes('node:http') && second[1].includes('createTransport'),
+    'the audit must include aliased public HTTP(S) requests and the Nodemailer transport');
   assert.ok(second[1].includes('node:dns'),
     'the completeness-check grep never names node:dns, the primitive mail setup resolves MX and SRV records with');
   const otherPattern = new RegExp(second[1].split('\\|').map((alt) => alt.replace(/\(/g, '\\(')).join('|'));
@@ -1268,6 +1319,11 @@ test('docs/README.md counts the outbound calls with a recipe that still matches 
   }
   assert.ok(others.some((h) => h.file === 'core/sources/imap.mjs' && h.text.includes('node:dns')),
     'the completeness-check grep no longer turns up the node:dns import in core/sources/imap.mjs');
+  assert.deepEqual([...new Set(others.map(hit=>hit.file))].sort(),['core/booking-guest.mjs','core/documents.mjs','core/family-guest.mjs','core/mail-send.mjs','core/secrets.mjs','core/server.mjs','core/sources/imap.mjs','core/sources/oauth.mjs','core/web-research.mjs','zelos.mjs'],
+    'new network or native-process owners need an explicit audit, not only an updated count');
+  assert.equal(others.filter(hit=>hit.file==='core/web-research.mjs'&&hit.text.includes('transport.request')).length,1,
+    'the public reader has exactly one direct HTTP(S) request entry point');
+  assert.ok(others.some(hit=>hit.file==='core/web-research.mjs'&&hit.text.includes('node:dns/promises')),'public-web DNS must remain accounted for');
   assert.equal(others.length, stated(/(\w+) lines come back/, 'how many lines the completeness check returns'),
     `the completeness-check grep returns ${others.length} lines today, and the page says otherwise:\n  ${show(others)}`);
 });

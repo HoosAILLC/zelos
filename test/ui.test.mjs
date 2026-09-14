@@ -24,6 +24,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
+import { stripFixedNavigation } from './ui-navigation.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const UI = path.join(ROOT, 'ui');
@@ -410,13 +411,13 @@ test('every bucket has a label a person can read without decoding', () => {
 });
 
 test('sweepSummary reads as a sentence, and survives a run with no stats', () => {
-  // In a person's words — emails, appointments — and without the duration,
+  // In a person's words — messages, appointments — and without the duration,
   // which reads as a machine readout beside them and lives in the hover title.
   assert.equal(
     fmt.sweepSummary({ stats: { messages: 1, events: 2, items: 3, ms: 8_430 } }),
-    '1 email · 2 appointments · 3 items',
+    '1 message · 2 appointments · 3 items',
   );
-  assert.equal(fmt.sweepSummary({ stats: { messages: 214, events: 28 } }), '214 emails · 28 appointments');
+  assert.equal(fmt.sweepSummary({ stats: { messages: 214, events: 28 } }), '214 messages · 28 appointments');
   assert.equal(fmt.sweepSummary({ stats: {} }), '');
   assert.equal(fmt.sweepSummary(null), '');
   assert.equal(fmt.sweepDetail({ stats: { ms: 41_800 } }), 'took 41.8s');
@@ -497,11 +498,11 @@ test('no file in ui/ can put a string into the DOM as markup', () => {
   }
 });
 
-test('the page loads no remote resources; its one fixed release link is navigation only', () => {
+test('the page loads no remote resources; reviewed official links are navigation only', () => {
   // Zero CDN, works offline, and the server's CSP would refuse it anyway.
   const remote = /(https?:)?\/\/(?!127\.0\.0\.1|localhost)[a-z0-9]/i;
   for (const file of uiFiles()) {
-    const text = fs.readFileSync(file, 'utf8');
+    const text = stripFixedNavigation(path.relative(ROOT,file).split(path.sep).join('/'),fs.readFileSync(file, 'utf8'));
     for (const [i, line] of text.split('\n').entries()) {
       if (/^\s*(\*|\/\/|<!--)/.test(line)) continue;      // prose
       if (line.includes('http://www.w3.org/2000/svg')) continue; // an XML namespace, not a fetch
@@ -2010,7 +2011,9 @@ test('Settings can set who you are, and the value has a reader on the other end'
   // The readers, named rather than assumed.
   const triage = fs.readFileSync(path.join(ROOT, 'core/triage.mjs'), 'utf8');
   assert.match(triage, /const userEmail = str\(identity\.email\)/, 'core/triage.mjs no longer reads identity.email');
-  assert.match(triage, /sameEmail\(a\?\.email, ctx\.userEmail\)\)\) score \+= 6/, 'the To: branch this feeds is gone');
+  assert.match(triage, /identity\.emails/, 'triage no longer reads the configured own-account aliases');
+  assert.match(triage, /msg\.to\.some\(\(a\) => ctx\.userEmails\.some\(email => sameEmail\(a\?\.email, email\)\)\)\) score \+= 6/,
+    'the To: branch must recognize every configured own-account address');
   const sweep = fs.readFileSync(path.join(ROOT, 'core/sweep.mjs'), 'utf8');
   assert.match(sweep, /config\?\.identity\?\.email/, 'core/sweep.mjs no longer reads identity.email');
 });
@@ -3138,6 +3141,7 @@ function reqPathHolds(reqPath, text) {
 class PlainNode {
   constructor(tag) {
     this.tag = tag;
+    this.tagName = tag.toUpperCase();
     this.attributes = {};
     this.children = [];
     this.dataset = {};
@@ -3159,6 +3163,10 @@ class PlainNode {
   get hidden() { return 'hidden' in this.attributes; }
 
   set hidden(value) { if (value) this.attributes.hidden = ''; else delete this.attributes.hidden; }
+
+  get disabled() { return 'disabled' in this.attributes; }
+
+  set disabled(value) { if (value) this.attributes.disabled = ''; else delete this.attributes.disabled; }
 
   /** A `value` attribute is an input's default value, which a browser reflects as `.value` until someone types. */
   setAttribute(key, value) {
@@ -3207,19 +3215,51 @@ class PlainNode {
 
   scrollIntoView() {}
 
+  matches(selector) {
+    if (selector.startsWith('.')) {
+      const classes = (this.attributes.class || '').split(/\s+/);
+      return selector.slice(1).split('.').every(name => classes.includes(name));
+    }
+    if (selector.startsWith('#')) return this.attributes.id === selector.slice(1);
+    if (selector.startsWith('[')) {
+      const attributes = [...selector.matchAll(/\[([^=\]]+)(?:="([^"]*)")?\]/g)];
+      return attributes.length > 0 && attributes.every(([, name, value]) =>
+        value === undefined ? name in this.attributes : this.attributes[name] === value);
+    }
+    return this.tag === selector;
+  }
+
   closest(selector) {
-    const cls = selector.replace(/^\./, '');
     for (let n = this; n; n = n.parentNode) {
-      if ((n.attributes.class || '').split(/\s+/).includes(cls)) return n;
+      if (selector.split(',').some(part => n.matches(part.trim()))) return n;
     }
     return null;
   }
 
-  querySelectorAll() { return []; }
+  querySelectorAll(selector) {
+    const found = [];
+    const visit = node => {
+      for (const child of node.children) {
+        if (selector.split(',').some(part => child.matches(part.trim()))) found.push(child);
+        visit(child);
+      }
+    };
+    visit(this);
+    return found;
+  }
+
+  querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
 
   /** Fire a listener the way a browser would: `this` is the node, as is the target. */
-  fire(type) {
-    for (const fn of this.listeners.get(type) ?? []) fn.call(this, { target: this, currentTarget: this, preventDefault() {} });
+  fire(type, props = {}) {
+    const event = { target: this, currentTarget: this, preventDefault() { this.defaultPrevented = true; },
+      stopPropagation() { this.stopped = true; }, ...props };
+    for (let node = this; node; node = node.parentNode) {
+      event.currentTarget = node;
+      for (const fn of node.listeners.get(type) ?? []) fn.call(node, event);
+      if (event.stopped) break;
+    }
+    return event;
   }
 }
 
@@ -3230,11 +3270,12 @@ function withPlainDom(t) {
   const realRaf = globalThis.requestAnimationFrame;
   globalThis.Node = PlainNode;
   globalThis.document = {
-    documentElement: { style: { setProperty() {} } },
+    documentElement: { dataset: {}, style: { setProperty() {} } },
     visibilityState: 'visible',
     addEventListener() {},
     removeEventListener() {},
     createElement: (tag) => new PlainNode(tag),
+    createElementNS: (namespace, tag) => { const node = new PlainNode(tag); node.namespaceURI = namespace; return node; },
     createTextNode: (text) => {
       const node = new PlainNode('#text');
       node.textContent = String(text);
@@ -3363,11 +3404,12 @@ const GUESSES = {
   'frank@icloud.com': { label: 'iCloud Mail', host: 'imap.mail.me.com', port: 993, secure: true, auth: 'password', signIn: null, clientReady: false, appPasswordUrl: 'https://account.apple.com/account/manage', note: 'iCloud Mail requires an app-specific password. This provider does not accept your normal password over IMAP.', known: true },
 };
 
-function runAppScenario({ initiallyConfigured = true, storageUnavailable = false, beforeBoot = '', scenario }) {
+function runAppScenario({ initiallyConfigured = true, storageUnavailable = false, mobile = true, beforeBoot = '', scenario }) {
   // Run the actual shell in its own process: its subscriptions and timers live
   // for the whole page, and must not leak into the renderer tests in this file.
     const script = `
       import assert from 'node:assert/strict';
+      import { mock } from 'node:test';
       const PlainNode = ${PlainNode.toString()};
       const plainWalk = ${plainWalk.toString()};
       const textOf = ${textOf.toString()};
@@ -3384,22 +3426,40 @@ function runAppScenario({ initiallyConfigured = true, storageUnavailable = false
       globalThis.localStorage = storage();
       globalThis.sessionStorage = storage();
       const windowEvents = {};
+      const mediaQueries = new Map();
+      const matchMedia = query => {
+        if (!mediaQueries.has(query)) {
+          const listeners = new Set();
+          mediaQueries.set(query, { media: query, matches: ${JSON.stringify(mobile)},
+            addEventListener(type, listener) { if (type === 'change') listeners.add(listener); },
+            removeEventListener(type, listener) { if (type === 'change') listeners.delete(listener); },
+            change(matches) { this.matches = matches; for (const listener of listeners) listener({ media: query, matches }); },
+          });
+        }
+        return mediaQueries.get(query);
+      };
       globalThis.window = {
-        location: { href: 'http://127.0.0.1/?t=test', host: '127.0.0.1', hash: '#/now' },
-        history: { replaceState() {} }, addEventListener: (name, fn) => { windowEvents[name] = fn; }, scrollTo() {},
-        matchMedia: () => ({ matches: true }),
+        location: { href: 'http://127.0.0.1/?t=test#/now', host: '127.0.0.1', hash: '#/now' },
+        history: { replaceState(_state, _title, url) { if (url) window.location.hash = new URL(url, window.location.href).hash; } }, addEventListener: (name, fn) => { windowEvents[name] = fn; }, scrollTo() {},
+        matchMedia,
       };
       const root = new PlainNode('div');
       PlainNode.prototype.contains = function(node) { return plainWalk(this).includes(node); };
       PlainNode.prototype.focus = function() { document.activeElement = this; };
       PlainNode.prototype.getBoundingClientRect = () => ({ height: 100 });
-      PlainNode.prototype.querySelector = function(selector) {
-        return plainWalk(this).find(n => (n.attributes.class || '').split(' ').includes(selector.slice(1))) || null;
+      const documentEvents = new Map();
+      const fireDocument = (type, props = {}) => {
+        const event = { type, preventDefault() { this.defaultPrevented = true; }, ...props };
+        for (const listener of documentEvents.get(type) || []) listener(event);
+        return event;
       };
       globalThis.document = {
-        documentElement: { style: { setProperty() {} } }, body: new PlainNode('body'), activeElement: null,
-        visibilityState: 'visible', addEventListener() {}, removeEventListener() {},
+        documentElement: { dataset: {}, style: { setProperty() {} } }, body: new PlainNode('body'), activeElement: null,
+        visibilityState: 'visible',
+        addEventListener(type, listener) { documentEvents.set(type, [...(documentEvents.get(type) || []), listener]); },
+        removeEventListener(type, listener) { documentEvents.set(type, (documentEvents.get(type) || []).filter(fn => fn !== listener)); },
         createElement: tag => new PlainNode(tag),
+        createElementNS: (namespace, tag) => { const node = new PlainNode(tag); node.namespaceURI = namespace; return node; },
         createTextNode: text => { const n = new PlainNode('#text'); n.textContent = String(text); return n; },
         getElementById: id => id === 'app' ? root : null,
       };
@@ -3424,8 +3484,20 @@ function runAppScenario({ initiallyConfigured = true, storageUnavailable = false
       api.helpLinks = async () => ({});
       const settle = async () => { await new Promise(setImmediate); await new Promise(setImmediate); };
       ${beforeBoot}
+      // Exercise the real initial launch hold without adding a wall-clock wait
+      // to every route/save scenario. Restore normal timers before interaction.
+      let launchClock = 0;
+      mock.method(performance, 'now', () => launchClock);
+      mock.timers.enable({ apis: ['setTimeout'] });
       await import(${JSON.stringify(fileUrl(UI, 'app.js'))});
       await settle();
+      assert.ok(root.querySelector('.zelos-launch'), 'the ready workspace retains its initial launch screen');
+      launchClock = 1999; mock.timers.tick(1999);
+      assert.ok(root.querySelector('.zelos-launch'), 'the launch must not end before its deadline');
+      launchClock = 2000; mock.timers.tick(1);
+      await settle();
+      assert.equal(root.querySelector('.zelos-launch'), null, 'the real timer must reveal the ready workspace');
+      mock.timers.reset(); mock.restoreAll();
       ${scenario}
     `;
     const run = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', timeout: 10_000 });
@@ -3453,6 +3525,208 @@ test('the skip link focuses the current view without changing its route', () => 
     assert.equal(window.location.hash, '#/today');
     assert.equal(main.firstChild, content, 'the current calendar must stay in place');
     assert.equal(document.activeElement, main);
+  ` });
+});
+
+test('the mobile sidebar toggle, backdrop and Escape preserve an unfinished reminder and restore focus', () => {
+  runAppScenario({ mobile: true, scenario: `
+    const byLabel = label => plainWalk(root).find(n => n.attributes['aria-label'] === label);
+    const toggle = byLabel('Toggle sidebar');
+    const backdrop = byLabel('Close sidebar');
+    assert.ok(toggle && backdrop);
+    assert.equal(toggle.getAttribute('aria-controls'), 'workspace-sidebar');
+    assert.equal(toggle.getAttribute('aria-expanded'), 'false');
+    assert.ok(plainWalk(toggle).some(n => n.tag === 'svg' && n.namespaceURI === 'http://www.w3.org/2000/svg'));
+    findButton(root, 'Add a reminder').fire('click');
+    const capture = plainWalk(root).find(n => n.attributes.class === 'capture');
+    const field = plainWalk(capture).find(n => n.tag === 'textarea');
+    field.value = 'Keep this unfinished reminder';
+    toggle.fire('click');
+    assert.equal(document.documentElement.dataset.sidebarOpen, 'true');
+    assert.equal(toggle.getAttribute('aria-expanded'), 'true');
+    const currentLink = plainWalk(root).find(n => n.getAttribute('aria-current') === 'page');
+    assert.equal(document.activeElement, currentLink, 'opening the drawer focuses its current view');
+    fireDocument('keydown', { key: 'Escape' });
+    assert.equal(document.documentElement.dataset.sidebarOpen, 'false');
+    assert.equal(toggle.getAttribute('aria-expanded'), 'false');
+    assert.equal(document.activeElement, toggle);
+    assert.equal(capture.hidden, false, 'one Escape must close only the sidebar');
+    assert.equal(field.value, 'Keep this unfinished reminder');
+    fireDocument('keydown', { key: 'Escape' });
+    assert.equal(capture.hidden, true);
+    assert.equal(document.activeElement, findButton(root, 'Add a reminder'));
+    toggle.fire('click');
+    backdrop.fire('click');
+    assert.equal(document.documentElement.dataset.sidebarOpen, 'false');
+    assert.equal(toggle.getAttribute('aria-expanded'), 'false');
+    assert.equal(document.activeElement, toggle);
+    assert.equal(field.value, 'Keep this unfinished reminder');
+  ` });
+});
+
+test('sidebar links preserve real view routes and navigation closes the phone drawer', () => {
+  runAppScenario({ mobile: true, scenario: `
+    const sidebar = () => plainWalk(root).find(n => n.attributes.id === 'workspace-sidebar');
+    const links = () => plainWalk(sidebar()).filter(n => (n.attributes.class || '').split(' ').includes('nav-link'));
+    assert.deepEqual(links().map(n => n.getAttribute('href')), [
+      '#/ask', '#/jobs', '#/search', '#/progress', '#/finance', '#/health', '#/family', '#/shopping', '#/documents', '#/booking', '#/now', '#/today', '#/mail', '#/owed', '#/calendar', '#/settings',
+    ]);
+    const toggle = plainWalk(root).find(n => n.attributes['aria-label'] === 'Toggle sidebar');
+    toggle.fire('click');
+    const mainBefore = plainWalk(root).find(n => n.attributes.id === 'main');
+    const contentBefore = mainBefore.firstChild;
+    const currentLink = links().find(n => n.getAttribute('href') === '#/now');
+    currentLink.querySelector('.nav-label').fire('click');
+    assert.equal(document.documentElement.dataset.sidebarOpen, 'false', 'clicking the current route also closes the drawer');
+    assert.equal(document.activeElement, mainBefore);
+    assert.equal(mainBefore.firstChild, contentBefore, 'a same-route link must not replace the view');
+    toggle.fire('click');
+    assert.equal(document.documentElement.dataset.sidebarOpen, 'true');
+    const askLink = links().find(n => n.getAttribute('href') === '#/ask');
+    askLink.fire('click');
+    // Follow the anchor's native navigation and deliver its hashchange event.
+    window.location.hash = askLink.getAttribute('href');
+    windowEvents.hashchange();
+    assert.equal(document.documentElement.dataset.sidebarOpen, 'false');
+    assert.equal(toggle.getAttribute('aria-expanded'), 'false');
+    assert.equal(links().filter(n => n.getAttribute('aria-current') === 'page').length, 1);
+    assert.equal(links().find(n => n.getAttribute('aria-current') === 'page').getAttribute('href'), '#/ask');
+    const main = plainWalk(root).find(n => n.attributes.id === 'main');
+    assert.equal(main.dataset.view, 'ask');
+    assert.equal(document.activeElement, main);
+    assert.ok(plainWalk(main).some(n => n.attributes['aria-label'] === 'Your question'));
+  ` });
+});
+
+const mailShellFixture = `
+  const mailCalls = [];
+  const mailbox = { id: 'work', label: 'Work', address: 'owner@example.test', canSend: true };
+  const message = { id: 'message/one', source_id: mailbox.id, from_email: 'partner@example.test',
+    subject: 'A saved email', body: 'Original plain text', sent_at: '2026-09-11T09:00:00Z' };
+  let storedDraft = { id: 'draft/one', message_id: message.id, account_id: mailbox.id, to_email: message.from_email,
+    subject: 'Re: A saved email', body: 'Original draft', state: 'pending' };
+  const detail = () => ({ message, accountId: mailbox.id, replyTo: message.from_email, draft: { ...storedDraft } });
+  api.mailMessages = async () => ({ accounts: [mailbox], messages: [message], nextCursor: null });
+  api.mailMessage = async id => { mailCalls.push(['message', id]); return detail(); };
+  api.mailDraft = async id => { mailCalls.push(['draft', id]); return detail(); };
+  let saveMail = async value => {
+    storedDraft = { ...storedDraft, to_email: value.to, subject: value.subject, body: value.body };
+    return { draft: { ...storedDraft } };
+  };
+  api.saveMailReply = async value => { mailCalls.push(['save', value]); return saveMail(value); };
+  api.sendMailReply = async () => { throw new Error('A route or save must never send email'); };
+  const goto = async hash => { window.location.hash = hash; await windowEvents.hashchange(); await settle(); };
+  const field = label => plainWalk(root).find(n => n.attributes['aria-label'] === label);
+  const mainNode = () => plainWalk(root).find(n => n.attributes.id === 'main');
+`;
+
+test('Email sidebar and encoded message/draft routes reach the correct saved records', () => {
+  runAppScenario({ beforeBoot: mailShellFixture, scenario: `
+    const link = plainWalk(root).find(n => n.getAttribute('href') === '#/mail');
+    assert.match(textOf(link), /Email/);
+    assert.ok(plainWalk(link).some(n => n.tag === 'svg'));
+    await goto('#/mail/message%2Fone');
+    assert.equal(mainNode().dataset.view, 'mail');
+    assert.deepEqual(mailCalls[0], ['message', 'message/one']);
+    assert.equal(field('Reply body').value, 'Original draft');
+    await goto('#/mail/draft/draft%2Fone');
+    assert.ok(mailCalls.some(call => call[0] === 'draft' && call[1] === 'draft/one'));
+    await goto('#/mail/draft/draft%2Ftwo');
+    assert.ok(mailCalls.some(call => call[0] === 'draft' && call[1] === 'draft/two'), 'changing only a draft ID must load the next draft');
+    assert.ok(!mailCalls.some(call => call[0] === 'save'));
+  ` });
+});
+
+test('leaving Email waits for saves, restores its route on failure, and safely retries', () => {
+  runAppScenario({ beforeBoot: mailShellFixture, scenario: `
+    await goto('#/mail/message%2Fone');
+    const body = field('Reply body');
+    body.value = 'Keep my latest reply'; body.fire('input');
+    let rejectSave;
+    saveMail = () => new Promise((resolve, reject) => { rejectSave = reject; });
+    window.location.hash = '#/today';
+    const leaving = windowEvents.hashchange();
+    await settle();
+    assert.equal(mainNode().dataset.view, 'mail', 'the old view stays until its write finishes');
+    rejectSave(new Error('Cannot save right now'));
+    await leaving;
+    assert.equal(window.location.hash, '#/mail/message%2Fone');
+    assert.equal(field('Reply body'), body);
+    assert.equal(body.value, 'Keep my latest reply');
+    assert.match(textOf(root), /Could not leave Email/);
+    saveMail = async value => ({ draft: { ...storedDraft, body: value.body } });
+    await goto('#/today');
+    assert.equal(mainNode().dataset.view, 'today');
+    assert.equal(mailCalls.filter(call => call[0] === 'save').length, 2);
+    const store = await import(${JSON.stringify(fileUrl(UI, 'lib/store.js'))});
+    store.notify(null);
+  ` });
+});
+
+test('a later route wins while an Email save is pending', () => {
+  runAppScenario({ beforeBoot: mailShellFixture, scenario: `
+    await goto('#/mail/message%2Fone');
+    field('Reply body').value = 'Save before leaving'; field('Reply body').fire('input');
+    let releaseSave;
+    saveMail = value => new Promise(resolve => { releaseSave = () => resolve({ draft: { ...storedDraft, body: value.body } }); });
+    window.location.hash = '#/today'; const first = windowEvents.hashchange();
+    await settle();
+    window.location.hash = '#/ask'; const latest = windowEvents.hashchange();
+    releaseSave(); await Promise.all([first, latest]);
+    assert.equal(window.location.hash, '#/ask');
+    assert.equal(mainNode().dataset.view, 'ask');
+    assert.equal(mailCalls.filter(call => call[0] === 'save').length, 1);
+  ` });
+});
+
+test('desktop flush saves both Promises and Email edits without sending', () => {
+  runAppScenario({ beforeBoot: mailShellFixture + `
+    api.state = async () => ({ items: [], drafts: [{ ...storedDraft }], events: [], counts: {}, notes: [], runs: {} });
+    api.updateDraft = async (id, patch) => { mailCalls.push(['owed-save', id, patch]); return {}; };
+  `, scenario: `
+    await goto('#/owed');
+    const owedBody = plainWalk(root).find(n => n.tag === 'textarea' && n.attributes['aria-label']?.startsWith('Draft to'));
+    owedBody.value = 'Edited in Promises'; owedBody.fire('input');
+    await goto('#/mail/message%2Fone');
+    field('Reply body').value = 'Edited in Email'; field('Reply body').fire('input');
+    assert.equal(await globalThis.__zelosFlushDrafts(), true);
+    assert.ok(mailCalls.some(call => call[0] === 'owed-save' && call[2].body === 'Edited in Promises'));
+    assert.ok(mailCalls.some(call => call[0] === 'save' && call[1].body === 'Edited in Email'));
+  ` });
+});
+
+test('desktop sidebar collapse is independent of the mobile drawer and survives navigation', () => {
+  runAppScenario({ mobile: false, scenario: `
+    const toggle = plainWalk(root).find(n => n.attributes['aria-label'] === 'Toggle sidebar');
+    assert.equal(toggle.getAttribute('aria-expanded'), 'true');
+    toggle.fire('click');
+    assert.equal(document.documentElement.dataset.sidebarCollapsed, 'true');
+    assert.notEqual(document.documentElement.dataset.sidebarOpen, 'true');
+    assert.equal(toggle.getAttribute('aria-expanded'), 'false');
+    window.location.hash = '#/today';
+    windowEvents.hashchange();
+    assert.equal(document.documentElement.dataset.sidebarCollapsed, 'true');
+    assert.equal(toggle.getAttribute('aria-expanded'), 'false');
+    toggle.fire('click');
+    assert.equal(document.documentElement.dataset.sidebarCollapsed, 'false');
+    assert.equal(toggle.getAttribute('aria-expanded'), 'true');
+  ` });
+});
+
+test('crossing the sidebar breakpoint closes the phone drawer and updates its accessible state', () => {
+  runAppScenario({ mobile: true, scenario: `
+    const toggle = plainWalk(root).find(n => n.attributes['aria-label'] === 'Toggle sidebar');
+    const media = window.matchMedia('(max-width: 759px)');
+    toggle.fire('click');
+    assert.equal(document.documentElement.dataset.sidebarOpen, 'true');
+    media.change(false);
+    assert.equal(document.documentElement.dataset.sidebarOpen, 'false');
+    assert.equal(toggle.getAttribute('aria-expanded'), 'true', 'the desktop sidebar is initially expanded');
+    toggle.fire('click');
+    assert.equal(document.documentElement.dataset.sidebarCollapsed, 'true');
+    media.change(true);
+    assert.equal(document.documentElement.dataset.sidebarOpen, 'false');
+    assert.equal(toggle.getAttribute('aria-expanded'), 'false', 'returning to phone width does not reopen the drawer');
   ` });
 });
 
@@ -3541,7 +3815,7 @@ test('no screen in onboarding, and no mail card, shows a first-timer a protocol 
   assert.match(seen, /Step 1 of 5/);
   for (const name of ['Welcome', 'AI', 'Email', 'Calendar', 'Done']) assert.match(seen, new RegExp(`\\b${name}\\b`), `step name ${name} is not on the first screen`);
   assert.match(seen, /Zelos reads your email and calendar, and tells you what needs you\./);
-  assert.match(seen, /It never sends, moves or deletes your mail\. Your archive is stored on this computer\./);
+  assert.match(seen, /Your private library stays on the computer running Zelos\. Review a reply and choose Send reply whenever you are ready\./);
   assert.ok(findButton(view, 'Set up Zelos'), 'no "Set up Zelos" button');
   await settle();
   assert.ok(findButton(view, 'Look around with made-up data first'), 'no "Look around with made-up data first" button');
@@ -3754,6 +4028,40 @@ test('a draft edit lands in the board copy before the save returns, so a repaint
   await settle();
   assert.deepEqual(puts.filter((p) => p.method === 'PUT').map((p) => p.body),
     [{ body: 'The body as edited.', state: 'edited' }]);
+});
+
+test('a Promises reply saves before opening Email and keeps edits when saving fails', async (t) => {
+  withPlainDom(t);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const owed = await import(fileUrl(UI, 'views/owed.js'));
+  const { api } = await import(fileUrl(UI, 'lib/api.js'));
+  const routes = [];
+  const bodies = [];
+  let fail = true;
+  let release;
+  t.mock.method(api, 'updateDraft', async (_id, patch) => {
+    bodies.push(patch.body);
+    if (fail) throw new Error('The draft could not be saved');
+    await new Promise(resolve => { release = resolve; });
+  });
+  t.mock.method(api, 'sendMailReply', async () => assert.fail('Opening a draft must never send it'));
+  store.state.board = { ...store.state.board, items: [], drafts: [{ id: 'review/draft', state: 'pending', body: 'Original' }] };
+  const view = owed.renderOwed({ tz: 'UTC', navigate: hash => routes.push(hash) });
+  const area = findInput(view, node => node.tag === 'textarea');
+  const review = findButton(view, 'Review & send in Zelos');
+  area.value = 'The exact edited reply'; area.fire('input');
+  review.fire('click'); await settle();
+  assert.deepEqual(routes, []);
+  assert.equal(area.value, 'The exact edited reply');
+  assert.match(textOf(view), /Your text is still here/);
+  fail = false;
+  review.fire('click'); await settle();
+  assert.equal(review.disabled, true);
+  assert.deepEqual(routes, []);
+  release(); await settle();
+  assert.deepEqual(routes, ['#/mail/draft/review%2Fdraft']);
+  assert.deepEqual(bodies, ['The exact edited reply', 'The exact edited reply']);
 });
 
 test('native leave flushes a draft before its debounce and waits for the write', async (t) => {
@@ -4184,10 +4492,11 @@ test('the mailto rides the live textarea at click time, and says so when only th
   area.fire('blur');
   await settle();
 
-  // Copy stays the first-class door.
+  // Review is the main action; Copy and the external email program remain.
   const actions = plainWalk(view).find((n) => (n.attributes.class || '') === 'draft-actions');
-  assert.equal(textOf(actions.children[0]), 'Copy the text');
+  assert.equal(textOf(actions.children[0]), 'Review & send in Zelos');
   assert.match(actions.children[0].attributes.class, /solid/);
+  assert.ok(findButton(actions, 'Copy the text'));
 });
 
 test('the hero can be told "Not a thing", through the same controls the rows get', async (t) => {
@@ -4504,7 +4813,7 @@ test('the guided AI card stores the key, tests, picks the model itself, saves an
   assert.equal(tested.model, 'claude-sonnet-5', 'the test did not carry the model the card picked');
   assert.equal(tested.baseUrl, anthropic.baseUrl);
   const saved = calls.find((c) => c.path === '/api/config').body.model;
-  assert.deepEqual(saved, { protocol: 'anthropic', label: 'Anthropic', baseUrl: anthropic.baseUrl, model: 'claude-sonnet-5', keyRef: 'model.default' });
+  assert.deepEqual(saved, { protocol: 'anthropic', label: 'Anthropic', baseUrl: anthropic.baseUrl, model: 'claude-sonnet-5', keyRef: 'model.default', maxTokens: 8192 });
   assert.equal(key.value, '', 'the key is still in the box after it was stored');
   assert.match(onScreen(panel), /Working\. Zelos will use Claude\./);
   assert.equal(done, 1, 'onDone did not fire, so onboarding would not advance');
@@ -4882,9 +5191,9 @@ test('Settings opens on Email, reads in plain words, keeps every route, and puts
   const first = plainWalk(share).find((n) => n.attributes.role === 'tabpanel').children[0];
   assert.match(textOf(first), /^This is NOT where you choose the AI that reads your mail — that is under AI\. Leave this off unless you know what it is\./);
 
-  // Other things it can read opens by telling most people to leave.
+  // Other things it can read includes optional accounts and local sources.
   const other = settings.renderSettings({ sub: 'sources', navigate() {}, rerender() {} });
-  assert.match(onScreen(other), /Most people need nothing here\. If you use any of these work tools, add them\./);
+  assert.match(onScreen(other), /Add other accounts or local sources you want Zelos to read\./);
 
   // You: the address is "yours", and a blank name is explained in terms of the replies.
   const you = settings.renderSettings({ sub: 'you', navigate() {}, rerender() {} });
@@ -4892,12 +5201,14 @@ test('Settings opens on Email, reads in plain words, keeps every route, and puts
   assert.match(onScreen(you), /If you leave this blank, the replies Zelos writes for you will not be signed\./);
   assert.doesNotMatch(onScreen(you), /prompt/, 'the You tab still talks about prompts');
 
-  // Privacy: two sentences and one switch on the card; the two numbers under Advanced.
+  // Privacy: explain hosted sharing and the content switch; numbers stay under Advanced.
   const privacy = settings.renderSettings({ sub: 'privacy', navigate() {}, rerender() {} });
-  assert.match(onScreen(privacy), /Zelos only talks to the AI service you chose\. It sends nothing to us and nothing to anyone else\./);
-  assert.match(onScreen(privacy), /Let the AI read the full text of your emails \(recommended — it does a better job\)/);
-  assert.doesNotMatch(onScreen(privacy), /Characters of each|Most items per|telemetry|endpoint/, 'the expert numbers are on the Privacy card');
-  assert.match(anywhere(privacy), /Characters of each email sent to the AI/, 'the expert numbers are gone rather than folded');
+  assert.match(onScreen(privacy), /AI reviews and Ask send selected board content to your chosen AI service/);
+  assert.match(onScreen(privacy), /With Claude, that content goes to Anthropic/);
+  assert.match(onScreen(privacy), /Include full message text and calendar descriptions in AI reviews/);
+  assert.match(onScreen(privacy), /questions, notes and existing board summaries can also contain private information/);
+  assert.doesNotMatch(onScreen(privacy), /Characters from each|Most items per|telemetry|endpoint/, 'the expert numbers are on the Privacy card');
+  assert.match(anywhere(privacy), /Characters from each message or calendar description/, 'the expert numbers are gone rather than folded');
 
   // About: one plain line on passwords, the spend as "AI usage today", the essay folded and un-shouted.
   const about = settings.renderSettings({ sub: 'about', navigate() {}, rerender() {} });
@@ -5023,7 +5334,8 @@ test('no user-facing failure names an address the person did not type, and the b
   assert.match(app, /label: 'Promises', render: renderOwed/);
   assert.match(app, /button\('Add a reminder', \{/);
   assert.match(app, /class: 'btn solid', text: 'Save' \}/);
-  assert.match(app, /: 'no AI chosen yet' \}/);
+  assert.match(app, /text: model\?\.configured \? \(model\.local \? 'Local AI' : 'Connected AI'\) : 'Choose an AI'/);
+  assert.match(app, /text: model\?\.configured \? model\.label : 'Finish setting up Zelos'/);
   // Tokens and duration left the line for its hover title and the About panel.
   assert.ok(!/tokenNode/.test(app), 'the token line is still painted beside the header');
   assert.match(app, /parts\.node\.setAttribute\('title', title\)/, 'the duration and spend have no hover title');
@@ -5035,7 +5347,7 @@ test('no user-facing failure names an address the person did not type, and the b
   assert.match(items, /title: 'More',\n\s+'aria-label': `More — \$\{item\.headline \|\| 'this item'\}`/, 'the ··· button has no name');
   const owed = fs.readFileSync(path.join(UI, 'views/owed.js'), 'utf8');
   assert.match(owed, /section\('Replies it wrote for you', \{/);
-  assert.match(owed, /note: 'Open one in your email program, check it, and press send there\./);
+  assert.match(owed, /note: 'Review a reply in Email, then choose Send reply when it is ready\./);
   assert.match(owed, /button\('Copy the text', \{/);
   assert.ok(!/section\('Ready to send'/.test(owed), '"Ready to send" is back beside "never sends mail"');
   const today = fs.readFileSync(path.join(UI, 'views/today.js'), 'utf8');
@@ -5144,7 +5456,7 @@ test('Ask labels a response cut short by its answer limit and keeps that notice 
   field.value = 'And next?';
   form.fire('submit');
   await settle();
-  const next = plainWalk(view).find(n => n.attributes.class === 'exchange');
+  const next = plainWalk(view).filter(n => n.attributes.class === 'exchange').at(-1);
   assert.equal(textOf(plainWalk(next).find(n => n.attributes.class === 'exchange-note-slot')), '', 'a normal answer must not get the warning');
 });
 
@@ -5196,13 +5508,13 @@ test('Ask, Search, the Calendar and the sharing panel meet a first-timer without
   const ask = await import(fileUrl(UI, 'views/ask.js'));
   let seen = onScreen(ask.renderAsk(ctx));
   assert.match(seen, /Ask needs an AI/);
-  assert.match(seen, /Questions are answered by the AI you choose/);
+  assert.match(seen, /Ask general questions.*AI you choose/);
   assert.ok(findButton(ask.renderAsk(ctx), 'Choose an AI'), 'the empty state does not offer "Choose an AI"');
   assert.doesNotMatch(seen, STRAGGLERS, explain('Ask, empty', seen));
   // And with one: the page itself, lede and form.
   store.state.health = { model: { configured: true }, backend: { name: 'encrypted-file' } };
   seen = onScreen(ask.renderAsk(ctx));
-  assert.match(seen, /Ask about your own mail, calendar and notes/);
+  assert.match(seen, /Ask a question.*private records/);
   assert.doesNotMatch(seen, STRAGGLERS, explain('Ask', seen));
   // The one sentence the page says when the server answers 409 is not
   // reachable without a server, so it is read off the source.
@@ -5704,6 +6016,6 @@ test('Your data counts what Zelos is holding, and stands unchanged when the rout
   };
   const bare = settings.renderSettings({ sub: 'data', navigate() {}, rerender() {} });
   await settle();
-  assert.match(onScreen(bare), /Your board and saved history live in one folder on this computer\./);
+  assert.match(onScreen(bare), /Your records and saved history live on the computer running Zelos\./);
   assert.doesNotMatch(onScreen(bare), /on disk/, 'a panel with no answer must not claim a size');
 });

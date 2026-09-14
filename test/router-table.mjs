@@ -35,10 +35,6 @@
  *    that is not MCP", and the AI-token suite asserts that rather than assuming
  *    it.
  *
- * test/security.test.mjs still carries its own copy of this parser at :159. It
- * is not one of the files this pass owns, and the swap is one import plus a
- * deletion; until it happens, the two derivations read the same table from the
- * same file, so neither can drift away from the router — only from each other.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -50,8 +46,7 @@ const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const ROUTE_QUERY = { '/api/search': '?q=x' };
 
 /** -> [[method, requestPath], ...] for every route core/server.mjs serves. */
-export function readRouterTable() {
-  const source = fs.readFileSync(path.join(REPO, 'core', 'server.mjs'), 'utf8');
+export function readRouterTable(source = fs.readFileSync(path.join(REPO, 'core', 'server.mjs'), 'utf8')) {
   const block = /\nconst ROUTES = \[\n([\s\S]*?)\n\];/.exec(source);
   if (!block) throw new Error('core/server.mjs has no ROUTES array this parser can read — fix the parser, do not restate the table');
 
@@ -69,25 +64,39 @@ export function readRouterTable() {
   // closes a literal, because the pattern bodies contain escaped slashes.
   const ROUTE = /\[\s*'([A-Z]+)'\s*,\s*(?:\/(.+?)\/\s*,|new RegExp\(`(.+?)`\)\s*,)/g;
   const rows = [];
+  let parsedRows = 0;
   for (const m of block[1].matchAll(ROUTE)) {
+    parsedRows++;
     const method = m[1];
     const pattern = (m[2] ?? m[3])
+      .replaceAll('\\\\.', '.')              // template-string escaped literal dot
+      .replaceAll('\\.', '.')                // regex-literal escaped literal dot
       .replaceAll('${ID}', SAMPLE_ID)      // the interpolated segment
       .replaceAll('\\/', '/')              // an escaped slash is just a slash
       .replace(/^\^/, '')
       .replace(/\$$/, '');
-    if (/[\\^$*+?()[\]{}|]/.test(pattern)) {
-      throw new Error(`this parser cannot turn ${method} ${m[2] ?? m[3]} into a request path — it left ${pattern}`);
+    // Expand every flat literal alternative, including each Plaid action.
+    // Anything more complex still fails closed and needs a parser update.
+    let variants = [pattern];
+    while (variants.some(p => /\(([A-Za-z0-9_-]+(?:\|[A-Za-z0-9_-]+)+)\)/.test(p))) {
+      variants = variants.flatMap(p => {
+        const g = /\(([A-Za-z0-9_-]+(?:\|[A-Za-z0-9_-]+)+)\)/.exec(p);
+        return g ? g[1].split('|').map(v => p.slice(0,g.index)+v+p.slice(g.index+g[0].length)) : [p];
+      });
     }
-    rows.push([method, `${pattern}${ROUTE_QUERY[pattern] ?? ''}`]);
+    if (variants.length > 256) throw new Error(`too many route alternatives for ${method}`);
+    for (const p of variants) {
+      if (/[\\^$*+?()[\]{}|]/.test(p)) throw new Error(`this parser cannot turn ${method} ${p} into a request path`);
+      rows.push([method, `${p}${ROUTE_QUERY[p] ?? ''}`]);
+    }
   }
 
   // Every line of the table has to have been read. A row this regex skipped
   // would be a route silently exempt from the tests below it, which is the exact
   // failure this derivation exists to end.
   const declared = block[1].split('\n').filter((line) => /^\s*\['[A-Z]+'/.test(line)).length;
-  if (rows.length !== declared) {
-    throw new Error(`core/server.mjs declares ${declared} routes and this parser read ${rows.length}`);
+  if (parsedRows !== declared) {
+    throw new Error(`core/server.mjs declares ${declared} routes and this parser read ${parsedRows}`);
   }
   if (rows.length < 25) throw new Error(`only ${rows.length} routes were read — the parser is broken`);
   return rows;

@@ -103,7 +103,7 @@ export function stepLine(current = step) {
 function shell(rerender, navigate, { title, lede, body, primary = null, skip = 'Do this later', actions = null, help = null }) {
   return el('div', { class: 'view view-onboarding' }, [
     el('header', { class: 'ob-head' }, [
-      el('p', { class: 'ob-mark', title: 'Zelos, in Greek', text: 'ΖΗΛΟΣ' }),
+      el('p', { class: 'ob-mark', text: 'Zelos' }),
       progressRail(rerender),
       el('p', { class: 'quiet-note ob-count', text: stepLine() }),
     ]),
@@ -264,13 +264,13 @@ function startScreen(rerender, navigate) {
 
   return shell(rerender, navigate, {
     title: 'Zelos reads your email and calendar, and tells you what needs you.',
-    lede: 'It never sends, moves or deletes your mail. Your archive is stored on this computer.',
+    lede: 'Your private library stays on the computer running Zelos. Review a reply and choose Send reply whenever you are ready.',
     body: el('div', { class: 'stack' }, [
       sampleNote,
       el('ul', { class: 'ob-points' }, [
-        el('li', { text: 'Zelos only looks at your mail. It never marks anything read, never moves anything, never deletes anything.' }),
-        el('li', { text: 'The thinking is done by an AI you choose. Choose one running on this computer to process what Zelos reads here.' }),
-        el('li', { text: 'Zelos never sends mail. It writes replies for you; you press send, in your own email program.' }),
+        el('li', { text: 'Reading mail never marks anything read, moves anything, or deletes anything in your mailbox.' }),
+        el('li', { text: 'Your chosen AI does the thinking for your private library.' }),
+        el('li', { text: 'Replies stay drafts until you review the sender, recipient and message, then choose Send reply. You can also use your own email program.' }),
       ]),
     ]),
     actions,

@@ -17,20 +17,32 @@
  *    whatever it contains.
  */
 
+import { launchScreen, animateLaunch, createLaunchHold } from './lib/loading.js';
 import { el, button, meander, replace, focusQuietly } from './lib/dom.js';
 import {
   state, subscribe, refresh, watchSweeps, watchBoard, startSweep, railCounts, timezone,
   needsOnboarding, onboardingDone, applyAccent, currentAccent, notify, nowMark, checkAgainLine,
 } from './lib/store.js';
+import { icon } from './lib/icons.js';
 import { api, hasToken } from './lib/api.js';
 import { BUCKET_LABEL, sweepSummary, sweepDetail, tokenLine } from './lib/format.js';
 import { humanDelta, formatDay } from './lib/time.js';
 import { createCommandMenu, commandShortcut } from './lib/commands.js';
 import { parseConnectionTarget } from './lib/source-status.js';
+import { installSelects } from './lib/select.js';
 
+import { renderProgress } from './views/progress.js';
+import { renderFinance } from './views/finance.js';
+import { renderHealth } from './views/health.js';
+import { renderJobs } from './views/jobs.js';
+import { renderDocuments } from './views/documents.js';
+import { renderBooking } from './views/booking.js';
+import { renderShopping } from './views/shopping.js';
+import { renderFamily } from './views/family.js';
 import { renderNow } from './views/now.js';
 import { renderToday } from './views/today.js';
-import { renderOwed } from './views/owed.js';
+import { renderOwed, flushDrafts } from './views/owed.js';
+import { renderMail, flushMailDrafts } from './views/mail.js';
 import { renderCalendar, tickNowLine } from './views/calendar.js';
 import { renderSearch } from './views/search.js';
 import { renderAsk } from './views/ask.js';
@@ -46,9 +58,18 @@ const VIEWS = [
   // "Promises", not "Owed": owed what, by whom? was the audit's question. The
   // view holds what you promised and what was promised to you.
   { id: 'owed', label: 'Promises', render: renderOwed, countKey: 'drafts' },
+  { id: 'mail', label: 'Email', render: renderMail, countKey: null },
   { id: 'calendar', label: 'Calendar', render: renderCalendar, countKey: 'events' },
   { id: 'search', label: 'Search', render: renderSearch, countKey: null },
   { id: 'ask', label: 'Ask', render: renderAsk, countKey: null },
+  { id: 'progress', label: 'Progress', render: renderProgress, countKey: null },
+  { id: 'finance', label: 'Money', render: renderFinance, countKey: null },
+  { id: 'health', label: 'Health', render: renderHealth, countKey: null },
+  { id: 'jobs', label: 'Zelos', render: renderJobs, countKey: null },
+  { id: 'documents', label: 'Imports', render: renderDocuments, countKey: null },
+  { id: 'booking', label: 'Booking', render: renderBooking, countKey: null },
+  { id: 'shopping', label: 'Groceries', render: renderShopping, countKey: null },
+  { id: 'family', label: 'Family', render: renderFamily, countKey: null },
   { id: 'settings', label: 'Settings', render: renderSettings, countKey: null },
 ];
 
@@ -64,10 +85,22 @@ const BUCKET_ROUTE = {
 };
 
 const root = document.getElementById('app');
+const holdLaunch = createLaunchHold(() => render({ force: true }));
 
 let route = { view: 'now', sub: null };
+let routeHash = window.location.hash || '#/now';
+let routeTransition = 0;
+let mailVisit = 0;
 let lastRenderKey = '';
 let setupActive = false;
+
+// Desktop reload/quit waits for both editors. A failed save keeps the page and
+// its recoverable text open; sending is never part of this callback.
+globalThis.__zelosFlushDrafts = async () => {
+  await flushDrafts();
+  await flushMailDrafts();
+  return true;
+};
 
 // A model save changes whether setup is needed, but does not finish a setup
 // already on screen. Keep that flow until its own Finish/Skip action marks it
@@ -81,7 +114,8 @@ function parseHash() {
   const [view, sub, target] = raw.split('/');
   if (view === 'welcome') return { view: 'welcome', sub: null };
   const known = VIEWS.find((v) => v.id === view);
-  return { view: known ? known.id : 'now', sub: sub || null,
+  return { view: known ? known.id : 'now', sub: view === 'mail' && sub === 'draft' ? null : sub || null,
+    mailDraftId: view === 'mail' && sub === 'draft' ? parseConnectionTarget(target) : null,
     connectionId: view === 'settings' ? parseConnectionTarget(target) : null };
 }
 
@@ -128,7 +162,7 @@ function announce(node, text) {
  * live region above, so this line is where "Checking your mail…", "Finished
  * checking" and a check's failure are spoken as well as shown.
  *
- * What it says is "Last checked 20 minutes ago · 214 emails · 28
+ * What it says is "Last checked 20 minutes ago · 214 messages · 28
  * appointments". The run's duration and the day's token spend — "41.8s",
  * "9.8k tokens in · 135 out" — were the most prominent numbers on the screen
  * and the least explicable ones (bus tokens? is this costing me money?), so
@@ -147,7 +181,7 @@ function buildSweepLine() {
   };
 }
 
-/** "Last checked 20 minutes ago · 3 emails", or the state of the check under way. */
+/** "Last checked 20 minutes ago · 3 messages", or the state of the check under way. */
 export function sweepLineText(s, last, scheduler = null) {
   if (s.running) return s.message || 'Checking your mail…';
   // One paint after a check ends: what it found, before the line settles back
@@ -230,6 +264,7 @@ function capturePanel() {
   // "Add a reminder", because "Note" did not say what the box was for.
   const toggle = button('Add a reminder', {
     class: 'btn quiet',
+    'aria-label': 'Add a reminder',
     'aria-expanded': 'false',
     onClick: (e) => {
       const btn = e.currentTarget;
@@ -257,14 +292,27 @@ let chrome = null;
 
 function buildChrome() {
   const capture = capturePanel();
-  const dateNode = el('p', { class: 'topbar-date mono' });
+  const dateNode = el('p', { class: 'topbar-date' });
+  const pageNode = el('span', { class: 'page-name', text: 'Now' });
+  const sidebarToggle = button(icon('panel'), {
+    class: 'btn quiet icon-button sidebar-toggle', 'aria-label': 'Toggle sidebar',
+    'aria-controls': 'workspace-sidebar', 'aria-expanded': 'false',
+    onClick: () => {
+      const mobile = window.matchMedia('(max-width: 759px)').matches;
+      const key = mobile ? 'sidebarOpen' : 'sidebarCollapsed';
+      const open = document.documentElement.dataset[key] !== 'true';
+      document.documentElement.dataset[key] = String(open);
+      sidebarToggle.setAttribute('aria-expanded', String(mobile ? open : !open));
+      if (mobile && open) focusQuietly(chrome?.railNode.querySelector('.nav-link.is-current'));
+    },
+  });
   const sweepBtn = button('Check now', {
     class: 'btn solid',
     onClick: () => startSweep('auto'),
   });
   const sweep = buildSweepLine();
-  const commandsButton = button('Commands', {
-    class: 'btn quiet', 'aria-haspopup': 'dialog',
+  const commandsButton = button(icon('command'), {
+    class: 'btn quiet icon-button', 'aria-label': 'Commands', 'aria-haspopup': 'dialog',
     'aria-keyshortcuts': 'Control+Shift+P Meta+Shift+P',
     title: 'Commands (⌘/Ctrl+Shift+P)',
     onClick: () => commands.open(),
@@ -288,21 +336,29 @@ function buildChrome() {
         disabled: state.sweep.running, reason: 'A check is already running', run: () => startSweep('auto') },
     ],
   });
+  capture.toggle.classList.add('capture-toggle');
   const topbarNode = el('header', { class: 'topbar' }, [
     el('div', { class: 'topbar-row' }, [
-      el('a', { class: 'wordmark', href: '#/now' }, [
-        el('span', { class: 'wordmark-name', text: 'Zelos' }),
-        // The tooltip answers "is that a logo glitch?" — it is the name, in Greek.
-        el('span', { class: 'wordmark-greek', 'aria-hidden': 'true', title: 'Zelos, in Greek', text: 'ΖΗΛΟΣ' }),
-      ]),
+      sidebarToggle,
+      pageNode,
       dateNode,
       el('div', { class: 'topbar-actions' }, [commandsButton, capture.toggle, sweepBtn]),
     ]),
     capture.panel,
     sweep.node,
   ]);
+  const backdropNode = button('', { class: 'sidebar-backdrop', 'aria-label': 'Close sidebar',
+    onClick: () => {
+      document.documentElement.dataset.sidebarOpen = 'false';
+      sidebarToggle.setAttribute('aria-expanded', 'false');
+      focusQuietly(sidebarToggle);
+    },
+  });
   return {
     topbarNode,
+    pageNode,
+    sidebarToggle,
+    backdropNode,
     dateNode,
     sweepBtn,
     sweep,
@@ -324,6 +380,7 @@ function railLink(view, counts, current) {
     href: `#/${view.id}`,
     'aria-current': view.id === current ? 'page' : null,
   }, [
+    icon(view.id),
     el('span', { class: 'nav-label', text: view.label }),
     view.countKey ? el('span', { class: `nav-count mono${count ? ' has-some' : ''}`, text: String(count) }) : null,
     el('span', { class: 'nav-marker', 'aria-hidden': 'true' }),
@@ -332,23 +389,46 @@ function railLink(view, counts, current) {
 
 function rail(current) {
   const counts = railCounts();
-  return el('nav', { class: 'rail', 'aria-label': 'Sections' }, [
-    el('div', { class: 'nav' }, VIEWS.map((v) => railLink(v, counts, current))),
-    meander({ class: 'rail-rule' }),
+  const links = (ids) => ids.map(id => railLink(VIEWS.find(v => v.id === id), counts, current));
+  const model = state.health?.model;
+  return el('nav', { class: 'rail', id: 'workspace-sidebar', 'aria-label': 'Sections',
+    onclick: (event) => {
+      if (!event.target.closest('a') || document.documentElement.dataset.sidebarOpen !== 'true') return;
+      document.documentElement.dataset.sidebarOpen = 'false';
+      chrome?.sidebarToggle.setAttribute('aria-expanded', 'false');
+      focusQuietly(main);
+    },
+  }, [
+    el('a', { class: 'wordmark', href: '#/now' }, [
+      el('span', { class: 'brand-symbol', text: 'Z', 'aria-hidden': 'true' }),
+      el('span', { class: 'wordmark-name', text: 'Zelos' }),
+    ]),
+    el('div', { class: 'nav nav-primary' }, links(['ask', 'jobs', 'search'])),
+    el('div', {class:'nav'}, links(['progress','finance','health','family','shopping','documents','booking'])),
+    el('div', { class: 'rail-workspace' }, [
+      el('h2', { class: 'rail-heading', text: 'Workspace' }),
+      el('div', { class: 'nav' }, links(['now', 'today', 'mail', 'owed', 'calendar'])),
+    ]),
     el('div', { class: 'rail-buckets' }, [
-      el('h2', { class: 'rail-heading', text: 'The board' }),
-      el('ul', { class: 'bucket-list' }, Object.keys(BUCKET_LABEL).map((bucket) => el('li', {},
-        el('a', { class: `bucket-line${counts[bucket] ? '' : ' is-zero'}`, href: BUCKET_ROUTE[bucket] }, [
+      el('h2', { class: 'rail-heading', text: 'Your board' }),
+      el('ul', { class: 'bucket-list' }, Object.keys(BUCKET_LABEL).filter(b => counts[b]).map(bucket => el('li', {},
+        el('a', { class: 'bucket-line', href: BUCKET_ROUTE[bucket] }, [
+          el('span', { class: 'bucket-dot', 'aria-hidden': 'true' }),
           el('span', { class: 'bucket-name', text: BUCKET_LABEL[bucket] }),
-          el('span', { class: 'bucket-count mono', text: String(counts[bucket] || 0) }),
+          el('span', { class: 'bucket-count', text: String(counts[bucket]) }),
         ])))),
     ]),
-    // `label` has a default ("Claude"), so it is not evidence of anything —
-    // only `configured` is. Naming a model the app cannot call would be a lie
-    // told in the calmest possible typeface.
-    el('p', { class: 'rail-foot mono', text: state.health?.model?.configured
-      ? `${state.health.model.label}${state.health.model.local ? ' · on this computer' : ''}`
-      : 'no AI chosen yet' }),
+    el('div', { class: 'rail-bottom' }, [
+      el('div', { class: 'nav' }, links(['settings'])),
+      el('a', { class: 'rail-model', href: '#/settings/model' }, [
+        el('span', { class: 'model-avatar', text: 'Z', 'aria-hidden': 'true' }),
+        el('span', { class: 'rail-model-copy' }, [
+          el('span', { class: 'rail-model-title', text: model?.configured ? (model.local ? 'Local AI' : 'Connected AI') : 'Choose an AI' }),
+          el('span', { class: 'rail-foot', text: model?.configured ? model.label : 'Finish setting up Zelos' }),
+        ]),
+        el('span', { class: `connection-dot${model?.configured ? ' is-ready' : ''}`, 'aria-hidden': 'true' }),
+      ]),
+    ]),
   ]);
 }
 
@@ -400,17 +480,13 @@ function toastBar() {
 /* ------------------------------------------------------------- whole screens */
 
 function bootScreen() {
-  return el('div', { class: 'screen' }, [
-    el('p', { class: 'screen-mark', text: 'ΖΗΛΟΣ' }),
-    meander(),
-    el('p', { class: 'screen-line', text: 'Opening the board…' }),
-  ]);
+  return launchScreen();
 }
 
 function fatalScreen() {
   const f = state.fatal;
   return el('div', { class: 'screen' }, [
-    el('p', { class: 'screen-mark', text: 'ΖΗΛΟΣ' }),
+    el('p', { class: 'screen-mark', text: 'Zelos' }),
     meander(),
     el('h1', { class: 'screen-title', text: f.title }),
     el('p', { class: 'screen-line', text: f.detail }),
@@ -427,7 +503,7 @@ function noTokenScreen() {
   // mark its preload leaves); a browser tab has the address the terminal
   // printed, which is what carries the key a bookmark strips.
   return el('div', { class: 'screen' }, [
-    el('p', { class: 'screen-mark', text: 'ΖΗΛΟΣ' }),
+    el('p', { class: 'screen-mark', text: 'Zelos' }),
     meander(),
     el('h1', { class: 'screen-title', text: 'This page has no session key' }),
     el('p', { class: 'screen-line', text: window.zelos
@@ -443,6 +519,7 @@ function renderKey() {
     route.view,
     route.sub || '',
     route.connectionId || '',
+    route.mailDraftId || '',
     state.phase,
     state.rev,
     state.fatal ? '1' : '0',
@@ -459,6 +536,8 @@ function currentView() {
     navigate,
     sub: route.sub,
     connectionId: route.connectionId,
+    mailDraftId: route.mailDraftId,
+    mailVisit,
     rerender: () => render({ force: true }),
   };
   if (showOnboarding()) return renderOnboarding(ctx);
@@ -489,7 +568,7 @@ let renderQueued = false;
 function editingInMain() {
   const active = document.activeElement;
   if (!active || !main || !main.contains(active)) return false;
-  if (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.tagName === 'SELECT') return true;
+  if (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.tagName === 'SELECT' || active.getAttribute('role') === 'combobox') return true;
   // A button inside an open editor still counts. Tabbing from a text field to
   // "Save account" lands focus on the button, and flushing in that moment
   // rebuilds the view — the open form and everything typed into it gone
@@ -559,8 +638,10 @@ function render({ force = false } = {}) {
     layout = null;
     return;
   }
-  if (state.phase === 'boot') {
-    replace(root, bootScreen());
+  if (state.phase === 'boot' || holdLaunch()) {
+    // Preserve the first-paint logo so store notifications do not restart it.
+    if (!root.querySelector('.zelos-launch')) replace(root, bootScreen());
+    animateLaunch(root.querySelector('.zelos-launch'));
     main = null;
     chromeWrap = null;
     layout = null;
@@ -632,7 +713,7 @@ function paintChrome() {
   if (!chromeWrap) return;
   if (!chrome) chrome = buildChrome();
   if (chrome.topbarNode.parentNode !== chromeWrap) {
-    replace(chromeWrap, [chrome.topbarNode, chrome.railNode, chrome.tabbarNode, chrome.toastSlot]);
+    replace(chromeWrap, [chrome.topbarNode, chrome.railNode, chrome.backdropNode, chrome.tabbarNode, chrome.toastSlot]);
   }
 
   // The date comes from the ROLLED key, not from the board's `now` string: a
@@ -640,6 +721,11 @@ function paintChrome() {
   // header must say the day the reader is living in.
   const nm = nowMark();
   chrome.dateNode.textContent = nm.key ? formatDay(nm.key) : '';
+  chrome.pageNode.textContent = VIEWS.find(v => v.id === route.view)?.label || 'Zelos';
+  main.dataset.view = route.view;
+  chrome.sidebarToggle.setAttribute('aria-expanded', String(window.matchMedia('(max-width: 759px)').matches
+    ? document.documentElement.dataset.sidebarOpen === 'true'
+    : document.documentElement.dataset.sidebarCollapsed !== 'true'));
   chrome.sweepBtn.textContent = state.sweep.running ? 'Checking…' : 'Check now';
   chrome.sweepBtn.disabled = state.sweep.running;
   if (chrome.commands.isOpen) chrome.commands.refresh();
@@ -679,6 +765,12 @@ document.addEventListener('keydown', (e) => {
   }
   if (chrome?.commands.isOpen) return;
   if (e.key !== 'Escape') return;
+  if (document.documentElement.dataset.sidebarOpen === 'true') {
+    document.documentElement.dataset.sidebarOpen = 'false';
+    chrome?.sidebarToggle.setAttribute('aria-expanded', 'false');
+    focusQuietly(chrome?.sidebarToggle);
+    return;
+  }
   if (!chrome || chrome.capture.panel.hidden || !chrome.capture.panel.isConnected) return;
   chrome.capture.panel.hidden = true;
   chrome.capture.toggle.setAttribute('aria-expanded', 'false');
@@ -686,13 +778,12 @@ document.addEventListener('keydown', (e) => {
 });
 
 /**
- * The rail sticks below the header, and the header's height is not a constant:
+ * The Ask viewport accounts for the header, whose height is not a constant:
  * a wrapped sweep error makes it two lines taller, and narrowing the window
  * re-wraps the header row.
  *
  * Measuring only after a paint is not enough — nothing repaints on a resize, so
- * the rail would keep a stale offset and either slide under the header or hang
- * a gap below it until the next store event. An observer on the bar itself
+ * the composer would keep a stale viewport offset until the next store event. An observer on the bar itself
  * catches every cause of a height change: reflow, resize, and a font landing.
  */
 const topbarWatcher = typeof ResizeObserver === 'function'
@@ -711,6 +802,11 @@ function measureTopbar() {
   topbarWatcher?.disconnect();
   topbarWatcher?.observe(bar);
 }
+
+window.matchMedia('(max-width: 759px)').addEventListener?.('change', () => {
+  document.documentElement.dataset.sidebarOpen = 'false';
+  paintChrome();
+});
 
 /**
  * Where focus lands after a sub-route move.
@@ -763,10 +859,33 @@ function focusConnectionTarget() {
   return true;
 }
 
-function onRoute() {
+async function onRoute() {
+  const transition = ++routeTransition;
+  const nextHash = window.location.hash || '#/now';
+  const nextRoute = parseHash();
+  if (['mail', 'owed'].includes(route.view) && nextHash !== routeHash) {
+    try {
+      // Promises can edit the same reply as Email. Finish that write before
+      // either editor hands the reply to the other one.
+      if (route.view === 'mail') await flushMailDrafts();
+      else await flushDrafts();
+    } catch (error) {
+      if (transition !== routeTransition) return;
+      // Restore the current entry without another hashchange: sidebar clicks,
+      // browser Back, and direct hashes all use this same save gate.
+      window.history.replaceState(null, '', routeHash);
+      const label = route.view === 'mail' ? 'Email' : 'Promises';
+      notify(`Could not leave ${label}: ${error.message} Your reply is still here.`, { tone: 'warn' });
+      return;
+    }
+    if (transition !== routeTransition) return;
+  }
   const before = route.view;
   const beforeSub = route.sub;
-  route = parseHash();
+  route = nextRoute;
+  routeHash = nextHash;
+  if (route.view === 'mail' && before !== 'mail') mailVisit += 1;
+  document.documentElement.dataset.sidebarOpen = 'false';
   render({ force: true });
   if (before !== route.view) {
     // A new view starts at its top. Same-view re-renders (a deferred board
@@ -782,6 +901,7 @@ function onRoute() {
 
 /* --------------------------------------------------------------------- boot */
 
+installSelects();
 applyAccent(currentAccent());
 route = parseHash();
 render();

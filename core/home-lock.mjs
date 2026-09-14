@@ -69,13 +69,13 @@ const FOREIGN_LOCK_MAX_AGE_MS = 30 * 24 * 60 * 60_000;
 
 const currentUid = () => (typeof process.getuid === 'function' ? process.getuid() : null);
 
-/** 'alive' | 'gone' | 'denied' — denied being `EPERM`, which decides nothing. */
+/** Only ESRCH proves absence; permission and unsupported-operation errors do not. */
 function signalProcess(pid) {
   try {
     process.kill(pid, 0);
     return 'alive';
   } catch (err) {
-    return err.code === 'EPERM' ? 'denied' : 'gone';
+    return err.code === 'ESRCH' ? 'gone' : 'denied';
   }
 }
 
@@ -110,6 +110,11 @@ export function lockHolderState(record, probe = {}) {
   const state = signal(pid);
   if (state === 'gone') return { held: false, why: 'the process that took it is gone' };
   if (state === 'alive') return { held: true, why: 'the process that took it is still running' };
+
+  // Windows has no POSIX uid, so missing ownership is normal and does not
+  // establish pid reuse. Backup/restore also requires stricter evidence than
+  // the advisory startup warning: never replace data while liveness is unknown.
+  if (uid === null || probe.strict) return { held: true, why: 'the process could not be checked safely' };
 
   // EPERM. Whether that is life or a recycled pid depends on who wrote it.
   const holderUid = Number.isInteger(record?.uid) ? record.uid : null;

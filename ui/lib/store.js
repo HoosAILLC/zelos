@@ -1,3 +1,4 @@
+import { celebrateCompletion } from './completion.js';
 /**
  * ui/lib/store.js — one copy of the truth, and the sweep stream that keeps it
  * honest.
@@ -693,6 +694,7 @@ export async function setItemState(id, next, { until = undefined, silent = false
   emit();
   try {
     await api.setItemState(id, next, until === undefined ? {} : { until });
+    if (!silent && next === 'done' && prior?.state !== 'done') celebrateCompletion();
     await loadBoard();
     // "Done", "dismissed" and "snoozed" all take a row off the board, and all
     // three are one slipped click away from losing something real — so each

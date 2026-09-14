@@ -27,12 +27,13 @@ import { el, button, meander, section, copyText, replace } from '../lib/dom.js';
    of /api/connectors, and a one-line wrapper in ui/lib/api.js would be a second
    place to look for a call that has exactly one call site. */
 import { api, request } from '../lib/api.js';
-import { state, saveConfig, loadConfig, setAccent, applyAccent, currentAccent, DEFAULT_ACCENT, markOnboarded, nowMark } from '../lib/store.js';
+import { state, saveConfig, loadConfig, setAccent, applyAccent, currentAccent, DEFAULT_ACCENT, markOnboarded, nowMark, notify, startSweep, subscribe } from '../lib/store.js';
 import { plural, tokenLine } from '../lib/format.js';
 import { monthName } from '../lib/time.js';
 import { aiAccessPanel } from './ai-access.js';
 import { sourceStatusLine, connectionRecovery, setupStatus } from '../lib/source-status.js';
 import { backupPanel, canUseBackups } from '../lib/backup.js';
+import { automaticBackupPanel } from '../lib/automatic-backup.js';
 import { updatesPanel } from '../lib/updates.js';
 
 /**
@@ -739,6 +740,7 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
     baseUrl: cfg.baseUrl || '',
     model: cfg.model || '',
     keyRef: cfg.keyRef || 'model.default',
+    maxTokens: cfg.maxTokens ?? 8192,
     // The guided card to show, or null for the expert form alone. Set by
     // choose(); restored from the saved config once the presets arrive.
     guide: null,
@@ -753,6 +755,7 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
   guidedWrap.hidden = true;
   const formWrap = el('div', { class: 'chosen' });
   const probeNote = el('p', { class: 'quiet-note' });
+  const advanced = fold('Advanced', [probeNote, formWrap]);
   // The "Stuck?" line, redrawn with the card's name once one is chosen so the
   // message Claude gets is about Anthropic's key page and not both.
   const helpSlot = el('div');
@@ -772,6 +775,23 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
 
     const baseInput = input({ value: draft.baseUrl, placeholder: 'https://…' });
     baseInput.addEventListener('input', () => { draft.baseUrl = baseInput.value.trim(); });
+
+    const limitInput = input({ type: 'number', value: String(draft.maxTokens), min: '1', max: '1000000', step: '1' });
+    limitInput.addEventListener('input', () => { draft.maxTokens = limitInput.value; });
+
+    function responseLimit() {
+      const value = Number(limitInput.value);
+      if (!Number.isInteger(value) || value < 1 || value > 1_000_000) {
+        status.bad('Response limit must be a whole number from 1 to 1,000,000.');
+        limitInput.setAttribute('aria-invalid', 'true');
+        const toggle = advanced.querySelector('.unfold-toggle');
+        if (toggle?.getAttribute('aria-expanded') === 'false') toggle.click();
+        limitInput.focus();
+        return null;
+      }
+      limitInput.removeAttribute('aria-invalid');
+      return value;
+    }
 
     // One key box. It sits in the guided card when there is one and in the
     // Advanced form otherwise; the helpers below read it wherever it is.
@@ -840,6 +860,8 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
     }
 
     async function save() {
+      const maxTokens = responseLimit();
+      if (maxTokens === null) return false;
       if (!draft.baseUrl || !draft.model) {
         status.bad('An address and a model id are both required — both are under Advanced.');
         return false;
@@ -861,6 +883,7 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
             baseUrl: draft.baseUrl,
             model: draft.model,
             keyRef: draft.keyRef,
+            maxTokens,
           },
         });
         status.good('Saved.');
@@ -908,6 +931,7 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
      * for the person to type but the key.
      */
     async function checkItWorks() {
+      if (responseLimit() === null) return false;
       if (!draft.model) {
         status.bad('Zelos could not pick a model for this service — choose one under Advanced.');
         return false;
@@ -916,7 +940,11 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
       if (!answered) return false;
       const saved = await save();
       if (!saved) return false;
-      status.good(`Working. Zelos will use ${friendly()}.`);
+      const message = `Working. Zelos will use ${friendly()}.`;
+      status.good(message);
+      // Saving replaces this panel. The shared notification remains visible
+      // after that render and after onboarding advances to its next step.
+      notify(message);
       onDone?.();
       return true;
     }
@@ -978,6 +1006,9 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
       field('Model', modelInput, {
         hint: isLocal() ? 'Whatever your runtime has pulled.' : 'The provider’s model id, exactly as they spell it.',
       }),
+      field('Response limit (tokens)', limitInput, {
+        hint: 'The maximum response size in tokens (small pieces of text), including reasoning for models that use it. Raise this if a review is cut short. Larger replies can take longer and cost more; your model may have a lower maximum.',
+      }),
       datalist,
       el('div', { class: 'row-inline' }, [
         button('List available models', { class: 'btn quiet', onClick: loadModels }),
@@ -993,6 +1024,7 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
           class: 'btn solid',
           onClick: async () => {
             const ok = await save();
+            if (ok) notify('AI settings saved.');
             if (ok && onDone) onDone();
           },
         }),
@@ -1130,7 +1162,7 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
     choiceWrap,
     guidedWrap,
     fold('More choices', moreWrap),
-    fold('Advanced', [probeNote, formWrap]),
+    advanced,
     helpSlot,
   ]);
 }
@@ -2794,12 +2826,66 @@ export function calendarPanel({ compact = false, onDone = null, rerender, connec
 
 /* ------------------------------------------------------------------ sources */
 
+function messagesSetupHelp() {
+  return el('div', { class: 'chosen stack' }, [
+    el('h3', { class: 'chosen-label', text: 'Read the texts already on this Mac' }),
+    el('p', { text: '1. Open Messages on this Mac and check that your texts appear. Your iPhone and Mac must use the same Apple Account. If SMS texts are missing, check Messages in iCloud or Text Message Forwarding on your iPhone.' }),
+    el('p', { text: '2. On this Mac, open System Settings → Privacy & Security → Full Disk Access. Add the installed Zelos app and turn access on yourself, then quit and reopen Zelos. This is a broad macOS permission needed to read the local Messages database; Zelos cannot grant it for you.' }),
+    el('p', { text: '3. Save this source, then choose Read sources now below. It imports locally available text without asking AI. It cannot read texts that have not reached this Mac.' }),
+    el('p', { class: 'quiet-note', text: 'Text only: no attachments, calls or voicemail. Zelos never sends, changes, deletes or marks your messages read. Names may appear as phone numbers or email addresses.' }),
+    el('p', { class: 'quiet-note' }, [
+      'For local-only import, keep automatic checks off in ',
+      el('a', { href: '#/settings/sweep', text: 'Schedule' }),
+      '. Imported text stays in Zelos on this Mac until you request an AI review or share it with an AI. A full review sends selected excerpts to your configured AI; Check now and automatic checks can also request that review.',
+    ]),
+  ]);
+}
+
+/** Collection is an explicit mode: never let an automatic/full review stand in
+ * for the local-only action promised by this button. The existing sweep stream
+ * owns completion; acceptance of the POST is only the beginning of the read. */
+function readSourcesControl() {
+  const status = statusLine();
+  const hasSources = () => ['mail', 'calendars', 'sources'].some(key =>
+    (state.config?.[key] || []).some(source => source.enabled !== false));
+  const read = button('Read sources now', {
+    class: 'btn quiet',
+    onClick: async () => {
+      if (state.sweep.running || !hasSources()) return;
+      await startSweep('light');
+      paint();
+    },
+  });
+  function paint() {
+    read.disabled = state.sweep.running || !hasSources();
+    if (state.sweep.running) status.working('A check is running. Reading results will appear in each connection’s status.');
+    else if (state.sweep.error) status.bad(state.sweep.error);
+    else if (!hasSources()) status.clear();
+    else {
+      const result = state.sweep.lastResult;
+      if (result?.mode !== 'light') status.clear();
+      else if (result.ok === false || result.stats?.sourcesFailed > 0) status.bad('Some sources could not be read. Review each connection’s reading status for details.');
+      else status.good('Finished reading sources without asking AI. Review each connection’s reading status for details.');
+    }
+  }
+  const unsubscribe = subscribe(() => {
+    if (!read.isConnected) { unsubscribe(); return; }
+    paint();
+  });
+  paint();
+  return el('div', { class: 'stack' }, [
+    read,
+    el('p', { class: 'quiet-note', text: 'Reads all enabled email accounts, calendars and other sources into Zelos without asking AI. Existing waiting times still apply. This does not turn automatic checks on or off.' }),
+    status.node,
+  ]);
+}
+
 /**
  * The editor for `config.sources` — the third place config keeps a source, and
  * until now the one with no screen at all.
  *
- * There is nothing about any particular connector in this function, and that is
- * the whole point of it: the picker is the registry's `sources` connectors, the
+ * Setup help can explain a source's platform permissions; the controls still
+ * come from its manifest. The picker is the registry's `sources` connectors, the
  * body is whatever `fields[]` that connector declared, and the credential is the
  * one it asked for in the words it asked for it. A feed, a ticket queue and a
  * repository each get a form nobody wrote.
@@ -2833,6 +2919,7 @@ export function sourceForm(source, { manifests = [], onSaved, onCancel }) {
       stored: state.secretRefs.includes(draft.keyRef),
     });
     body.replaceChildren(
+      ...(manifest?.type === 'imessage' ? [messagesSetupHelp()] : []),
       ...controls.nodes,
       credential ? credential.node : el('p', { class: 'quiet-note', text: 'This source needs no credential.' }),
     );
@@ -2899,7 +2986,7 @@ export function sourcesPanel({ rerender, connectionId = null } = {}) {
   const editor = el('div', { class: 'editor' });
   const status = statusLine();
 
-  wrap.appendChild(el('p', { class: 'panel-lede', text: 'Most people need nothing here. If you use any of these work tools, add them. Zelos only ever reads them — nothing is ever written back.' }));
+  wrap.appendChild(el('p', { class: 'panel-lede', text: 'Add other accounts or local sources you want Zelos to read. It never sends messages or changes the original content.' }));
 
   wrap.appendChild(el('div', { class: 'stack' }, sources.length
     ? sources.map((src) => el('div', connectionCardProps(src, connectionId), [
@@ -2959,6 +3046,7 @@ export function sourcesPanel({ rerender, connectionId = null } = {}) {
   })));
   wrap.appendChild(editor);
   wrap.appendChild(status.node);
+  wrap.appendChild(readSourcesControl());
   if (connectionId && !sources.some(src => src.id === connectionId)) wrap.prepend(missingConnection());
   return wrap;
 }
@@ -3055,16 +3143,16 @@ function privacyPanel() {
   const maxInput = input({ type: 'number', value: String(cfg.maxItemsPerSweep), min: '10', max: '1000' });
 
   return el('div', { class: 'panel' }, [
-    el('p', { class: 'panel-lede', text: 'Zelos only talks to the AI service you chose. It sends nothing to us and nothing to anyone else.' }),
-    checkbox('Let the AI read the full text of your emails (recommended — it does a better job)', {
+    el('p', { class: 'panel-lede', text: 'AI reviews and Ask send selected board content to your chosen AI service. With Claude, that content goes to Anthropic. Your connected accounts also contact their own services when Zelos checks for updates.' }),
+    checkbox('Include full message text and calendar descriptions in AI reviews', {
       checked: sendBodies,
       onChange: (v) => { sendBodies = v; },
-      hint: 'Switched off, the AI sees only who wrote, the subject, and the first couple of lines. It will be worse at judging what matters, and it will say less about why.',
+      hint: 'Switched off, email and text previews, sender names, subjects and basic calendar details can still be shared. Your questions, notes and existing board summaries can also contain private information. This reduces sharing; it does not make hosted AI local.',
     }),
     fold('Advanced', [
       el('p', { class: 'quiet-note', text: 'There is no telemetry, analytics or remote font. Reading and AI use your configured services; Check for updates contacts GitHub only when you press it. These two numbers cap what each AI request carries.' }),
       el('div', { class: 'grid-2' }, [
-        field('Characters of each email sent to the AI', charsInput),
+        field('Characters from each message or calendar description', charsInput),
         field('Most items per check', maxInput),
       ]),
     ]),
@@ -3171,12 +3259,24 @@ function dataPanel() {
   async function exportSnapshot() {
     status.working('Gathering…');
     try {
-      const [board, config] = await Promise.all([api.state(), api.config()]);
+      const board = await api.state();
+      // Export board content deliberately, not connection settings or transport
+      // diagnostics. Private feed URLs can themselves be bearer credentials.
+      const pick = (record, fields) => Object.fromEntries(fields
+        .filter(key => Object.hasOwn(record, key)).map(key => [key, record[key]]));
+      const exportedBoard = pick(board, [
+        'items', 'counts', 'finished', 'events', 'drafts', 'notes', 'first', 'eventWindow', 'now',
+      ]);
+      // Older or extended event records may carry raw calendar blobs. Keep only
+      // the event's content fields, which are still private and not safe to share.
+      exportedBoard.events = (board.events || []).map(event => pick(event, [
+        'id', 'calendar_id', 'uid', 'recurrence_id', 'title', 'description', 'location',
+        'starts_at', 'ends_at', 'all_day', 'organizer', 'attendees', 'rsvp', 'status', 'url',
+      ]));
       const payload = JSON.stringify({
         exportedAt: new Date().toISOString(),
         version: state.health?.version || null,
-        config: config.config,
-        board,
+        board: exportedBoard,
       }, null, 2);
       const blob = new Blob([payload], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
@@ -3185,7 +3285,7 @@ function dataPanel() {
       a.click();
       a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 10_000);
-      status.good('Board snapshot saved. It contains no passwords and is not a full backup.');
+      status.good('Board snapshot download started. It contains private board content and excludes connection settings. Keep it private; it is not a full backup.');
     } catch (err) {
       status.bad(err.message);
     }
@@ -3200,8 +3300,9 @@ function dataPanel() {
   return el('div', { class: 'panel' }, [
     el('p', { class: 'panel-lede', text: canUseBackups()
       ? 'Your board and saved history live on this computer. Create a backup before moving computers or making a big change.'
-      : 'Your board and saved history live in one folder on this computer. For a complete data backup, quit Zelos first, then copy the whole folder to a private location. Passwords kept in your computer’s password storage may need to be entered again on a different computer.' }),
+      : 'Your records and saved history live on the computer running Zelos. Use the encrypted backups below to keep verified recovery copies. Keep a separate private copy and its recovery key before moving to another computer.' }),
     dataStats(),
+    automaticBackupPanel(),
     backupPanel(),
     field('The Zelos folder', input({ value: home, readonly: true })),
     el('div', { class: 'row-inline' }, [
@@ -3216,7 +3317,7 @@ function dataPanel() {
         : button('Copy the folder path', { class: 'btn solid', onClick: copyPath }),
       button('Save board snapshot', { class: 'btn quiet', onClick: exportSnapshot }),
     ]),
-    el('p', { class: 'quiet-note', text: 'The snapshot includes the current board and settings, without passwords. It does not include your full mail archive, captures or complete item history. Use a backup to restore your data.' }),
+    el('p', { class: 'quiet-note', text: 'The snapshot contains private board content and excludes connection settings. Keep it private. It does not include your full mail archive, captures or complete item history. Use a backup to restore your data.' }),
     canShowFolder() ? null : el('p', { class: 'quiet-note', text: folderHint(platform) }),
     section('Erasing everything', {}, [
       el('p', { class: 'quiet-note', text: 'To erase everything: quit Zelos, then drag this folder to the Trash and empty the Trash.' }),
@@ -3250,6 +3351,7 @@ function aboutPanel() {
   const lifetimeUsage = tokenLine(lifetime);
   const lifetimeAsked = lifetimeUsage ? Number(lifetime.modelRuns) || 0 : 0;
   return el('div', { class: 'panel panel-about' }, [
+    el('p', { class: 'about-brand', text: 'Zelos' }),
     el('dl', { class: 'facts' }, [
       el('dt', { text: 'Version' }), el('dd', { class: 'mono', text: state.health?.version || '—' }),
       el('dt', { text: 'Folder' }), el('dd', { class: 'mono', text: state.health?.home || '—' }),

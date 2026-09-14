@@ -12,7 +12,7 @@ import { lockHolderState, readHomeLock } from './home-lock.mjs';
 export const MAINTENANCE_FILE = '.data-maintenance';
 const LEASE_DIR = '.data-connections';
 const attached = new WeakMap();
-function isHeld(value) { try { return lockHolderState(value).held; } catch { return true; } }
+function isHeld(value) { try { return lockHolderState(value, { strict: true }).held; } catch { return true; } }
 const error = () => Object.assign(new Error('Zelos is backing up or restoring data, or another Zelos/AI client still has this data open. Close other clients and try again.'), { code: 'ZELOS_DATA_BUSY' });
 function stat(file) { try { return fs.lstatSync(file); } catch (e) { if (e.code === 'ENOENT') return null; throw e; } }
 function read(file) {

@@ -132,23 +132,35 @@ export function autogrow(textarea, { min = 96 } = {}) {
   return fit;
 }
 
-/** Copy to clipboard, falling back to a hidden textarea when the API is absent. */
+/** Copy without moving the reader's focus or selection when clipboard access is refused. */
 export async function copyText(text) {
   try {
     await navigator.clipboard.writeText(text);
     return true;
   } catch {
+    const previousFocus = document.activeElement;
+    const fieldSelection = typeof previousFocus?.selectionStart === 'number'
+      ? [previousFocus.selectionStart, previousFocus.selectionEnd, previousFocus.selectionDirection] : null;
+    const selection = document.getSelection?.();
+    const ranges = selection ? Array.from({ length: selection.rangeCount }, (_, index) => selection.getRangeAt(index).cloneRange()) : [];
     const scratch = el('textarea', { class: 'offscreen' });
     scratch.value = text;
-    document.body.appendChild(scratch);
-    scratch.select();
-    let ok = false;
     try {
-      ok = document.execCommand('copy');
+      document.body.appendChild(scratch);
+      scratch.select();
+      return Boolean(document.execCommand('copy'));
     } catch {
-      ok = false;
+      return false;
+    } finally {
+      scratch.remove();
+      if (previousFocus?.isConnected) {
+        focusQuietly(previousFocus);
+        if (fieldSelection) previousFocus.setSelectionRange?.(...fieldSelection);
+      }
+      if (selection && ranges.length) {
+        selection.removeAllRanges();
+        for (const range of ranges) selection.addRange(range);
+      }
     }
-    scratch.remove();
-    return ok;
   }
 }

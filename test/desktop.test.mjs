@@ -22,10 +22,11 @@ import { PassThrough } from 'node:stream';
 import { registerHooks } from 'node:module';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { classifyTarget, guardWebContents } from '../desktop/guard.js';
-import { clampToDisplays, DEFAULT_BOUNDS, MIN_SIZE, WindowState } from '../desktop/window-state.js';
-import { buildAppMenuTemplate, buildTrayMenuTemplate, supportsLoginItem, VIEWS } from '../desktop/menus.js';
-import { startCore } from '../desktop/runtime.js';
+const desktopAvailable = fs.existsSync(new URL('../desktop', import.meta.url));
+const { classifyTarget, guardWebContents } = desktopAvailable ? await import('../desktop/guard.js') : {};
+const { clampToDisplays, DEFAULT_BOUNDS, MIN_SIZE, WindowState } = desktopAvailable ? await import('../desktop/window-state.js') : {};
+const { buildAppMenuTemplate, buildTrayMenuTemplate, supportsLoginItem, VIEWS } = desktopAvailable ? await import('../desktop/menus.js') : {};
+const { startCore } = desktopAvailable ? await import('../desktop/runtime.js') : {};
 /* The lock used to be defined in desktop/runtime.js and is now in core/, which
    is what made it reachable from the published package at all — `desktop/` is
    deliberately not shipped, so a lock living there was a lock only a git
@@ -34,6 +35,7 @@ import { startCore } from '../desktop/runtime.js';
    against that caller. See core/home-lock.mjs for the whole story. */
 import { acquireHomeLock, holdHome, lockHolderState, readHomeLock } from '../core/home-lock.mjs';
 
+if (!desktopAvailable) { it('native desktop distribution is available', { skip: 'Desktop is excluded from this npm deployment; native tests require the source checkout.' }, () => {}); } else {
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, '..');
 
@@ -526,7 +528,7 @@ describe('menus', () => {
     // Search still counts as a position, so ⌘6 is the sixth thing on screen.
     for (const [i, item] of go.submenu.entries()) {
       if (item.label === 'Search') continue;
-      assert.equal(item.accelerator, `CmdOrCtrl+${i + 1}`, `${item.label} lost the number of its place`);
+      assert.equal(item.accelerator, i<9 ? `CmdOrCtrl+${i + 1}` : undefined, `${item.label} has an invalid position shortcut`);
     }
   });
 
@@ -1118,6 +1120,20 @@ describe('the shell, booted against a stub Electron', () => {
     // backstop rather than a wall.
     handler({ url: `${booted.zelos.url}app.css` }, (r) => verdicts.push(r.cancel));
     assert.equal(verdicts.at(-1), false);
+  });
+
+  it('logs only the destination host when blocking an outbound request', () => {
+    const messages = [];
+    const previousWarn = booted.zelos.logger.warn;
+    booted.zelos.logger.warn = (message, meta) => messages.push({ message, meta });
+    try {
+      recorded.beforeRequest.handler({ url: 'https://blocked.example/private/FICTIONAL_PATH?value=FICTIONAL_QUERY#FICTIONAL_FRAGMENT' }, result => {
+        assert.equal(result.cancel, true);
+      });
+      assert.equal(messages.length, 1);
+      assert.deepEqual(messages[0].meta, { scheme: 'https:', host: 'blocked.example' });
+      assert.doesNotMatch(JSON.stringify(messages), /FICTIONAL_|private\/|value=/);
+    } finally { booted.zelos.logger.warn = previousWarn; }
   });
 
   it('shuts WebRTC off: the board\'s CSP gains webrtc \'block\', and the peer layer gets no UDP', () => {
@@ -2144,3 +2160,5 @@ describe('the shell as a stdio MCP server', () => {
     assert.deepEqual(replies[1].result.tools, []);
   });
 });
+
+}
