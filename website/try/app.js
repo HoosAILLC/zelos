@@ -31,6 +31,7 @@ import { parseConnectionTarget } from './lib/source-status.js';
 
 import { renderProgress } from './views/progress.js';
 import { renderFinance } from './views/finance.js';
+import { renderFamily } from './views/family.js';
 import { renderHealth } from './views/health.js';
 import { renderJobs } from './views/jobs.js';
 import { renderDocuments } from './views/documents.js';
@@ -61,6 +62,7 @@ const VIEWS = [
   { id: 'ask', label: 'Ask', render: renderAsk, countKey: null },
   { id: 'progress', label: 'Progress', render: renderProgress, countKey: null },
   { id: 'finance', label: 'Money', render: renderFinance, countKey: null },
+  { id: 'family', label: 'Family', render: renderFamily, countKey: null },
   { id: 'health', label: 'Health', render: renderHealth, countKey: null },
   { id: 'jobs', label: 'Zelos', render: renderJobs, countKey: null },
   { id: 'documents', label: 'Imports', render: renderDocuments, countKey: null },
@@ -399,7 +401,7 @@ function rail(current) {
       el('span', { class: 'wordmark-name', text: 'Zelos' }),
     ]),
     el('div', { class: 'nav nav-primary' }, links(['ask', 'jobs', 'search'])),
-    el('div', {class:'nav'}, links(['progress','finance','health','shopping','documents','booking'])),
+    el('div', {class:'nav'}, links(['progress','finance','health','family','shopping','documents','booking'])),
     el('div', { class: 'rail-workspace' }, [
       el('h2', { class: 'rail-heading', text: 'Workspace' }),
       el('div', { class: 'nav' }, links(['now', 'today', 'mail', 'owed', 'calendar'])),

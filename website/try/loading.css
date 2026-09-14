@@ -1,0 +1,63 @@
+/* Zelos motion: a quiet reveal, a soft sweep, and a three-stroke pulse.
+   All completion is driven by real app state; animation never holds up content. */
+/* The three masks follow the original wing artwork. The silhouette stays intact. */
+.zelos-launch { gap: 0; --wing-cycle: 3400ms; }
+.zelos-launch-brand { display: flex; align-items: center; flex-direction: column; }
+.zelos-launch-mark { position: relative; display: block; width: 180px; max-width: 100%; height: 91px; overflow: visible; }
+.zelos-launch-wing { position: absolute; top: 0; width: calc((100% - 12px) / 2); height: 100%; }
+.zelos-launch-wing--left { left: 0; transform: scaleX(-1); }
+.zelos-launch-wing--right { right: 0; }
+.zelos-wing-motion { position: absolute; inset: 0; transform-origin: 3% 96%; }
+.zelos-feather { position: absolute; inset: 0; display: block; mask: var(--feather) center / contain no-repeat; -webkit-mask: var(--feather) center / contain no-repeat; background: var(--ink); animation: zelos-feather-form 700ms cubic-bezier(.22,1,.36,1) var(--form-delay) both; }
+.zelos-launch-name { display: flex; gap: 6px; margin: 27px 0 0; font: 500 13px/1.3 var(--sans, system-ui); color: var(--ink); }
+.zelos-launch-letter { display: inline-block; animation: zelos-letter-in 850ms cubic-bezier(.16,1,.3,1) var(--letter-in) both, zelos-letter-wave var(--wing-cycle) ease-in-out var(--letter-beat) infinite; }
+.zelos-launch-letter:nth-child(1) { --letter-in: 340ms; --letter-beat: 1400ms; }
+.zelos-launch-letter:nth-child(2) { --letter-in: 415ms; --letter-beat: 1475ms; }
+.zelos-launch-letter:nth-child(3) { --letter-in: 490ms; --letter-beat: 1550ms; }
+.zelos-launch-letter:nth-child(4) { --letter-in: 565ms; --letter-beat: 1625ms; }
+.zelos-launch-letter:nth-child(5) { --letter-in: 640ms; --letter-beat: 1700ms; }
+.zelos-launch .screen-line { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.zelos-feather--1 { --feather: url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20660%20712%22%3E%3Cpath%20fill%3D%22white%22%20d%3D%22M214%20543%20L252%20544%20L304%20549%20L336%20549%20L315%20579%20L277%20613%20L231%20639%20L187%20653%20L105%20666%20L54%20682%20L18%20701%20L25%20677%20L39%20647%20L63%20612%20L78%20596%20L99%20579%20L135%20559%20L170%20548%20L214%20543%20Z%22%2F%3E%3C%2Fsvg%3E"); --form-delay: 0ms; }
+.zelos-feather--2 { --feather: url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20660%20712%22%3E%3Cpath%20fill%3D%22white%22%20d%3D%22M553%20311%20L554%20326%20L550%20356%20L541%20387%20L529%20412%20L512%20437%20L490%20460%20L454%20486%20L409%20505%20L370%20512%20L329%20512%20L278%20507%20L235%20506%20L171%20514%20L139%20524%20L110%20538%20L77%20561%20L58%20580%20L54%20583%20L56%20574%20L72%20539%20L101%20499%20L134%20468%20L185%20434%20L227%20414%20L287%20394%20L430%20364%20L480%20350%20L529%20328%20L553%20311%20Z%22%2F%3E%3C%2Fsvg%3E"); --form-delay: 140ms; }
+.zelos-feather--3 { --feather: url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20660%20712%22%3E%3Cpath%20fill%3D%22white%22%20d%3D%22M641%2012%20L643%2012%20L647%2046%20L647%2093%20L637%20147%20L626%20176%20L612%20202%20L592%20229%20L570%20251%20L533%20277%20L486%20299%20L429%20318%20L255%20365%20L202%20385%20L159%20408%20L117%20439%20L79%20479%20L52%20520%20L34%20559%20L26%20588%20L24%20585%20L17%20552%20L15%20504%20L18%20479%20L26%20446%20L37%20417%20L54%20385%20L78%20353%20L106%20325%20L162%20284%20L211%20256%20L299%20212%20L398%20167%20L458%20137%20L517%20104%20L587%2058%20L626%2027%20L641%2012%20Z%22%2F%3E%3C%2Fsvg%3E"); --form-delay: 280ms; }
+.shell { animation: zelos-shell-in 220ms ease-out; }
+.zelos-loading { padding: 22px 0; width: 100%; min-width: 0; }
+.zelos-loading--inline { display: inline-block; width: auto; padding: 8px 0; }
+.zelos-loading-status { display: flex; align-items: center; gap: 12px; color: var(--ink-2); font-size: 13px; line-height: 1.5; }
+.zelos-pulse, .answer.is-waiting::before { display: inline-block; flex: 0 0 20px; width: 20px; height: 20px; color: var(--ink); background-image: linear-gradient(currentColor,currentColor),linear-gradient(currentColor,currentColor),linear-gradient(currentColor,currentColor); background-position: 2px center,8px center,14px center; background-repeat: no-repeat; background-size: 2px 6px,2px 14px,2px 8px; border-radius: 1px; animation: zelos-pulse 1400ms ease-in-out infinite; }
+.zelos-skeleton { display: grid; gap: 0; margin-top: 24px; overflow: hidden; position: relative; border-radius: 14px; }
+.zelos-skeleton-item { min-width: 0; padding: 22px 0; border-bottom: 1px solid color-mix(in srgb, var(--ink) 6%, transparent); }
+.zelos-skeleton-line { display: block; height: 9px; width: 56%; border-radius: 999px; background: color-mix(in srgb, var(--ink) 8%, transparent); }
+.zelos-skeleton-line + .zelos-skeleton-line { width: 82%; height: 7px; margin-top: 13px; background: color-mix(in srgb, var(--ink) 5%, transparent); }
+.zelos-skeleton-item:nth-child(2) .zelos-skeleton-line { width: 43%; }
+.zelos-skeleton-item:nth-child(2) .zelos-skeleton-line + .zelos-skeleton-line { width: 67%; }
+.zelos-skeleton-item:nth-child(3) .zelos-skeleton-line { width: 49%; }
+.zelos-skeleton::after { border-radius: inherit; content: ''; position: absolute; inset: 0; pointer-events: none; background: linear-gradient(100deg,transparent 25%,color-mix(in srgb, var(--ink) 3%, transparent) 50%,transparent 75%); transform: translateX(-100%); animation: zelos-sweep 2400ms ease-in-out infinite; }
+.zelos-skeleton--cards { grid-template-columns: repeat(3,minmax(0,1fr)); gap: 24px; }
+.zelos-skeleton--cards .zelos-skeleton-item { padding: 24px 0 40px; }
+.zelos-skeleton--cards .zelos-skeleton-line { width: 60%; height: 10px; }
+.zelos-skeleton--cards .zelos-skeleton-line + .zelos-skeleton-line { width: 42%; height: 28px; margin-top: 24px; border-radius: 9px; }
+.answer.is-waiting { display: flex; align-items: center; gap: 12px; min-height: 28px; color: var(--ink-2); }
+.answer.is-waiting::before { content: ''; }
+.assistant-message:has(.answer[aria-busy="true"]):not(:has(.is-waiting)) .assistant-label::after { content: ''; display: inline-block; width: 4px; height: 4px; margin-left: 8px; vertical-align: middle; border-radius: 50%; background: currentColor; animation: zelos-breathe 1800ms ease-in-out infinite; }
+.mail-list-status.is-loading::before, .health-notice.is-loading::before { content: ''; display: inline-block; width: 5px; height: 5px; margin-right: 9px; vertical-align: middle; border-radius: 50%; background: var(--ink); animation: zelos-breathe 1800ms ease-in-out infinite; }
+@keyframes zelos-feather-form { from { opacity: 0; clip-path: inset(0 100% 0 0); } to { opacity: 1; clip-path: inset(0); } }
+@keyframes zelos-letter-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes zelos-letter-wave {
+  0%, 100% { transform: translateY(0); opacity: .72; }
+  32% { transform: translateY(-1px); opacity: 1; }
+  68% { transform: translateY(0); opacity: .72; }
+}
+@keyframes zelos-shell-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes zelos-arrive { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes zelos-breathe { 0%,100% { opacity: .48; } 50% { opacity: 1; } }
+@keyframes zelos-sweep { 0% { transform: translateX(-100%); } 100% { transform: translateX(100%); } }
+@keyframes zelos-pulse { 0%,100% { background-size: 2px 6px,2px 14px,2px 8px; opacity: .6; } 33% { background-size: 2px 14px,2px 8px,2px 6px; opacity: 1; } 66% { background-size: 2px 8px,2px 6px,2px 14px; opacity: .8; } }
+@media (max-width: 520px) { .zelos-skeleton--cards { grid-template-columns: 1fr; gap: 0; } .zelos-skeleton--cards .zelos-skeleton-item { padding: 20px 0; } }
+@media (prefers-reduced-motion: reduce) {
+  .shell, .zelos-launch-brand, .zelos-launch-mark, .zelos-wing-motion, .zelos-feather, .zelos-launch-name, .zelos-launch-letter, .zelos-pulse, .zelos-skeleton::after, .answer.is-waiting::before,
+  .assistant-message:has(.answer[aria-busy="true"]) .assistant-label::after, .mail-list-status.is-loading::before, .health-notice.is-loading::before { animation: none; transform: none; }
+  .zelos-launch-letter { opacity: 1; filter: none; }
+  .zelos-feather { opacity: 1; clip-path: none; background: var(--ink); }
+  .zelos-skeleton::after { display: none; }
+}

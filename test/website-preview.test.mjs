@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import {detectRecurring,findDuplicateCandidates} from '../website/try/lib/money-patterns.js';
+import {balancePresentation,scopedBankSnapshot} from '../website/try/lib/money-accuracy.js';
 const fresh=()=>import(`../website/try/lib/api.js?test=${Math.random()}`);
 // Use request directly so each test owns an independent browser-memory fixture.
 test('interactive preview supports completion, undo, history and new notes',async()=>{
@@ -41,4 +43,91 @@ test('external actions are blocked and demo transport has no network or persiste
  const {request}=await fresh();for(const path of ['/api/mail/send','/api/secrets','/api/documents/preview','/api/shopping/list','/api/mail/oauth'])await assert.rejects(request(path,{method:'POST',body:{}}),/installed app/);
  const source=fs.readFileSync(new URL('../website/try/lib/api.js',import.meta.url),'utf8');assert.doesNotMatch(source,/\bfetch\s*\(|new EventSource|new WebSocket|localStorage|sessionStorage/);
  const sample=fs.readFileSync(new URL('../website/try/lib/sample-data.js',import.meta.url),'utf8');assert.doesNotMatch(sample,/\/Users\/|\/private\/|ebe25ca50874/);
+});
+
+async function moneyHistory(request) {
+ const current=await request('/api/finance');
+ const months=current.summary.currencies[0].months.map(value=>value.month);
+ const pages=await Promise.all(months.map(month=>request('/api/finance?month='+month)));
+ const rows=pages.flatMap(page=>page.transactions);
+ const dates=rows.map(row=>row.date).sort();
+ return {...current,transactions:rows,scope:{start:dates[0],end:dates.at(-1)}};
+}
+const reviewBody=(candidate,type,action,scope,extra={})=>({key:candidate.key,rowIds:candidate.rowIds,type,action,scope,...extra});
+test('Money snapshot preserves unknown, zero and credit amounts and keeps pending outside posted totals and exports',async()=>{
+ const {request,download}=await fresh();const history=await moneyHistory(request),bank=await request('/api/finance/plaid');
+ const balances=bank.items[0].accounts;
+ assert(balances.every(account=>account.balances.cached&&account.balances.retrievedAt&&account.balances.sourceUpdatedAt===null));
+ const unknown=balances.find(account=>account.balances.availableCents===null);assert(unknown);assert.equal(unknown.balances.availableCents,null);
+ const zero=balances.find(account=>account.mapping.accountId==='demo_reserve');assert.equal(zero.balances.currentCents,0);assert.equal(zero.balances.availableCents,0);
+ const credit=balances.find(account=>account.mapping.accountId==='demo_card');assert.equal(balancePresentation('credit_card',credit.balances).label,'Amount owed');assert.equal(credit.balances.currentCents,174200);
+ const scope={entities:history.entities,section:'personal',accountId:'demo_reserve',currency:'USD'};
+ assert.equal(scopedBankSnapshot(bank,history.accounts,scope).balances.length,1);assert.equal(scopedBankSnapshot(bank,history.accounts,scope).pending.length,0);
+ assert.equal(bank.pending.length,2);assert(bank.pending.every(pending=>!history.transactions.some(row=>row.id===pending.id)));
+ const csv=await (await download('/api/finance/export')).text();for(const pending of bank.pending)assert(!csv.includes(pending.description));
+ credit.balances.currentCents=0;assert.equal((await request('/api/finance/plaid')).items[0].accounts.find(account=>account.mapping.accountId==='demo_card').balances.currentCents,174200);
+});
+test('Money recurring confirmation is explicit, idempotent and reversible without changing recorded spending',async()=>{
+ const {request}=await fresh();const before=await moneyHistory(request);
+ const candidate=detectRecurring(before.transactions).find(value=>value.name==='Fable Music');assert(candidate);assert.equal(candidate.rows.length,3);
+ const body=reviewBody(candidate,'recurring','confirm-recurring',before.scope);
+ const {decision}=await request('/api/finance/review',{method:'POST',body});assert.equal(decision.action,'confirm-recurring');
+ const repeated=await request('/api/finance/review',{method:'POST',body});assert.equal(repeated.decision.id,decision.id);
+ const confirmed=await moneyHistory(request);assert(confirmed.transactions.filter(row=>candidate.rowIds.includes(row.id)).every(row=>row.category==='Recurring bill'));
+ assert.equal(confirmed.summary.currencies[0].expenseCents,before.summary.currencies[0].expenseCents);
+ assert.equal((await request('/api/finance/review')).decisions.length,1);
+ await request('/api/finance/review',{method:'POST',body:{action:'undo',decisionId:decision.id}});
+ const restored=await moneyHistory(request);assert(restored.transactions.filter(row=>candidate.rowIds.includes(row.id)).every(row=>row.category==='Entertainment'));
+ assert.equal((await request('/api/finance/review')).decisions[0].undone,true);
+});
+test('Money duplicate evidence excludes only the chosen import and Undo restores it',async()=>{
+ const {request}=await fresh();const before=await moneyHistory(request);
+ const candidate=findDuplicateCandidates(before.transactions,{accounts:before.accounts}).find(value=>value.rowIds.includes('demo_duplicate_receipt'));assert(candidate);assert.equal(candidate.ambiguous,false);
+ assert.deepEqual(new Set(candidate.rows.map(row=>row.importSource)),new Set(['bank','document']));
+ const body=reviewBody(candidate,'duplicate','exclude-duplicate',before.scope,{excludeId:'demo_duplicate_receipt'});
+ const result=await request('/api/finance/review',{method:'POST',body});
+ const month=candidate.rows[0].date.slice(0,7);
+ const originalTotal=before.transactions.filter(row=>row.date.startsWith(month)&&row.status!=='excluded'&&row.kind!=='transfer'&&row.amountCents<0).reduce((total,row)=>total-row.amountCents,0);
+ const after=await request('/api/finance?month='+month);assert.equal(after.summary.currencies[0].expenseCents,originalTotal-3850);
+ assert.equal(after.transactions.find(row=>row.id==='demo_duplicate_receipt').status,'excluded');assert.equal(after.transactions.find(row=>row.id==='demo_duplicate_bank').status,'confirmed');
+ await request('/api/finance/review',{method:'POST',body});assert.equal((await request('/api/finance?month='+month)).summary.currencies[0].expenseCents,originalTotal-3850);
+ await request('/api/finance/review',{method:'POST',body:{action:'undo',decisionId:result.decision.id}});assert.equal((await request('/api/finance?month='+month)).summary.currencies[0].expenseCents,originalTotal);
+ const reset=await fresh();assert.deepEqual((await reset.request('/api/finance/review')).decisions,[]);
+});
+test('Money rejects stale evidence and refuses Undo after an intervening edit',async()=>{
+ const {request}=await fresh();const before=await moneyHistory(request);
+ const candidate=findDuplicateCandidates(before.transactions,{accounts:before.accounts}).find(value=>value.rowIds.includes('demo_duplicate_receipt'));
+ const body=reviewBody(candidate,'duplicate','exclude-duplicate',before.scope,{excludeId:'demo_duplicate_receipt'});
+ await assert.rejects(request('/api/finance/review',{method:'POST',body:{...body,excludeId:'unrelated'}}),/which of these two/);
+ const {decision}=await request('/api/finance/review',{method:'POST',body});
+ await request('/api/finance/transactions',{method:'POST',body:{id:'demo_duplicate_receipt',description:'Edited receipt'}});
+ await assert.rejects(request('/api/finance/review',{method:'POST',body:{action:'undo',decisionId:decision.id}}),error=>error.status===409&&/changed after/.test(error.message));
+ const recurring=detectRecurring(before.transactions).find(value=>value.name==='Fable Music');
+ await request('/api/finance/transactions',{method:'POST',body:{id:recurring.rowIds[0],amountCents:-999999}});
+ await assert.rejects(request('/api/finance/review',{method:'POST',body:reviewBody(recurring,'recurring','confirm-recurring',before.scope)}),error=>error.status===409&&/evidence changed/.test(error.message));
+ const current=await moneyHistory(request);assert.equal(current.transactions.find(row=>row.id==='demo_duplicate_receipt').status,'excluded');
+});
+test('Family previews isolate private records, selected collaborator access and stable source snapshots',async()=>{
+ const {request}=await fresh();const owner=await request('/api/family'),parent=await request('/api/family?person=jamie'),collaborator=await request('/api/family?person=sam');
+ assert.equal(owner.me.id,'alex');assert(owner.records.some(row=>row.id==='family_alex_private'));assert(!owner.records.some(row=>row.id==='family_jamie_private'));
+ assert.deepEqual(new Set(parent.records.map(row=>row.id)),new Set(['family_school','family_meal_snapshot','family_jamie_private']));
+ assert.deepEqual(collaborator.records.map(row=>row.id),['family_task_snapshot']);assert.deepEqual(collaborator.children,[]);
+ assert.equal(collaborator.grants[0].includeFuture,false);assert.equal(collaborator.grants[0].permissions.submitTasks,false);assert.equal(collaborator.grants[0].permissions.uploadDocuments,false);assert(collaborator.grants[0].expiresAt);
+ for(const view of [owner,parent,collaborator]){assert.equal(view.demo.readOnly,true);assert.equal(view.permissions.manage,false);assert.equal(view.portal.ready,false);assert.deepEqual(view.credentials,[]);assert.deepEqual(view.invitations,[]);}
+ const task=owner.records.find(row=>row.id==='family_task_snapshot'),plan=owner.records.find(row=>row.id==='family_meal_snapshot');
+ const source=(await request('/api/state')).items.find(row=>row.id===task.source.id);assert.equal(task.title,source.headline);
+ assert.equal(plan.source.id,(await request('/api/health-tracking')).plans[0].id);
+ await request(`/api/items/${source.id}/correction`,{method:'POST',body:{decision:'corrected',headline:'Changed in Today'}});
+ assert.equal((await request('/api/family')).records.find(row=>row.id===task.id).title,task.title);
+ await assert.rejects(request('/api/family?person=unknown'),error=>error.status===404);
+});
+test('new preview surfaces cannot link banks, share, invite or mint credentials and all local module imports resolve',async()=>{
+ const {request}=await fresh();
+ for(const path of ['/api/finance/plaid/start','/api/finance/plaid/configure','/api/finance/plaid/sync','/api/finance/plaid/disconnect','/api/family/action','/api/family/snapshot','/api/family/invite','/api/family/credentials'])await assert.rejects(request(path,{method:'POST',body:{action:'invite.create'}}),/installed app/);
+ for(const file of ['api.js','demo-money.js','demo-family.js','bank-link.js']){const source=fs.readFileSync(new URL('../website/try/lib/'+file,import.meta.url),'utf8');assert.doesNotMatch(source,/\bfetch\s*\(|new EventSource|new WebSocket|localStorage|sessionStorage/);}
+ const family=fs.readFileSync(new URL('../website/try/views/family.js',import.meta.url),'utf8');assert.doesNotMatch(family,/type:\s*['"](?:password|file)['"]|navigator\.clipboard|window\.open|method:\s*['"]POST['"]/);
+ const app=fs.readFileSync(new URL('../website/try/app.js',import.meta.url),'utf8');assert.match(app,/id: 'family', label: 'Family'/);
+ assert.match(fs.readFileSync(new URL('../website/try/demo.js',import.meta.url),'utf8'),/'finance','family','health'/);
+ const pending=[new URL('../website/try/app.js',import.meta.url)],seen=new Set();
+ while(pending.length){const url=pending.pop();if(seen.has(url.href))continue;seen.add(url.href);const source=fs.readFileSync(url,'utf8');for(const match of source.matchAll(/(?:from\s*|import\s*)['"](\.[^'"]+)['"]/g)){const dependency=new URL(match[1],url);assert(fs.existsSync(dependency),'Missing '+dependency.pathname);pending.push(dependency);}}
 });

@@ -35,6 +35,8 @@ export const api = {
   cancelJob: id => request(`/api/assistant/jobs/${encodeURIComponent(id)}/cancel`,{method:'POST',body:{}}),
   jobReport: id => download(`/api/assistant/jobs/${encodeURIComponent(id)}/report.pdf`),
   finance: (options={}) => request(`/api/finance?${queryString(options)}`,{signal:options.signal}),
+  financeReviews: () => request('/api/finance/review'),
+  reviewFinance: body => request('/api/finance/review',{method:'POST',body}),
   addFinanceEntity: body => request('/api/finance/entities',{method:'POST',body}),
   saveFinanceAccount: body => request('/api/finance/accounts',{method:'POST',body}),
   importFinanceStatement: body => request('/api/finance/import',{method:'POST',body}),

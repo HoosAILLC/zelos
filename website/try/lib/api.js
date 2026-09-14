@@ -2,6 +2,8 @@
  * model calls, sending, checkout or persistent storage. Every mutation is local.
  * Unsupported operations fail with an explicit demo limitation. */
 import seed from './sample-data.js';
+import {createDemoMoney} from './demo-money.js';
+import {createDemoFamily} from './demo-family.js';
 export {api} from './endpoints.js';
 export const hasToken=()=>true;
 export class ApiError extends Error{constructor(message,{status=400,path=''}={}){super(message);this.name='ApiError';this.status=status;this.path=path;}}
@@ -30,6 +32,9 @@ const checkedAt=now();
 records['/api/state'].runs.last.ended_at=checkedAt;
 records['/api/state'].briefing.lastChecked=checkedAt;
 records['/api/state'].briefing.asOf=checkedAt;
+const fail=(message,status=400)=>{throw new ApiError(message,{status});};
+const demoMoney=createDemoMoney(records['/api/finance'],{now,fail});
+const demoFamily=createDemoFamily(records,{now,fail});
 const blocked='This action needs the installed app. The website demo uses fictional records, runs only in this tab, and never connects accounts, uploads files, sends email or makes purchases.';
 function reject(path){throw new ApiError(blocked,{status:501,path});}
 function findItem(itemId){const item=allItems.find(x=>x.id===itemId);if(!item)throw new ApiError('Sample item not found.',{status:404});return item;}
@@ -74,6 +79,9 @@ export async function request(path,{method='GET',body,signal}={}){
   if(route==='/api/state')return clone(board());
   if(route==='/api/shopping')return shopping();
   if(route==='/api/finance')return finance(p);
+  if(route==='/api/finance/plaid')return demoMoney.status();
+  if(route==='/api/finance/review')return demoMoney.reviews();
+  if(route==='/api/family')return demoFamily(p.get('person')||'alex');
   if(route==='/api/progress')return progress(p);
   if(route==='/api/search')return {q:p.get('q')||'',results:search(p.get('q')||'',Number(p.get('limit'))||30,p.get('includeHistory')==='1')};
   if(route==='/api/events'){const start=p.get('start')||p.get('from')||'',end=p.get('end')||p.get('to')||'9999';return {events:clone(records['/api/state'].events.filter(e=>e.starts_at>=start&&e.starts_at<=end)),start,end,limited:false};}
@@ -89,6 +97,7 @@ export async function request(path,{method='GET',body,signal}={}){
   if(records[route]!==undefined)return clone(records[route]);
   return reject(path);
  }
+ if(route==='/api/finance/review'&&method==='POST')return demoMoney.review(body);
  if(/\/api\/items\/[^/]+\/state$/.test(route)){
   const item=findItem(route.split('/')[3]),before=item.state;item.state=body.state;item.state_at=now();item.updated_at=now();item.snoozed_until=body.state==='snoozed'?(body.until??new Date(Date.now()+86400000).toISOString()):null;
   const entries=history.get(item.id)||[];entries.unshift({id:++sequence,recorded_at:now(),origin:'user',kind:'changed',changes:[{field:'state',before,after:item.state}]});history.set(item.id,entries);
@@ -109,7 +118,7 @@ export async function request(path,{method='GET',body,signal}={}){
  if(route==='/api/health-tracking/plan-state'){for(const plan of records['/api/health-tracking'].plans)for(const entry of plan.entries)if(entry.id===body.id||entry.id===body.entryId)entry.state=body.state;return clone(records['/api/health-tracking']);}
  if(route==='/api/health-tracking/delete'){const key=healthCollections[body.kind]||({metric:'metrics',lab:'labs',plan:'plans',grocery:'groceryItems'})[body.kind];if(key)records['/api/health-tracking'][key]=records['/api/health-tracking'][key].filter(x=>x.id!==body.id);return clone(records['/api/health-tracking']);}
  const financeKey=({entities:'entities',accounts:'accounts',transactions:'transactions',invoices:'invoices'})[route.split('/').pop()];
- if(route.startsWith('/api/finance/')&&financeKey){const value=upsert(records['/api/finance'][financeKey],body,financeKey);return {ok:true,record:value};}
+ if(route.startsWith('/api/finance/')&&financeKey){const value=upsert(records['/api/finance'][financeKey],body,financeKey);return {ok:true,record:value,[{entities:'entity',accounts:'account',transactions:'transaction',invoices:'invoice'}[financeKey]]:value};}
  if(route==='/api/mail/importance'){const m=messages.find(x=>x.id===(body.id||body.messageId));const importance={important:body.important,reason:'Your preference in this demo'};if(m)m.importance=importance;return {importance,learned:false};}
  if(route==='/api/mail/draft'||route==='/api/mail/save'){const m=messages.find(x=>x.id===body.messageId);const draft={id:body.draftId||id('draft'),message_id:body.messageId,account_id:'s_sample',to_email:body.to||m?.from_email||'',subject:body.subject||`Re: ${m?.subject||'Your project'}`,body:body.body||'Example draft — Thanks for the update. I will review the revised scope and confirm the next steps before our meeting.\n\nAlex',state:'draft',updated_at:now()};drafts.set(draft.id,draft);return {draft:clone(draft)};}
  if(route.startsWith('/api/drafts/')){const d=records['/api/state'].drafts.find(x=>x.id===route.split('/').pop());if(d)Object.assign(d,body,{updated_at:now()});return {draft:clone(d)};}

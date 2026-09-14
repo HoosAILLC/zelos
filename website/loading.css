@@ -1,0 +1,63 @@
+/* The same feather masks and flight proportions as the app opening.
+   Progressive enhancement: the document is never hidden, locked or made inert. */
+.site-launch {
+  --launch-ink: #f5f5f5; --sans: Hanken, system-ui, sans-serif;
+  position: fixed; inset: 0; width: 100vw; height: 100vh; height: 100dvh;
+  max-width: none; max-height: none; margin: 0; padding: 24px;
+  border: 0; background: #000; color: var(--launch-ink); color-scheme: dark;
+  box-sizing: border-box; overflow: auto; place-content: center; justify-items: center;
+}
+.site-launch:not(:popover-open) { display: none; }
+.site-launch:popover-open {
+  display: grid;
+  /* Popovers are nonmodal: this still releases the page if JavaScript fails. */
+  animation: site-launch-failsafe 1ms step-end 3000ms forwards;
+}
+.site-launch::backdrop { background: transparent; pointer-events: none; }
+.site-launch-skip {
+  position: absolute; bottom: max(28px, env(safe-area-inset-bottom)); left: 50%;
+  transform: translateX(-50%); padding: 12px 20px; min-height: 44px;
+  border: 1px solid #555; border-radius: 999px; background: transparent;
+  color: var(--launch-ink); font: 400 12px/1.5 var(--sans); white-space: nowrap;
+  cursor: pointer;
+}
+.site-launch-skip:hover { border-color: #aaa; background: #151515; }
+.site-launch-skip:focus-visible { outline: 2px solid currentColor; outline-offset: 5px; }
+.site-launch[data-paused] * { animation-play-state: paused; }
+@keyframes site-launch-failsafe { to { opacity: 0; visibility: hidden; pointer-events: none; } }
+.site-launch { gap: 0; --wing-cycle: 3400ms; }
+.site-launch-brand { display: flex; align-items: center; flex-direction: column; }
+.site-launch-mark { position: relative; display: block; width: 180px; max-width: 100%; height: 91px; overflow: visible; }
+.site-launch-wing { position: absolute; top: 0; width: calc((100% - 12px) / 2); height: 100%; }
+.site-launch-wing--left { left: 0; transform: scaleX(-1); }
+.site-launch-wing--right { right: 0; }
+.site-wing-motion { position: absolute; inset: 0; transform-origin: 3% 96%; }
+.site-feather { position: absolute; inset: 0; display: block; mask: var(--feather) center / contain no-repeat; -webkit-mask: var(--feather) center / contain no-repeat; background: var(--launch-ink); animation: site-feather-form 700ms cubic-bezier(.22,1,.36,1) var(--form-delay) both; }
+.site-launch-name { display: flex; gap: 6px; margin: 27px 0 0; font: 500 13px/1.3 var(--sans, system-ui); color: var(--launch-ink); }
+.site-launch-letter { display: inline-block; animation: site-letter-in 850ms cubic-bezier(.16,1,.3,1) var(--letter-in) both, site-letter-wave var(--wing-cycle) ease-in-out var(--letter-beat) infinite; }
+.site-launch-letter:nth-child(1) { --letter-in: 340ms; --letter-beat: 1400ms; }
+.site-launch-letter:nth-child(2) { --letter-in: 415ms; --letter-beat: 1475ms; }
+.site-launch-letter:nth-child(3) { --letter-in: 490ms; --letter-beat: 1550ms; }
+.site-launch-letter:nth-child(4) { --letter-in: 565ms; --letter-beat: 1625ms; }
+.site-launch-letter:nth-child(5) { --letter-in: 640ms; --letter-beat: 1700ms; }
+.site-launch .screen-line { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.site-feather--1 { --feather: url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20660%20712%22%3E%3Cpath%20fill%3D%22white%22%20d%3D%22M214%20543%20L252%20544%20L304%20549%20L336%20549%20L315%20579%20L277%20613%20L231%20639%20L187%20653%20L105%20666%20L54%20682%20L18%20701%20L25%20677%20L39%20647%20L63%20612%20L78%20596%20L99%20579%20L135%20559%20L170%20548%20L214%20543%20Z%22%2F%3E%3C%2Fsvg%3E"); --form-delay: 0ms; }
+.site-feather--2 { --feather: url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20660%20712%22%3E%3Cpath%20fill%3D%22white%22%20d%3D%22M553%20311%20L554%20326%20L550%20356%20L541%20387%20L529%20412%20L512%20437%20L490%20460%20L454%20486%20L409%20505%20L370%20512%20L329%20512%20L278%20507%20L235%20506%20L171%20514%20L139%20524%20L110%20538%20L77%20561%20L58%20580%20L54%20583%20L56%20574%20L72%20539%20L101%20499%20L134%20468%20L185%20434%20L227%20414%20L287%20394%20L430%20364%20L480%20350%20L529%20328%20L553%20311%20Z%22%2F%3E%3C%2Fsvg%3E"); --form-delay: 140ms; }
+.site-feather--3 { --feather: url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20660%20712%22%3E%3Cpath%20fill%3D%22white%22%20d%3D%22M641%2012%20L643%2012%20L647%2046%20L647%2093%20L637%20147%20L626%20176%20L612%20202%20L592%20229%20L570%20251%20L533%20277%20L486%20299%20L429%20318%20L255%20365%20L202%20385%20L159%20408%20L117%20439%20L79%20479%20L52%20520%20L34%20559%20L26%20588%20L24%20585%20L17%20552%20L15%20504%20L18%20479%20L26%20446%20L37%20417%20L54%20385%20L78%20353%20L106%20325%20L162%20284%20L211%20256%20L299%20212%20L398%20167%20L458%20137%20L517%20104%20L587%2058%20L626%2027%20L641%2012%20Z%22%2F%3E%3C%2Fsvg%3E"); --form-delay: 280ms; }
+@keyframes site-feather-form { from { opacity: 0; clip-path: inset(0 100% 0 0); } to { opacity: 1; clip-path: inset(0); } }
+@keyframes site-letter-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes site-letter-wave {
+  0%, 100% { transform: translateY(0); opacity: .72; }
+  32% { transform: translateY(-1px); opacity: 1; }
+  68% { transform: translateY(0); opacity: .72; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .site-wing-motion, .site-feather, .site-launch-letter { animation: none; transform: none; }
+  .site-launch-letter { opacity: 1; }
+  .site-feather { opacity: 1; clip-path: none; }
+}
+@media (forced-colors: active) {
+  .site-launch { --launch-ink: CanvasText; background: Canvas; }
+  .site-launch-skip { border-color: ButtonText; }
+}

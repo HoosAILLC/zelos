@@ -10,8 +10,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
+import { buildWebsite, readWebsiteRelease } from '../scripts/build-website.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -32,10 +34,11 @@ test('the root and desktop manifests carry the same version', { skip: !fs.exists
   assert.equal(lock.packages[''].version, root.version);
 });
 
-test('the website ships the current UI and versioned download routes together', { skip: !fs.existsSync(path.join(ROOT,'website')) && 'Website packaging is absent in npm deployment.' }, () => {
+test('the website previews the current UI while retaining verified published downloads', { skip: !fs.existsSync(path.join(ROOT,'website')) && 'Website packaging is absent in npm deployment.' }, () => {
   execFileSync(process.execPath, ['scripts/build-website.mjs'], { cwd: ROOT, stdio: 'pipe' });
   const output = path.join(ROOT, '.site-dist');
   const version = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')).version;
+  const release = readWebsiteRelease(ROOT, version);
   const walk = (dir) => fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) =>
     entry.isDirectory() ? walk(path.join(dir, entry.name)) : [path.join(dir, entry.name)]);
   for (const source of walk(path.join(ROOT, 'ui'))) {
@@ -43,17 +46,101 @@ test('the website ships the current UI and versioned download routes together', 
     if (relative === 'index.html' || relative === path.join('lib', 'api.js')) continue;
     assert.equal(fs.readFileSync(path.join(output, 'demo', relative), 'utf8'), fs.readFileSync(source, 'utf8'), relative);
   }
+  for (const name of ['zelos-icon-32.png', 'zelos-favicon.svg', 'zelos-icon-180.png', 'zelos-wordmark-white.png', 'zelos-mark-white.png']) {
+    assert.deepEqual(fs.readFileSync(path.join(output, 'demo/assets/brand', name)),
+      fs.readFileSync(path.join(ROOT, 'assets/brand', name)), `The demo must include its referenced brand asset ${name}`);
+  }
   const data = fs.readFileSync(path.join(output, 'demo/lib/demo-data.js'), 'utf8');
   assert.equal(JSON.parse(data.replace(/^export default /, '').replace(/;\s*$/, '')).version, version);
-  assert.match(fs.readFileSync(path.join(output, 'index.html'), 'utf8'), new RegExp(`Version ${version.replaceAll('.', '\\.')}`));
+  assert.match(fs.readFileSync(path.join(output, 'index.html'), 'utf8'), new RegExp(`Version ${release.version.replaceAll('.', '\\.')}`));
   const redirects = fs.readFileSync(path.join(output, '_redirects'), 'utf8').trim().split('\n');
   for (const alias of ['Zelos-mac-apple-silicon.dmg', 'Zelos-mac-intel.dmg', 'Zelos-windows-x64.exe', 'Zelos-windows-arm64.exe', 'zelos-source.zip']) {
     const route = redirects.find((line) => line.startsWith(`/downloads/${alias} `));
     assert.ok(route, `Missing download alias ${alias}`);
-    assert.ok(route.includes(`/releases/download/v${version}/`), `Stale download ${route}`);
+    assert.ok(route.includes(`/releases/download/v${release.version}/`), `Unpublished download ${route}`);
   }
   assert.ok(!fs.readFileSync(path.join(output, 'demo/lib/api.js'), 'utf8').includes("const TOKEN_KEY = 'zelos.token'"), 'The demo must use its in-memory adapter');
-  assert.equal(JSON.parse(fs.readFileSync(path.join(output, 'release.json'), 'utf8')).version, version);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(output, 'release.json'), 'utf8')), release);
+});
+
+function releaseManifest(version) {
+  return { version, commit: 'a'.repeat(40), assets: [
+    `Zelos-${version}-arm64.dmg`, `Zelos-${version}-x64.dmg`,
+    `Zelos-${version}-setup-arm64.exe`, `Zelos-${version}-setup-x64.exe`, 'zelos-source.zip',
+  ].map((name) => ({ name, size: 2000, sha256: 'b'.repeat(64) })) };
+}
+
+function websiteFixture(t) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zelos-website-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const write = (file, value) => {
+    const target = path.join(root, file);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, typeof value === 'string' ? value : JSON.stringify(value));
+  };
+  write('package.json', { version: '1.8.4' });
+  write('website/release.json', releaseManifest('1.8.1'));
+  write('website/demo-data.json', { fictional: true });
+  write('website/demo/lib/api.js', '// demo adapter\n');
+  write('website/_headers', "/*\n  Content-Security-Policy: script-src 'self' {{SCRIPT_HASHES}}\n");
+  for (const name of ['index', 'help', 'privacy']) {
+    write(`website/${name}.html`, '<p>Version {{VERSION}}; preview {{PREVIEW_VERSION}}</p>');
+  }
+  write('ui/index.html', '<head><title>Zelos</title></head><body></body>');
+  write('assets/icon.svg', '<svg xmlns="http://www.w3.org/2000/svg"></svg>');
+  write('assets/brand/zelos-favicon.svg', '<svg xmlns="http://www.w3.org/2000/svg"></svg>');
+  return { root, write };
+}
+
+test('website-only builds never derive installer URLs from an unreleased preview version', (t) => {
+  const { root } = websiteFixture(t);
+  const out = buildWebsite({ root });
+  for (const page of ['index', 'help', 'privacy']) {
+    assert.equal(fs.readFileSync(path.join(out, `${page}.html`), 'utf8'), '<p>Version 1.8.1; preview 1.8.4</p>');
+  }
+  const routes = fs.readFileSync(path.join(out, '_redirects'), 'utf8').trim().split('\n');
+  assert.equal(routes.length, 11);
+  assert.ok(routes.every((route) => route.includes('/releases/download/v1.8.1/')));
+  assert.ok(routes.some((route) => route.endsWith('/Zelos-1.8.1-setup-arm64.exe 302!')));
+  assert.doesNotMatch(routes.join('\n'), /1\.8\.4/);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(out, 'release.json'), 'utf8')), releaseManifest('1.8.1'));
+  const data = fs.readFileSync(path.join(out, 'demo/lib/demo-data.js'), 'utf8');
+  assert.equal(JSON.parse(data.replace(/^export default /, '').replace(/;\s*$/, '')).version, '1.8.4');
+});
+
+test('a prepared tag-release manifest overrides the published version and preserves exact evidence', (t) => {
+  const { root, write } = websiteFixture(t);
+  const release = releaseManifest('1.8.4');
+  release.commit = 'c'.repeat(40);
+  write('release-assets/release.json', release);
+  const out = buildWebsite({ root });
+  assert.equal(fs.readFileSync(path.join(out, 'index.html'), 'utf8'), '<p>Version 1.8.4; preview 1.8.4</p>');
+  const routes = fs.readFileSync(path.join(out, '_redirects'), 'utf8').trim().split('\n');
+  assert.ok(routes.every((route) => route.includes('/releases/download/v1.8.4/')));
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(out, 'release.json'), 'utf8')), release);
+});
+
+test('website builds reject missing, incomplete, or mismatched download evidence before writing output', (t) => {
+  const { root, write } = websiteFixture(t);
+  fs.rmSync(path.join(root, 'website/release.json'));
+  assert.throws(() => buildWebsite({ root }), /ENOENT/);
+  for (const mutate of [
+    (r) => { r.assets.pop(); },
+    (r) => { r.assets[1] = r.assets[0]; },
+    (r) => { r.assets[0].size = 0; },
+    (r) => { r.assets[0].sha256 = ''; },
+    (r) => { r.commit = 'unknown'; },
+    (r) => { r.version = '../1.8.1'; },
+  ]) {
+    const release = releaseManifest('1.8.1');
+    mutate(release);
+    write('website/release.json', release);
+    assert.throws(() => buildWebsite({ root }), /Website downloads require/);
+  }
+  write('website/release.json', releaseManifest('1.8.1'));
+  write('release-assets/release.json', releaseManifest('1.8.2'));
+  assert.throws(() => buildWebsite({ root }), /Release assets do not match/);
+  assert.equal(fs.existsSync(path.join(root, '.site-dist')), false);
 });
 
 test('CI installs the shell\'s build tools from the lockfile, with no fallback', { skip: !fs.existsSync(path.join(ROOT,'.github')) && 'CI workflow is absent in npm deployment.' }, () => {

@@ -4,6 +4,7 @@ const paths = {
   booking: 'M6 2v4m8-4v4M3 8h14M3 4h14v14H3Zm4 9 2 2 4-5',
   shopping: 'M2 3h2l2 10h10l2-7H5M7 17h1m6 0h1',
   progress: 'M3 17V3m0 14h14M6 13l4-5 3 2 4-6',
+  family: 'M7 3a3 3 0 1 1 0 6 3 3 0 0 1 0-6ZM1 18v-3a6 6 0 0 1 12 0v3M15 5a2 2 0 1 1 0 4m0 3a4 4 0 0 1 4 4v2',
   finance: 'M2 5h16v11H2ZM2 8h16m-5 4h3',
   health: 'M10 17 3 10C-2 3 7 0 10 6c3-6 12-3 7 4l-7 7ZM3 10h4l2-4 2 8 2-4h4',
   jobs: 'M4 5h12v12H4ZM7 5V3h6v2M7 9h6M7 13h4',

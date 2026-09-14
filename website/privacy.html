@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Privacy — Zelos</title>
-<meta name="description" content="Zelos has no server and collects nothing. What the app reads, where it keeps it, what it sends to the providers and the model you chose, and how to delete all of it.">
+<meta name="description" content="Understand where Zelos stores your records, how configured AI and connected services use them, and what the 1.8.4 preview adds for sharing, sending and recovery.">
 <link rel="canonical" href="https://zelos-app.netlify.app/privacy">
 <meta name="theme-color" content="#f4f3ef">
 <meta name="color-scheme" content="light">
@@ -14,7 +14,7 @@
 <link rel="preload" href="/fonts/cinzel.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="preload" href="/fonts/hankengrotesk.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="/styles.css">
-<link rel="stylesheet" href="/campaign-info.css">
+<link rel="stylesheet" href="/campaign-info.css?v=20260914">
 </head>
 <!-- No <style> block and no style="" attribute anywhere in this file, for the
      same reason 404.html has none: _headers sends style-src 'self' with no
@@ -56,15 +56,12 @@
 
 <section class="band" aria-labelledby="privacy-title">
   <div class="band-head">
-    <p class="eyebrow">Privacy policy · effective 10 September 2026</p>
-    <h2 id="privacy-title">There is no Zelos server. This page is short because of it.</h2>
-    <p class="band-note">Zelos is a program you download and run on your own computer. It has no
-      account to create, no backend to talk to, and no way to see what you do with it. What follows
-      is everything it reads, where it keeps it, the handful of places it sends anything, and how
-      to delete all of it.</p>
+    <p class="eyebrow">Privacy policy · updated 14 September 2026</p>
+    <h2 id="privacy-title">Your workspace.<br>Your connections. Your choice.</h2>
+    <p class="band-note">Zelos runs on your own computer and does not require a Zelos cloud account. Your archive lives there. The services and people you choose to connect can receive the information needed for those features. This page explains those choices.</p>
   </div>
 
-  <p class="note">This policy describes public release {{VERSION}}. The homepage also previews a newer development build with additional features, including reviewed email sending, document imports, and optional grocery and booking connections. Those features require their own setup and may contact the services you configure.</p>
+  <p class="note">The public-release sections below describe {{VERSION}}. The newer {{PREVIEW_VERSION}} QA preview adds reviewed sending, personal records, bank linking, web research, family sharing, document imports, and recovery copies. Its additional data flows are described in <a href="#preview">Preview connections and sharing</a>.</p>
 
   <div class="privacy-grid">
 
@@ -73,13 +70,10 @@
       <p><strong>Nothing.</strong> The people who make Zelos do not receive your mail, your
         calendar, your address, your name, a device identifier, usage statistics, crash reports,
         or a record that you installed it. There is no telemetry, no analytics, no automatic update check,
-        no remote font, no remote image. The source is public, the program has zero third-party
-        dependencies, and the only outbound connections it can make are the ones listed on this
-        page — you can watch it with <code>lsof -i</code> and count them against your own
-        settings.</p>
+        no remote font, no remote image. The source is public. Outbound connections depend on your version and enabled features, as described below. The newer preview bundles dependencies for features such as PDF generation and email sending; it does not add app analytics.</p>
       <p>This website is a static page on Netlify. It sets no cookies of its own and runs no
         analytics. Netlify keeps ordinary server logs for the requests that fetch it, under its own
-        privacy policy, which we do not see.</p>
+        privacy policy. The wing introduction uses a session-only preference so it does not replay on every visit within the same tab.</p>
       <p><strong>Check for updates</strong> in the app asks GitHub for the latest public Zelos
         release only when you press it. That request includes no mail, calendar data, credentials
         or installed version. GitHub receives ordinary connection information, such as your IP
@@ -131,8 +125,7 @@
         request is inference only. Zelos trains nothing, operates
         no model, and keeps no copy of what it sent; how the provider treats it is governed by the
         provider's terms and the key you gave it.</p>
-      <p>Point Zelos at a local model — Ollama, LM Studio, llama.cpp, vLLM — and nothing it read
-        leaves your computer at all.</p>
+      <p>A model served on your computer can process requests locally. A local or LAN address alone does not guarantee that: the server can be configured to route requests onward. Connected sources and optional services still use their own network connections.</p>
     </div>
 
     <div class="glass pane">
@@ -230,6 +223,19 @@
     </div>
 
   </div>
+</section>
+
+<section class="band" id="preview" aria-labelledby="preview-privacy-title">
+<div class="band-head"><p class="eyebrow">Additional features / {{PREVIEW_VERSION}} QA preview</p><h2 id="preview-privacy-title">Preview connections<br>and sharing.</h2><p class="band-note">These additions are separate from public release {{VERSION}}. They are optional and depend on the connections, records, recipients, and actions you configure.</p></div>
+<div class="privacy-grid">
+<article class="glass pane"><h2>Money and bank connections</h2><p>When configured, Plaid connects to the institution you authorize. Zelos stores imported transaction records and saved balance and pending-activity snapshots in your local workspace. Linking and refreshing contact Plaid and the bank. The preview does not make payments or cancel subscriptions. Recurring and duplicate suggestions need your review.</p></article>
+<article class="glass pane"><h2>Personal records and AI</h2><p>Answers can use saved Money, Health, Progress, plans, and committed import records, with references to the relevant entries. These personal-record conversations, document reviews, and health planning require a local/LAN model connection. The server’s own routing controls onward processing. The app stores conversations and saved answer text so they can be reopened.</p></article>
+<article class="glass pane"><h2>Reviewed sending and public research</h2><p>The preview can send a reply through your configured sending service after you review the recipient and final text and choose Send reply. That service and the recipients receive the message. Background drafting never sends. Optional public-page reading contacts the URL you enter; optional Brave Search sends the separately entered search query to Brave. These research tools are off until you enable and use them.</p></article>
+<article class="glass pane"><h2>Documents and grocery handoff</h2><p>PDF/OCR extraction runs on the computer running Zelos using installed tools. Extracted text goes to the configured local/LAN model to prepare a preview. You choose which records to save. Optional grocery handoff sends only the list you review to the configured store service; the store handles its account and checkout.</p></article>
+<article class="glass pane"><h2>Family, collaborators and booking</h2><p>Remote access requires separate setup. Family members and collaborators see only the shared records and permissions you grant; records imported from the owner’s workspace are explicit snapshots. Invitations are copied links, not automatic emails. Guest booking pages expose your configured availability and collect the guest’s submitted booking details. Bookings are saved in Zelos; external calendar writes and email invitations are not performed.</p></article>
+<article class="glass pane"><h2>Backups and your copies</h2><p>Portable backup archives contain local records, settings, and portable credential files and are not password protected. Optional daily copies encrypt that archive and retain seven verified copies locally. Recovery requires the separately stored key. Keep protected copies on another device; local backups cannot protect against losing the computer. Operating-system keychain credentials and installed models are outside these archives.</p></article>
+</div>
+<p class="note">The interactive website demo uses fictional records and prepared answers in browser memory. Edits reset on reload. It blocks real account connections, sending, uploads, guest invitations, and purchases. Demo presentation preferences are separate from the installed app.</p>
 </section>
 
 </main>

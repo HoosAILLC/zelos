@@ -1,0 +1,31 @@
+{
+  "version": "1.8.1",
+  "commit": "b998c8868b1edc23c4bf52ce7db85026b5540851",
+  "assets": [
+    {
+      "name": "Zelos-1.8.1-arm64.dmg",
+      "size": 120923004,
+      "sha256": "8adf67e722e756797b723200f5e9c8330752c029321c38d2b25b3b9c40273e0e"
+    },
+    {
+      "name": "Zelos-1.8.1-x64.dmg",
+      "size": 125924597,
+      "sha256": "459c93a8e831f1a324a7c74cf6ed3cc5edc537befe49c92e8c50b5b99a9ebf2c"
+    },
+    {
+      "name": "Zelos-1.8.1-setup-arm64.exe",
+      "size": 97289134,
+      "sha256": "5cddada7b35142cf2327a412bbae6d54fe5015bccc17f369abde0987764cc2c6"
+    },
+    {
+      "name": "Zelos-1.8.1-setup-x64.exe",
+      "size": 100929984,
+      "sha256": "aa5a27aef72e01cd335f55e49cd850651dba833e86986ef0e45b179384adfa36"
+    },
+    {
+      "name": "zelos-source.zip",
+      "size": 21208444,
+      "sha256": "44b9803d176ed85e0482379e579d46cdce217666c57b4d03dd68a1bed00c54ac"
+    }
+  ]
+}
