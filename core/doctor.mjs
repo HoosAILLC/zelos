@@ -505,7 +505,7 @@ async function checkModelKey(config, deps) {
         chosen
           ? `No key has been saved for this AI service, so every check will fail before it starts. For experts: the service is ${address}.`
           : `No AI has been chosen yet, and no key has been saved for the AI service. For experts: the service is ${address}.`,
-        'Open Settings → AI and paste the key your AI service gave you. Zelos keeps it in this computer’s own password store — it is never written into the settings file, and it never appears in a log. To use a local connection without a provider key, run Ollama or LM Studio and select it. AI requests go to the model server you configure; its routing and other connected services can still use the network.',
+        'Open Settings → AI and paste the key your AI service gave you. Zelos keeps it in this computer’s own password store — it is never written into the settings file, and it never appears in a log. To use a local connection without an AI service key, run Ollama or LM Studio and select it. AI requests go to the model server you configure; its routing and other connected services can still use the network.',
       ),
       key: null,
     };
@@ -526,7 +526,7 @@ async function checkModelEndpoint(config, deps, { key, keyChecked, timeoutMs, si
     return check(
       'model', label, 'fail',
       'No AI service has been chosen yet, so Zelos cannot think about anything it reads.',
-      'Open Zelos, go to Settings → AI, and pick an AI service. For a local connection without a provider key, run Ollama or LM Studio and select it. AI requests go to the model server you configure; its routing and other connected services can still use the network.',
+      'Open Zelos, go to Settings → AI, and pick an AI service. For a local connection without an AI service key, run Ollama or LM Studio and select it. AI requests go to the model server you configure; its routing and other connected services can still use the network.',
     );
   }
   if (!keyChecked) {

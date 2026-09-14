@@ -1165,7 +1165,7 @@ test('REGRESSION: redaction runs once over the original text, never over its own
   }
 });
 
-test('REGRESSION: redaction is linear in the reply, however many times the password appears', async () => {
+test('REGRESSION: redaction is linear in the reply, however many times the password appears', async (t) => {
   /* The repair for the nested-marker cascade above replaced the per-form
      split/join with a single left-to-right scan — and the obvious way to write
      that scan re-runs `indexOf` for EVERY form from the cursor on EVERY hit,
@@ -1174,13 +1174,34 @@ test('REGRESSION: redaction is linear in the reply, however many times the passw
      existed: 7 ms at 18 KB, 29 ms at 72 KB, 431 ms at 288 KB — 15x the time for
      4x the input, against MAX_RESPONSE_BYTES of 96 MB.
 
-     So the assertion is a SHAPE, not a stopwatch reading: quadrupling the reply
-     must not multiply the time by anything like sixteen. A wall-clock budget
-     alone would be flaky on a loaded runner; a ratio survives a slow machine,
-     because a slow machine is slow at both sizes. */
+     A ratio of two single TCP timings still measured scheduling and GC: CI
+     reported 3 ms versus 39 ms for the already-linear code. Instead, count the
+     candidate positions searched by indexOf for the known credential forms.
+     A hit searches only through its match; a miss searches the remaining tail.
+     The original bug repeatedly searched absent forms through that whole tail,
+     so it violates this bound regardless of CPU speed or network scheduling.
+     Keep the real connection and redacted-result assertions as well. */
   const pass = 'hunter2!';
-  const timeFor = async (repeats) => {
-    let ms = 0;
+  const forms = new Set([
+    pass, `"${pass}"`, Buffer.from(pass).toString('base64'),
+    Buffer.from(`\0u\0${pass}`).toString('base64'),
+  ]);
+  const indexOf = String.prototype.indexOf;
+  let active = null;
+  const probe = t.mock.method(String.prototype, 'indexOf', function (needle, from = 0) {
+    const at = indexOf.call(this, needle, from);
+    if (active && forms.has(needle) && this.length >= active.payloadLength) {
+      const text = String(this);
+      let work = active.messages.get(text);
+      if (!work) active.messages.set(text, work = { positions: 0, calls: 0 });
+      work.calls++;
+      work.positions += Math.max(0, (at < 0 ? text.length - needle.length + 1 : at + 1) - from);
+    }
+    return at;
+  });
+  const workFor = async (repeats) => {
+    const measurement = { payloadLength: `${pass} `.length * repeats, messages: new Map() };
+    active = measurement;
     await withServer(
       {
         onCommand: ({ tag, verb, send }) => {
@@ -1189,26 +1210,38 @@ test('REGRESSION: redaction is linear in the reply, however many times the passw
         },
       },
       async ({ port }) => {
-        const started = performance.now();
         const result = await testConnection({
           host: '127.0.0.1', port, secure: false, user: 'u', pass, timeoutMs: 30_000,
         });
-        ms = performance.now() - started;
         assert.equal(result.ok, false);
+        assert.match(result.error, /AUTHENTICATIONFAILED/, 'the diagnosis survives redaction');
+        assert.equal(result.error.match(/<password withheld>/g)?.length, repeats);
         assert.ok(!result.error.includes(pass), 'the password survived a reply that repeats it');
       },
     );
-    return ms;
+    active = null;
+    assert.ok(measurement.messages.size > 0, 'the probe must observe real credential searches');
+    let positions = 0;
+    for (const [message, work] of measurement.messages) {
+      assert.ok(work.calls >= repeats, 'the probe must observe the repeated credential matches');
+      assert.ok(work.positions <= forms.size * (message.length + 1),
+        `redaction searched ${work.positions} positions for a ${message.length}-character reply; `
+        + 'each credential form may scan the reply only once');
+      positions += work.positions;
+    }
+    return positions;
   };
 
-  // A floor keeps the ratio meaningful when both numbers round to nothing.
-  const small = Math.max(await timeFor(4_000), 1);
-  const large = Math.max(await timeFor(16_000), 1);
-  assert.ok(
-    large < small * 8,
-    `redaction is superlinear: 4,000 repeats took ${small.toFixed(0)}ms and 16,000 took ${large.toFixed(0)}ms `
-    + '(4x the input should cost about 4x, not 16x)',
-  );
+  try {
+    const small = await workFor(4_000);
+    const large = await workFor(16_000);
+    assert.ok(large <= small * 4,
+      `4x the reply searched ${large} positions versus ${small}; search work must grow linearly`);
+    t.diagnostic(`Credential search positions: ${small} at 4,000 repeats; ${large} at 16,000 repeats.`);
+  } finally {
+    active = null;
+    probe.mock.restore();
+  }
 });
 
 test('* BYE followed by a dropped connection rejects the in-flight command', async () => {

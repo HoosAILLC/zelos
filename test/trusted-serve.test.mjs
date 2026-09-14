@@ -267,7 +267,7 @@ function cli(t, extraEnv) {
     child.on('error', reject);
     child.on('close', (code) => resolve(code));
   });
-  t.after(async () => { if (child.exitCode === null) child.kill('SIGTERM'); await closed; });
+  t.after(async () => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM'); await closed; });
   return { child, closed, cliHome, get stdout() { return stdout; }, get stderr() { return stderr; } };
 }
 
@@ -298,5 +298,15 @@ test('CLI wires the private settings and prints a stable entry URL without a ses
   assert.ok(!run.stdout.includes('?t='));
   assert.ok(!/[a-f0-9]{64}/.test(run.stdout));
   run.child.kill('SIGTERM');
-  assert.equal(await run.closed, 0);
+  const code = await run.closed;
+  // Windows terminates the process instead of delivering the POSIX signal to
+  // Zelos's shutdown handler. Startup and private access above run on every OS;
+  // verify the actual termination outcome without expecting that handler there.
+  if (process.platform === 'win32') {
+    assert.equal(code, null);
+    assert.equal(run.child.signalCode, 'SIGTERM');
+  } else {
+    assert.equal(code, 0);
+    assert.equal(run.child.signalCode, null);
+  }
 });

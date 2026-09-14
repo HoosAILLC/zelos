@@ -1107,18 +1107,36 @@ test('the scan budget spans the document, not each rule', () => {
   // rule: 800 copies of a never-matching 125-entry BYDAY list — well inside
   // the subscribed-calendar byte cap — froze the sweep for ~19 seconds with
   // every individual rule comfortably under its own allowance.
-  const started = Date.now();
   const rule = `RRULE:FREQ=YEARLY;COUNT=5;BYDAY=${Array(125).fill('99MO').join(',')}`;
-  const events = parseICS_toEvents(
+  const { vevents } = parseICS(
     ics(
       ...Array.from({ length: 800 }, (_, i) =>
         vevent(`UID:runaway-4-${i}`, 'DTSTART;TZID=America/New_York:00010101T090000', rule, 'SUMMARY:Nothing, in bulk'),
       ).flat(),
     ),
-    { from: '2026-08-20', to: '2026-10-26', tzid: NY },
   );
+  // Count actual candidate reads instead of elapsed time: slower runners and
+  // other test processes do not change how much work this document may buy.
+  // Initialization reads each weekday once; recurrence adds at most the shared
+  // 4m scan allowance. A fresh budget per rule crosses this bound and fails
+  // immediately, rather than running the entire hostile document to a timeout.
+  let visited = 0;
+  const maxVisits = 4_000_000 + vevents.length * 125;
+  for (const ev of vevents) {
+    for (const entry of ev.rrule.byday) {
+      const weekday = entry.weekday;
+      Object.defineProperty(entry, 'weekday', {
+        get() {
+          if (++visited > maxVisits) assert.fail('one scan budget must cover the whole document');
+          return weekday;
+        },
+      });
+    }
+  }
+  const events = expand(vevents, { from: '2026-08-20', to: '2026-10-26', tzid: NY });
   assert.equal(events.length, 0, 'nothing matches, and DTSTART itself is outside the window');
-  assert.ok(Date.now() - started < 3000, 'one budget must cover the whole document');
+  assert.ok(visited > 500_000, 'the fixture must exercise the shared budget across several rules');
+  assert.equal(events.incomplete, true, 'budget exhaustion must mark the result as incomplete');
 });
 
 test('an unsupported FREQ degrades to a single occurrence', () => {

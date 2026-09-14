@@ -11,6 +11,11 @@ show a warning. Continue only if you trust the download. The sections
 [Installing on Windows](#installing-on-windows--and-what-you-will-actually-see)
 below say what to click. The rest of this page is for people who type commands.
 
+This checkout describes the **1.8.4 QA candidate**, which is not a published
+release. Candidate installers are temporary GitHub Actions artifacts; native
+build and acceptance checks must finish before release. The download links above
+continue to point to published builds.
+
 ## Updating from an earlier version
 
 Quit Zelos, then copy the data folder shown in Settings to a safe location before
@@ -36,8 +41,37 @@ clients before starting; restore refuses to replace data while another client is
 using it. Only restore a backup you trust, with a version that supports its schema.
 The command-line/browser app retains the full-folder backup procedure above.
 
+**Daily encrypted backups** and **Back up now** create `.zelos-encrypted`
+recovery copies in the data folder and keep the latest seven verified copies.
+Recovering one requires its separate `.automatic-backup-key`; it first produces
+a private, decrypted `.zelos-backup` archive for the reviewed restore workflow.
+Keep a copy of the archive and a separately protected key on another device.
+See [Encrypted recovery copies](LOCAL-ASSISTANT.md#encrypted-recovery-copies)
+for locations and recovery steps. These copies are not a full computer backup
+and do not include operating-system keychain credentials or installed AI models.
+
 **Settings → About → Check for updates** checks the official GitHub release when
 pressed. It sends no account content or credentials, and does not install anything.
+
+## Optional PDF and scan imports
+
+Imports accepts PDF, PNG and JPEG files up to **8 MB**, with PDFs limited to
+**12 pages**. Install the following optional tools on the computer running Zelos:
+
+- **Poppler** provides `pdfinfo` and `pdftotext` for PDFs, plus `pdftoppm` for
+  scanned PDF pages.
+- **Tesseract OCR**, with its English (`eng`) language data, reads PNG/JPEG
+  images and scanned PDF pages. Scanned PDFs need both tools.
+
+These tools are not included in the desktop installer. Zelos checks the system
+PATH and common installation folders. If it cannot find a tool, install it and
+reopen Zelos. On Windows, add the folder containing the tool's executables to
+PATH if it is not found automatically.
+
+Text extraction runs on the computer running Zelos. The extracted text is then
+sent to your configured AI on that computer or local network to prepare a
+preview; configure that model in Settings first. Review the preview and choose
+which records to save. No records are committed just by selecting a file.
 
 ## Path 1 — Command-line usage
 
@@ -127,7 +161,7 @@ already include these dependencies; they do not need this step.
 You will see a banner like this, and your browser will open:
 
 ```
-  ZELOS 1.8.2
+  ZELOS 1.8.4
   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   Open   http://127.0.0.1:7777/?t=9c1f…
@@ -355,9 +389,11 @@ reasonable to click past *this* one is that you can read the source and build
 the installer yourself.
 
 1. **Take the installer that matches your machine.**
-   `Zelos-1.8.2-setup-x64.exe` for an ordinary PC, `-arm64` for Windows on ARM,
-   or the combined installer if you are not sure. The wrong one either runs
-   slowly under emulation or does not run at all.
+   Choose `Zelos-VERSION-setup-x64.exe` for an ordinary PC or
+   `Zelos-VERSION-setup-arm64.exe` for Windows on ARM, replacing `VERSION` with
+   the version you downloaded. Check Settings → System → About → System type
+   if unsure. Each architecture has its own installer; there is no combined
+   installer. The wrong one may run under emulation or fail to run.
 2. **Your browser may refuse to keep the file.** Edge says *"…setup.exe was
    blocked because it could harm your device"*; Chrome says *"…isn't commonly
    downloaded"*. Open the downloads list, click the **…** beside the file, and
@@ -393,7 +429,7 @@ can clear it first: right-click the `.exe` → **Properties** → tick **Unblock
 at the bottom of the **General** tab → **OK**. In PowerShell that is:
 
 ```
-Unblock-File .\Zelos-1.8.2-setup-x64.exe
+Unblock-File .\Zelos-VERSION-setup-x64.exe
 ```
 
 That marker is a real safety mechanism — clear it only from something you built
@@ -469,16 +505,11 @@ directly.
   warning above is macOS and Windows doing their job. You are choosing to trust
   a build; the reason that is a reasonable choice here is that you can read the
   source and, if you want, produce the build yourself.
-- **Windows is built and tested, but nobody has lived with it.** The suite runs
-  on Windows as well as macOS and Linux, on four Node versions each, on every
-  push to `main` and every pull request — and the installers are packaged on a
-  Windows runner that has to go green first. That says the code runs there and
-  the package builds. It does not say the experience is good: no person has
-  installed Zelos on Windows and used it for a week. The tray behaviour, the
-  shortcuts and the dialog wording above are what the tests, the build
-  configuration and Windows itself say they are, not something anyone has sat
-  and watched. If something is wrong on that side, it will not already have been
-  noticed — which is a reason to report it, not a reason to assume it is you.
+- **Automated checks do not replace native acceptance testing.** The desktop
+  workflow builds and checks each supported Mac and Windows architecture.
+  A passing build does not establish that native dialogs, clipboard permissions,
+  tray behaviour or input methods work in every setup. The 1.8.4 QA candidate
+  remains under verification; report platform-specific issues before release.
 - **The app is shipped unpacked, on purpose.** Most Electron apps bundle their
   code into an opaque `app.asar` archive. Zelos does not: `asar` is off in the
   build configuration. Open `/Applications/Zelos.app/Contents/Resources/`
@@ -487,9 +518,9 @@ directly.
   byte for byte the ones in this repository. An app whose entire claim is "you
   can check what it does" should not hide its own code. Diff them against a
   clone if you want to be sure.
-- **No auto-update, at all.** The app never contacts a server to ask whether it
-  is old. Check back here yourself when you want a newer version, and install it
-  the same way.
+- **Updates are manual.** Settings → About → Check for updates contacts the
+  official GitHub release only when pressed. Zelos does not download or install
+  an update automatically.
 - **One copy at a time, and it tells you rather than stopping you.** Launching
   the app while the app is already running brings the existing window forward.
   The other pairing — a `zelos` running in a terminal and the app in the tray,
@@ -508,8 +539,8 @@ directly.
 - **Architecture matters on both platforms.** Take the `arm64` build for Apple
   Silicon and Windows on ARM, and the `x64` build for Intel Macs and ordinary
   PCs. The wrong one either runs slowly under emulation or does not run at all.
-  Windows is the one place you can dodge the question, by taking the combined
-  installer instead; it is larger because it contains both.
+  Windows installers are separate for each architecture. Check System type in
+  Windows Settings if you are unsure which to download.
 
 ---
 
