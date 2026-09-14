@@ -324,7 +324,9 @@ function buildChrome() {
       ...VIEWS.map((view, index) => ({
         id: `view-${view.id}`, label: `Go to ${view.label}`,
         keywords: view.id === 'owed' ? 'drafts replies waiting' : 'navigate',
-        shortcut: window.zelos?.desktop ? (view.id === 'search' ? '⌘/Ctrl+F' : `⌘/Ctrl+${index + 1}`) : null,
+        shortcut: window.zelos?.desktop
+          ? (view.id === 'search' ? '⌘/Ctrl+F' : index < 9 ? `⌘/Ctrl+${index + 1}` : null)
+          : null,
         run: () => navigate(`#/${view.id}`),
       })),
       { id: 'capture', label: 'Add a reminder', keywords: 'capture note', run: () => {

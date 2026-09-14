@@ -199,8 +199,8 @@ Press `Ctrl-C` in the terminal to stop it.
 
 - A real application window and a Dock/taskbar icon.
 - A tray icon with **Check now**, **Open Zelos** and **Quit**.
-- A menu bar, so ⌘C and ⌘V work in the draft editors, and ⌘1…⌘6 jump between
-  views.
+- A menu bar supports copy/paste and view shortcuts: ⌘/Ctrl+1–5 and 7–9,
+  with ⌘/Ctrl+F for Search.
 - It keeps running when you close the window, so scheduled sweeps keep
   happening. Exactly when, by platform:
   - **macOS** — always. That is how macOS apps work; ⌘Q quits.

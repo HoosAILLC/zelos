@@ -116,3 +116,45 @@ test('command failures are reported after closing and releasing modal focus', as
   assert.deepEqual(errors, ['Could not save']); assert.equal(menu.isOpen, false);
   assert.equal(document.activeElement, trigger);
 });
+
+test('the real palette advertises supported desktop shortcuts and keeps later views reachable', async t => {
+  const document = installDom(t);
+  const source = fs.readFileSync(new URL('../ui/app.js', import.meta.url), 'utf8');
+  const viewsBlock = source.match(/const VIEWS = \[([\s\S]*?)\];/)[1];
+  const views = [...viewsBlock.matchAll(/\{ id: '([^']+)', label: '([^']+)'/g)]
+    .map(([, id, label]) => ({ id, label }));
+  const capture = source.match(/function capturePanel\(\) \{[\s\S]*?\n\}/)[0];
+  const chrome = source.match(/function buildChrome\(\) \{[\s\S]*?\n\}/)[0];
+  const calls = [];
+  window.zelos = { desktop: true };
+  const context = vm.createContext({ el, button, icon, focusQuietly, createCommandMenu, document, window,
+    state: { sweep: { running: false } }, route: { view: 'now' }, VIEWS: views,
+    api: {}, navigate: hash => calls.push(hash), startSweep() {}, notify() {},
+    buildSweepLine: () => ({ node: el('div') }), rail: () => el('nav'), tabbar: () => el('nav'),
+  });
+  const built = vm.runInContext(`${capture}\n${chrome}\nbuildChrome()`, context);
+  document.body.appendChild(built.topbarNode);
+  built.commands.open();
+  const expected = new Map([
+    ['Now', '⌘/Ctrl+1'], ['Today', '⌘/Ctrl+2'], ['Promises', '⌘/Ctrl+3'],
+    ['Email', '⌘/Ctrl+4'], ['Calendar', '⌘/Ctrl+5'], ['Search', '⌘/Ctrl+F'],
+    ['Ask', '⌘/Ctrl+7'], ['Progress', '⌘/Ctrl+8'], ['Money', '⌘/Ctrl+9'],
+  ]);
+  const options = [...built.commands.node.querySelectorAll('[role="option"]')];
+  for (const { label } of views) {
+    const option = options.find(row => text(row.querySelector('span')) === `Go to ${label}`);
+    assert.ok(option, `${label} must stay in the palette`);
+    assert.equal(option.querySelector('kbd')?.textContent ?? null, expected.get(label) ?? null,
+      `${label} must advertise only its supported native shortcut`);
+  }
+  const input = built.commands.node.querySelector('input');
+  input.value = 'settings'; input.fire('input'); input.fire('keydown', { key: 'Enter' });
+  await settle();
+  assert.deepEqual(calls, ['#/settings'], 'a view without a digit shortcut still runs from the palette');
+
+  delete window.zelos;
+  built.commands.open();
+  assert.equal(built.commands.node.querySelectorAll('kbd').length, 0,
+    'browser users must not see shortcuts owned by the native desktop menu');
+  built.commands.close();
+});
