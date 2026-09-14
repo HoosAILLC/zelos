@@ -326,6 +326,23 @@ h1{font-size:clamp(72px,14vw,105px)}
 }
 
 /* Feature guide for the latest preview, with the published download kept clear. */
+.vision-status{padding:24px 28px;border:1px solid #cbd1c1;border-radius:22px;background:#e7e9df;margin-bottom:24px}
+.vision-status strong{display:block;font-weight:600;font-size:17px;margin-bottom:8px}
+.vision-status p{font-size:14px;color:#51564b;max-width:980px}
+.vision-journey{list-style:none;margin:0;padding:0;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:18px}
+.vision-journey li{padding:28px;border:1px solid var(--line);border-radius:24px;min-width:0}
+.vision-step{display:block;font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:#626954;margin-bottom:28px}
+.vision-journey h3,.vision-connections h3,.vision-foundation h3{font-size:29px;line-height:1.12;letter-spacing:-.04em;margin-bottom:18px}
+.vision-journey p,.vision-connections p,.vision-foundation p:not(.eyebrow){font-size:15px;color:var(--muted);line-height:1.65}
+.vision-connections{display:grid;grid-template-columns:1fr 1fr;gap:45px;padding:34px 0 28px;margin-top:8px;border-bottom:1px solid var(--line)}
+.vision-connections h3{font-size:25px}
+.vision-controls{font-size:13px;color:var(--muted);margin-top:22px;max-width:1050px}
+.vision-foundation{display:flex;align-items:center;justify-content:space-between;gap:36px;padding:30px;border:1px solid var(--line);border-radius:24px;background:#e9e8e1;margin-top:28px}
+.vision-foundation>div{max-width:750px}
+.vision-foundation .eyebrow{margin-bottom:14px}
+.vision-foundation .text-link{flex-shrink:0}
+@media(max-width:1100px){.vision-journey{grid-template-columns:repeat(2,minmax(0,1fr))}.vision-journey li{padding:28px}.vision-foundation{align-items:flex-start;flex-direction:column;gap:18px}}
+@media(max-width:760px){.vision-status{padding:24px}.vision-journey{grid-template-columns:1fr;gap:16px}.vision-journey li{padding:26px}.vision-step{margin-bottom:20px}.vision-connections{grid-template-columns:1fr;gap:28px}.vision-foundation{padding:25px}.vision-foundation h3{font-size:27px}}
 .new-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:24px}
 .new-grid article{display:flex;flex-direction:column;align-items:flex-start;padding:34px;border-radius:26px;background:#e7e9df;border:1px solid #d8dccd}
 .new-grid .feature-number{margin-bottom:27px;letter-spacing:.07em;text-transform:uppercase;font-size:10px}
