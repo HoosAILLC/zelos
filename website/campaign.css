@@ -332,6 +332,18 @@ h1{font-size:clamp(72px,14vw,105px)}
 .vision-journey{list-style:none;margin:0;padding:0;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:18px}
 .vision-journey li{padding:28px;border:1px solid var(--line);border-radius:24px;min-width:0}
 .vision-step{display:block;font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:#626954;margin-bottom:28px}
+.vision-glasses{display:grid;grid-template-columns:1fr 1.1fr;gap:55px;padding:38px;border:1px solid var(--line);border-radius:26px;background:#e9e8e1;margin-top:28px;scroll-margin-top:28px}
+.vision-glasses .eyebrow{margin-bottom:23px}
+.vision-glasses h3{font-size:clamp(34px,3.5vw,50px);line-height:1.05;letter-spacing:-.045em;margin-bottom:23px}
+.vision-glasses p{font-size:15px;color:var(--muted);line-height:1.65}
+.vision-glasses .glasses-availability{font-size:13px;margin-top:22px}
+.glasses-availability strong{color:var(--ink);font-weight:600}
+.glasses-examples{list-style:none;padding:0;margin:0;min-width:0}
+.glasses-examples li+li{border-top:1px solid #cccbc2;margin-top:19px;padding-top:19px}
+.glasses-examples h4{font-size:19px;font-weight:500;letter-spacing:-.02em;line-height:1.25;margin:0 0 7px}
+.glasses-examples p{font-size:14px}
+@media(max-width:900px){.vision-glasses{gap:30px;padding:30px}}
+@media(max-width:760px){.vision-glasses{grid-template-columns:1fr;gap:28px;padding:26px}.vision-glasses .eyebrow{font-size:10px}}
 .vision-journey h3,.vision-connections h3,.vision-foundation h3{font-size:29px;line-height:1.12;letter-spacing:-.04em;margin-bottom:18px}
 .vision-journey p,.vision-connections p,.vision-foundation p:not(.eyebrow){font-size:15px;color:var(--muted);line-height:1.65}
 .vision-connections{display:grid;grid-template-columns:1fr 1fr;gap:45px;padding:34px 0 28px;margin-top:8px;border-bottom:1px solid var(--line)}
