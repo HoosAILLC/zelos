@@ -1,5 +1,6 @@
 /** Small local line icons. Paths are fixed artwork; user content is always text. */
 const paths = {
+  heart: 'M10 17 3 10C-2 3 7 0 10 6c3-6 12-3 7 4l-7 7Z',
   family: 'M7 3a3 3 0 1 1 0 6 3 3 0 0 1 0-6ZM1 18v-3a6 6 0 0 1 12 0v3M15 5a2 2 0 1 1 0 4m0 3a4 4 0 0 1 4 4v2',
   documents: 'M5 2h7l4 4v12H5ZM12 2v5h4M8 11h5M8 14h5',
   booking: 'M6 2v4m8-4v4M3 8h14M3 4h14v14H3Zm4 9 2 2 4-5',

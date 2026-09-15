@@ -19,7 +19,7 @@ export function createBankPanel({getData,onChange,onClose}){
   const form=el('form',{class:'money-bank-setup'},[
    el('span',{class:'money-eyebrow',text:'One-time setup'}),el('h3',{text:'Enable bank linking for your Zelos'}),
    note('Create or sign in to your Plaid developer account and activate real-account access through Trial or Production. Enable Transactions and your bank’s OAuth access. Then enter your application keys here.'),
-   el('div',{class:'workspace-actions'},[external('Open Plaid dashboard ↗','https://dashboard.plaid.com/'),external('Trial setup guide ↗','https://support.plaid.com/hc/en-us/articles/39994173227159-What-is-the-Plaid-Trial-plan')]),
+   el('div',{class:'workspace-actions'},[external('Open Plaid dashboard','https://dashboard.plaid.com/'),external('Trial setup guide','https://support.plaid.com/hc/en-us/articles/39994173227159-What-is-the-Plaid-Trial-plan')]),
    el('div',{class:'workspace-form-grid'},[field('Client ID',client),field('Production secret',secret)]),
    note('Use the production secret, including for Trial. These are application keys, not your bank password. Zelos stores them in its encrypted credential store on the computer running Zelos and never displays them again.'),
    button('Save Plaid setup',{class:'btn solid',type:'submit',disabled:state.busy})]);
@@ -55,7 +55,7 @@ export function createBankPanel({getData,onChange,onClose}){
   if(state.data){
    if(!state.data.configured||state.setup)children.push(setup());
    else children.push(el('div',{class:'workspace-actions'},[button('Continue to Plaid',{class:'btn solid',disabled:state.busy,onClick:()=>run(async()=>{state.session=await bankApi.action('start');state.notice='Open the secure sign-in below. When finished, return here and click “I finished linking.”';})}),button('Edit Plaid setup',{class:'btn quiet',disabled:state.busy,onClick:()=>{state.setup=true;paint();}})]));
-   if(state.session)children.push(el('div',{class:'money-bank-session'},[external('Open secure bank sign-in ↗',state.session.url),button('I finished linking',{class:'btn solid',disabled:state.busy,onClick:()=>check(state.session.id)}),note('The sign-in link lasts 30 minutes. Keep this Zelos tab open while you link.') ]));
+   if(state.session)children.push(el('div',{class:'money-bank-session'},[external('Open secure bank sign-in',state.session.url),button('I finished linking',{class:'btn solid',disabled:state.busy,onClick:()=>check(state.session.id)}),note('The sign-in link lasts 30 minutes. Keep this Zelos tab open while you link.') ]));
    for(const s of state.data.sessions||[])if(s.id!==state.session?.id)children.push(el('div',{class:'money-bank-session'},[note('An earlier bank sign-in is waiting. If you completed it, retrieve your accounts here.'),button('Check completed sign-in',{class:'btn quiet',disabled:state.busy,onClick:()=>check(s.id)})]));
    children.push(...state.data.items.map(bankCard));
   }

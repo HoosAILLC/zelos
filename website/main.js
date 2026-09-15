@@ -403,11 +403,17 @@ function armMenu() {
   const links = document.getElementById('nav-links');
   if (!button || !links) return;
   button.closest('.nav').classList.add('menu-ready');
-  const close = () => { button.setAttribute('aria-expanded', 'false'); links.classList.remove('is-open'); };
+  const setOpen = open => {
+    button.setAttribute('aria-expanded', String(open));
+    button.setAttribute('aria-label', open ? 'Close navigation' : 'Open navigation');
+    button.textContent = open ? 'Close' : 'Menu';
+    links.classList.toggle('is-open', open);
+  };
+  const close = () => setOpen(false);
+  close();
   button.addEventListener('click', () => {
     const open = button.getAttribute('aria-expanded') !== 'true';
-    button.setAttribute('aria-expanded', String(open));
-    links.classList.toggle('is-open', open);
+    setOpen(open);
   });
   links.addEventListener('click', (event) => { if (event.target.closest('a')) close(); });
   document.addEventListener('keydown', (event) => {

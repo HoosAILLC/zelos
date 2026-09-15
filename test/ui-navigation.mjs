@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 const HEALTH_DECLARATION="const sourceURLs=new Set(['https://www.who.int/news-room/fact-sheets/detail/healthy-diet','https://www.cdc.gov/physical-activity-basics/adding-adults/index.html','https://www.fda.gov/food/nutrition-food-labeling-and-critical-foods/food-allergies']);";
 const SHOPPING_ANCHOR="el('a', { href: 'https://docs.instacart.com/developer_platform_api/get_started/api-keys', target: '_blank', rel: 'noopener noreferrer', text: 'Get a developer API key' })";
-const BRAVE_ANCHOR="el('a', { href: 'https://api-dashboard.search.brave.com/app/keys', target: '_blank', rel: 'noopener noreferrer', text: 'Get a Brave Search API key ↗' })";
+const BRAVE_ANCHOR="el('a', { href: 'https://api-dashboard.search.brave.com/app/keys', target: '_blank', rel: 'noopener noreferrer', text: 'Get a Brave Search API key' })";
 const MEAL_PHOTO_SOURCES = [
   "https://www.pexels.com/photo/bowl-of-oatmeal-with-sliced-fruits-and-berries-4725747/",
   "https://www.pexels.com/photo/spoon-in-a-bowl-with-yogurt-and-berries-10421049/",
@@ -57,8 +57,8 @@ export function stripFixedNavigation(where, source) {
     const helper="const external=(text,href)=>el('a',{class:'btn quiet',text,href,target:'_blank',rel:'noopener noreferrer'});";
     assert.equal(source.split(helper).length-1,1,'Plaid navigation must use the exact protected anchor helper');
     for(const call of [
-      "external('Open Plaid dashboard ↗','https://dashboard.plaid.com/')",
-      "external('Trial setup guide ↗','https://support.plaid.com/hc/en-us/articles/39994173227159-What-is-the-Plaid-Trial-plan')",
+      "external('Open Plaid dashboard','https://dashboard.plaid.com/')",
+      "external('Trial setup guide','https://support.plaid.com/hc/en-us/articles/39994173227159-What-is-the-Plaid-Trial-plan')",
     ]) {
       assert.equal(source.split(call).length-1,1,'Plaid must use each exact reviewed setup link once');
       source=source.replace(call,'');

@@ -1,20 +1,24 @@
 A clearer day
 =============
 
-A morning overview and a meeting brief bring the useful details together.
+Meetings, replies, and next steps in focus. A little more room to get outside.
 
-1.8.4 preview  ·  Fictional demo data  ·  Edited walkthrough.
+30-second lifestyle film. Dramatized scenes with licensed stock actors, not customer testimonials. Original instrumental score; no spoken narration.
 
-This edited product walkthrough uses actual interface captures and fictional records. The soundtrack is original instrumental audio, with no spoken narration. All narrative text appears on screen.
+00:00:00–00:00:04  Let Zelos bring your day together.
+Scene: Hands working at a laptop in morning light.
 
-00:00:00–00:00:03  Your day. Already in focus.
+00:00:06–00:00:10  Meetings. Replies. Your next move.
+Scene: A person finishes typing and closes a laptop.
 
-00:00:03–00:00:10  Bring your meetings, messages, and commitments into one view.
-On screen: Know what needs you. The Zelos Now overview with meetings, messages, and commitments.
+00:00:13–00:00:18  Less catching up. More getting out.
+Scene: A walk along a sunlit forest trail.
 
-00:00:10–00:00:19  Ask for a meeting brief. Get useful details with their sources.
-On screen: Get straight to the context. The Zelos Ask meeting brief with source references.
+00:00:24–00:00:29  Make room for life.
+Scene: Two people take in the view together beside a lake.
 
-00:00:19–00:00:23  A little less catching up. More time to show up.
+Small on-screen label at the beginning and end: Dramatized scenes. The final image also displays ZELOS.
 
-00:00:23–00:00:27  Explore the current preview at zelos-app.netlify.app.
+Zelos helps bring meetings, replies, and next steps together. These illustrative scenes do not promise or measure a specific amount of time saved.
+
+Footage and music credits: https://zelos.life/video/credits.html

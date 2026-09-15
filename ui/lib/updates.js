@@ -27,7 +27,7 @@ export function updatesPanel() {
         if (!/^\d+\.\d+\.\d+$/.test(release.latestVersion) || release.releaseUrl !== official) throw new Error('The release link could not be verified.');
         const notes = typeof release.notes === 'string' ? release.notes : '';
         replace(result, [
-          el('a', { class: 'btn quiet', href: official, target: '_blank', rel: 'noopener noreferrer', text: 'Release notes and downloads ↗' }),
+          el('a', { class: 'btn quiet', href: official, target: '_blank', rel: 'noopener noreferrer', text: 'Release notes and downloads' }),
           release.updateAvailable ? el('p', { class: 'quiet-note', text: 'Back up your data, then quit Zelos before replacing the app. Your existing data folder stays in place.' }) : null,
           notes ? el('details', {}, [el('summary', { text: 'What is in this release' }), el('pre', { class: 'code', style: { 'white-space': 'pre-wrap' }, text: notes })]) : null,
         ]);

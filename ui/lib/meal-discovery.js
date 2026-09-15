@@ -1,5 +1,6 @@
 /** Private recipe browsing. Choices save locally; only Add changes the week. */
 import { el, button, focusQuietly } from './dom.js';
+import { icon } from './icons.js';
 import { api } from './api.js';
 import { mealPhoto, mealPhotoFigure, mealPhotoCredit } from './meal-photos.js';
 
@@ -234,7 +235,7 @@ export function createMealDiscovery({ getWeek, onWeekUpdated = async () => {}, o
       mealPhotoFigure(photo),
       el('div', { class: 'md-card-body' }, [
         el('div', { class: 'md-card-heading' }, [el('div', {}, [el('p', { class: 'md-eyebrow', text: [label(recipe.slot), recipe.cuisine].filter(Boolean).join(' · ') }),
-          el('h3', { text: recipe.title })]), button(favorite ? '♥' : '♡', { class: 'md-heart', 'aria-label': `${favorite ? 'Unsave' : 'Save'} ${recipe.title}`,
+          el('h3', { text: recipe.title })]), button(icon('heart'), { class: 'md-heart', 'aria-label': `${favorite ? 'Unsave' : 'Save'} ${recipe.title}`,
           'aria-pressed': String(favorite), disabled: unavailable(), dataset: { discoveryFocus: `heart:${id}` }, onClick: () => taste(recipe, favorite ? 'clear' : 'favorite') })]),
         el('div', { class: 'md-meta' }, [el('span', { text: Number.isFinite(recipe.minutes) ? `${recipe.minutes} min` : 'Time not listed' }),
           el('span', { text: estimate(recipe) })]),

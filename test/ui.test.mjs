@@ -3068,7 +3068,7 @@ test('the Microsoft registration form is hidden when the server ships the client
   assert.ok(missing, 'the missing-client branch is gone');
   assert.ok(!/is required/.test(missing[0]), 'the button still answers "…ID is required"');
   assert.match(missing[0], /setupLink\(setupUrl\)/, 'the button does not route to the setup page');
-  assert.match(src, /function setupLink\(href\)[\s\S]*?text: 'Show me how ↗'/, 'there is no Show me how link');
+  assert.match(src, /function setupLink\(href\)[\s\S]*?text: 'Show me how'/, 'there is no Show me how link');
   // The page itself is the server's (GET /api/guides): ui/ names no remote host.
   assert.ok(!/github\.com|OAUTH\.md#/.test(src.replace(/^\s*(\*|\/\/).*$/gm, '')), 'the setup page is spelled out in ui/');
   const server = fs.readFileSync(path.join(ROOT, 'core/server.mjs'), 'utf8');
@@ -3835,7 +3835,7 @@ test('no screen in onboarding, and no mail card, shows a first-timer a protocol 
   assert.match(anywhere(view), /Ollama on 11434/, 'the probe sentence is gone rather than folded');
   findButtons(view, /^Claude, by Anthropic/)[0].fire('click');
   seen = onScreen(view);
-  assert.match(seen, /1\. Open.*Anthropic’s key page ↗.*they may ask you to sign in or make an account/);
+  assert.match(seen, /1\. Open.*Anthropic’s key page.*they may ask you to sign in or make an account/);
   assert.match(seen, /2\. Press Create Key and copy it\./);
   assert.match(seen, /3\. Paste it here\./);
   assert.match(seen, /Pay-as-you-go\. You can set a monthly spending cap on their site\./);
@@ -3905,7 +3905,7 @@ test('no screen in onboarding, and no mail card, shows a first-timer a protocol 
   emailInput.value = 'frank@hotmail.com';
   emailInput.fire('change');
   await settle();
-  assert.ok(plainWalk(view).some((n) => n.tag === 'a' && textOf(n) === 'Show me how ↗' && !plainHidden(n)), 'no "Show me how" link on the Hotmail card');
+  assert.ok(plainWalk(view).some((n) => n.tag === 'a' && textOf(n) === 'Show me how' && !plainHidden(n)), 'no "Show me how" link on the Hotmail card');
   assert.ok(plainHidden(findInput(view, (n) => n.attributes.placeholder === '00000000-0000-0000-0000-000000000000')), 'the client-id field is on the card');
   findButton(view, 'Sign in with Microsoft').fire('click');
   await settle();
@@ -3927,7 +3927,7 @@ test('no screen in onboarding, and no mail card, shows a first-timer a protocol 
   findButtons(view, /^iPhone or Mac/)[0].fire('click');
   await settle();
   seen = onScreen(view);
-  assert.match(seen, /appleid\.apple\.com ↗.*Sign-In and Security → App-Specific Passwords → name it Zelos/);
+  assert.match(seen, /appleid\.apple\.com.*Sign-In and Security → App-Specific Passwords → name it Zelos/);
   assert.match(seen, /Your Apple ID email/);
   assert.ok(findButton(view, 'Check it works and save'), 'no one-button finish on the guided calendar');
   assert.doesNotMatch(seen, JARGON, `the iCloud card: ${seen.match(JARGON)?.[0]}`);
@@ -3938,7 +3938,7 @@ test('no screen in onboarding, and no mail card, shows a first-timer a protocol 
   findButtons(view, /^Google Calendar/)[0].fire('click');
   await settle();
   seen = onScreen(view);
-  assert.match(seen, /1\. Open.*Google Calendar on the web ↗/);
+  assert.match(seen, /1\. Open.*Google Calendar on the web/);
   assert.match(seen, /3\. Scroll to ‘Secret address in iCal format’ and copy it\./);
   assert.doesNotMatch(seen, JARGON, `the Google Calendar card: ${seen.match(JARGON)?.[0]}`);
 
@@ -4829,7 +4829,7 @@ test('the guided AI card stores the key, tests, picks the model itself, saves an
   store.state.config = { ...store.state.config, model: { ...DEFAULTS.model } };
   const fresh = settings.modelPanel({ compact: true });
   await settle();
-  assert.match(onScreen(fresh), /1\. Open.*Anthropic’s key page ↗/, 'a fresh home does not open on the Claude card');
+  assert.match(onScreen(fresh), /1\. Open.*Anthropic’s key page/, 'a fresh home does not open on the Claude card');
   const freshKey = findInput(fresh, (n) => n.attributes.type === 'password');
   freshKey.value = 'sk-ant-not-a-real-key';
   findButton(fresh, 'Check it works').fire('click');
@@ -5111,7 +5111,7 @@ test('the account editor\'s Microsoft refusal shows the setup page, not the name
   findButton(panel, 'Sign in with Microsoft').fire('click');
   await settle();
   assert.match(onScreen(panel), /One more step first/);
-  assert.ok(plainWalk(panel).some((n) => n.tag === 'a' && textOf(n) === 'Show me how ↗' && !plainHidden(n)),
+  assert.ok(plainWalk(panel).some((n) => n.tag === 'a' && textOf(n) === 'Show me how' && !plainHidden(n)),
     'the refusal promises "the page below" and shows no page');
   assert.doesNotMatch(onScreen(panel), /docs\/OAUTH\.md/, 'a repo file path stands where the link belongs');
 });

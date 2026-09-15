@@ -2152,6 +2152,7 @@ html[data-sidebar-collapsed="true"] .topbar, html[data-sidebar-collapsed="true"]
   .row-body { min-width: 0; flex-basis: calc(100% - 54px); }
   .row-tools { margin-left: 44px; }
   .row-tools .btn, .sources-toggle { min-height: 44px; }
+  .snooze-pick .input { min-height: 44px; font-size: 16px; }
   .source-link { max-width: 100%; }
   .draft-body { font-size: 16px; }
   .ask-welcome { padding-top: 8vh; }

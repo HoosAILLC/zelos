@@ -174,7 +174,7 @@ test('CSV download exports authenticated loaded records within the selected filt
   t.mock.method(URL, 'createObjectURL', blob => { output = blob; return 'blob:synthetic-finance'; });
   t.mock.method(URL, 'revokeObjectURL', () => {});
   t.mock.timers.enable({ apis: ['setTimeout'] });
-  f.input('Finance workspace filter', f.company.id); await settle(); f.click('Export ↗'); await settle();
+  f.input('Finance workspace filter', f.company.id); await settle(); f.click('Export'); await settle();
   assert.ok(output instanceof Blob); assert.match(await output.text(), /Office supplies/); assert.doesNotMatch(await output.text(), /Travel refund/);
   assert.ok(f.calls.some(call=>call.name==='finance'&&call.args[0].entityId===f.company.id));
   assert.match(text(f.root), /Exported the selected date range/); t.mock.timers.tick(1000);
@@ -248,7 +248,7 @@ test('pending entries stay outside historical spending, posted rows and CSV expo
   assert.match(text(f.root),/spending date filter does not apply/);
   f.click('Transactions');assert.doesNotMatch(text(f.root.querySelector('[aria-label="Transactions"]')),/Unposted/);
   let output;t.mock.method(URL,'createObjectURL',blob=>{output=blob;return 'blob:test';});t.mock.method(URL,'revokeObjectURL',()=>{});
-  t.mock.timers.enable({apis:['setTimeout']});f.click('Export ↗');assert.doesNotMatch(await output.text(),/Unposted/);t.mock.timers.tick(1000);
+  t.mock.timers.enable({apis:['setTimeout']});f.click('Export');assert.doesNotMatch(await output.text(),/Unposted/);t.mock.timers.tick(1000);
   f.click('Personal');await settle();f.click('Pending');
   assert.match(text(f.root.querySelector('[aria-label="Pending transactions"]')),/Unposted personal purchase/);
   assert.doesNotMatch(text(f.root.querySelector('[aria-label="Pending transactions"]')),/office purchase/);

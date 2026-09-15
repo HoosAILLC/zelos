@@ -3,26 +3,50 @@
     {
       "slug": "a-clearer-day",
       "title": "A clearer day",
-      "description": "A morning overview and a meeting brief bring the useful details together.",
-      "durationSeconds": 27,
-      "width": 1280,
-      "height": 720,
+      "description": "Meetings, replies, and next steps in focus. A little more room to get outside.",
+      "durationSeconds": 30,
+      "width": 1920,
+      "height": 1080,
       "fps": 24,
-      "bytes": 2178081,
-      "sha256": "ad79e2e3b24191938b802f05cc945d0164bbb160446505dd4ee0a57c679d4c3e",
-      "previewVersion": "1.8.4"
+      "bytes": 16466992,
+      "sha256": "d660002239bf7de77a36cf7d29d15d78a26607aeb71914b42d99aa4fda94a570",
+      "previewVersion": "1.8.4",
+      "footage": "Licensed live-action; dramatized scenes",
+      "creditsURL": "/video/credits.html",
+      "portrait": {
+        "file": "a-clearer-day-portrait.mp4",
+        "poster": "a-clearer-day-portrait.jpg",
+        "width": 720,
+        "height": 1280,
+        "bytes": 8792018,
+        "sha256": "9e08d016f81c2efe09a6f6559157221d39cb0887c07a6caab9ee90b3f404226a"
+      },
+      "file": "a-clearer-day.mp4",
+      "poster": "a-clearer-day.jpg"
     },
     {
       "slug": "make-room-for-dinner",
       "title": "Make room for dinner",
-      "description": "Turn health preferences into a meal plan you review and a useful grocery list.",
+      "description": "Choose meals, review your grocery list, and put your attention back into cooking and being together.",
       "durationSeconds": 30,
-      "width": 1280,
-      "height": 720,
+      "width": 1920,
+      "height": 1080,
       "fps": 24,
-      "bytes": 2135802,
-      "sha256": "4ccab6daef4ac342544e534a4b8eae76c2aa883eb57429a3c496ade1bb66173f",
-      "previewVersion": "1.8.4"
+      "bytes": 12335667,
+      "sha256": "b6a4753d0a35408f0b0565463b508396b799800b72dc140e9004a8b4631b3096",
+      "previewVersion": "1.8.4",
+      "footage": "Licensed live-action; dramatized scenes",
+      "creditsURL": "/video/credits.html",
+      "portrait": {
+        "file": "make-room-for-dinner-portrait.mp4",
+        "poster": "make-room-for-dinner-portrait.jpg",
+        "width": 720,
+        "height": 1280,
+        "bytes": 7096321,
+        "sha256": "069b1b1f31cadd4b00350352cb9e3f8992e3e630973da2d1cbfdd2eec9b89b4b"
+      },
+      "file": "make-room-for-dinner.mp4",
+      "poster": "make-room-for-dinner.jpg"
     }
   ]
 }

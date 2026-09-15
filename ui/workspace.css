@@ -359,6 +359,7 @@ button.zelos-select[hidden] { display:none; }
 .health-table-wrap,.finance-table-scroll { border-radius:12px; }
 .ask-context-chip-label { border-radius:999px; }
 @media(max-width:759px) {
+  .mail-importance .input, .money-workspace .money-controls .input { min-height:44px; font-size:16px; }
   button.zelos-select.input { min-height:44px; font-size:16px; }
   .zelos-select-option { min-height:44px; }
   .ask-history .zelos-select { flex-basis:0; width:0; max-width:none; }

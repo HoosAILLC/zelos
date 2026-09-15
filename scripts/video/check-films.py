@@ -1,57 +1,61 @@
 #!/usr/bin/env python3
-"""Verify the committed product films decode and match their public metadata."""
-
+"""Validate all four published lifestyle edits, posters, and accessibility files."""
+from pathlib import Path
 import hashlib
 import json
-from pathlib import Path
 import shutil
 import struct
 import subprocess
+from PIL import Image
 
+ROOT=Path(__file__).resolve().parents[2]
+VIDEO=ROOT/'website/video'
 
-ROOT = Path(__file__).resolve().parents[2]
-OUTPUT = ROOT / "website/video"
+def command(args):
+    return subprocess.run(args,check=True,text=True,capture_output=True)
 
+def atoms(path):
+    names=[]
+    with path.open('rb') as f:
+        while True:
+            header=f.read(8)
+            if len(header)<8: break
+            size,name=struct.unpack('>I4s',header);header_size=8
+            if size==1:size=struct.unpack('>Q',f.read(8))[0];header_size=16
+            names.append(name.decode('ascii'))
+            if size==0:break
+            assert size>=header_size
+            f.seek(size-header_size,1)
+    return names
 
 def main():
-    ffprobe, ffmpeg = shutil.which("ffprobe"), shutil.which("ffmpeg")
-    if not ffprobe or not ffmpeg:
-        raise SystemExit("Install ffmpeg (including ffprobe) to check the films.")
-    films = json.loads((OUTPUT / "films.json").read_text())["films"]
-    assert len(films) == 2, "Both product films must be present"
+    ffmpeg=shutil.which('ffmpeg');ffprobe=shutil.which('ffprobe')
+    assert ffmpeg and ffprobe,'FFmpeg and ffprobe are required'
+    films=json.loads((VIDEO/'films.json').read_text())['films']
+    assert {f['slug'] for f in films}=={'a-clearer-day','make-room-for-dinner'}
     for film in films:
-        path = OUTPUT / f"{film['slug']}.mp4"
-        content = path.read_bytes()
-        assert len(content) == film["bytes"], f"Stale byte count: {path.name}"
-        assert hashlib.sha256(content).hexdigest() == film["sha256"], f"Stale hash: {path.name}"
-        probe = json.loads(subprocess.check_output([ffprobe, "-v", "error", "-show_streams", "-show_format", "-of", "json", str(path)]))
-        video = next(s for s in probe["streams"] if s["codec_type"] == "video")
-        audio = next(s for s in probe["streams"] if s["codec_type"] == "audio")
-        assert (video["width"], video["height"]) == (1280, 720)
-        assert video["codec_name"] == "h264" and video["pix_fmt"] == "yuv420p"
-        assert video["r_frame_rate"] == "24/1"
-        assert audio["codec_name"] == "aac" and audio["channels"] == 2
-        assert abs(float(probe["format"]["duration"]) - film["durationSeconds"]) < 0.1
-        # Parse top-level ISO-BMFF atoms; a filename containing “moov” is not proof.
-        atoms, position = [], 0
-        while position + 8 <= len(content):
-            size, kind = struct.unpack_from(">I4s", content, position)
-            if size == 1:
-                size = struct.unpack_from(">Q", content, position + 8)[0]
-            elif size == 0:
-                size = len(content) - position
-            assert size >= 8, "Invalid MP4 atom size"
-            atoms.append(kind)
-            position += size
-        assert atoms.index(b"moov") < atoms.index(b"mdat"), "Movie is not optimized for progressive playback"
-        result = subprocess.run([ffmpeg, "-v", "error", "-i", str(path), "-f", "null", "-"], capture_output=True, text=True)
-        assert result.returncode == 0 and not result.stderr.strip(), result.stderr
-        assert (OUTPUT / f"{film['slug']}.jpg").stat().st_size > 10000
-        assert (OUTPUT / f"{film['slug']}.vtt").read_text().startswith("WEBVTT\n")
-        transcript = (OUTPUT / f"{film['slug']}.txt").read_text()
-        assert "Fictional demo data" in transcript and "Edited walkthrough" in transcript
-        print(f"PASS {film['title']}: full decode, H.264/AAC, 720p, 24 fps, {film['durationSeconds']}s, fast start, poster, text track, transcript, SHA-256")
+        assert film['durationSeconds']==30 and film['fps']==24
+        for entry,size in [(film,(1920,1080)),(film['portrait'],(720,1280))]:
+            path=VIDEO/entry['file']
+            probe=json.loads(command([ffprobe,'-v','error','-show_streams','-show_format','-of','json',str(path)]).stdout)
+            v=next(s for s in probe['streams'] if s['codec_type']=='video')
+            a=next(s for s in probe['streams'] if s['codec_type']=='audio')
+            assert v['codec_name']=='h264' and v['pix_fmt']=='yuv420p'
+            assert (v['width'],v['height'])==size
+            assert v['avg_frame_rate']=='24/1' and int(v['nb_frames'])==720
+            assert abs(float(v['duration'])-30)<.001
+            assert abs(float(probe['format']['duration'])-30)<.05
+            assert a['codec_name']=='aac' and a['channels']==2 and int(a['sample_rate'])==48000
+            atom_names=atoms(path);assert atom_names.index('moov')<atom_names.index('mdat')
+            assert entry['bytes']==path.stat().st_size
+            assert entry['sha256']==hashlib.sha256(path.read_bytes()).hexdigest()
+            assert Image.open(VIDEO/entry['poster']).size==size
+            result=command([ffmpeg,'-v','error','-i',str(path),'-f','null','-'])
+            assert not result.stderr,result.stderr
+            print(f'PASS {path.name}: {size[0]}×{size[1]}, 720 frames, H.264/AAC, fast start, full decode',flush=True)
+        assert (VIDEO/(film['slug']+'.vtt')).read_text().startswith('WEBVTT')
+        assert 'Dramatized scenes' in (VIDEO/(film['slug']+'.txt')).read_text()
+    assert (VIDEO/'credits.html').is_file()
+    print('All four lifestyle films passed validation.')
 
-
-if __name__ == "__main__":
-    main()
+if __name__=='__main__':main()

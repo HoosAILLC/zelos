@@ -1,26 +1,24 @@
 Make room for dinner
 ====================
 
-Turn health preferences into a meal plan you review and a useful grocery list.
+Choose meals, review your grocery list, and put your attention back into cooking and being together.
 
-1.8.4 preview  ·  Fictional demo data  ·  Edited walkthrough.
+30-second lifestyle film. Dramatized scenes with licensed stock actors, not customer testimonials. Original instrumental score; no spoken narration.
 
-This edited product walkthrough uses actual interface captures and fictional records. The soundtrack is original instrumental audio, with no spoken narration. All narrative text appears on screen.
+00:00:01–00:00:05  Zelos plans around your goals and tastes.
+Scene: A couple discusses a recipe with a laptop nearby.
 
-00:00:00–00:00:03  Dinner starts with a little less work.
+00:00:06–00:00:10  Choose your meals. Review your grocery list.
+Scene: The same couple unpacks fresh groceries in their kitchen.
 
-00:00:03–00:00:08  Bring your health goals, food preferences, and household needs together.
-On screen: Your preferences come first. The Zelos Health goals and food preferences.
+00:00:14–00:00:18  Less time deciding. More time cooking together.
+Scene: They chop vegetables and prepare a meal together.
 
-00:00:08–00:00:13  Explore meal ideas. Choose what fits your week.
-On screen: Make the week more delicious. The Zelos Groceries Discovery recipe cards.
+00:00:24–00:00:29  Make room for dinner.
+Scene: They enjoy dinner and conversation at home.
 
-00:00:13–00:00:20  Review meal suggestions that fit the preferences you provide.
-On screen: A plan that fits your week. The Zelos Health meal-plan review.
+Small on-screen label at the beginning and end: Dramatized scenes. The final image also displays ZELOS.
 
-00:00:20–00:00:26  Take a reviewed meal plan into groceries. You choose what to buy and check out.
-On screen: The plan becomes a list. The Zelos Groceries list.
+Zelos helps suggest meals and prepare a grocery list using preferences you provide. You review the plan and choose what to buy. The people shown do the shopping, cooking, and cleanup. No automatic ordering, delivery, or robotic cooking is demonstrated.
 
-00:00:26–00:00:30  Less planning dinner. More enjoying it. Explore Zelos at zelos-app.netlify.app.
-
-Meal suggestions are reviewed by you. Grocery purchasing, cooking, and cleanup are not automated in this preview.
+Footage and music credits: https://zelos.life/video/credits.html

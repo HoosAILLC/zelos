@@ -14,7 +14,7 @@
 <link rel="preload" href="/fonts/cinzel.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="preload" href="/fonts/hankengrotesk.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="/styles.css">
-<link rel="stylesheet" href="/campaign-info.css?v=20260914-pages">
+<link rel="stylesheet" href="/campaign-info.css?v=20260915-mobile">
 </head>
 <!-- "Ask Claude to walk me through this."
 
@@ -84,13 +84,11 @@
      one leading newline the parser drops — so re-bake before publishing. -->
 <body>
 
-<div class="backdrop backdrop-still" aria-hidden="true"></div>
-<canvas class="motes" aria-hidden="true"></canvas>
 <a class="skip" href="#main">Skip to content</a>
 
 <nav class="nav" aria-label="Primary">
   <a class="wordmark" href="/" aria-label="Zelos, home"><img class="brand-wordmark" src="/img/brand/zelos-wordmark.svg" width="1460" height="600" alt="Zelos"></a>
-  <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="nav-links">Menu <span aria-hidden="true">+</span></button>
+  <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="nav-links">Menu</button>
   <ul class="nav-links" id="nav-links"><li><a href="/features">Features</a></li><li><a href="/watch">Films</a></li><li><a href="/vision">Vision</a></li><li><a href="/help" aria-current="page">Help</a></li><li><a href="/download" class="nav-cta">Get Zelos</a></li></ul>
 </nav>
 
@@ -98,12 +96,10 @@
 
 <section class="band" aria-labelledby="help-title">
   <div class="band-head">
-    <p class="eyebrow">Help · for after you have downloaded Zelos</p>
-    <h1 id="help-title">A good start.<br>A little help when you need it.</h1>
-    <p class="band-note">Every setup step below has a message already written for you. Hand it to
-      Claude and Claude will walk you through that one step — one thing at a time, in plain words,
-      asking you what you see. Nothing about you is in the message: not your email address, not a
-      password. Only which screen you are on and what it needs.</p>
+    <p class="eyebrow">Setup help</p>
+    <h1 id="help-title">A little help. <br>A good start.</h1>
+    <p class="band-note">Pick what you need help with. Each guide includes a message you can copy into your preferred AI chat for step-by-step help.</p>
+    <nav class="help-quicklinks" aria-label="Jump to setup"><a href="#open">Open the app</a><a href="#ai">Choose AI</a><a href="#email">Email</a><a href="#calendar">Calendar</a><a href="#preview">Preview features</a><a href="#else">Other help</a></nav>
   </div>
 
   <p class="note">The regular download is {{VERSION}}. The homepage showcases the {{PREVIEW_VERSION}} QA preview, which adds newer workspaces and connections. <a href="#preview">Using the preview? Start here.</a> Check Settings → About to see your version.</p>
@@ -125,7 +121,7 @@
 </section>
 
 <section class="band" id="preview" aria-labelledby="preview-title">
-<div class="band-head"><p class="eyebrow">Using the {{PREVIEW_VERSION}} QA preview</p><h2 id="preview-title">Set up the features<br>you want to use.</h2><p class="band-note">The newer workspaces are available in the preview source and test installers, separately from public release {{VERSION}}. Keep a backup before trying a preview with existing data.</p></div>
+<div class="band-head"><p class="eyebrow">Using the {{PREVIEW_VERSION}} QA preview</p><h2 id="preview-title">Set up the features <br>you want to use.</h2><p class="band-note">The newer workspaces are available in the preview source and test installers, separately from public release {{VERSION}}. Keep a backup before trying a preview with existing data.</p></div>
 <div class="privacy-grid preview-guide">
 <article class="glass pane"><h3>Choose your AI</h3><p>Start in Settings → AI. General archive tasks can use a compatible hosted service with your own key. Questions about saved personal records, document review, and health planning require a model served on your computer or local network. That server’s routing controls where processing occurs. Zelos does not include an AI subscription.</p></article>
 <article class="glass pane"><h3>Connect Money</h3><p>Bank linking requires configured Plaid credentials and a supported institution. Saved bank balances include retrieval times; pending charges stay separate from posted spending. You can also import statements. Review recurring and duplicate suggestions before confirming a change, and use Undo if needed.</p></article>
@@ -136,7 +132,7 @@
 <article class="glass pane"><h3>Plan meals and groceries</h3><p>Save your preferences and review the generated plan before using it. Mark grocery items Needed, Have, or Bought. Optional store sharing needs separate setup and a review of the list being sent. Prices are estimates; checkout happens with the store. Health records preserve your reported results and do not provide a diagnosis.</p></article>
 <article class="glass pane"><h3>Choose the right installer</h3><p>Use Apple Silicon or Intel for your Mac, and x64 or ARM64 for your Windows PC. All four preview packages passed automated build and runtime checks; hands-on Windows install and upgrade acceptance remains. Messages import is Mac-only and needs Full Disk Access. The main workspaces work independently of Messages.</p></article>
 </div>
-<p class="note"><a href="https://github.com/HoosAILLC/zelos/blob/codex/cross-platform-qa/docs/INSTALL.md">Full preview installation guide ↗</a> · <a href="/privacy#preview">Preview privacy details ↗</a> · <a href="/download">Downloads and preview source →</a></p>
+<p class="note"><a href="https://github.com/HoosAILLC/zelos/blob/codex/cross-platform-qa/docs/INSTALL.md">Full preview installation guide</a> · <a href="/privacy#preview">Preview privacy details</a> · <a href="/download">Downloads and preview source</a></p>
 </section>
 
 <!-- ─────────────────────────────────────────── (a) opening it -->
@@ -684,6 +680,6 @@ Start by asking me the first of the three questions.</textarea>
   </div>
 <nav class="info-footer-pages" aria-label="Site pages"><a href="/features">Features</a><a href="/watch">Films</a><a href="/vision">Vision</a><a href="/download">Download</a><a href="/help">Help</a><a href="/privacy">Privacy</a></nav></footer>
 
-<script type="module" src="/main.js?v=20260914-pages"></script>
+<script type="module" src="/main.js?v=20260915-mobile"></script>
 </body>
 </html>

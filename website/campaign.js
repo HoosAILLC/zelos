@@ -18,32 +18,91 @@ function redirectLegacySection() {
 redirectLegacySection();
 window.addEventListener('hashchange',redirectLegacySection);
 
-const menu=document.querySelector('.menu'), navigation=document.querySelector('#navigation');
-function closeMenu(){menu?.setAttribute('aria-expanded','false');navigation?.classList.remove('is-open');}
-menu?.addEventListener('click',()=>{const open=menu.getAttribute('aria-expanded')!=='true';menu.setAttribute('aria-expanded',String(open));navigation?.classList.toggle('is-open',open);});
-navigation?.addEventListener('click',event=>{if(event.target.closest('a'))closeMenu();});
-document.addEventListener('keydown',event=>{if(event.key==='Escape'&&menu?.getAttribute('aria-expanded')==='true'){closeMenu();menu.focus();}});
-window.matchMedia('(min-width: 761px)').addEventListener('change',closeMenu);
+const menu = document.querySelector('.menu');
+const navigation = document.querySelector('#navigation');
+const desktop = window.matchMedia('(min-width: 761px)');
 
-const demo=document.querySelector('#zelos-demo');
-const routes=new Set(['now','today','owed','mail','calendar','search','ask','progress','finance','family','health','jobs','documents','booking','shopping','settings']);
-const requested=new URLSearchParams(location.search).get('demo');
-let pendingRoute=routes.has(requested)?requested:'now';
-function markRoute(route){document.querySelectorAll('.demo-routes button').forEach(button=>button.setAttribute('aria-pressed',String(button.dataset.demoRoute===route)));}
-function selectRoute(route){if(!routes.has(route)||!demo)return;pendingRoute=route;demo.contentWindow?.postMessage({type:'zelos-demo-route',route},location.origin);markRoute(route);}
-document.querySelectorAll('[data-demo-route]').forEach(control=>{
-  const route=control.dataset.demoRoute;
-  if(!routes.has(route))return;
-  if(demo)control.addEventListener('click',()=>selectRoute(route));
-  else if(control.tagName==='A')control.href='/features?demo='+encodeURIComponent(route)+'#see';
-});
-if(demo){
-  demo.addEventListener('load',()=>selectRoute(pendingRoute));
-  window.addEventListener('message',event=>{if(event.origin!==location.origin||event.source!==demo.contentWindow||event.data?.type!=='zelos-demo-ready'||!routes.has(event.data.route))return;markRoute(event.data.route);});
-  markRoute(pendingRoute);
+function setMenu(open) {
+  menu?.setAttribute('aria-expanded', String(open));
+  menu?.setAttribute('aria-label', open ? 'Close navigation' : 'Open navigation');
+  if (menu) menu.textContent = open ? 'Close' : 'Menu';
+  navigation?.classList.toggle('is-open', open);
 }
+function closeMenu() { setMenu(false); }
+closeMenu();
+menu?.addEventListener('click', () => setMenu(menu.getAttribute('aria-expanded') !== 'true'));
+navigation?.addEventListener('click', event => {
+  if (event.target.closest('a')) closeMenu();
+});
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape' && menu?.getAttribute('aria-expanded') === 'true') {
+    closeMenu();
+    menu.focus();
+  }
+});
+document.addEventListener('pointerdown', event => {
+  if (menu?.getAttribute('aria-expanded') === 'true' && !event.target.closest('.site-header')) closeMenu();
+});
 
-// Native players start only through user interaction and never overlap audio.
-const films=[...document.querySelectorAll('video')];
-films.forEach(video=>video.addEventListener('play',()=>{films.forEach(other=>{if(other!==video)other.pause();});}));
-document.addEventListener('visibilitychange',()=>{if(document.hidden)films.forEach(video=>video.pause());});
+const demo = document.querySelector('#zelos-demo');
+const routes = new Set(['now','today','owed','mail','calendar','search','ask','progress','finance','family','health','jobs','documents','booking','shopping','settings']);
+const requested = new URLSearchParams(location.search).get('demo');
+let pendingRoute = routes.has(requested) ? requested : 'now';
+const controls = [...document.querySelectorAll('[data-demo-route]')];
+const mobileLaunch = document.querySelector('[data-mobile-demo-link]');
+
+function markRoute(route) {
+  document.querySelectorAll('.demo-routes button').forEach(button => {
+    button.setAttribute('aria-pressed', String(button.dataset.demoRoute === route));
+  });
+  if (mobileLaunch) mobileLaunch.href = '/try/#/' + route;
+}
+function mountDemo() {
+  // A phone loads the full-screen demo only after its visitor opens it.
+  if (!desktop.matches || !demo || demo.getAttribute('src')) return;
+  const source = demo.dataset.src;
+  if (source) demo.src = source.split('#')[0] + '#/' + pendingRoute;
+}
+function selectRoute(route) {
+  if (!routes.has(route)) return;
+  pendingRoute = route;
+  markRoute(route);
+  if (!desktop.matches || !demo) return;
+  mountDemo();
+  if (demo.getAttribute('src')) demo.contentWindow?.postMessage({type:'zelos-demo-route', route}, location.origin);
+}
+function syncLayout() {
+  closeMenu();
+  controls.forEach(control => {
+    const route = control.dataset.demoRoute;
+    if (!routes.has(route) || control.tagName !== 'A') return;
+    control.href = desktop.matches ? '/features?demo=' + route + '#see' : '/try/#/' + route;
+  });
+  markRoute(pendingRoute);
+  mountDemo();
+}
+controls.forEach(control => {
+  const route = control.dataset.demoRoute;
+  if (!routes.has(route)) return;
+  control.addEventListener('click', event => {
+    if (!desktop.matches || !demo) return;
+    // Modified clicks retain ordinary link behavior, including the route.
+    if (control.tagName === 'A' && (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey)) return;
+    event.preventDefault();
+    selectRoute(route);
+    if (control.tagName === 'A') {
+      const motion = window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth';
+      document.getElementById('see')?.scrollIntoView({behavior: motion, block: 'start'});
+    }
+  });
+});
+if (demo) {
+  demo.addEventListener('load', () => selectRoute(pendingRoute));
+  window.addEventListener('message', event => {
+    if (event.origin !== location.origin || event.source !== demo.contentWindow || event.data?.type !== 'zelos-demo-ready' || !routes.has(event.data.route)) return;
+    pendingRoute = event.data.route;
+    markRoute(pendingRoute);
+  });
+}
+desktop.addEventListener('change', syncLayout);
+syncLayout();

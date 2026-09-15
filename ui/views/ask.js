@@ -151,7 +151,7 @@ function buildWebControls() {
   } });
   webSetup = el('div', { class: 'ask-web-setup', hidden: true }, [
     el('p', { text: 'Connect your own Brave Search key. It is saved in Zelos’s secret store and never sent to the AI.' }),
-    el('a', { href: 'https://api-dashboard.search.brave.com/app/keys', target: '_blank', rel: 'noopener noreferrer', text: 'Get a Brave Search API key ↗' }),
+    el('a', { href: 'https://api-dashboard.search.brave.com/app/keys', target: '_blank', rel: 'noopener noreferrer', text: 'Get a Brave Search API key' }),
     el('div', { class: 'ask-web-key-row' }, [webKeyField, webSaveButton]),
   ]);
   webDetails = el('div', { class: 'ask-web-details', hidden: true }, [

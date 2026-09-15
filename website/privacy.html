@@ -14,7 +14,7 @@
 <link rel="preload" href="/fonts/cinzel.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="preload" href="/fonts/hankengrotesk.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="/styles.css">
-<link rel="stylesheet" href="/campaign-info.css?v=20260914-pages">
+<link rel="stylesheet" href="/campaign-info.css?v=20260915-mobile">
 </head>
 <!-- No <style> block and no style="" attribute anywhere in this file, for the
      same reason 404.html has none: _headers sends style-src 'self' with no
@@ -35,13 +35,11 @@
 
 <!-- The same room, held still. No <video> here — this page is prose from its
      first line, so it takes the poster frame and keeps the veil closed. -->
-<div class="backdrop backdrop-still" aria-hidden="true"></div>
-<canvas class="motes" aria-hidden="true"></canvas>
 <a class="skip" href="#main">Skip to content</a>
 
 <nav class="nav" aria-label="Primary">
   <a class="wordmark" href="/" aria-label="Zelos, home"><img class="brand-wordmark" src="/img/brand/zelos-wordmark.svg" width="1460" height="600" alt="Zelos"></a>
-  <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="nav-links">Menu <span aria-hidden="true">+</span></button>
+  <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="nav-links">Menu</button>
   <ul class="nav-links" id="nav-links"><li><a href="/features">Features</a></li><li><a href="/watch">Films</a></li><li><a href="/vision">Vision</a></li><li><a href="/help">Help</a></li><li><a href="/download" class="nav-cta">Get Zelos</a></li></ul>
 </nav>
 
@@ -50,7 +48,7 @@
 <section class="band" aria-labelledby="privacy-title">
   <div class="band-head">
     <p class="eyebrow">Privacy policy · updated 14 September 2026</p>
-    <h1 id="privacy-title">Your workspace.<br>Your connections. Your choice.</h1>
+    <h1 id="privacy-title">Your workspace. <br>Your connections. Your choice.</h1>
     <p class="band-note">Zelos runs on your own computer and does not require a Zelos cloud account. Your archive lives there. The services and people you choose to connect can receive the information needed for those features. This page explains those choices.</p>
   </div>
 
@@ -219,7 +217,7 @@
 </section>
 
 <section class="band" id="preview" aria-labelledby="preview-privacy-title">
-<div class="band-head"><p class="eyebrow">Additional features / {{PREVIEW_VERSION}} QA preview</p><h2 id="preview-privacy-title">Preview connections<br>and sharing.</h2><p class="band-note">These additions are separate from public release {{VERSION}}. They are optional and depend on the connections, records, recipients, and actions you configure.</p></div>
+<div class="band-head"><p class="eyebrow">Additional features / {{PREVIEW_VERSION}} QA preview</p><h2 id="preview-privacy-title">Preview connections <br>and sharing.</h2><p class="band-note">These additions are separate from public release {{VERSION}}. They are optional and depend on the connections, records, recipients, and actions you configure.</p></div>
 <div class="privacy-grid">
 <article class="glass pane"><h2>Money and bank connections</h2><p>When configured, Plaid connects to the institution you authorize. Zelos stores imported transaction records and saved balance and pending-activity snapshots in your local workspace. Linking and refreshing contact Plaid and the bank. The preview does not make payments or cancel subscriptions. Recurring and duplicate suggestions need your review.</p></article>
 <article class="glass pane"><h2>Personal records and AI</h2><p>Answers can use saved Money, Health, Progress, plans, and committed import records, with references to the relevant entries. These personal-record conversations, document reviews, and health planning require a local/LAN model connection. The server’s own routing controls onward processing. The app stores conversations and saved answer text so they can be reopened.</p></article>
@@ -244,6 +242,6 @@
   </div>
 <nav class="info-footer-pages" aria-label="Site pages"><a href="/features">Features</a><a href="/watch">Films</a><a href="/vision">Vision</a><a href="/download">Download</a><a href="/help">Help</a><a href="/privacy">Privacy</a></nav></footer>
 
-<script type="module" src="/main.js?v=20260914-pages"></script>
+<script type="module" src="/main.js?v=20260915-mobile"></script>
 </body>
 </html>

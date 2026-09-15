@@ -96,13 +96,13 @@ export function fold(label, children, { open = false } = {}) {
 /** The way to the one-time Microsoft setup, as a button — or its name alone when the server sent no page. */
 function setupLink(href) {
   if (!/^https:\/\/\S+$/i.test(String(href || ''))) return el('span', { class: 'quiet-note', text: 'The setup page is described in docs/OAUTH.md, under Microsoft.' });
-  return el('a', { class: 'btn', href, target: '_blank', rel: 'noopener noreferrer', text: 'Show me how ↗' });
+  return el('a', { class: 'btn', href, target: '_blank', rel: 'noopener noreferrer', text: 'Show me how' });
 }
 
 /** An outbound link, https only, opened in a new tab — what desktop/guard.js hands to the system browser. */
 function outLink(href, text) {
   if (!/^https:\/\/\S+$/i.test(String(href || ''))) return el('span', { text });
-  return el('a', { class: 'link', href, target: '_blank', rel: 'noopener noreferrer', text: `${text} ↗` });
+  return el('a', { class: 'link', href, target: '_blank', rel: 'noopener noreferrer', text: `${text}` });
 }
 
 /* ------------------------------------------------------------ ask Claude */
