@@ -59,7 +59,7 @@ export function animateWebsiteWings(screen, { document, window }) {
   };
 }
 
-export function createWebsiteLaunch({ document = globalThis.document, window = globalThis.window, duration = 1600 } = {}) {
+export function createWebsiteLaunch({ document = globalThis.document, window = globalThis.window, duration = 3000 } = {}) {
   const screen = element(document, 'div', {
     id: 'zelos-site-launch', class: 'site-launch', popover: 'auto', role: 'dialog',
     'aria-labelledby': 'zelos-site-launch-title',
@@ -110,7 +110,7 @@ export function createWebsiteLaunch({ document = globalThis.document, window = g
     previousFocus = document.activeElement;
     opened = true;
     // Arm the independent exit before showing or attempting any animation.
-    timer = window.setTimeout(close, Math.min(2400, Math.max(0, duration)));
+    timer = window.setTimeout(close, Math.min(3000, Math.max(0, duration)));
     try {
       screen.showPopover();
       skip.focus({ preventScroll: true });

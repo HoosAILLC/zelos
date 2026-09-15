@@ -45,11 +45,11 @@ test('unsupported browsers preserve the page and leave replay hidden', t => {
   assert.equal(f.replay.hidden, true);
 });
 
-test('the intro is brief, automatic only once per session, with no content lock', t => {
+test('the intro lasts three seconds, automatic only once per session, with no content lock', t => {
   const f = fixture(t), launch = initWebsiteLaunch(f);
   assert.equal(launch.isOpen, true);
   assert.equal(f.timers.size, 1);
-  assert.equal([...f.timers.values()][0].duration, 1600);
+  assert.equal([...f.timers.values()][0].duration, 3000);
   assert.equal(f.replay.hidden, false);
   assert.equal(f.main.hidden, false);
   assert.equal(f.main.hasAttribute('inert'), false);
