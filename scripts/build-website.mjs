@@ -2,7 +2,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { describe } from '../core/connectors/index.mjs';
+import { MEAL_CATALOG } from '../core/meal-catalog.mjs';
+import { GROCERY_STORES } from '../core/grocery-stores.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -41,30 +42,60 @@ export function readWebsiteRelease(root, previewVersion) {
   return release;
 }
 
-export function buildWebsite({ root = ROOT } = {}) {
-  const out = path.join(root, '.site-dist');
+const walk = dir => fs.readdirSync(dir, {withFileTypes:true}).flatMap(entry => entry.isDirectory() ? walk(path.join(dir,entry.name)) : [path.join(dir,entry.name)]);
+
+// Everything visual comes from the application on every build. Only explicit
+// demo adapters are overlaid; a second checked-in UI cannot silently go stale.
+export function previewSource(source) {
+  return source.replace(/(['"`])zelos\.(?!demo\.)/g, '$1zelos.demo.')
+    .replace(/(['"])\/assets\//g, '$1./assets/');
+}
+
+function buildPreview(root, out, version) {
+  const target = path.join(out, 'try');
+  const adapters = new Set(['lib/api.js','lib/bank-link.js','views/family.js']);
+  for (const file of walk(path.join(root,'website/try'))) {
+    const relative = path.relative(path.join(root,'website/try'),file).split(path.sep).join('/');
+    if (fs.existsSync(path.join(root,'ui',relative)) && !adapters.has(relative)) {
+      throw new Error(`Website preview would shadow the current UI: ${relative}. Keep visual changes in ui/.`);
+    }
+  }
+  fs.rmSync(target, {recursive:true, force:true});
+  fs.cpSync(path.join(root, 'ui'), target, {recursive:true});
+  for (const file of walk(target)) if (file.endsWith('.js')) fs.writeFileSync(file, previewSource(fs.readFileSync(file,'utf8')));
+  fs.cpSync(path.join(root, 'website/try'), target, {recursive:true});
+  fs.mkdirSync(path.join(target, 'assets'), {recursive:true});
+  for (const name of ['icon.svg','brand','meals']) {
+    const source = path.join(root,'assets',name);
+    if (fs.existsSync(source)) fs.cpSync(source,path.join(target,'assets',name),{recursive:true});
+  }
+  const apiSource = fs.readFileSync(path.join(root,'ui/lib/api.js'),'utf8');
+  const query = /function queryString\([\s\S]*?\n\}/.exec(apiSource)?.[0];
+  const endpoints = /export const api = \{[\s\S]*?\n\};/.exec(apiSource)?.[0];
+  if (!query || !endpoints) throw new Error('The current app API could not be adapted for the website preview');
+  fs.writeFileSync(path.join(target,'lib/endpoints.js'), `// Generated from ui/lib/api.js; every operation uses the fictional transport.\nimport {request,download} from './api.js';\n${query}\n${endpoints}\n`);
+  fs.writeFileSync(path.join(target,'lib/demo-version.js'), `export default ${JSON.stringify(version)};\n`);
+  fs.writeFileSync(path.join(target,'lib/demo-catalog.js'), `export const recipes=${JSON.stringify(MEAL_CATALOG)};\nexport const stores=${JSON.stringify(GROCERY_STORES)};\n`);
+  const index = fs.readFileSync(path.join(target,'index.html'),'utf8')
+    .replace('<title>Zelos</title>','<title>Try Zelos — current app preview</title>')
+    .replaceAll('href="/','href="./').replaceAll('src="/','src="./')
+    .replace('</head>','<meta name="robots" content="noindex">\n<link rel="stylesheet" href="./demo.css">\n<script src="./demo-boot.js"></script>\n</head>')
+    .replace('</body>','<script type="module" src="./demo.js"></script>\n</body>');
+  fs.writeFileSync(path.join(target,'index.html'),index);
+  // Old bookmarks retain their route and now reach the same current preview.
+  fs.rmSync(path.join(out,'demo'),{recursive:true,force:true});
+  fs.cpSync(target,path.join(out,'demo'),{recursive:true});
+}
+
+export function buildWebsite({ root = ROOT, out = path.join(root, '.site-dist') } = {}) {
   const { version: previewVersion } = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
   const release = readWebsiteRelease(root, previewVersion);
   const { version } = release;
   fs.rmSync(out, { recursive: true, force: true });
   fs.cpSync(path.join(root, 'website'), out, { recursive: true });
-  fs.cpSync(path.join(root, 'ui'), path.join(out, 'demo'), { recursive: true });
-  // The adapter keeps all demo data and mutations in memory using the current UI.
-  fs.cpSync(path.join(root, 'website/demo'), path.join(out, 'demo'), { recursive: true });
-  fs.mkdirSync(path.join(out, 'demo/assets'), { recursive: true });
-  fs.copyFileSync(path.join(root, 'assets/icon.svg'), path.join(out, 'demo/assets/icon.svg'));
-  fs.cpSync(path.join(root, 'assets/brand'), path.join(out, 'demo/assets/brand'), { recursive: true });
-  const data = JSON.parse(fs.readFileSync(path.join(root, 'website/demo-data.json'), 'utf8'));
-  fs.writeFileSync(path.join(out, 'demo/lib/demo-data.js'), `export default ${JSON.stringify({ ...data, version: previewVersion })};\n`);
-  fs.writeFileSync(path.join(out, 'demo/lib/connectors.js'), `export default ${JSON.stringify(describe())};\n`);
-  let html = fs.readFileSync(path.join(out, 'demo/index.html'), 'utf8')
-    .replace('<title>Zelos</title>', '<title>Zelos — live demo</title>')
-    .replaceAll('href="/', 'href="./').replaceAll('src="/', 'src="./')
-    .replace('</head>', '<link rel="stylesheet" href="./demo.css">\n</head>')
-    .replace('</body>', '<script type="module" src="./demo-banner.js"></script>\n</body>');
-  fs.writeFileSync(path.join(out, 'demo/index.html'), html);
+  buildPreview(root,out,previewVersion);
   const scriptHashes = new Set();
-  for (const name of ['index.html', 'help.html', 'privacy.html']) {
+  for (const name of fs.readdirSync(out).filter(name => name.endsWith('.html'))) {
     const target = path.join(out, name);
     const page = fs.readFileSync(target, 'utf8').replaceAll('{{VERSION}}', version).replaceAll('{{PREVIEW_VERSION}}', previewVersion);
     fs.writeFileSync(target, page);
@@ -78,9 +109,10 @@ export function buildWebsite({ root = ROOT } = {}) {
   const downloads = downloadNames(version);
   const redirects = Object.entries(downloads).flatMap(([alias, name]) =>
     [...new Set([alias, alias.toLowerCase()])].map((a) => `/downloads/${a} ${base}/${name} 302!`));
-  fs.writeFileSync(path.join(out, '_redirects'), `${redirects.join('\n')}\n`);
+  const staticRedirects = fs.existsSync(path.join(root,'website/_redirects')) ? fs.readFileSync(path.join(root,'website/_redirects'),'utf8') : '';
+  fs.writeFileSync(path.join(out, '_redirects'), `${redirects.join('\n')}\n${staticRedirects}`);
   fs.writeFileSync(path.join(out, 'release.json'), `${JSON.stringify(release, null, 2)}\n`);
-  fs.rmSync(path.join(out, 'demo-data.json'));
+  fs.rmSync(path.join(out, 'demo-data.json'),{force:true});
   console.log(`Built website for published Zelos ${version} with development preview ${previewVersion}`);
   return out;
 }

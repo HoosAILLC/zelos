@@ -1,9 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import {detectRecurring,findDuplicateCandidates} from '../website/try/lib/money-patterns.js';
-import {balancePresentation,scopedBankSnapshot} from '../website/try/lib/money-accuracy.js';
-const fresh=()=>import(`../website/try/lib/api.js?test=${Math.random()}`);
+import os from 'node:os';
+import path from 'node:path';
+import {fileURLToPath,pathToFileURL} from 'node:url';
+import {buildWebsite} from '../scripts/build-website.mjs';
+const root=fileURLToPath(new URL('..',import.meta.url));
+const output=fs.mkdtempSync(path.join(os.tmpdir(),'zelos-preview-test-'));
+buildWebsite({root,out:output});
+process.on('exit',()=>fs.rmSync(output,{recursive:true,force:true}));
+import {detectRecurring,findDuplicateCandidates} from '../ui/lib/money-patterns.js';
+import {balancePresentation,scopedBankSnapshot} from '../ui/lib/money-accuracy.js';
+const fresh=()=>import(pathToFileURL(path.join(output,'try/lib/api.js')).href+`?test=${Math.random()}`);
 // Use request directly so each test owns an independent browser-memory fixture.
 test('interactive preview supports completion, undo, history and new notes',async()=>{
  const {request}=await fresh();const before=await request('/api/state'),item=before.items.find(x=>x.state==='open');
@@ -125,9 +133,71 @@ test('new preview surfaces cannot link banks, share, invite or mint credentials 
  const {request}=await fresh();
  for(const path of ['/api/finance/plaid/start','/api/finance/plaid/configure','/api/finance/plaid/sync','/api/finance/plaid/disconnect','/api/family/action','/api/family/snapshot','/api/family/invite','/api/family/credentials'])await assert.rejects(request(path,{method:'POST',body:{action:'invite.create'}}),/installed app/);
  for(const file of ['api.js','demo-money.js','demo-family.js','bank-link.js']){const source=fs.readFileSync(new URL('../website/try/lib/'+file,import.meta.url),'utf8');assert.doesNotMatch(source,/\bfetch\s*\(|new EventSource|new WebSocket|localStorage|sessionStorage/);}
- const family=fs.readFileSync(new URL('../website/try/views/family.js',import.meta.url),'utf8');assert.doesNotMatch(family,/type:\s*['"](?:password|file)['"]|navigator\.clipboard|window\.open|method:\s*['"]POST['"]/);
- const app=fs.readFileSync(new URL('../website/try/app.js',import.meta.url),'utf8');assert.match(app,/id: 'family', label: 'Family'/);
+ const family=fs.readFileSync(new URL('../website/try/views/family.js',import.meta.url),'utf8');assert.match(family,/mountFamily/);assert.doesNotMatch(family,/type:\s*['"](?:password|file)['"]|navigator\.clipboard|window\.open/);
+ const app=fs.readFileSync(pathToFileURL(path.join(output,'try/app.js')),'utf8');assert.match(app,/id: 'family', label: 'Family'/);
  assert.match(fs.readFileSync(new URL('../website/try/demo.js',import.meta.url),'utf8'),/'finance','family','health'/);
- const pending=[new URL('../website/try/app.js',import.meta.url)],seen=new Set();
+ const pending=[pathToFileURL(path.join(output,'try/app.js'))],seen=new Set();
  while(pending.length){const url=pending.pop();if(seen.has(url.href))continue;seen.add(url.href);const source=fs.readFileSync(url,'utf8');for(const match of source.matchAll(/(?:from\s*|import\s*)['"](\.[^'"]+)['"]/g)){const dependency=new URL(match[1],url);assert(fs.existsSync(dependency),'Missing '+dependency.pathname);pending.push(dependency);}}
+});
+
+test('current meal discovery uses the app recipe catalog, isolated favorites and reversible choices',async()=>{
+ const {request}=await fresh();const week=new Date().toISOString().slice(0,10),url='/api/shopping/meals?weekStart='+week;
+ const before=await request(url);assert.equal(before.recipes.length,90);assert.match(before.note,/no live AI call/);
+ const recipe=before.recipes.find(value=>value.title==='Blueberry walnut oatmeal');assert(recipe);assert(recipe.ingredients.length);assert(recipe.steps.length);
+ const saved=await request('/api/shopping/meals/taste',{method:'POST',body:{recipeId:recipe.id,action:'favorite',expectedRevision:before.revision}});
+ assert(saved.favorites.includes(recipe.id));
+ await assert.rejects(request('/api/shopping/meals/taste',{method:'POST',body:{recipeId:recipe.id,action:'skip',expectedRevision:before.revision}}),error=>error.status===409);
+ const undone=await request('/api/shopping/meals/taste',{method:'POST',body:{recipeId:recipe.id,action:'clear',expectedRevision:saved.revision}});assert(!undone.favorites.includes(recipe.id));
+ const separate=await fresh();assert.deepEqual((await separate.request(url)).favorites,[]);
+});
+
+test('current weekly planner builds only selected sample meals and updates the same health grocery records',async()=>{
+ const {request}=await fresh(),weekStart=new Date().toISOString().slice(0,10);
+ const before=await request('/api/shopping/week?weekStart='+weekStart);assert.equal(before.week.meals.length,21);
+ const library=await request('/api/shopping/meals?weekStart='+weekStart),recipe=library.recipes.find(value=>value.slot==='dinner');
+ const added=await request('/api/shopping/meals/add',{method:'POST',body:{weekStart,mealId:'0-dinner',recipeId:recipe.id,expectedRevision:before.week.revision}});
+ assert.equal(added.week.meals.find(value=>value.id==='0-dinner').recipeId,recipe.id);
+ const built=await request('/api/shopping/week/build',{method:'POST',body:{weekStart,weekId:added.week.id,expectedRevision:added.week.revision,selectedIds:['0-dinner'],choices:{}}});
+ assert.deepEqual(built.week.selectedIds,['0-dinner']);assert.match(built.notice,/No order was placed/);
+ const health=await request('/api/health-tracking'),groceries=health.groceryItems.filter(value=>value.planId===added.week.id);
+ assert.equal(groceries.length,built.groceryCount);assert.equal(health.plans.find(value=>value.id===added.week.id).entries.length,1);
+ assert.equal(groceries.find(value=>value.name===recipe.ingredients[0].name).quantity,recipe.ingredients[0].quantity*added.week.servings+' '+recipe.ingredients[0].unit);
+ const shopping=await request('/api/shopping');assert.equal(shopping.mealPlanner,true);assert(shopping.items.some(value=>value.id===groceries[0].id));
+ await assert.rejects(request('/api/shopping/week/build',{method:'POST',body:{weekStart,weekId:added.week.id,expectedRevision:added.week.revision,selectedIds:[],choices:{}}}),error=>error.status===409);
+ await assert.rejects(request('/api/shopping/list',{method:'POST',body:{}}),/installed app/);
+});
+
+test('generated preview cannot reach network transports and includes the current app assets and controls',()=>{
+ const walk=dir=>fs.readdirSync(dir,{withFileTypes:true}).flatMap(entry=>entry.isDirectory()?walk(path.join(dir,entry.name)):[path.join(dir,entry.name)]);
+ for(const file of walk(path.join(output,'try')).filter(file=>file.endsWith('.js'))){
+  const source=fs.readFileSync(file,'utf8');assert.doesNotMatch(source,/\bfetch\s*\(|new (?:EventSource|WebSocket|XMLHttpRequest)\b/,path.relative(output,file));
+ }
+ const index=fs.readFileSync(path.join(output,'try/index.html'),'utf8');assert.match(index,/meal-discovery.css/);assert.match(index,/zelos-launch-brand/);
+ assert(fs.existsSync(path.join(output,'try/assets/meals/oatmeal.jpg')));assert(fs.existsSync(path.join(output,'try/lib/select.js')));
+ const app=fs.readFileSync(path.join(output,'try/app.js'),'utf8');assert.match(app,/installSelects\(\)/);assert.match(app,/animateLaunch\(/);
+ const store=fs.readFileSync(path.join(output,'try/lib/store.js'),'utf8');assert.match(store,/'zelos.demo.accent'/);assert.doesNotMatch(store,/'zelos.accent'/);
+});
+
+
+test('prepared Ask examples never substitute Northstar for a different meeting topic',async()=>{
+ const {openStream}=await fresh();let answer='';await openStream('/api/ask',{body:{question:'Help me prepare for my meeting about Cedar House.'},onEvent:(event,data)=>{if(event==='delta')answer+=data.text;}});
+ assert.match(answer,/Cedar House review/);assert.match(answer,/Owen/);assert.doesNotMatch(answer,/Northstar launch/);
+ answer='';await openStream('/api/ask',{body:{question:'Help me prepare for a meeting about an unrelated project.'},onEvent:(event,data)=>{if(event==='delta')answer+=data.text;}});
+ assert.match(answer,/prepared example answers/);assert.doesNotMatch(answer,/## Northstar/);
+});
+
+test('Health prepares an honest editable dinner example and saves the reviewed plan exactly once',async()=>{
+ const {request}=await fresh(),weekStart=new Date().toISOString().slice(0,10);
+ const result=await request('/api/health-tracking/plan-preview',{method:'POST',body:{weekStart,instructions:'Simple dinners for two'}});
+ assert.match(result.model,/prepared example/);assert.match(result.preview.assumptions.join(' '),/not a response to your instructions/);assert.equal(result.preview.entries.length,7);
+ result.preview.title='Reviewed sample dinners';result.preview.groceries.pop();
+ await assert.rejects(request('/api/health-tracking/plan-save',{method:'POST',body:{preview:result.preview,reviewed:false}}),/Review/);
+ const saved=await request('/api/health-tracking/plan-save',{method:'POST',body:{preview:result.preview,reviewed:true}});assert.equal(saved.saved,true);assert.equal(saved.plan.title,'Reviewed sample dinners');
+ const repeated=await request('/api/health-tracking/plan-save',{method:'POST',body:{preview:result.preview,reviewed:true}});assert.equal(repeated.plan.id,saved.plan.id);
+ const health=await request('/api/health-tracking');assert.equal(health.plans.filter(plan=>plan.id===saved.plan.id).length,1);
+ assert.equal(health.groceryItems.filter(item=>item.planId===saved.plan.id).length,result.preview.groceries.length);
+ const shopping=await request('/api/shopping');assert.equal(shopping.totals.unknownPrices,result.preview.groceries.length);
+ const stale=await request('/api/health-tracking/plan-preview',{method:'POST',body:{weekStart}});
+ await request('/api/health-tracking/profile',{method:'POST',body:{goals:'Changed example goal'}});
+ await assert.rejects(request('/api/health-tracking/plan-save',{method:'POST',body:{preview:stale.preview,reviewed:true}}),error=>error.status===409);
 });

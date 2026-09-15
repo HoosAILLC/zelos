@@ -1,0 +1,44 @@
+{
+  "previewVersion": "1.8.4",
+  "capturedOn": "2026-09-14",
+  "source": "Current Zelos app UI with the website fictional-data adapter, captured through the supported browser screenshot API.",
+  "records": "Fictional. Health preferences saved, example meal plan reviewed and saved, resulting grocery list captured.",
+  "captures": [
+    {
+      "file": "dinner-discovery.png",
+      "sha256": "f4c74a7f80c790f99a33b791fb2c0c2fb2279922f52aad8373cb9ff0ed0ce7c6",
+      "width": 1280,
+      "height": 800
+    },
+    {
+      "file": "dinner-groceries.png",
+      "sha256": "b77d859be875995c1ee8367445beceb3103a7231939dada5520753771449ddaa",
+      "width": 1280,
+      "height": 800
+    },
+    {
+      "file": "dinner-health.png",
+      "sha256": "675a86dc5a64075cae96f79cb46ab516353539d75e5edf3c04acc34cbba8e442",
+      "width": 1280,
+      "height": 800
+    },
+    {
+      "file": "dinner-meal-plan.png",
+      "sha256": "679f7ca8e5a697207422a058adde8c80c19073a08da450d17e19ae9dc01a4bb5",
+      "width": 1280,
+      "height": 800
+    },
+    {
+      "file": "morning-ask.png",
+      "sha256": "46488db460d4e233b450a6903a16a997c46d026f39b21cbb8109fd4c681fa696",
+      "width": 1280,
+      "height": 800
+    },
+    {
+      "file": "morning-now.png",
+      "sha256": "0c198710c2315dcb5fb8c4ad2bcea73d9f2c2442654f757098093b8d9fb67bda",
+      "width": 1280,
+      "height": 800
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+{
+  "films": [
+    {
+      "slug": "a-clearer-day",
+      "title": "A clearer day",
+      "description": "A morning overview and a meeting brief bring the useful details together.",
+      "durationSeconds": 27,
+      "width": 1280,
+      "height": 720,
+      "fps": 24,
+      "bytes": 2178081,
+      "sha256": "ad79e2e3b24191938b802f05cc945d0164bbb160446505dd4ee0a57c679d4c3e",
+      "previewVersion": "1.8.4"
+    },
+    {
+      "slug": "make-room-for-dinner",
+      "title": "Make room for dinner",
+      "description": "Turn health preferences into a meal plan you review and a useful grocery list.",
+      "durationSeconds": 30,
+      "width": 1280,
+      "height": 720,
+      "fps": 24,
+      "bytes": 2135802,
+      "sha256": "4ccab6daef4ac342544e534a4b8eae76c2aa883eb57429a3c496ade1bb66173f",
+      "previewVersion": "1.8.4"
+    }
+  ]
+}

@@ -33,3 +33,6 @@ textarea,pre{border-radius:16px!important}
 .preview-guide h3{font-size:25px;margin-bottom:16px;line-height:1.2}
 .preview-guide p{line-height:1.65}
 #preview{scroll-margin-top:90px}
+.band-head>h1{font-size:clamp(38px,5vw,66px);line-height:1.05;letter-spacing:-.045em;margin:0 0 24px}
+.info-footer-pages{display:flex;flex-wrap:wrap;gap:16px 24px;font-size:13px;margin-top:28px}
+.nav-links a[aria-current="page"]{text-decoration:underline;text-underline-offset:5px}

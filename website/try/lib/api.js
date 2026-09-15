@@ -2,6 +2,8 @@
  * model calls, sending, checkout or persistent storage. Every mutation is local.
  * Unsupported operations fail with an explicit demo limitation. */
 import seed from './sample-data.js';
+import previewVersion from './demo-version.js';
+import {createDemoMeals} from './demo-meals.js';
 import {createDemoMoney} from './demo-money.js';
 import {createDemoFamily} from './demo-family.js';
 export {api} from './endpoints.js';
@@ -35,6 +37,9 @@ records['/api/state'].briefing.asOf=checkedAt;
 const fail=(message,status=400)=>{throw new ApiError(message,{status});};
 const demoMoney=createDemoMoney(records['/api/finance'],{now,fail});
 const demoFamily=createDemoFamily(records,{now,fail});
+const demoMeals=createDemoMeals(records,{now,fail,id});
+records['/api/health'].version=previewVersion;
+export const requestFamilyDownload=()=>reject('/api/family/documents');
 const blocked='This action needs the installed app. The website demo uses fictional records, runs only in this tab, and never connects accounts, uploads files, sends email or makes purchases.';
 function reject(path){throw new ApiError(blocked,{status:501,path});}
 function findItem(itemId){const item=allItems.find(x=>x.id===itemId);if(!item)throw new ApiError('Sample item not found.',{status:404});return item;}
@@ -46,7 +51,7 @@ function board(){
  b.briefing.replies=messages.filter(m=>m.direction==='in').slice(0,3).map(m=>({id:m.id,title:m.subject,person:m.from_name,receivedAt:m.sent_at,href:'#/mail/'+m.id}));b.briefing.counts.replies=b.briefing.replies.length;
  return b;
 }
-function shopping(){const s=clone(records['/api/shopping']);s.items=clone(records['/api/health-tracking'].groceryItems);const wanted=s.items.filter(x=>x.state==='needed');s.groups=wanted.map(x=>({name:x.name,quantityText:x.quantity,itemIds:[x.id],estimatedMinor:Math.round((x.estimatedCost||0)*100),unknownPrices:x.estimatedCost==null?1:0,meals:[]}));s.totals.items=wanted.length;s.totals.estimatedMinor=wanted.reduce((n,x)=>n+Math.round((x.estimatedCost||0)*100),0);return s;}
+function shopping(){const s=clone(records['/api/shopping']);s.items=clone(records['/api/health-tracking'].groceryItems);s.mealPlanner=true;s.profile=clone(records['/api/health-tracking'].profile);s.storePreferences=demoMeals.stores();const wanted=s.items.filter(x=>x.state==='needed');s.groups=wanted.map(x=>({name:x.name,quantityText:x.quantity,itemIds:[x.id],estimatedMinor:Math.round((x.estimatedCost||0)*100),unknownPrices:x.estimatedCost==null?1:0,meals:[]}));s.totals.items=wanted.length;s.totals.unknownPrices=wanted.filter(item=>item.estimatedCost==null).length;s.totals.estimatedMinor=wanted.reduce((n,x)=>n+Math.round((x.estimatedCost||0)*100),0);return s;}
 function finance(params){
  const f=clone(records['/api/finance']),entity=params.get('entityId')||'',month=params.get('month')||today.toISOString().slice(0,7);
  const all=f.transactions.filter(x=>!entity||x.entityId===entity);f.transactions=all.filter(x=>x.date.startsWith(month));f.invoices=f.invoices.filter(x=>!entity||x.entityId===entity);
@@ -78,6 +83,9 @@ export async function request(path,{method='GET',body,signal}={}){
  if(method==='GET'){
   if(route==='/api/state')return clone(board());
   if(route==='/api/shopping')return shopping();
+  if(route==='/api/shopping/week')return demoMeals.week(p.get('weekStart'));
+  if(route==='/api/shopping/meals')return demoMeals.library(p.get('weekStart'));
+  if(route==='/api/shopping/store-preferences')return demoMeals.stores();
   if(route==='/api/finance')return finance(p);
   if(route==='/api/finance/plaid')return demoMoney.status();
   if(route==='/api/finance/review')return demoMoney.reviews();
@@ -92,11 +100,12 @@ export async function request(path,{method='GET',body,signal}={}){
   if(/\/api\/items\/[^/]+\/evidence$/.test(route)){const item=findItem(route.split('/')[3]);return {item:clone(item),status:'Illustrative sample evidence',correction:item.payload?.userCorrection||null,sources:search(item.headline.includes('Northstar')?'Northstar':item.person||'scope',3).filter(x=>x.kind==='message').map(x=>({available:true,author:x.from_name,date:x.date,quote:x.excerpt,href:'#/mail/'+x.id})),reviewRequired:true};}
   if(route==='/api/booking/slots'){const settings=records['/api/booking'].settings;const slots=[];for(let n=1;n<=7;n++){const d=new Date();d.setDate(d.getDate()+n);if(!settings.weekdays.includes(d.getDay()))continue;d.setHours(10,0,0,0);slots.push({startsAt:d.toISOString(),endsAt:new Date(+d+settings.durationMinutes*60000).toISOString()});}return {slots,timezone:settings.timezone,durationMinutes:settings.durationMinutes};}
   if(route==='/api/sample-data')return {installed:true,counts:{messages:messages.length,events:records['/api/state'].events.length,items:allItems.length}};
-  if(route==='/api/updates')return {currentVersion:'1.8.4',latest:null,checkedAt:null,canInstall:false};
+  if(route==='/api/updates')return {currentVersion:previewVersion,latest:null,checkedAt:null,canInstall:false};
   if(route==='/api/local/probe')return {found:[],note:'Live AI connections are available in the installed app.'};
   if(records[route]!==undefined)return clone(records[route]);
   return reject(path);
  }
+ if(route.startsWith('/api/shopping/meals/')||route.startsWith('/api/shopping/week/')||route==='/api/shopping/store-preferences')return demoMeals.action(route,body);
  if(route==='/api/finance/review'&&method==='POST')return demoMoney.review(body);
  if(/\/api\/items\/[^/]+\/state$/.test(route)){
   const item=findItem(route.split('/')[3]),before=item.state;item.state=body.state;item.state_at=now();item.updated_at=now();item.snoozed_until=body.state==='snoozed'?(body.until??new Date(Date.now()+86400000).toISOString()):null;
@@ -111,7 +120,9 @@ export async function request(path,{method='GET',body,signal}={}){
  if(route==='/api/shopping/item'){const item=records['/api/health-tracking'].groceryItems.find(x=>x.id===body.id);if(item){item.state=body.state;item.updatedAt=now();}return shopping();}
  if(route==='/api/booking/settings'){Object.assign(records['/api/booking'].settings,body,{updatedAt:now()});return clone(records['/api/booking']);}
  if(route==='/api/booking/cancel'){const b=records['/api/booking'].bookings.find(x=>x.id===body.id);if(b){b.state='cancelled';b.cancelledAt=now();}return clone(records['/api/booking']);}
- if(route==='/api/health-tracking/profile'){Object.assign(records['/api/health-tracking'].profile,body);return clone(records['/api/health-tracking']);}
+ if(route==='/api/health-tracking/plan-preview')return demoMeals.healthPreview(body);
+ if(route==='/api/health-tracking/plan-save')return demoMeals.saveHealthPreview(body);
+ if(route==='/api/health-tracking/profile'){Object.assign(records['/api/health-tracking'].profile,body,{updatedAt:now()});return clone(records['/api/health-tracking']);}
  const healthCollections={walking:'walking',labs:'labs',metrics:'metrics',plans:'plans',groceries:'groceryItems'};
  const healthKey=healthCollections[route.split('/').pop()];
  if(route.startsWith('/api/health-tracking/')&&healthKey){const value=upsert(records['/api/health-tracking'][healthKey],body,healthKey);return {...clone(records['/api/health-tracking']),record:value};}
@@ -130,11 +141,12 @@ export async function request(path,{method='GET',body,signal}={}){
 }
 function answerFor(question){
  const q=String(question||'').toLowerCase();let term='',text='';
- if(/northstar|meeting|prepare|project|review/.test(q)){term='Northstar';text='## Northstar launch review\n\nConfirm three decisions: the final presentation, print quantities, and who owns the content handoff. Bring the revised deck and scope. Leave ten minutes to agree on owners and dates.\n\nThe value: your meeting prep starts from saved project context, so you spend less time finding the thread.';}
- else if(/money|finance|income|spend|studio|invoice/.test(q)){term='invoice';const c=finance(new URLSearchParams()).summary.currencies[0];text=`## Your studio at a glance\n\nRecorded income: **$${(c.incomeCents/100).toLocaleString()}**. Recorded expenses: **$${(c.expenseCents/100).toLocaleString()}**. Net cash flow: **$${(c.netCents/100).toLocaleString()}**.\n\nOpen Money to inspect transactions, invoices, categories, and cash flow. These totals summarize the sample records; they are not a live bank connection.`;}
+ if(/cedar/.test(q)){term='Cedar';text='## Cedar House review\n\nConfirm the oak finish, check lighting lead times, and reconcile the deposit with the revised scope. Ask Owen for the preferred installation window before agreeing to a date.\n\nBring the saved scope and decision notes into the meeting, then agree on owners and next steps.';}
+ else if(/northstar/.test(q)){term='Northstar';text='## Northstar launch review\n\nConfirm three decisions: the final presentation, print quantities, and who owns the content handoff. Bring the revised deck and scope. Leave ten minutes to agree on owners and dates.\n\nThe value: your meeting prep starts from saved project context, so you spend less time finding the thread.';}
+ else if(/money|finance|income|spend|studio|invoice/.test(q)){term='invoice';const company=records['/api/finance'].entities.find(value=>value.type==='company');const c=finance(new URLSearchParams(company?{entityId:company.id}:{})).summary.currencies[0];text=`## Your studio at a glance\n\nRecorded income: **$${(c.incomeCents/100).toLocaleString()}**. Recorded expenses: **$${(c.expenseCents/100).toLocaleString()}**. Net cash flow: **$${(c.netCents/100).toLocaleString()}**.\n\nOpen Money to inspect transactions, invoices, categories, and cash flow. These totals summarize the sample records; they are not a live bank connection.`;}
  else if(/health|meal|dinner|grocer|walk|food/.test(q)){term='dinner';text='## A simpler plan for the week\n\nStart with the saved meal plan: a roasted vegetable bowl, lemon chicken with greens, and a relaxed afternoon walk. Your grocery list separates what you need from what you already have.\n\nOpen Health to explore the plan and Groceries to mark ingredients as bought. In the installed app, AI can prepare a plan from the preferences and records you choose.';}
  else if(/progress|complete|report|finished/.test(q)){text=`## Work you can point to\n\nYou have **${records['/api/progress'].totals.completed} completed items** in this sample week. They include presentation reviews, scope updates, production approvals, and studio accounts.\n\nOpen Progress to inspect the completion history. In the installed app, choose work for a weekly report and create a PDF.`;}
- else if(/cedar|decision/.test(q)){term='Cedar';text='## Cedar House decisions\n\nConfirm the oak finish, check lighting lead times, and reconcile the deposit with the revised scope. Ask Owen for the preferred installation window before agreeing to a date.\n\nThis brings decisions and open questions back into one place, instead of leaving them scattered across old conversations.';}
+ else if(/decision/.test(q)){term='Cedar';text='## Cedar House decisions\n\nConfirm the oak finish, check lighting lead times, and reconcile the deposit with the revised scope. Ask Owen for the preferred installation window before agreeing to a date.\n\nThis brings decisions and open questions back into one place, instead of leaving them scattered across old conversations.';}
  else if(/week|today|attention|priorit|promise|next|day/.test(q)){term='Northstar';text='## Start with what needs you\n\n1. Resolve the overlapping shop-drawing review and timber delivery.\n2. Approve the Northstar launch presentation.\n3. Send the revised Thistlebank scope.\n4. Check the promises waiting on other people.\n\nOpen Now for the briefing, Calendar for the overlap, and Promises for follow-ups.';}
  else {return {text:'This website uses prepared example answers, not a live AI model. Try **“Prepare me for the Northstar review”**, **“What needs my attention this week?”**, **“How is the studio doing?”**, or **“Plan dinners for the week.”**\n\nIn the installed app, Zelos can answer your own questions using the records you connect and the AI provider you choose.',sources:[]};}
  return {text:'*Example answer · fictional workspace · no live AI call*\n\n'+text,sources:term?search(term,3):[]};
