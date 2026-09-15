@@ -216,7 +216,12 @@ export function isLocalAddress(baseUrl)      // localhost/127.0.0.1/::1/*.local/
 ```
 
 `opts`: `{protocol, baseUrl, model, apiKey, system, messages:[{role,content}], maxTokens,
-temperature, json:boolean, timeoutMs=120000, signal, retries=3}`.
+temperature, json:boolean, stream:boolean, timeoutMs=120000, signal, retries=3}`.
+
+`complete({stream:true})` collects the existing streaming transport into one completed answer.
+Full Anthropic board reviews use this path so active reasoning can outlast the non-streaming
+request deadline. Partial, interrupted, cancelled and token-limited boards are not merged.
+The small Settings connection test and other providers keep their existing request path.
 
 **`timeoutMs` is an IDLE budget, not a total one.** A streaming answer resets it on every chunk
 that arrives, so a long reply is never killed for being long — only for going quiet for

@@ -1051,6 +1051,93 @@ test('the Stop button still reaches a stream that is mid-flight', async () => {
   assert.ok(Date.now() - started < 3000, 'Stop must not wait out the idle deadline');
 });
 
+test('a collected Claude completion survives long thinking and pings without another request', async () => {
+  const frame = (event) => `data: ${JSON.stringify(event)}\n\n`;
+  const reply = '{"first":null,"items":[],"notes":["A quiet morning."]}';
+  mock.plan.push({
+    chunks: [
+      frame({ type: 'message_start', message: { model: 'claude-sonnet-5', usage: { input_tokens: 1400, output_tokens: 1 } } }),
+      frame({ type: 'content_block_delta', delta: { type: 'thinking_delta', thinking: 'private synthetic reasoning' } }),
+      ': proxy keepalive\n\n',
+      frame({ type: 'ping' }),
+      frame({ type: 'content_block_delta', delta: { type: 'signature_delta', signature: 'synthetic' } }),
+      frame({ type: 'content_block_delta', delta: { type: 'text_delta', text: reply.slice(0, 24) } }),
+      frame({ type: 'content_block_delta', delta: { type: 'text_delta', text: reply.slice(24) } }),
+      frame({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 12000 } }),
+      frame({ type: 'message_stop' }),
+    ],
+    delayMs: 150,
+  });
+  const started = Date.now();
+  const result = await complete({
+    protocol: 'anthropic', baseUrl: mock.origin, model: 'claude-sonnet-5',
+    messages: [{ role: 'user', content: 'Return a board.' }],
+    json: true, stream: true, maxTokens: 32768, timeoutMs: 700, retries: 0,
+  });
+  assert.ok(Date.now() - started > 700, 'thinking outlasted the former total deadline');
+  assert.equal(mock.requests.length, 1, 'an active generation must not be repeated');
+  assert.equal(mock.last().body.stream, true);
+  assert.equal(mock.last().body.max_tokens, 32768);
+  assert.equal(result.text, reply, 'thinking and signatures never enter the board');
+  assert.deepEqual(result.usage, { input: 1400, output: 12000 });
+  assert.equal(result.model, 'claude-sonnet-5');
+  assert.equal(result.stopReason, 'stop');
+});
+
+test('a collected Claude completion still stops on silence and cancellation', async (t) => {
+  for (const cancelled of [false, true]) await t.test(cancelled ? 'cancelled' : 'silent', async () => {
+    mock.reset();
+    mock.plan.push({ chunks: [': ping\n\n'], thenHang: true });
+    const controller = new AbortController();
+    const timer = cancelled ? setTimeout(() => controller.abort(), 100) : null;
+    try {
+      await assert.rejects(complete({
+        protocol: 'anthropic', baseUrl: mock.origin, model: 'claude-sonnet-5',
+        messages: [{ role: 'user', content: 'Return a board.' }],
+        stream: true, timeoutMs: cancelled ? 30000 : 400, signal: controller.signal,
+      }), cancelled ? /cancelled/ : /did not respond in time/);
+      assert.equal(mock.requests.length, 1, 'no retry after a stream has started');
+    } finally { clearTimeout(timer); }
+  });
+});
+
+test('a collected Claude completion rejects unfinished and failed streams even after balanced JSON', async (t) => {
+  const text = 'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"{\\"items\\":[]}"}}\n\n';
+  for (const failed of [false, true]) await t.test(failed ? 'provider error' : 'unfinished EOF', async () => {
+    mock.reset();
+    mock.plan.push({ chunks: [text, ...(failed ? ['data: {"type":"error","error":{"message":"synthetic interruption"}}\n\n'] : [])] });
+    await assert.rejects(complete({
+      protocol: 'anthropic', baseUrl: mock.origin, model: 'claude-sonnet-5',
+      messages: [{ role: 'user', content: 'Return a board.' }], stream: true,
+    }), failed ? /synthetic interruption/ : /before the answer was complete/);
+    assert.equal(mock.requests.length, 1);
+  });
+});
+
+test('a collected Claude completion preserves length stops and nonstreaming JSON fallbacks', async (t) => {
+  for (const fallback of [false, true]) await t.test(fallback ? 'JSON fallback' : 'SSE length stop', async () => {
+    mock.reset();
+    mock.plan.push(fallback ? {
+      body: { ...ANTHROPIC_MESSAGE, stop_reason: 'max_tokens', usage: { input_tokens: 12, output_tokens: 32768 } },
+    } : {
+      chunks: [
+        'data: {"type":"message_start","message":{"model":"mock-anthropic-model","usage":{"input_tokens":12}}}\n\n',
+        'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"pong"}}\n\n',
+        'data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":32768}}\n\n',
+        'data: {"type":"message_stop"}\n\n',
+      ],
+    });
+    const result = await complete({
+      protocol: 'anthropic', baseUrl: mock.origin, model: 'claude-sonnet-5',
+      messages: [{ role: 'user', content: 'Return a board.' }], stream: true,
+    });
+    assert.equal(mock.requests.length, 1);
+    assert.equal(result.text, 'pong');
+    assert.equal(result.stopReason, 'length');
+    assert.deepEqual(result.usage, { input: 12, output: 32768 });
+  });
+});
+
 /* ------------------------------------------------------------------ *
  * Retry policy
  * ------------------------------------------------------------------ */

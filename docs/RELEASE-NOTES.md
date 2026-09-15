@@ -1,9 +1,14 @@
-# Zelos 1.8.1
+# Zelos 1.8.2
 
-This patch corrects outdated privacy wording in the native About window, Settings and documentation: manual update checks contact GitHub only when requested. It includes the backup and recovery tools, recorded item history, and navigation improvements introduced in 1.8.
+This patch fixes long Claude inbox reviews. Zelos receives the response as Claude produces it and waits for the complete board before saving any results. An active response can take longer than two minutes; a connection that stops making progress still times out.
+
+- **Long Claude reviews:** Full Anthropic reviews use the existing streaming connection. Thinking and keepalive messages keep the connection active, while only the finished response is used to build the board. Cancelled, interrupted or truncated replies cannot replace the board.
+- **Response limit:** Settings → AI → Advanced → Response limit (tokens) exposes the reply allowance. For Sonnet 5 this covers reasoning as well as the visible answer; increase it if a review reaches the limit. Existing settings are preserved when another AI field is saved.
+
+This version also includes the privacy wording corrections in 1.8.1 and the backup, history and navigation improvements introduced in 1.8.
 
 - **Back up and restore:** Settings → Your data can create a private backup of the archive, drafts, captures, history, settings and portable credentials. Restore validates the file, previews its contents, asks before replacement, and keeps a recovery copy. Other Zelos and AI clients must close before the data is replaced.
-- **What changed?:** Item cards show recorded changes to deadlines, priority, status and explanations. Repeated unchanged assessments add no noise. History begins with this version; older changes are not invented. Task-selection changes remain distinct from completing a task.
+- **What changed?:** Item cards show recorded changes to deadlines, priority, status and explanations. Repeated unchanged assessments add no noise. History begins when this feature is first installed; older changes are not invented. Task-selection changes remain distinct from completing a task.
 - **Commands:** The visible Commands button and ⌘/Ctrl+Shift+P open searchable navigation, capture and check actions with keyboard selection and focus return.
 - **Connection recovery:** Reading warnings open the exact account. Setup status distinguishes saved configuration from a recorded successful read; retry controls respect connection waiting times.
 - **Manual update checks:** Settings → About checks the official GitHub release only when pressed, without account content or credentials. It shows release notes and downloads; installation remains a user action.
