@@ -88,7 +88,9 @@ function configArgs(extra = {}) {
 
 /** No shell is launched, including for Windows npm's codex.cmd shim. */
 export async function discoverCodexCommand({ platform = process.platform, arch = process.arch, env = process.env, userHome = os.homedir(), access = fs.access, readFile = fs.readFile, realpath = fs.realpath } = {}) {
-  const p = platform === 'win32' ? path.win32 : path;
+  // Use the requested platform's path rules even when discovery is tested on
+  // another OS. Node's default `path` follows the host, not this argument.
+  const p = platform === 'win32' ? path.win32 : path.posix;
   const get = (key) => Object.entries(env).find(([name]) => name.toLowerCase() === key.toLowerCase())?.[1] || '';
   const dirs = get('PATH').split(platform === 'win32' ? ';' : ':').filter((dir) => dir && p.isAbsolute(dir));
   if (platform === 'darwin') dirs.push('/opt/homebrew/bin', '/usr/local/bin', p.join(userHome, '.local/bin'), '/Applications/Codex.app/Contents/Resources', '/Applications/ChatGPT.app/Contents/Resources');

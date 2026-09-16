@@ -107,8 +107,15 @@ test('Windows npm shim resolves directly to its native executable, never a launc
 });
 
 test('macOS GUI startup discovers standard install folders without a login shell', async () => {
-  const command = await discoverCodexCommand({ platform: 'darwin', env: { PATH: '/usr/bin:relative' }, userHome: '/Users/nemo', access: async (file) => { if (file !== '/opt/homebrew/bin/codex') throw new Error(); } });
+  const visited = [];
+  const command = await discoverCodexCommand({ platform: 'darwin', env: { PATH: '/usr/bin:relative' }, userHome: '/Users/nemo', realpath: async (file) => file, access: async (file) => { visited.push(file); if (file !== '/opt/homebrew/bin/codex') throw new Error(); } });
   assert.deepEqual(command, { command: '/opt/homebrew/bin/codex', args: [] });
+  assert.deepEqual(visited, ['/usr/bin/codex', '/opt/homebrew/bin/codex']);
+});
+
+test('Linux user install discovery uses POSIX paths on every test host', async () => {
+  const command = await discoverCodexCommand({ platform: 'linux', env: { PATH: 'relative:/missing' }, userHome: '/home/nemo', realpath: async (file) => file, access: async (file) => { if (file !== '/home/nemo/.local/bin/codex') throw new Error(); } });
+  assert.deepEqual(command, { command: '/home/nemo/.local/bin/codex', args: [] });
 });
 
 test('older protocol without environment isolation is refused before app-server starts', async (t) => {
