@@ -75,7 +75,9 @@ function fakeRuntime({ handler, configPatch, oldSchema = false, killDelayMs = 0,
 async function setup(t, options = {}) {
   const home = await fs.mkdtemp(path.join(os.tmpdir(), 'zelos-chatgpt-test-'));
   const runtime = fakeRuntime(options);
-  const adapter = createCodexSubscription({ home, spawnImpl: runtime.spawn, resolveCommand: async () => ({ command: '/installed/codex', args: [] }), requestTimeoutMs: 150, ...options.adapter });
+  // Schema fixtures use real filesystem operations, which can take longer on
+  // busy CI hosts. Timing-specific tests set their own short deadlines.
+  const adapter = createCodexSubscription({ home, spawnImpl: runtime.spawn, resolveCommand: async () => ({ command: '/installed/codex', args: [] }), requestTimeoutMs: 5_000, ...options.adapter });
   t.after(async () => { await adapter.close(); await new Promise((resolve) => setImmediate(resolve)); await fs.rm(home, { recursive: true, force: true }); });
   return { ...runtime, home, adapter };
 }
