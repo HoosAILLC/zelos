@@ -747,3 +747,20 @@ describe('where doctor looks for the home', () => {
     }
   });
 });
+
+test('doctor checks ChatGPT sign-in instead of requesting an API key or spending inference', async () => {
+  const { DEFAULTS } = await import('../core/config.mjs');
+  const config = structuredClone(DEFAULTS);
+  config.model = { ...config.model, protocol: 'chatgpt', baseUrl: 'https://chatgpt.com', model: 'auto', keyRef: null };
+  freshHome({ config });
+  let connected = true, reads = 0;
+  const deps = { ...SILENT_DEPS, subscriptionStatus: async () => { reads++; return { installed: true, connected, error: null }; } };
+  const report = await diagnose({ config, deps });
+  assert.equal(byId(report, 'model.key').status, 'pass');
+  assert.equal(byId(report, 'model').status, 'pass');
+  connected = false;
+  const missing = await diagnose({ config, deps });
+  assert.equal(byId(missing, 'model').status, 'fail');
+  assert.match(byId(missing, 'model').detail, /not signed in/i);
+  assert.equal(reads, 2);
+});

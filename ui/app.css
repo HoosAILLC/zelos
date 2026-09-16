@@ -2205,3 +2205,13 @@ html[data-sidebar-collapsed="true"] .rail { visibility: hidden; }
   .view-settings:has(> .banner) > [role="tabpanel"] { grid-row: 4; }
 }
 .status.is-bad, .draft-status.is-bad, .exchange-note.is-bad { color: #efb3a9; }
+
+/* Account setup stays readable and usable in the narrow onboarding card. */
+.subscription-choice { grid-template-columns: minmax(0, 1fr); }
+.subscription-setup, .subscription-alternative { min-width: 0; overflow-wrap: anywhere; }
+.subscription-setup .btn, .subscription-alternative .btn { min-height: 44px; }
+.subscription-setup .input { min-height: 44px; font-size: 16px; width: 100%; max-width: 100%; }
+@media (max-width: 759px) {
+  .subscription-setup .row-inline { align-items: stretch; }
+  .subscription-setup .row-inline > .btn { flex: 1 1 180px; text-align: center; }
+}

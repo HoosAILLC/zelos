@@ -32,6 +32,7 @@ import { DEFAULTS, loadConfig, paths, validateConfig } from './config.mjs';
 import { SCHEMA_VERSION, hasFts5 } from './db.mjs';
 import { backend as secretBackend, getSecret as readSecret } from './secrets.mjs';
 import { isLocalAddress, listModels } from './llm.mjs';
+import { createCodexSubscription } from './codex-subscription.mjs';
 import { guessImapHost, testConnection as testImapConnection } from './sources/imap.mjs';
 import { testConnection as testCalDavConnection } from './sources/caldav.mjs';
 import { parseICS } from './sources/ics.mjs';
@@ -67,6 +68,10 @@ const DEFAULT_DEPS = Object.freeze({
   backend: secretBackend,
   getSecret: readSecret,
   listModels,
+  subscriptionStatus: async () => {
+    const connection = createCodexSubscription();
+    try { return await connection.status(); } finally { await connection.close(); }
+  },
   testImap: testImapConnection,
   testCalDav: testCalDavConnection,
   fetchImpl: (...args) => globalThis.fetch(...args),
@@ -460,6 +465,9 @@ async function checkSecrets(deps, home) {
 async function checkModelKey(config, deps) {
   const label = 'AI key';
   const model = config?.model ?? {};
+  if (model.protocol === 'chatgpt') return {
+    result: check('model.key', 'ChatGPT sign-in', 'pass', 'ChatGPT subscription uses OpenAI sign-in. No API key is needed.'), key: null,
+  };
   const address = String(model.baseUrl ?? '').trim().replace(/\/+$/, '');
   // A model nobody has chosen yet means "not set up", not "broken". The
   // difference is the whole point of the exit code: `zelos doctor` fails when
@@ -521,6 +529,16 @@ async function checkModelEndpoint(config, deps, { key, keyChecked, timeoutMs, si
   const model = config?.model ?? {};
   const address = String(model.baseUrl ?? '').trim().replace(/\/+$/, '');
   const chosen = String(model.model ?? '').trim();
+
+  if (model.protocol === 'chatgpt') {
+    try {
+      const status = await deps.subscriptionStatus();
+      return check('model', label, status.connected ? 'pass' : chosen ? 'fail' : 'warn',
+        status.connected ? 'ChatGPT is signed in through Zelos. Requests use your plan’s Codex allowance.'
+          : status.error || 'ChatGPT is not signed in to Zelos yet.',
+        status.connected ? null : 'Open Settings → AI → Your ChatGPT subscription. Install or update the official Codex CLI if prompted, then sign in.');
+    } catch (error) { return check('model', label, 'fail', errorText(error), 'Check ChatGPT sign-in in Settings → AI.'); }
+  }
 
   if (!address) {
     return check(

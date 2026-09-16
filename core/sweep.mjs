@@ -24,6 +24,7 @@ import { loadConfig } from './config.mjs';
 import { prepareAutomaticDrafts } from './mail-autodrafts.mjs';
 import { complete as llmComplete, extractJSON, LLMError, isLocalAddress, localRuntimeOptions } from './llm.mjs';
 import { getSecret as realGetSecret } from './secrets.mjs';
+import { getSubscriptionStatus } from './codex-subscription.mjs';
 import {
   enabledSources,
   get as connectorFor,
@@ -307,6 +308,7 @@ const DEFAULT_DEPS = Object.freeze({
   fetchEvents: defaultFetchEvents,
   complete: llmComplete,
   getSecret: realGetSecret,
+  subscriptionStatus: getSubscriptionStatus,
 });
 
 /* ------------------------------------------------------------------ *
@@ -1309,13 +1311,19 @@ function recomputeDerived(db, { now = nowISO() } = {}) {
  * ref list so the check is injectable — the Scheduler tests never open a
  * keychain — and so a key pasted after launch is seen on the very next tick.
  */
-async function modelNotReadyReason(config, getSecret) {
+async function modelNotReadyReason(config, getSecret, subscriptionStatus) {
   const model = config?.model;
   // Both sentences name the Settings tab by the label it wears ("AI") and
   // neither names the base URL: this reason reaches the board's banner, and
   // an address the person never typed reads there as the program having gone
   // somewhere on its own. Same words as core/llm.mjs's empty-model error.
   if (!model?.baseUrl || !model?.model) return 'No AI has been chosen yet — open Settings → AI and pick one';
+  if (model.protocol === 'chatgpt') {
+    try {
+      const status = await subscriptionStatus();
+      return status.connected ? null : status.error || 'Sign in to ChatGPT in Settings → AI to resume automatic reviews';
+    } catch { return 'Check your ChatGPT connection in Settings → AI to resume automatic reviews'; }
+  }
   if (isLocalAddress(model.baseUrl)) return null;
   let key = null;
   try {
@@ -1478,10 +1486,10 @@ export class Scheduler {
     // not set up. status() — and so /api/health — carries the reason instead.
     // Logged once per distinct reason, not every tick: the operator's own home
     // had a line like this every half hour for as long as the app lived.
-    const { getSecret } = { ...DEFAULT_DEPS, ...this.deps };
+    const { getSecret, subscriptionStatus } = { ...DEFAULT_DEPS, ...this.deps };
     let reason;
     this.#preflights += 1;
-    try { reason = await modelNotReadyReason(this.config, getSecret); }
+    try { reason = await modelNotReadyReason(this.config, getSecret, subscriptionStatus); }
     finally { this.#preflights -= 1; }
     // Keychain access can outlive stop(), a restart or a schedule change.
     // A retired tick must never start writing after maintenance closes SQLite,

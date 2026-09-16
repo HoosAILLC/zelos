@@ -1,255 +1,145 @@
+/** UI integration gaps for the current generated website preview.
+ *
+ * The former website/demo transport was retired. Completion, undo, reset,
+ * meal/finance interactions, Ask streaming and read-only Family access are
+ * exercised in website-preview.test.mjs. This file keeps the additional public
+ * API/view contracts against the actual build output. Real connection edits,
+ * secret storage, simulated arrivals, scheduler wakeups and cursor-paged history
+ * belonged to the retired transport; they are not claimed by this browser demo.
+ */
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { describe } from '../core/connectors/index.mjs';
-import { installDom, text, findButton, walk, settle } from './helpers/ui-dom.mjs';
+import { installDom, text, findButton } from './helpers/ui-dom.mjs';
 
-if (!fs.existsSync(new URL('../website', import.meta.url))) { test('public website demo is available', { skip: 'Website demo is excluded from this npm deployment.' }, () => {}); } else {
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-async function adapter(t, prepare = () => {}) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zelos-demo-test-'));
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const data = JSON.parse(fs.readFileSync(path.join(root, 'website/demo-data.json'), 'utf8'));
-  prepare(data);
-  // Use the release views with only the same adapter overlay as the website.
-  fs.cpSync(path.join(root, 'ui'), dir, { recursive: true });
-  fs.copyFileSync(path.join(root, 'website/demo/lib/api.js'), path.join(dir, 'lib/api.js'));
-  fs.writeFileSync(path.join(dir, 'package.json'), '{"type":"module"}');
-  fs.writeFileSync(path.join(dir, 'lib/demo-data.js'), `export default ${JSON.stringify(data)};`);
-  fs.writeFileSync(path.join(dir, 'lib/connectors.js'), `export default ${JSON.stringify(describe())};`);
-  const realTimer = setTimeout;
-  t.mock.method(globalThis, 'setTimeout', (fn, _ms, ...args) => realTimer(fn, 0, ...args));
-  t.mock.method(globalThis, 'fetch', () => { throw new Error('The demo must never contact a server'); });
-  const importUi = file => import(pathToFileURL(path.join(dir, file)).href);
-  return { ...await importUi('lib/api.js'), data, importUi };
-}
+if (!fs.existsSync(path.join(root, 'website'))) {
+  test('public website preview is available', { skip: 'Website preview is excluded from this npm deployment.' }, () => {});
+} else {
+  const { buildWebsite, previewSource } = await import('../scripts/build-website.mjs');
+  const output = fs.mkdtempSync(path.join(os.tmpdir(), 'zelos-demo-build-test-'));
+  buildWebsite({ root, out: output });
+  test.after(() => fs.rmSync(output, { recursive: true, force: true }));
 
-test('demo board matches the hydrated release UI and exposes known sample connection health', async t => {
-  const { api, data } = await adapter(t);
-  const oldWindow = globalThis.window;
-  globalThis.window = { location: { href: 'http://127.0.0.1/' } };
-  t.after(() => { if (oldWindow === undefined) delete globalThis.window; else globalThis.window = oldWindow; });
-  const real = await import('../ui/lib/api.js');
-  assert.deepEqual(Object.keys(api).sort(), Object.keys(real.api).sort(), 'every release UI API method needs a demo equivalent');
-  const { PRESETS } = await import('../core/llm.mjs');
-  assert.deepEqual(await api.presets(), PRESETS.filter(preset => !preset.local), 'guided setup needs the same provider key-page links and defaults');
-  const board = await api.state();
-  assert.ok(board.items.every(item => Array.isArray(item.sourceRefs) && typeof item.sourceInactive === 'boolean'));
-  assert.ok(board.events.every(event => Array.isArray(event.attendees)));
-  assert.deepEqual(board.finished, []);
-  assert.equal(board.sourceStatus.length, data.config.mail.length + data.config.calendars.length + data.config.sources.length);
-  assert.ok(board.sourceStatus.every(row => row.ok === true && row.lastSuccessAt && row.configKey));
-  await api.saveConfig({ sources: [...data.config.sources, { id: 'new-source', type: 'todoist', label: 'New sample connection', enabled: true }] });
-  const fresh = (await api.state()).sourceStatus.find(row => row.id === 'new-source');
-  assert.equal(fresh.ok, null);
-  assert.equal(fresh.lastSuccessAt, null);
-});
-
-test('demo done, restore and timed snooze preserve the actual item action contract', async t => {
-  const { api } = await adapter(t);
-  const id = (await api.state()).items[0].id;
-  await api.setItemState(id, 'done');
-  assert.ok((await api.state()).finished.some(item => item.id === id));
-  await api.setItemState(id, 'open');
-  assert.ok((await api.state()).items.some(item => item.id === id));
-  const until = new Date(Math.floor((Date.now() + 3_600_000) / 1000) * 1000).toISOString();
-  await api.setItemState(id, 'snoozed', { until });
-  const snoozed = (await api.state()).items.find(item => item.id === id);
-  assert.equal(Date.parse(snoozed.snoozed_until), Date.parse(until));
-  const later = Date.parse(until) + 1;
-  t.mock.method(Date, 'now', () => later);
-  const awake = (await api.state()).items.find(item => item.id === id);
-  assert.equal(awake.state, 'open');
-  assert.equal(awake.snoozed_until, null);
-  await assert.rejects(api.setItemState(id, 'snoozed', { until: 'bad date' }), { status: 400 });
-});
-
-test('demo search supplies excerpts and keeps inactive task history opt-in', async t => {
-  const { api, data } = await adapter(t, data => {
-    data.items[0].sourceInactive = true;
-    data.items[0].headline = 'HistoricalTaskExample';
-    data.items[0].why = 'Retained history, absent from the current selection.';
-  });
-  assert.equal((await api.state()).items.some(item => item.id === data.items[0].id), false);
-  assert.deepEqual((await api.search('HistoricalTaskExample')).results, []);
-  const hit = (await api.search('HistoricalTaskExample', { includeHistory: true })).results[0];
-  assert.equal(hit.sourceInactive, true);
-  assert.equal(hit.excerpt, data.items[0].why);
-  assert.equal(hit.ref, `item:${data.items[0].id}`);
-  const draft = (await api.state()).drafts[0];
-  await api.updateDraft(draft.id, { body: 'Revised demo reply', state: 'edited' });
-  assert.equal((await api.state()).drafts.find(row => row.id === draft.id).body, 'Revised demo reply');
-  // Even an object that refuses to be read is accepted: only the ref is kept.
-  await api.setSecret('demo-no-value', { toString() { throw new Error('secret was read'); } });
-  assert.ok((await api.config()).secretRefs.includes('demo-no-value'));
-});
-
-test('demo history starts empty, records actual actions and pages without duplicates as new changes arrive', async t => {
-  const { api, request } = await adapter(t);
-  const [item, other] = (await api.state()).items;
-  const history = query => request(`/api/items/${item.id}/history${query || ''}`);
-  const first = await history();
-  assert.deepEqual(first.entries, [], 'sample items must not acquire invented older history');
-  assert.equal(first.nextBefore, null);
-  assert.ok(Number.isFinite(Date.parse(first.recordedSince)));
-  await api.setItemState(item.id, 'done');
-  await api.setItemState(item.id, 'done');
-  const done = await history();
-  assert.equal(done.entries.length, 1, 'unchanged state and board reads are not changes');
-  assert.equal(done.entries[0].origin, 'user');
-  assert.equal(done.entries[0].kind, 'changed');
-  assert.deepEqual(done.entries[0].changes, [{ field: 'state', before: 'open', after: 'done' }]);
-  await api.setItemState(item.id, 'open');
-  await api.setItemState(item.id, 'dismissed');
-  const page = await history('?limit=2');
-  assert.equal(page.entries.length, 2);
-  assert.equal(page.nextBefore, page.entries.at(-1).id);
-  await api.setItemState(item.id, 'open');
-  const older = await history(`?limit=2&before=${page.nextBefore}`);
-  assert.deepEqual(older.entries.map(row => row.id), [done.entries[0].id]);
-  assert.equal(older.nextBefore, null);
-  page.entries[0].changes[0].after = 'tampered';
-  assert.equal((await history()).entries.some(row => row.changes.some(change => change.after === 'tampered')), false);
-  assert.deepEqual((await request(`/api/items/${other.id}/history`)).entries, [], 'history belongs to one item');
-  for (const query of ['?limit=0', '?limit=51', '?limit=1.5', '?limit=2&limit=2', '?before=0', '?before=no']) {
-    await assert.rejects(history(query), { status: 400 });
+  async function adapter(t) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zelos-demo-ui-test-'));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    // Each UI import graph has independent browser-memory data. Images are not
+    // fetched by the small DOM fixture; copy the generated code, not media.
+    const generated = path.join(output, 'try');
+    fs.cpSync(generated, dir, { recursive: true, filter: source => source !== path.join(generated, 'assets') });
+    fs.writeFileSync(path.join(dir, 'package.json'), '{"type":"module"}');
+    const realTimer = setTimeout;
+    t.mock.method(globalThis, 'setTimeout', (fn, _ms, ...args) => realTimer(fn, 0, ...args));
+    t.mock.method(globalThis, 'fetch', () => { throw new Error('The preview must never contact a server'); });
+    const importUi = file => import(pathToFileURL(path.join(dir, file)).href);
+    return { ...await importUi('lib/api.js'), importUi };
   }
-  await assert.rejects(request('/api/items/missing/history'), { status: 404 });
-});
 
-test('demo timed wake-ups and simulated arrivals produce truthful new history', async t => {
-  const { api, request, openStream, data } = await adapter(t);
-  const id = (await api.state()).items[0].id;
-  const until = new Date(Date.now() + 3_600_000).toISOString();
-  await api.setItemState(id, 'snoozed', { until });
-  t.mock.method(Date, 'now', () => Date.parse(until) + 1);
-  await api.state(); await api.state();
-  const history = await request(`/api/items/${id}/history`);
-  assert.equal(history.entries.length, 2);
-  assert.equal(history.entries[0].origin, 'automatic');
-  assert.deepEqual(history.entries[0].changes.find(change => change.field === 'state'), { field: 'state', before: 'snoozed', after: 'open' });
-  const controller = new AbortController();
-  let finish;
-  const finished = new Promise(resolve => { finish = resolve; });
-  const stream = openStream('/api/sweep/stream', { signal: controller.signal, onEvent: (event, result) => {
-    if (event === 'done' || event === 'failed') finish({ event, result });
-  } });
-  await api.sweep('auto');
-  assert.equal((await finished).event, 'done');
-  controller.abort(); await stream;
-  const arrival = data.sweepArrivals[0].item;
-  const added = await request(`/api/items/${arrival.id}/history`);
-  assert.equal(added.entries.length, 1);
-  assert.equal(added.entries[0].origin, 'sample');
-  assert.equal(added.entries[0].kind, 'created');
-  assert.ok(added.entries[0].changes.some(change => change.field === 'headline' && change.before === null && change.after === arrival.headline));
-});
+  test('generated preview exposes the current app API and uses canonical history and settings views', async t => {
+    installDom(t);
+    const { api } = await adapter(t);
+    const real = await import('../ui/lib/api.js');
+    assert.deepEqual(Object.keys(api).sort(), Object.keys(real.api).sort(), 'new app methods need the generated fictional transport too');
+    for (const file of ['views/settings.js', 'lib/item-history.js', 'lib/updates.js', 'lib/subscription.js']) {
+      const expected = previewSource(fs.readFileSync(path.join(root, 'ui', file), 'utf8'));
+      assert.equal(fs.readFileSync(path.join(output, 'try', file), 'utf8'), expected, `${file} must not become a second stale UI`);
+      assert.equal(fs.readFileSync(path.join(output, 'demo', file), 'utf8'), expected, `the old /demo bookmark must use the current ${file}`);
+    }
+    const health = await api.health();
+    assert.match(health.model.label, /Example answers.*no live AI/);
+    assert.equal(health.backend.writable, false);
+    assert.match(health.backend.note, /Fictional records.*No passwords/);
+    assert.equal((await api.state()).sourceStatus.length, 0, 'the preview must not invent successful account connections');
+  });
 
-test('demo light reads keep AI activity and sample decisions out, and preserve the next full review', async t => {
-  const { api, request, openStream, data } = await adapter(t);
-  const before = await api.state();
-  async function run(mode) {
+  test('current preview keeps finished search history opt-in, draft edits local, and snooze reversible', async t => {
+    const { api, request } = await adapter(t);
+    const item = (await api.state()).items.find(row => row.state === 'open');
+    await request(`/api/items/${item.id}/correction`, { method: 'POST', body: { decision: 'corrected', headline: 'HistoricalTaskExample' } });
+    await api.setItemState(item.id, 'done');
+    assert.deepEqual((await api.search('HistoricalTaskExample')).results, []);
+    const hit = (await api.search('HistoricalTaskExample', { includeHistory: true })).results.find(row => row.id === item.id);
+    assert.equal(hit.excerpt, item.why);
+    assert.equal(hit.ref, `item:${item.id}`);
+    const until = new Date(Date.now() + 3_600_000).toISOString();
+    await api.setItemState(item.id, 'snoozed', { until });
+    const snoozed = (await api.state()).items.find(row => row.id === item.id);
+    assert.equal(snoozed.state, 'snoozed');
+    assert.equal(Date.parse(snoozed.snoozed_until), Date.parse(until));
+    await api.setItemState(item.id, 'open');
+    assert.equal((await api.state()).items.find(row => row.id === item.id).snoozed_until, null);
+    const draft = (await api.state()).drafts[0];
+    assert.ok(draft, 'the current sample board must include a reviewable draft');
+    await api.updateDraft(draft.id, { body: 'Revised fictional reply', state: 'edited' });
+    assert.equal((await api.state()).drafts.find(row => row.id === draft.id).body, 'Revised fictional reply');
+    await assert.rejects(request('/api/mail/send', { method: 'POST', body: { draftId: draft.id } }), { status: 501 });
+  });
+
+  test('canonical history and update views handle the preview without native backup or false update claims', async t => {
+    installDom(t);
+    const { api, request, importUi } = await adapter(t);
+    const { state } = await importUi('lib/store.js');
+    state.board = await api.state(); state.config = (await api.config()).config; state.health = await api.health();
+    const item = state.board.items.find(row => row.state === 'open');
+    assert.deepEqual((await request(`/api/items/${item.id}/history`)).entries, [], 'fictional data must not acquire invented older history');
+    await api.setItemState(item.id, 'done');
+    const { itemHistory } = await importUi('lib/item-history.js');
+    const history = itemHistory(item);
+    await history.toggle.listeners.get('click')[0].call(history.toggle);
+    assert.match(text(history.panel), /You.*Changed/);
+    assert.match(text(history.panel), /Status: Open → Done/);
+    const snapshot = await request(`/api/items/${item.id}/history`);
+    snapshot.entries[0].changes[0].after = 'tampered';
+    assert.equal((await request(`/api/items/${item.id}/history`)).entries[0].changes[0].after, 'done');
+    const update = await request('/api/updates');
+    assert.equal(update.canInstall, false);
+    assert.equal(update.latest, null);
+    const { updatesPanel } = await importUi('lib/updates.js');
+    const updates = updatesPanel();
+    await findButton(updates, 'Check for updates').listeners.get('click')[0]();
+    assert.match(text(updates), /This action needs the installed app/);
+    assert.doesNotMatch(text(updates), /You have the latest|undefined/);
+    const { backupPanel, canUseBackups } = await importUi('lib/backup.js');
+    assert.equal(canUseBackups(), false);
+    assert.equal(backupPanel(), null);
+  });
+
+  test('preview check events identify a demonstration and do not fabricate source reads, decisions or history', async t => {
+    const { api, request, openStream } = await adapter(t);
+    const before = await api.state();
     const controller = new AbortController();
     const events = [];
     let finish;
     const finished = new Promise(resolve => { finish = resolve; });
-    const stream = openStream('/api/sweep/stream', { signal: controller.signal, onEvent: (event, result) => {
-      events.push({ event, result });
-      if (event === 'done' || event === 'failed') finish({ event, result });
+    const stream = openStream('/api/sweep/stream', { signal: controller.signal, onEvent: (event, value) => {
+      events.push({ event, value });
+      if (event === 'done' || event === 'failed') finish({ event, value });
     } });
     try {
-      await api.sweep(mode);
-      const outcome = await finished;
-      assert.equal(outcome.event, 'done');
-      assert.equal(outcome.result.mode, mode);
-      return events;
+      await api.sweep('full');
+      const result = await finished;
+      assert.equal(result.event, 'done');
+      assert.equal(result.value.mode, 'demo', 'a button animation is not a real source/model run');
+      assert.equal(events.some(({ event, value }) => event === 'progress' && ['model', 'merge'].includes(value.phase)), false);
     } finally { controller.abort(); await stream; }
-  }
-  const events = await run('light');
-  const after = await api.state();
-  assert.equal(events.some(({ event, result }) => event === 'progress' && ['model', 'merge'].includes(result.phase)), false);
-  assert.deepEqual(after.items, before.items, 'reading must not create or reassess sample obligations');
-  assert.deepEqual(after.drafts, before.drafts, 'reading must not generate sample replies');
-  assert.deepEqual(after.first, before.first, 'reading must not change the sample AI pick');
-  assert.equal(after.runs.last.kind, 'light');
-  assert.equal(after.runs.last.tokens_in, 0); assert.equal(after.runs.last.tokens_out, 0);
-  assert.deepEqual((await request(`/api/items/${before.items[0].id}/history`)).entries, []);
-  await run('full');
-  const arrival = data.sweepArrivals[0].item;
-  assert.ok((await api.state()).items.some(item => item.id === arrival.id), 'light reads must not discard the next full demo arrival');
-  assert.equal((await request(`/api/items/${arrival.id}/history`)).entries[0].origin, 'sample');
-});
+    const after = await api.state();
+    for (const field of ['items', 'finished', 'drafts', 'sourceStatus', 'first', 'runs']) assert.deepEqual(after[field], before[field], field);
+    assert.deepEqual((await request(`/api/items/${before.items[0].id}/history`)).entries, []);
+    assert.equal(events[0].event, 'hello');
+  });
 
-test('release history and update views work against the demo without contacting a server or offering native backups', async t => {
-  installDom(t);
-  const { api, request, importUi } = await adapter(t);
-  const { state } = await importUi('lib/store.js');
-  state.board = await api.state(); state.config = (await api.config()).config; state.health = await api.health();
-  const { itemHistory } = await importUi('lib/item-history.js');
-  const item = state.board.items[0]; await api.setItemState(item.id, 'done');
-  const history = itemHistory(item);
-  await history.toggle.listeners.get('click')[0].call(history.toggle);
-  assert.match(text(history.panel), /You.*Changed/);
-  assert.match(text(history.panel), /Status: Open → Done/);
-  const info = await request('/api/updates/check', { method: 'POST', body: {} });
-  assert.equal(info.demo, true); assert.match(info.message, /demo/);
-  assert.equal(info.updateAvailable, undefined); assert.equal(info.latestVersion, undefined);
-  const { updatesPanel } = await importUi('lib/updates.js');
-  const updates = updatesPanel();
-  await findButton(updates, 'Check for updates').listeners.get('click')[0]();
-  assert.match(text(updates), /demo cannot check an installed copy/i);
-  assert.doesNotMatch(text(updates), /You have the latest|undefined|Could not check/);
-  const { backupPanel, canUseBackups } = await importUi('lib/backup.js');
-  assert.equal(canUseBackups(), false); assert.equal(backupPanel(), null);
-});
-
-test('demo setup status and exact-account recovery reflect configuration without inventing a successful read', async t => {
-  installDom(t);
-  const { api, importUi, data } = await adapter(t);
-  const id = 'new/mail % #';
-  await api.saveConfig({ mail: [...data.config.mail, { id, label: 'New demo mailbox', user: 'new@example.invalid', enabled: true }] });
-  const { state } = await importUi('lib/store.js');
-  state.config = (await api.config()).config; state.health = await api.health(); state.board = await api.state();
-  const { setupStatus, parseConnectionTarget } = await importUi('lib/source-status.js');
-  const paths = [];
-  const setup = setupStatus(route => paths.push(route));
-  assert.match(text(setup), /New demo mailbox: configured; no successful read recorded/);
-  assert.match(text(setup), /AI chosen.*test it/);
-  walk(setup).find(node => node.getAttribute('aria-label') === 'Review New demo mailbox').click();
-  assert.deepEqual(paths, [`#/settings/mail/${encodeURIComponent(id)}`]);
-  const { mailPanel } = await importUi('views/settings.js');
-  const panel = mailPanel({ connectionId: parseConnectionTarget(paths[0].split('/')[3]) });
-  const target = panel.querySelector('[data-connection-target]');
-  assert.match(text(target), /New demo mailbox/);
-  assert.ok(findButton(target, 'Check all connections'));
-  findButton(target, 'Edit').click(); await settle();
-  assert.ok(walk(panel).some(node => node.tag === 'input' && node.value === 'new@example.invalid'));
-  assert.equal((await api.state()).runs.last.id, state.board.runs.last.id, 'opening recovery and Edit must not start a check');
-  await api.saveConfig({ model: { baseUrl: 'https://model.example.invalid/v1', model: 'sample-model', keyRef: 'model.new' } });
-  state.health = await api.health();
-  assert.equal(state.health.model.local, false); assert.equal(state.health.model.configured, false);
-  assert.match(text(setupStatus(() => {})), /Choose an AI/);
-  await api.setSecret('model.new', 'unused demo field');
-  assert.equal((await api.health()).model.configured, true, 'a saved field is configuration, never a verified result');
-  await api.saveConfig({ model: { model: '' } });
-  assert.equal((await api.health()).model.configured, false);
-});
-
-test('family release view loads in the public demo while private family actions and downloads remain unavailable',async t=>{
-  installDom(t);
-  const {request,requestFamilyDownload,importUi}=await adapter(t);
-  const {renderFamily}=await importUi('views/family.js');
-  assert.equal(typeof renderFamily,'function','the public demo must resolve the family adapter imports');
-  for(const [path,options] of [
-    ['/api/family',{}],
-    ['/api/family/action',{method:'POST',body:{action:'member.invite',input:{}}}],
-    ['/api/family/snapshot',{method:'POST',body:{}}],
-    ['/api/family/documents/example',{}],
-  ])await assert.rejects(request(path,options),{status:501});
-  await assert.rejects(requestFamilyDownload('example'),{status:501});
-});
-
+  test('preview settings refuse real account and credential edits without changing sample configuration', async t => {
+    const { api } = await adapter(t);
+    const before = await api.config();
+    await assert.rejects(api.saveConfig({ mail: [{ id: 'new-mail', user: 'owner@example.invalid', enabled: true }] }), { status: 501 });
+    await assert.rejects(api.saveConfig({ model: { protocol: 'chatgpt', model: 'auto', keyRef: null } }), { status: 501 });
+    await assert.rejects(api.setSecret('demo-no-value', { toString() { throw new Error('secret was read'); } }), { status: 501 });
+    assert.deepEqual(await api.config(), before);
+    await assert.rejects(api.testModel({ protocol: 'chatgpt' }), { status: 501 });
+    assert.deepEqual(await api.config(), before, 'a refused connection check must not look like configuration success');
+  });
 }

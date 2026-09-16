@@ -71,16 +71,20 @@ has the exact extent of it.
 
 ## What leaves your machine
 
-Three things by default, and you chose all three: your mail provider, your calendar address, and
-your model endpoint — plus one host for each source you add in Settings → Sources, which is also
+Configured reading and AI use your mail provider, your calendar address, and
+your chosen model service — plus one host for each source you add in Settings → Sources, which is also
 an address you chose. Each connector names its host (`origins` in `core/connectors/*.mjs`) and the
 one transport they all share (`core/connectors/http.mjs`) refuses any other. Signing in with Google
 or Microsoft adds that provider's sign-in service — `accounts.google.com` and
 `oauth2.googleapis.com`, or `login.microsoftonline.com` — for the length of the sign-in and of each
-token refresh, and still no Zelos server. Of all of those, only
-the model request carries what Zelos read; point it at a local model and nothing it read leaves at
-all. **Check for updates** makes a manual request to the official GitHub release API,
-without account content or credentials. No telemetry, analytics, automatic update pings or crash reports.
+token refresh, and still no Zelos server. ChatGPT subscription mode sends selected AI context
+to OpenAI through the installed Codex CLI; a local CLI does not mean local inference.
+Connecting Claude Desktop separately lets Claude read only the Zelos scopes you enable.
+A local model keeps inference on your machine; separately requested sending, web research,
+shopping, and external-AI sharing still have their own network boundaries.
+**Check for updates** makes a manual request to the official GitHub release API,
+without account content or credentials. Zelos adds no telemetry, analytics, automatic update
+pings or crash reports; installed AI clients have their own network and data policies.
 
 Your keys live in your operating system's keychain — **when there is one**. With no keychain
 available (a headless Linux box, or a desktop without `secret-tool`), they go to `secrets.enc` in
@@ -110,11 +114,27 @@ matches a sign-in still in progress, and to a reply page with nothing in it —
 aimed at the model. Zelos never acts on what the model says — it renders, and you click. That is a
 stronger guarantee than claiming a model cannot be fooled. See [docs/SECURITY.md](docs/SECURITY.md).
 
-## Any model
+## Choose your AI
 
-Two wire protocols (`openai` and `anthropic`) cover every hosted provider and every local runtime.
-Settings probes the usual local ports — Ollama 11434, LM Studio 1234, llama.cpp 8080, vLLM 8000 —
-and offers whatever is already running before it offers you a paid one.
+The ChatGPT option is in the latest 1.8.4 preview source; published 1.8.1 installers
+do not yet include it.
+
+**Settings → AI → Your ChatGPT subscription** lets a ChatGPT account with Codex access power Zelos's
+supported in-app AI. Install the official Codex CLI, then sign in through OpenAI from
+Zelos. Requests share your plan's Codex limits; no API key is needed, and Zelos does not
+fall back to paid API usage when those limits run out.
+
+**Already use Claude?** Connect Claude Desktop to Zelos through **Settings → Share with
+another AI** and chat about the board, calendar, and email you choose to share. Your
+Claude account handles the conversation without an API key. This is a separate chat
+connection; it does not power Zelos's in-app AI or automatic reviews.
+
+API keys and local models remain available. The `openai` and `anthropic` wire protocols
+support compatible hosted services and local runtimes. Settings can find Ollama, LM
+Studio, llama.cpp, and vLLM on their usual local ports. Choosing a subscription does not
+unlock features that require a local model or change your health-sharing permissions.
+[AI subscription setup and limits](docs/AI-SUBSCRIPTIONS.md) explains both paths on Mac
+and Windows.
 
 ## Tests
 
@@ -132,6 +152,7 @@ rebinding, FTS injection, token forgery and MCP scope escapes.
 | [docs/README.md](docs/README.md) | the long version |
 | [docs/INSTALL.md](docs/INSTALL.md) | installing, including the unsigned-app dance |
 | [docs/SECURITY.md](docs/SECURITY.md) | the threat model, stated honestly |
+| [docs/AI-SUBSCRIPTIONS.md](docs/AI-SUBSCRIPTIONS.md) | ChatGPT sign-in, Claude Desktop sharing, and local-model boundaries |
 | [docs/SPEC.md](docs/SPEC.md) · [docs/SPEC-v2.md](docs/SPEC-v2.md) | what it is meant to do |
 | [docs/OAUTH.md](docs/OAUTH.md) | how Sign in with Google and Sign in with Microsoft work, and what registering them takes |
 | [docs/VERIFICATION.md](docs/VERIFICATION.md) | the Google review kit: scope justification, demo shot list, CASA checklist |

@@ -165,6 +165,11 @@ test('the provider is reduced to a closed list, and an address or a domain becom
   assert.equal(providerName(null), null);
   assert.equal(aiName('Claude'), 'anthropic');
   assert.equal(aiName('OpenAI'), 'openai');
+  assert.equal(aiName('ChatGPT'), 'chatgpt');
+  assert.equal(aiName('Your ChatGPT subscription'), 'chatgpt');
+  assert.equal(aiName('OpenAI, who make ChatGPT'), 'openai');
+  assert.equal(aiName('Claude Desktop'), 'claude-desktop');
+  assert.equal(aiName('Claude subscription'), 'claude-desktop');
   assert.equal(aiName('Ollama'), 'local');
   assert.equal(aiName('local'), 'local');
   assert.equal(aiName('something@else.com'), null);
@@ -246,7 +251,8 @@ test('the two links are https, open a new chat, and decode back to the exact mes
 /** The words on the screens, read out of the files that draw them. */
 const onboardingSrc = fs.readFileSync(path.join(ROOT, 'ui', 'views', 'onboarding.js'), 'utf8');
 const settingsSrc = fs.readFileSync(path.join(ROOT, 'ui', 'views', 'settings.js'), 'utf8');
-const screens = `${onboardingSrc}\n${settingsSrc}`;
+const subscriptionSrc = fs.readFileSync(path.join(ROOT, 'ui', 'lib', 'subscription.js'), 'utf8');
+const screens = `${onboardingSrc}\n${settingsSrc}\n${subscriptionSrc}`;
 
 /** The quoted controls a message names, and the step that names them. */
 const CONTROLS = {
@@ -372,7 +378,9 @@ test('the AI message names the two key pages the cards link, and the one button'
   const both = helpPrompt({ step: 'ai' }).prompt;
   assert.ok(both.includes(anthropic), 'no provider chosen: Anthropic’s page is missing');
   assert.ok(both.includes(openai), 'no provider chosen: OpenAI’s page is missing');
-  assert.match(both, /Claude is the recommended one/);
+  assert.match(both, /Ask which connection they want/);
+  assert.match(both, /Your ChatGPT subscription/);
+  assert.doesNotMatch(both, /Claude is the recommended one|There are two cards/);
   const claude = helpPrompt({ step: 'ai', provider: 'Claude' }).prompt;
   assert.ok(claude.includes(anthropic));
   assert.ok(!claude.includes(openai), 'the Claude card is told about OpenAI’s page');
@@ -467,4 +475,34 @@ test('the general message describes the five steps and the two buttons of the We
   assert.match(prompt, /Set up Zelos/);
   assert.match(prompt, /Look around with made-up data first/);
   assert.match(prompt, /Find out first what they want/);
+});
+
+
+test('ChatGPT subscription help follows the actual sign-in and save controls without asking for a key', () => {
+  const { prompt } = helpPrompt({ step: 'ai', provider: 'Your ChatGPT subscription', platform: 'windows' });
+  for (const control of ['Your ChatGPT subscription', 'Open Codex installation guide', 'Check again', 'Sign in with ChatGPT', 'Continue to OpenAI', 'Check sign-in', 'Cancel sign-in', 'Account default (recommended)', 'Refresh choices', 'Use ChatGPT subscription', 'Check a reply', 'Sign out of Zelos']) {
+    assert.ok(screens.includes(control), `missing real control ${control}`);
+    assert.ok(prompt.includes(control), `help omitted ${control}`);
+  }
+  assert.match(prompt, /No key or automatic pay-as-you-go fallback/);
+  assert.match(prompt, /optional and uses the plan allowance/);
+  assert.match(prompt, /automatic reviews/);
+  assert.match(prompt, /local-only health, money and mail-drafting/i);
+  assert.doesNotMatch(prompt, /1\. Open Anthropic|Create new secret key|paste it into “Your key”/);
+  assert.match(prompt, /only on OpenAI’s page/);
+  assert.match(prompt, /not their separate Codex app/);
+});
+
+test('Claude subscription help points to native Desktop sharing and keeps internal AI distinct', () => {
+  const { prompt } = helpPrompt({ step: 'ai', provider: 'Claude subscription' });
+  for (const text of ['Use Zelos with Claude Desktop', 'Share with another AI (advanced)', 'board, calendar and mail']) assert.ok(prompt.includes(text));
+  assert.match(prompt, /Chats run in Claude Desktop using its plan/);
+  assert.match(prompt, /does not power AI answers or automatic reviews inside Zelos/);
+  assert.doesNotMatch(prompt, /Create Key|Create new secret key|console\.anthropic\.com/);
+  assert.match(prompt, /Never ask for Claude sign-in credentials or account files/);
+  const welcome = helpPrompt({ step: 'general' }).prompt;
+  assert.match(welcome, /Your ChatGPT subscription/);
+  assert.match(welcome, /no separate key/);
+  assert.match(welcome, /pay-as-you-go Anthropic or OpenAI/);
+  assert.match(welcome, /Claude subscription works through/);
 });

@@ -1319,7 +1319,7 @@ test('docs/README.md counts the outbound calls with a recipe that still matches 
   }
   assert.ok(others.some((h) => h.file === 'core/sources/imap.mjs' && h.text.includes('node:dns')),
     'the completeness-check grep no longer turns up the node:dns import in core/sources/imap.mjs');
-  assert.deepEqual([...new Set(others.map(hit=>hit.file))].sort(),['core/booking-guest.mjs','core/documents.mjs','core/family-guest.mjs','core/mail-send.mjs','core/secrets.mjs','core/server.mjs','core/sources/imap.mjs','core/sources/oauth.mjs','core/web-research.mjs','zelos.mjs'],
+  assert.deepEqual([...new Set(others.map(hit=>hit.file))].sort(),['core/booking-guest.mjs','core/codex-subscription.mjs','core/documents.mjs','core/family-guest.mjs','core/mail-send.mjs','core/secrets.mjs','core/server.mjs','core/sources/imap.mjs','core/sources/oauth.mjs','core/web-research.mjs','zelos.mjs'],
     'new network or native-process owners need an explicit audit, not only an updated count');
   assert.equal(others.filter(hit=>hit.file==='core/web-research.mjs'&&hit.text.includes('transport.request')).length,1,
     'the public reader has exactly one direct HTTP(S) request entry point');

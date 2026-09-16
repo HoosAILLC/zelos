@@ -1,12 +1,14 @@
 /**
  * core/llm.mjs — the model adapter.
  *
- * Two wire protocols cover every mainstream provider and every local runtime,
+ * Two HTTP protocols cover the API providers and local runtimes,
  * because the protocol is not the company: `openai` speaks
  * POST {baseUrl}/chat/completions with a Bearer token, and `anthropic` speaks
  * POST {baseUrl}/v1/messages with x-api-key + anthropic-version. Ollama, LM
  * Studio, llama.cpp, vLLM and LocalAI all expose the openai shape, so "bring
  * your own model" is one code path, not a plugin system.
+ * `chatgpt` uses the isolated official Codex subscription adapter instead of
+ * either HTTP path. It never falls back to a separately billed API key.
  *
  * The rules that shape this file came from a build that got them wrong:
  *   - A missing key is only an error for a NON-local address. A keyless Ollama
@@ -20,6 +22,7 @@
  */
 
 import { log } from './log.mjs';
+import { completeSubscription, streamSubscription, listSubscriptionModels } from './codex-subscription.mjs';
 
 const llog = log.child('[llm]');
 
@@ -51,6 +54,14 @@ export class LLMError extends Error {
     this.address = address;
     this.retriable = retriable;
   }
+}
+
+function subscriptionError(error) {
+  if (error?.name === 'AbortError') return error;
+  return new LLMError(error?.message || 'ChatGPT could not finish this request. Check the connection in Settings → AI.', {
+    status: error?.status ?? null, address: 'https://chatgpt.com',
+    retriable: error?.retriable === true, cause: error,
+  });
 }
 
 /* ------------------------------------------------------------------ *
@@ -983,6 +994,11 @@ function errorInBody(raw) {
  * a total deadline. No partial result escapes; raw is null in this mode.
  */
 export async function complete(opts = {}) {
+  if (opts.protocol === 'chatgpt') {
+    const { apiKey: _unusedKey, ...subscriptionOptions } = opts;
+    try { return await completeSubscription(subscriptionOptions); }
+    catch (error) { throw subscriptionError(error); }
+  }
   if (opts.stream === true) {
     for await (const event of stream(opts)) {
       if (event.type === 'done') {
@@ -1147,6 +1163,12 @@ function midStreamDetail(req, raw) {
  * {type:'done', usage, model, text, stopReason}.
  */
 export async function* stream(opts = {}) {
+  if (opts.protocol === 'chatgpt') {
+    const { apiKey: _unusedKey, ...subscriptionOptions } = opts;
+    try { yield* streamSubscription(subscriptionOptions); }
+    catch (error) { throw subscriptionError(error); }
+    return;
+  }
   const req = buildChatRequest(opts, { stream: true });
   llog.debug('stream', { address: req.address, protocol: req.protocol, model: req.model });
   const { res, release, keepAlive } = await requestWithRetry(req, opts);
@@ -1301,6 +1323,12 @@ export async function listModels({
   timeoutMs,
   retries = 1,
 } = {}) {
+  if (protocol === 'chatgpt') {
+    try {
+      const catalog = await listSubscriptionModels({ signal, timeoutMs });
+      return catalog.models.map(row => ({ id: row.id, label: row.displayName || row.id }));
+    } catch (error) { throw subscriptionError(error); }
+  }
   const address = normalizeBase(baseUrl);
   const proto = requireProtocol(protocol, address);
   if (!address) {

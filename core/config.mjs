@@ -51,7 +51,7 @@ export const SECRET_KEYS = new Set([
   'clientsecret', 'client_secret', 'devicecode', 'device_code',
 ]);
 
-const PROTOCOLS = ['anthropic', 'openai'];
+const PROTOCOLS = ['anthropic', 'openai', 'chatgpt'];
 const CALENDAR_KINDS = ['ics', 'caldav', 'file'];
 
 /**
@@ -769,6 +769,10 @@ export function validateConfig(cfg) {
     checkUrl(errors, 'model.baseUrl', m.baseUrl, { schemes: ['http:', 'https:'], required: true });
     if (!isStr(m.model)) errors.push({ path: 'model.model', message: 'must be a string' });
     checkRef(errors, 'model.keyRef', m.keyRef, { allowNull: true });
+    if (m.protocol === 'chatgpt') {
+      if (m.baseUrl !== 'https://chatgpt.com') errors.push({ path: 'model.baseUrl', message: 'ChatGPT subscription uses the official sign-in connection at https://chatgpt.com' });
+      if (m.keyRef !== null) errors.push({ path: 'model.keyRef', message: 'ChatGPT subscription uses sign-in, not an API key; choose null' });
+    }
     if (!isInt(m.maxTokens, 1, 1_000_000)) errors.push({ path: 'model.maxTokens', message: 'must be an integer between 1 and 1000000' });
     if (typeof m.temperature !== 'number' || !(m.temperature >= 0 && m.temperature <= 2)) errors.push({ path: 'model.temperature', message: 'must be a number between 0 and 2' });
   }

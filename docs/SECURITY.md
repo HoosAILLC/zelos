@@ -316,7 +316,11 @@ those requested network operations offline.
    included. Zelos refuses *before* `LOGIN`, so a stripped connection costs you
    a sweep and never a password.
 2. **Your calendar URL** — an `.ics` feed or a CalDAV server.
-3. **Your model endpoint** — the `model.baseUrl` you chose. If you point that
+3. **Your model service** — the `model.baseUrl` you chose for an API/local
+   connection, or OpenAI through the installed Codex CLI when ChatGPT
+   subscription mode is selected. The latter sends the prepared AI context
+   to OpenAI; running the CLI locally does not make the inference local.
+   If you point an API-compatible connection
    at Ollama, LM Studio, llama.cpp, vLLM or LocalAI on `127.0.0.1`, then
    **inference stays on that machine**, and the local model can work without
    an API key. This does not prevent separately requested mail, web or shopping traffic.
@@ -330,12 +334,14 @@ those requested network operations offline.
 
 Those are the configured reading and model destinations. A manual update check
 adds the official GitHub release API, as described below.
-There is no telemetry, no analytics, no crash reporting, no automatic update check, no
+Zelos adds no telemetry, no analytics, no crash reporting, no automatic update check, no
 CDN, no remote font, no remote image, no "anonymous usage statistics". The
 runtime dependencies are pinned Nodemailer 10.0.9 for reviewed SMTP sending and
 PDFKit 0.19.1 for local reports, with transitive integrity hashes in the package
 lock. Native document extraction also uses installed Poppler and Tesseract.
-Their existence is part of the audit; a dependency list alone cannot prove an
+An installed model client such as Codex has its own network and data-handling
+policies; these Zelos guarantees do not describe all behavior of that separate
+program. Their existence is part of the audit; a dependency list alone cannot prove an
 absence of network behavior. You can verify it with `lsof -i` or
 Little Snitch or `tcpdump` and count the conversations against your own
 settings.
@@ -446,6 +452,41 @@ IMAP sockets, direct HTTP(S), DNS, SMTP transport construction and native proces
 imports separately. Fixed official guidance/help links in the UI are click-only
 browser navigation; they are not remote application resources.
 
+
+### ChatGPT subscription process boundary
+
+ChatGPT mode uses the official, locally installed Codex CLI's app-server
+interface over process input/output. The connection uses Codex-managed
+ChatGPT sign-in, not an API key or a copied browser session. OpenAI handles
+login and refresh. Zelos accepts only the supported ChatGPT account mode for
+this option and does not fall back to an API provider when it fails or reaches
+a limit. Provider limits remain shared with the account's other Codex use.
+
+The process runs with a separate Codex home below the Zelos data home and an
+ephemeral working directory. The prepared prompt travels through process
+input, not command-line arguments. Zelos does not grant the Codex model shell,
+filesystem, MCP, web, or other external tools through this adapter. It rejects
+tool and permission requests instead of approving them. Returned text is
+still untrusted model output and passes through the same caller validation as
+other providers. This boundary does not replace the bounded local tools in
+Zelos's separately assigned assistant; those retain the controls in section 2.
+
+Launching a subprocess does not make it untrusted-code isolation: the
+installed CLI is a trusted executable running as the current OS user. A
+compromised binary or another process running as that user can exceed the
+application's intended boundary. Tool restrictions constrain model actions,
+not malicious native code.
+
+Subscription mode is explicitly treated as cloud inference. It cannot satisfy
+local-model checks for health planning, saved health/money/progress/document/
+library context, document import previews, or private email drafting. The
+shared private-records gate also checks retained conversation context before
+switching providers can send earlier protected facts to a cloud model.
+`privacy.sendBodies` still applies before mail context is prepared. A different
+sign-in method does not grant access to additional records.
+
+See [AI subscription setup](AI-SUBSCRIPTIONS.md) for user-facing instructions
+and the official provider documentation checked on September 15, 2026.
 
 ### `privacy.sendBodies`
 
@@ -595,6 +636,15 @@ it here, including the parts that are not reassuring.
 **It is off. Nothing is exposed until you switch it on**, and then only the
 scopes you tick. `mail.bodies` starts off and is never turned on as a side
 effect of anything else. Turning on the calendar turns on the calendar.
+
+The Claude subscription option uses this existing boundary: the user signs
+in to Claude Desktop and connects its native local MCP client to Zelos. Claude
+handles the conversation and its own billing; Zelos neither receives Claude
+credentials nor uses that login for in-app AI or background reviews. Current
+MCP scopes do not expose the health or finance workspaces. Enabling ChatGPT
+as Zelos's model does not enable MCP sharing, and enabling MCP sharing does
+not select an in-app model. Already-returned context remains subject to the
+external client's retention and sharing behavior after access is revoked.
 
 ### Two credentials, and they do not overlap
 
@@ -792,6 +842,20 @@ credential fields are stripped and reported. Private calendar subscription
 URLs remain in that file and can themselves grant access. Treat config and
 full backups as private. Board snapshots exclude connection settings,
 diagnostics and raw calendar imports, but still contain private board content.
+
+ChatGPT subscription authentication is managed by the Codex CLI in the
+plaintext file `<ZELOS_HOME>/chatgpt-subscription/codex/auth.json`, separate from
+the user's normal Codex home. Zelos sets the subscription directories to
+`0700` on POSIX systems. On Windows, access relies on the user profile's ACL;
+Zelos does not install an additional ACL. This store does not use Zelos's
+keychain or encrypted-file credential backend. Zelos does not put its access
+or refresh tokens into `config.json`, the database, or settings responses,
+and does not copy the user's normal Codex login. The fixed portable-file
+allowlist in `core/backup.mjs` excludes the subscription directory; automatic
+backups use the same allowlist. Restoring a Zelos backup does not import a
+ChatGPT session. A manual copy of the entire data home can include these
+credentials and must be kept private. Operating-system user access remains
+the limit of this separation.
 
 Credentials never appear in `argv`, where `ps` would show them to every user on
 the machine. That is structural rather than careful: `describeCommand()` in

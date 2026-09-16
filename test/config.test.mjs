@@ -625,3 +625,13 @@ test('oauth.clients is the operator\'s own registrations, checked by shape, and 
   assert.ok(onDisk.length > 0, 'the save wrote something');
   assert.ok(onDisk.every((text) => !text.includes('GOCSPX-never-on-disk')), 'the secret reached the disk');
 });
+
+test('ChatGPT subscription settings need no key and cannot masquerade as a local endpoint', () => {
+  freshHome('chatgpt');
+  const cfg = saveConfig({ model: { protocol: 'chatgpt', label: 'ChatGPT subscription', baseUrl: 'https://chatgpt.com', model: 'auto', keyRef: null } });
+  assert.equal(validateConfig(cfg).ok, true);
+  const local = structuredClone(cfg); local.model.baseUrl = 'http://127.0.0.1:11434/v1';
+  assert.ok(validateConfig(local).errors.some(row => row.path === 'model.baseUrl'));
+  const keyed = structuredClone(cfg); keyed.model.keyRef = 'model.default';
+  assert.ok(validateConfig(keyed).errors.some(row => row.path === 'model.keyRef'));
+});

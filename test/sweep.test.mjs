@@ -2211,3 +2211,21 @@ test('the scheduler cancels an in-flight sweep when it is stopped', async (t) =>
   await pending;
   assert.equal(sawAbort, true);
 });
+
+test('ChatGPT scheduled reviews wait for sign-in and resume without an API key', async (t) => {
+  const db = fresh();
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.UTC(2026, 7, 8, 10, 0, 0) });
+  let connected = false, runs = 0, keyReads = 0;
+  const scheduler = new Scheduler({ db,
+    config: blankModelConfig({ model: { ...DEFAULTS.model, protocol: 'chatgpt', baseUrl: 'https://chatgpt.com', model: 'auto', keyRef: null } }),
+    deps: { getSecret: async () => { keyReads++; return null; }, subscriptionStatus: async () => ({ connected }) },
+    run: async () => { runs++; return { ok: true }; },
+  });
+  t.after(() => scheduler.stop());
+  scheduler.start(); t.mock.timers.tick(31 * 60_000); await flush();
+  assert.equal(runs, 0); assert.match(scheduler.status().lastResult.reason, /Sign in to ChatGPT/);
+  connected = true; t.mock.timers.tick(30 * 60_000); await flush();
+  assert.equal(runs, 1); assert.equal(keyReads, 0);
+  connected = false; t.mock.timers.tick(30 * 60_000); await flush();
+  assert.equal(runs, 1); assert.match(scheduler.status().lastResult.reason, /Sign in to ChatGPT/);
+});

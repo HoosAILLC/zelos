@@ -35,6 +35,7 @@ import { sourceStatusLine, connectionRecovery, setupStatus } from '../lib/source
 import { backupPanel, canUseBackups } from '../lib/backup.js';
 import { automaticBackupPanel } from '../lib/automatic-backup.js';
 import { updatesPanel } from '../lib/updates.js';
+import { subscriptionPanel } from '../lib/subscription.js';
 
 /**
  * The tab strip, in the order a person looks for things. The ids are routes
@@ -666,7 +667,7 @@ const GUIDED_PROVIDERS = {
   anthropic: {
     title: 'Claude, by Anthropic',
     badge: 'Recommended',
-    blurb: 'Easiest to set up. Made by the company that makes Claude.',
+    blurb: 'Uses a separate pay-as-you-go account from Anthropic.',
     friendly: 'Claude',
     keyPage: 'Anthropic’s key page',
     createStep: 'Press Create Key and copy it.',
@@ -675,7 +676,7 @@ const GUIDED_PROVIDERS = {
   openai: {
     title: 'OpenAI, who make ChatGPT',
     badge: null,
-    blurb: 'The company behind ChatGPT.',
+    blurb: 'Uses a separate pay-as-you-go account from OpenAI.',
     friendly: 'OpenAI',
     keyPage: 'OpenAI’s key page',
     createStep: 'Press Create new secret key and copy it.',
@@ -748,6 +749,7 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
   };
 
   const status = statusLine();
+  let subscription = null;
   const localWrap = el('div', { class: 'runtime-list' });
   const choiceWrap = el('div', { class: 'preset-grid' }, el('p', { class: 'quiet-note', text: 'Loading the list of AI services…' }));
   const moreWrap = el('div', { class: 'preset-grid' });
@@ -770,6 +772,24 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
   const friendly = () => draft.guide?.friendly || draft.label || 'this service';
 
   function drawForm() {
+    subscription?.dispose();
+    subscription = null;
+    advanced.hidden = draft.protocol === 'chatgpt';
+    if (draft.protocol === 'chatgpt') {
+      guidedWrap.hidden = false;
+      formWrap.replaceChildren();
+      replace(helpSlot, [askClaude({ step: 'ai', provider: 'chatgpt' })]);
+      subscription = subscriptionPanel({
+        model: draft.model || 'auto', maxTokens: draft.maxTokens,
+        onSave: async (model) => {
+          await saveConfig({ model });
+          notify('Saved. Zelos will use your ChatGPT subscription.');
+          onDone?.();
+        },
+      });
+      replace(guidedWrap, [subscription.node]);
+      return;
+    }
     const modelInput = input({ value: draft.model, placeholder: 'model id, e.g. llama3.1:8b', list: 'zelos-models' });
     modelInput.addEventListener('input', () => { draft.model = modelInput.value.trim(); });
 
@@ -1058,6 +1078,7 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
   }
 
   function choose(next, { scroll = true } = {}) {
+    if (draft.protocol === 'chatgpt' && next.protocol && next.protocol !== 'chatgpt') subscription?.dispose({ cancel: true });
     Object.assign(draft, next);
     drawForm();
     if (scroll) (draft.guide ? guidedWrap : formWrap).scrollIntoView({ block: 'nearest', behavior: 'smooth' });
@@ -1102,7 +1123,7 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
   });
 
   api.presets().then((presets) => {
-    const hosted = (presets || []).filter((p) => !p.local);
+    const hosted = (presets || []).filter((p) => !p.local && p.protocol !== 'chatgpt');
     const guided = hosted.filter((p) => GUIDED_PROVIDERS[p.id]);
     const rest = hosted.filter((p) => !GUIDED_PROVIDERS[p.id]);
 
@@ -1146,7 +1167,7 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
     // empty model id, and a card restored with that blank told the first
     // person to press "Check it works" that it could not pick a model — found
     // by driving the app, not by the tests, which always clicked the card.
-    const current = guided.find((p) => p.baseUrl && p.baseUrl === draft.baseUrl);
+    const current = draft.protocol === 'chatgpt' ? null : guided.find((p) => p.baseUrl && p.baseUrl === draft.baseUrl);
     if (current) choose({ guide: guideFor(current), model: draft.model || pickDefaultModel(current) }, { scroll: false });
   }).catch(() => {
     choiceWrap.replaceChildren(el('p', { class: 'quiet-note', text: 'Could not load the list of AI services.' }));
@@ -1159,11 +1180,21 @@ export function modelPanel({ compact = false, onDone = null } = {}) {
       ? 'Zelos sends your mail summaries to the AI you pick here, and to nothing else.'
       : 'Pick the AI that reads your mail. Your mail summaries go to the AI you choose.' }),
     localWrap,
+    el('div', { class: 'preset-grid subscription-choice' }, [
+      el('button', { type: 'button', class: 'preset', onclick: () => choose({ protocol: 'chatgpt', label: 'ChatGPT subscription', model: cfg.protocol === 'chatgpt' ? cfg.model || 'auto' : 'auto', guide: { title: 'Your ChatGPT subscription' } }) }, [
+        el('span', { class: 'preset-label', text: 'Your ChatGPT subscription' }),
+        el('span', { class: 'preset-note', text: 'Use the plan you already have through Codex. No separate key required.' }),
+      ]),
+    ]),
     choiceWrap,
     guidedWrap,
     fold('More choices', moreWrap),
     advanced,
     helpSlot,
+    el('div', { class: 'subscription-alternative' }, [
+      el('p', { class: 'quiet-note', text: 'Have a Claude subscription? You can use it in Claude Desktop with sharing enabled. Claude can read your Zelos board, calendar, and the mail you allow. This does not power AI answers or automatic reviews inside Zelos.' }),
+      el('a', { class: 'btn quiet', href: '#/settings/ai', text: 'Use Zelos with Claude Desktop' }),
+    ]),
   ]);
 }
 

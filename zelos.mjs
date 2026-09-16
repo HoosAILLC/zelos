@@ -678,7 +678,10 @@ export async function main(argv = process.argv.slice(2)) {
   const { paths: dataPaths } = await import('./core/config.mjs');
   assertNoMaintenance(dataPaths().home);
   const lease = registerDataConnection(dataPaths().db);
-  try { return await runWithData(flags); } finally { lease.release(); }
+  try { return await runWithData(flags); } finally {
+    const { closeSubscription } = await import('./core/codex-subscription.mjs');
+    try { await closeSubscription(); } finally { lease.release(); }
+  }
 }
 
 async function runWithData(flags) {

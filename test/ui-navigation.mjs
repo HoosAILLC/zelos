@@ -43,6 +43,20 @@ const MEAL_PHOTO_SOURCES = [
   "https://www.pexels.com/photo/photo-of-sliced-tomatoes-on-pita-bread-3872385/"
 ];
 export function stripFixedNavigation(where, source) {
+  if(where==='ui/lib/subscription.js'){
+    // A reviewed setup link plus a config value sent only to the local server.
+    // Behavioral tests verify render cannot start sign-in, save, or inference.
+    const install="const INSTALL_URL = 'https://learn.chatgpt.com/docs/cli';";
+    const spec="return { protocol: 'chatgpt', label: 'ChatGPT subscription', baseUrl: 'https://chatgpt.com', model: selectedModel, keyRef: null, maxTokens };";
+    for(const declaration of [install,spec]) {
+      assert.equal(source.split(declaration).length-1,1,'Subscription must use each exact reviewed address declaration once');
+      source=source.replace(declaration,'');
+    }
+    assert.equal([...source.matchAll(/\bINSTALL_URL\b/g)].length,1,'The setup address is used only once');
+    assert.match(source,/link\(INSTALL_URL, 'Open Codex installation guide'\)/,'The setup address must remain a click-only link');
+    assert.doesNotMatch(source,/\bfetch\s*\(/,'Subscription UI must use local API wrappers');
+    return source;
+  }
   if(where==='ui/lib/meal-photo-catalog.js'){
     for (const url of MEAL_PHOTO_SOURCES) {
       const line='    \"source\": '+JSON.stringify(url)+',';

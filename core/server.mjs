@@ -91,6 +91,7 @@ import { MailWorkspaceError, createMailWorkspace, listMail, getMailMessage, getM
 import { MailDraftError, generateReply } from './mail-draft.mjs';
 import { sampleStatus, seedSampleData, clearSampleData } from './sample-data.mjs';
 import { complete, stream, listModels, probeLocal, isLocalAddress, localRuntimeOptions, PRESETS } from './llm.mjs';
+import { getSubscriptionStatus, startSubscriptionLogin, cancelSubscriptionLogin, logoutSubscription, listSubscriptionModels, completeSubscription, closeSubscription } from './codex-subscription.mjs';
 import * as documents from './documents.mjs';
 import * as booking from './booking.mjs';
 import * as shopping from './shopping.mjs';
@@ -862,8 +863,15 @@ async function secretFor(ref) {
 }
 
 /** True when there is enough model configuration to make a call at all. */
-async function modelIsConfigured(model) {
+const DEFAULT_SUBSCRIPTION = Object.freeze({ status: getSubscriptionStatus, startLogin: startSubscriptionLogin,
+  cancelLogin: cancelSubscriptionLogin, logout: logoutSubscription, models: listSubscriptionModels,
+  complete: completeSubscription, close: closeSubscription });
+
+async function modelIsConfigured(model, subscription = DEFAULT_SUBSCRIPTION) {
   if (!model || !model.baseUrl || !model.model) return false;
+  if (model.protocol === 'chatgpt') {
+    try { return (await subscription.status()).connected === true; } catch { return false; }
+  }
   if (isLocalAddress(model.baseUrl)) return true; // keyless local runtimes are normal
   try {
     return (await listRefs()).includes(model.keyRef);
@@ -979,10 +987,10 @@ async function handleHealth(ctx) {
     home: paths().home,
     backend: { name: be.name, writable: be.writable, note: be.note },
     model: {
-      configured: await modelIsConfigured(cfg.model),
+      configured: await modelIsConfigured(cfg.model, ctx.subscription),
       label: cfg.model.label || cfg.model.model || '',
       protocol: cfg.model.protocol,
-      local: isLocalAddress(cfg.model.baseUrl),
+      local: cfg.model.protocol !== 'chatgpt' && isLocalAddress(cfg.model.baseUrl),
     },
     sweep: ctx.sweeps.status(),
     scheduler: ctx.scheduler?.status ? ctx.scheduler.status() : null,
@@ -1272,11 +1280,11 @@ async function handleModelTest(ctx) {
   const baseUrl = body.baseUrl || cfg.model.baseUrl;
   const model = body.model || cfg.model.model;
   const keyRef = body.keyRef === undefined ? cfg.model.keyRef : body.keyRef;
-  const apiKey = await secretFor(keyRef);
+  const apiKey = protocol === 'chatgpt' ? null : await secretFor(keyRef);
 
   const startedAt = Date.now();
   try {
-    const reply = await complete({
+    const reply = await (protocol === 'chatgpt' ? ctx.subscription.complete : complete)({
       protocol,
       baseUrl,
       model,
@@ -1308,9 +1316,34 @@ async function handleModelList(ctx) {
   const baseUrl = ctx.url.searchParams.get('baseUrl') || cfg.model.baseUrl;
   const keyRef = ctx.url.searchParams.get('keyRef') ?? cfg.model.keyRef;
   try {
+    if (protocol === 'chatgpt') {
+      const catalog = await ctx.subscription.models();
+      sendJSON(ctx.res, 200, catalog.models.map(row => ({ id: row.id, label: row.displayName || row.id })));
+      return;
+    }
     sendJSON(ctx.res, 200, await listModels({ protocol, baseUrl, apiKey: await secretFor(keyRef) }));
   } catch (err) {
     throw new HttpError(502, err.message);
+  }
+}
+
+async function handleSubscriptionStatus(ctx) {
+  sendJSON(ctx.res, 200, await ctx.subscription.status());
+}
+
+async function handleSubscriptionAction(ctx, [action]) {
+  const body = await readJSON(ctx.req, 2048);
+  const allowed = action === 'login' ? ['type'] : action === 'cancel' ? ['loginId'] : [];
+  if (Object.keys(body).some(key => !allowed.includes(key))) throw new HttpError(400, 'This sign-in action does not accept credentials or other settings.');
+  if (action === 'login' && body.type !== undefined && !['chatgpt', 'chatgptDeviceCode'].includes(body.type)) throw new HttpError(400, 'Choose browser sign-in or device-code sign-in.');
+  if (action === 'cancel') requireString(body, 'loginId', { max: 128 });
+  try {
+    const result = action === 'login' ? await ctx.subscription.startLogin({ type: body.type || 'chatgpt' })
+      : action === 'cancel' ? await ctx.subscription.cancelLogin({ loginId: body.loginId }) : await ctx.subscription.logout();
+    sendJSON(ctx.res, 200, result);
+  } catch (error) {
+    throw new HttpError(Number.isInteger(error?.status) && error.status >= 400 && error.status < 600 ? error.status : 502,
+      error?.message || 'ChatGPT sign-in could not finish. Try again from Settings → AI.');
   }
 }
 
@@ -2435,7 +2468,7 @@ async function handleAsk(ctx) {
   if ((includeHealth || personalKinds.length || requiresPrivateRecordsModel(ctx.db, question, priorMessages)) && !isPrivateRecordsModel(cfg.model)) {
     throw new HttpError(409, LOCAL_RECORDS_MESSAGE);
   }
-  if (!(await modelIsConfigured(cfg.model))) {
+  if (!(await modelIsConfigured(cfg.model, ctx.subscription))) {
     throw new HttpError(409, 'no model is configured yet — pick one in Settings');
   }
 
@@ -3129,7 +3162,7 @@ async function handleProgressPdf(ctx) {
   sendDownload(ctx,bytes,'application/pdf','zelos-weekly-report.pdf');
 }
 async function handleAssign(ctx) {
-  if (!(await modelIsConfigured(ctx.config().model))) throw new HttpError(409,'Choose a model in Settings before assigning a task.');
+  if (!(await modelIsConfigured(ctx.config().model, ctx.subscription))) throw new HttpError(409,'Choose a model in Settings before assigning a task.');
   sendJSON(ctx.res,202,{job:enqueueJob(ctx.db,await readJSON(ctx.req))});
   ctx.assistant.runNext().catch(()=>{});
 }
@@ -3245,6 +3278,8 @@ const ROUTES = [
   ['POST', /^\/api\/model\/test$/, handleModelTest],
   ['GET', /^\/api\/model\/list$/, handleModelList],
   ['GET', /^\/api\/model\/presets$/, handlePresets],
+  ['GET', /^\/api\/model\/subscription$/, handleSubscriptionStatus],
+  ['POST', /^\/api\/model\/subscription\/(login|cancel|logout)$/, handleSubscriptionAction],
   ['GET', /^\/api\/guides$/, handleGuides],
   ['POST', /^\/api\/help$/, handleHelp],
   ['GET', /^\/api\/local\/probe$/, handleLocalProbe],
@@ -3343,6 +3378,7 @@ export function createServer({
   mailSender = undefined,
   mailGenerator = generateReply,
   assistantComplete = undefined,
+  subscription = DEFAULT_SUBSCRIPTION,
   documentExtractor = documents.extractDocument,
   documentPreviewer = documents.previewDocument,
   healthPlanner = generateHealthPlan,
@@ -3726,6 +3762,7 @@ export function createServer({
       setConfig: (next) => { current = next; },
       deviceSignIns,
       browserSignIns,
+      subscription,
       dns,
       releaseChecker,
       mailWorkspace,
@@ -3773,6 +3810,7 @@ export function createServer({
     for(const entry of localWork)entry.controller.abort();
     deviceSignIns.closeAll();
     browserSignIns.closeAll();
+    Promise.resolve(subscription.close()).catch(() => {});
   });
 
   server.sessionToken = token;
@@ -3786,11 +3824,12 @@ export function createServer({
       backupStopped=true;clearInterval(backupTimer);
       const entries=[...localWork];for(const entry of entries)entry.controller.abort();
       await Promise.all([assistant.stop(),bookingService.stop(),closeGuest(),closeFamily(),...entries.map(entry=>entry.done)]);
+      await subscription.close();
     },
     // Native maintenance waits through the last credential write, not merely
     // through cancellation of the network request that preceded it.
     async cancelSignInsAndWait() {
-      await Promise.all([deviceSignIns.cancelAndWait(), browserSignIns.cancelAndWait()]);
+      await Promise.all([deviceSignIns.cancelAndWait(), browserSignIns.cancelAndWait(), subscription.close()]);
     },
     get config() { return current; },
     get scheduler() { return clock; },

@@ -594,7 +594,7 @@ Check the other network and process entry points too:
 grep -rn "http\.request\|https\.request\|transport\.request\|node:http\|node:dgram\|node:http2\|node:dns\|child_process\|createTransport" core/ zelos.mjs
 ```
 
-**Fourteen lines come back.** They account for:
+**Fifteen lines come back.** They account for:
 
 - `core/family-guest.mjs` creates the separate loopback family HTTP listener; its `node:net` import validates client address syntax and does not open a connection.
 
@@ -621,12 +621,21 @@ grep -rn "http\.request\|https\.request\|transport\.request\|node:http\|node:dgr
   `core/booking-guest.mjs`. Their HTTP imports serve requests; they do not
   establish an outbound connection. A `node:dns` comment in `core/server.mjs`
   is the remaining prose match.
-- Three native-process imports: `core/secrets.mjs` runs the keychain helper,
+- Four native-process imports: `core/secrets.mjs` runs the keychain helper,
   `zelos.mjs` opens the browser, and `core/documents.mjs` runs only `pdfinfo`,
   `pdftotext`, `pdftoppm` or `tesseract` on generated private temporary files.
   Document commands use `execFile` with `shell:false`, bounded time/output and
   cleanup on failure or cancellation. Uploaded filenames and model text do
   not become executable names or shell commands.
+  `core/codex-subscription.mjs` launches the installed official Codex app-server
+  directly, without a shell, for the optional ChatGPT subscription connection.
+  It uses a separate credential home, filters inherited environment variables,
+  and requires an ephemeral text-only session with tools, workspace access,
+  plugins, MCP servers and web search disabled. The CLI owns OpenAI sign-in and
+  its network requests; selected mail/calendar/board context leaves the machine
+  when this cloud option is used. API keys are never used as a fallback.
+  See [AI subscriptions](AI-SUBSCRIPTIONS.md) for credential storage, plan limits,
+  and the separate Claude Desktop sharing option.
 
 The second recipe includes `transport.request` and `node:http` because the web
 reader aliases the selected HTTP(S) module. Searching only `http.request` and

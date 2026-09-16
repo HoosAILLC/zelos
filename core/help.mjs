@@ -54,7 +54,7 @@ export const HELP_PROVIDERS = Object.freeze([
 ]);
 
 /** The AIs the AI step can be asked about. `local` is a program on the person's own computer. */
-export const HELP_AIS = Object.freeze(['anthropic', 'openai', 'local']);
+export const HELP_AIS = Object.freeze(['anthropic', 'openai', 'chatgpt', 'claude-desktop', 'local']);
 
 /** The three calendars the Calendar step names. */
 export const HELP_CALENDARS = Object.freeze(['google', 'icloud', 'outlook']);
@@ -121,6 +121,8 @@ export function aiName(raw) {
   const p = String(raw ?? '').trim().toLowerCase();
   if (!p) return null;
   if (HELP_AIS.includes(p)) return p;
+  if (['chatgpt subscription', 'your chatgpt subscription'].includes(p)) return 'chatgpt';
+  if (['claude desktop', 'claude subscription', 'your claude subscription'].includes(p)) return 'claude-desktop';
   if (/claude|anthropic/.test(p)) return 'anthropic';
   if (/openai|chatgpt|gpt/.test(p)) return 'openai';
   if (/ollama|lm studio|llama|vllm|local|this computer/.test(p)) return 'local';
@@ -168,28 +170,30 @@ const WHAT_ZELOS_IS =
 function generalPrompt() {
   return [
     'The screen they are on: the Welcome screen, the first thing Zelos shows. The title says “Zelos reads your email and calendar, and tells you what needs you.” Under it: “Your private library stays on the computer running Zelos. Review a reply and choose Send reply whenever you are ready.” There are two buttons, “Set up Zelos” and “Look around with made-up data first” (a week of invented mail, removable in one click), and a small “Skip the rest” link.',
-    'Setup is five named steps along the top — Welcome, AI, Email, Calendar, Done — and every one can be skipped. Step 2, AI: pick the AI that reads the mail (Claude or OpenAI, or a program already on this computer) and paste a key from that company’s website. Step 3, Email: type the email address, and Zelos says what that provider needs — usually a special app password made on the provider’s website, never the normal password. Step 4, Calendar: Google Calendar, iCloud or Outlook. Step 5, Done: press “Read my mail now” and Zelos reads the recent mail once.',
+    'Setup is five named steps along the top — Welcome, AI, Email, Calendar, Done — and every one can be skipped. Step 2, AI: choose “Your ChatGPT subscription” and sign in through Codex with no separate key, a pay-as-you-go Anthropic or OpenAI account with its own key, or an AI program already running on this computer. A Claude subscription works through “Use Zelos with Claude Desktop” sharing; it does not power Zelos’s own AI answers or automatic reviews. Step 3, Email: type the email address, and Zelos says what that provider needs — usually a special app password made on the provider’s website, never the normal password. Step 4, Calendar: Google Calendar, iCloud or Outlook. Step 5, Done: press “Read my mail now” and Zelos reads the recent mail once.',
     'Find out first what they want — to set Zelos up now, or to look around with the made-up data — and then which step they are stuck on.',
   ];
 }
 
 /* The AI step, ui/views/settings.js modelPanel() as onboarding mounts it. */
 function aiPrompt(ai) {
-  // The guided card's own words, for whichever card is up: settings.js's
-  // GUIDED_PROVIDERS spells the key page and the create button per company.
-  const company = ai === 'openai' ? 'OpenAI' : 'Anthropic';
-  const friendly = ai === 'openai' ? 'OpenAI' : 'Claude';
-  const create = ai === 'openai' ? 'Press Create new secret key and copy it.' : 'Press Create Key and copy it.';
-  const screen = `The screen they are on: Step 2 of 5, AI (the same panel is Settings › AI). The title is “Pick the AI that reads your mail.” There are two cards, “Claude, by Anthropic — Recommended” and “OpenAI, who make ChatGPT”; if an AI program such as Ollama is already running on this computer, a card “An AI program on this computer” sits above them and needs no key. Pressing a card opens a guided card with three lines — “1. Open ${company}’s key page” (a link that opens in a new tab), “2. ${create}”, “3. Paste it here.” — a box labelled “Your key”, and one button, “Check it works”. That button stores the key, tries it, and saves; when it works the card says “Working. Zelos will use ${friendly}.” and they press “Next”. Under the card are two folded drawers, “More choices” and “Advanced”, which they do not need. A saved key is never shown again; the box then says “a key is saved — paste a new one to replace it”.`;
-  const anthropic = `Getting a key from Anthropic: 1. Open Anthropic’s key page${at(keyPage('anthropic'))} — the link on the card opens it. They may have to sign in or make an account, and to add a payment method or a small amount of credit before a key will work. 2. Press “Create Key”, give it any name (“Zelos”), and copy the key; it is shown once. 3. Back in Zelos, paste it into “Your key” and press “Check it works”.`;
-  const openai = `Getting a key from OpenAI: 1. Open OpenAI’s key page${at(keyPage('openai'))} — the link on the card opens it. They may have to sign in or make an account, and to add billing before a key will work. 2. Press “Create new secret key”, give it any name, and copy the key; it is shown once. 3. Back in Zelos, paste it into “Your key” and press “Check it works”.`;
-  const local = 'They chose a local AI connection. No provider key is needed for this connection; AI requests go to the model server they configure. Its routing and other connected services can still use the network. The card says what the program is and which model it will use. If the card says the program has nothing loaded yet, they load a model in that program first, then press “Check it works”.';
-  const trouble = 'Common trouble: “Check it works” fails with a message about billing or credit — the key is fine, the account needs credit at the AI company’s site; the key was pasted with a space or a line break — paste it again; the card says “Paste the key first” — the box is empty. It is pay-as-you-go, and they can set a monthly spending cap on the AI company’s own site.';
-  const steps = ai === 'anthropic' ? [anthropic]
-    : ai === 'openai' ? [openai]
-      : ai === 'local' ? [local]
-        : ['They have not chosen a card yet; Claude is the recommended one.', anthropic, openai];
-  return [screen, ...steps, ...(ai === 'local' ? [] : [trouble])];
+  const screen = 'The screen they are on: Step 2 of 5, AI (also Settings › AI), titled “Pick the AI that reads your mail.” It offers “Your ChatGPT subscription”, “Claude, by Anthropic”, and “OpenAI, who make ChatGPT”. The latter two use separate pay-as-you-go accounts. If a local AI is already running on this computer, its card appears first. “More choices” and “Advanced” hold expert settings. Ask which connection they want; selecting a card does not save it.';
+  const subscription = 'ChatGPT: select “Your ChatGPT subscription”. Install or update OpenAI’s Codex command-line app using “Open Codex installation guide”, then “Check again” if shown. Press “Sign in with ChatGPT”, then “Continue to OpenAI”; sign in only on OpenAI’s page. Zelos checks completion; “Check sign-in” checks again and “Cancel sign-in” stops it. Once connected, keep “Account default (recommended)” or use “Refresh choices”, then press “Use ChatGPT subscription” to save. “Check a reply” is optional and uses the plan allowance. The plan must include Codex; Ask and mail/board reviews share its limits, including automatic reviews. No key or automatic pay-as-you-go fallback. “Sign out of Zelos” affects only this connection, not their separate Codex app. Existing privacy choices apply; local-only health, money and mail-drafting features still require a local AI.';
+  const desktop = 'A Claude subscription can be used in Claude Desktop: “Use Zelos with Claude Desktop” opens “Share with another AI (advanced)”. Enable sharing there and choose the board, calendar and mail access Claude may read. Chats run in Claude Desktop using its plan; this does not power AI answers or automatic reviews inside Zelos. Never ask for Claude sign-in credentials or account files.';
+  const hosted = (id) => {
+    const company = id === 'openai' ? 'OpenAI' : 'Anthropic';
+    const friendly = id === 'openai' ? 'OpenAI' : 'Claude';
+    const create = id === 'openai' ? 'Create new secret key' : 'Create Key';
+    return `${company} pay-as-you-go: the card says “1. Open ${company}’s key page”${at(keyPage(id))}, “2. Press ${create} and copy it.”, “3. Paste it here.” They may need to add billing. Press “${create}” there, copy the key into “Your key” in Zelos, then “Check it works”. This stores, tests and saves it; success says “Working. Zelos will use ${friendly}.” A saved key is hidden: “a key is saved — paste a new one to replace it”. Normal ChatGPT and Claude subscriptions do not pay for these separate accounts.`;
+  };
+  const local = 'They chose a local AI connection. No provider key is needed for this connection; AI requests go to the model server they configure. Its routing and other connected services can still use the network. The card names the program and model. If nothing is loaded, load a model in that program, then press “Check it works”.';
+  const trouble = 'For key-based accounts only: “Paste the key first” means the box is empty. If billing or credit is refused, check that company’s billing page; monthly spending controls live there.';
+  if (ai === 'chatgpt') return [screen, subscription, desktop];
+  if (ai === 'claude-desktop') return [screen, desktop, 'For answers inside Zelos, choose a ChatGPT subscription, a separate pay-as-you-go account, or a local AI instead.'];
+  if (ai === 'local') return [screen, local];
+  if (ai === 'anthropic' || ai === 'openai') return [screen, hosted(ai), trouble, desktop];
+  const subscriptionOverview = 'For an existing ChatGPT plan with Codex included, choose “Your ChatGPT subscription”, install Codex through “Open Codex installation guide” if needed, then “Sign in with ChatGPT” and “Continue to OpenAI”. After sign-in, press “Use ChatGPT subscription”. No separate key; reviews use the plan allowance, with no automatic pay-as-you-go fallback.';
+  return [screen, subscriptionOverview, desktop, hosted('anthropic'), hosted('openai'), trouble];
 }
 
 /* The Email step, ui/views/settings.js mailPanel() and simpleMailForm(). */
@@ -273,7 +277,7 @@ function calendarPrompt(calendar, guides) {
 function firstCheckPrompt() {
   return [
     'The screen they are on: Step 5 of 5, Done. The title is “Read my mail for the first time.” One button, “Read my mail now”, with a progress bar and a line of text under it; then “Go to the board” and “Skip the rest”. If an earlier step was skipped the screen says so — for example “Zelos can’t read anything yet — it still needs an AI (step 2) and an email account (step 3).” — and the button is greyed out until that step is done; the step buttons along the top go back to it.',
-    'What “Read my mail now” does: Zelos fetches the recent mail (the last two weeks, by default) and the calendar, then asks the AI they chose to read through it once and sort out what needs them — replies they owe, things they are waiting on, appointments coming up. The first time takes a few minutes and is the most expensive check, because every later check reads only what is new. It marks nothing as read, moves nothing, deletes nothing and sends nothing; what it reads stays on this computer.',
+    'What “Read my mail now” does: Zelos fetches the recent mail (the last two weeks, by default) and the calendar, then asks the AI they chose to read through it once and sort out what needs them — replies they owe, things they are waiting on, appointments coming up. The first time can take a few minutes and uses more AI processing; later checks focus on new mail. With a ChatGPT subscription, checks use the plan’s Codex allowance; separate key-based accounts use pay-as-you-go billing. It marks nothing as read, moves nothing, deletes nothing and sends nothing; what it reads stays on this computer.',
     'When it finishes the line says “Done.” and a sentence about what it read, and “Go to the board” shows the result. If it says “The check stopped.” the reason is written under it; it is nearly always the email account or the AI not answering — go back to step 2 or 3 and press the check button there. After this, Zelos checks on its own every half hour during the day, which Settings › Schedule can change.',
   ];
 }

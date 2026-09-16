@@ -6019,3 +6019,239 @@ test('Your data counts what Zelos is holding, and stands unchanged when the rout
   assert.match(onScreen(bare), /Your records and saved history live on the computer running Zelos\./);
   assert.doesNotMatch(onScreen(bare), /on disk/, 'a panel with no answer must not claim a size');
 });
+
+/* A subscription is an explicit account connection, never a key-shaped shortcut. */
+test('ChatGPT sign-in accepts only the OpenAI authorization page', async () => {
+  stubBrowserGlobals();
+  const { subscriptionAuthUrl } = await import(fileUrl(UI, 'lib/subscription.js'));
+  assert.equal(subscriptionAuthUrl('https://auth.openai.com/oauth/authorize?state=sample'), 'https://auth.openai.com/oauth/authorize?state=sample');
+  for (const value of ['javascript:alert(1)', 'http://auth.openai.com/oauth/authorize', 'https://auth.openai.com.evil.invalid/oauth/authorize', 'https://person:secret@auth.openai.com/oauth/authorize', 'https://auth.openai.com:8080/oauth/authorize', 'https://auth.openai.com/other', null]) {
+    assert.equal(subscriptionAuthUrl(value), null, String(value));
+  }
+});
+
+function subscriptionFetch(t, { read, login, cancel, logout, models = [], testReply } = {}) {
+  const calls = [];
+  const disconnected = { installed: true, connected: false, account: null, login: null, rateLimits: null, error: null };
+  const ok = value => ({ ok: true, status: 200, text: async () => JSON.stringify(value) });
+  globalThis.fetch = async (reqPath, init = {}) => {
+    const body = init.body ? JSON.parse(init.body) : null;
+    calls.push({ method: init.method || 'GET', path: reqPath, body });
+    if (reqPath === '/api/model/subscription') return ok(await (read?.() ?? disconnected));
+    if (reqPath === '/api/model/subscription/login') return ok(await login(body));
+    if (reqPath === '/api/model/subscription/cancel') return ok(await (cancel?.(body) ?? { canceled: true }));
+    if (reqPath === '/api/model/subscription/logout') return ok(await (logout?.() ?? { connected: false }));
+    if (reqPath === '/api/model/list?protocol=chatgpt') return ok(models);
+    if (reqPath === '/api/model/test') return ok(await (testReply?.(body) ?? { ok: true, sample: 'Hello.', ms: 1 }));
+    throw new Error(`unexpected ${reqPath}`);
+  };
+  t.after(() => { delete globalThis.fetch; });
+  return calls;
+}
+
+const chatgptConnected = () => ({ installed: true, connected: true, account: { type: 'chatgpt', email: 'person@example.invalid', planType: 'plus' }, login: null, rateLimits: null, error: null });
+
+test('ChatGPT setup restores the saved choice and saves without a key or an automatic paid test', async (t) => {
+  withPlainDom(t);
+  const calls = subscriptionFetch(t, { read: chatgptConnected, models: [{ id: 'account-choice', label: 'An account choice' }] });
+  const { subscriptionPanel } = await import(fileUrl(UI, 'lib/subscription.js'));
+  let saved = null;
+  const panel = subscriptionPanel({ model: 'saved-choice', maxTokens: 4096, onSave: async spec => { saved = spec; } });
+  t.after(panel.dispose);
+  await settle();
+  assert.deepEqual(calls.map(c => c.method), ['GET']);
+  assert.match(onScreen(panel.node), /Connected as person@example.invalid/);
+  assert.match(onScreen(panel.node), /does not switch to a separately billed service/);
+  assert.match(onScreen(panel.node), /Local-only health, money, and mail-drafting/);
+  assert.equal(findInput(panel.node, n => n.attributes.type === 'password'), undefined);
+  const chooser = findInput(panel.node, n => n.tag === 'select');
+  assert.equal(chooser.value, 'saved-choice');
+  findButton(panel.node, 'Refresh choices').fire('click');
+  await settle();
+  assert.equal(chooser.value, 'saved-choice', 'refresh must not overwrite a saved selection');
+  assert.ok(chooser.children.some(n => n.attributes.value === 'auto'));
+  chooser.value = 'account-choice';
+  chooser.fire('change');
+  findButton(panel.node, 'Use ChatGPT subscription').fire('click');
+  await settle();
+  assert.deepEqual(saved, { protocol: 'chatgpt', label: 'ChatGPT subscription', baseUrl: 'https://chatgpt.com', model: 'account-choice', keyRef: null, maxTokens: 4096 });
+  assert.equal(calls.some(c => c.method !== 'GET'), false, 'saving must not send a question or a secret');
+  findButton(panel.node, 'Check a reply').fire('click');
+  await settle();
+  assert.equal(calls.filter(c => c.path === '/api/model/test').length, 1);
+  assert.match(onScreen(panel.node), /ChatGPT answered/);
+});
+
+test('ChatGPT sign-in requires explicit actions, preserves pending controls, and cancels its own flow', async (t) => {
+  withPlainDom(t);
+  let pending = false;
+  const calls = subscriptionFetch(t, {
+    read: () => ({ installed: true, connected: false, account: null, login: pending ? { loginId: 'flow-one', status: 'pending' } : null }),
+    login: body => { assert.deepEqual(body, { type: 'chatgpt' }); pending = true; return { type: 'chatgpt', loginId: 'flow-one', authUrl: 'https://auth.openai.com/oauth/authorize?state=one' }; },
+    cancel: body => { assert.deepEqual(body, { loginId: 'flow-one' }); pending = false; return { canceled: true }; },
+  });
+  const { subscriptionPanel } = await import(fileUrl(UI, 'lib/subscription.js'));
+  const panel = subscriptionPanel({ onSave: async () => assert.fail('sign-in must not save automatically') });
+  t.after(panel.dispose);
+  await settle();
+  assert.equal(calls.some(c => c.path.endsWith('/login')), false);
+  assert.equal(plainWalk(panel.node).some(n => n.tag === 'a' && n.attributes.href?.includes('oauth/authorize')), false);
+  findButton(panel.node, 'Sign in with ChatGPT').fire('click');
+  await settle();
+  const continueLink = plainWalk(panel.node).find(n => n.tag === 'a' && n.textContent === 'Continue to OpenAI');
+  assert.equal(continueLink.attributes.href, 'https://auth.openai.com/oauth/authorize?state=one');
+  assert.equal(continueLink.attributes.target, '_blank');
+  const cancelButton = findButton(panel.node, 'Cancel sign-in');
+  findButton(panel.node, 'Check sign-in').fire('click');
+  await settle();
+  assert.equal(findButton(panel.node, 'Cancel sign-in'), cancelButton, 'a status poll must preserve keyboard focus');
+  cancelButton.fire('click');
+  await settle();
+  assert.match(onScreen(panel.node), /Sign-in canceled/);
+  assert.ok(findButton(panel.node, 'Sign in with ChatGPT'));
+  assert.equal(calls.filter(c => c.path.endsWith('/cancel')).length, 1);
+});
+
+test('ChatGPT setup rejects an unsafe sign-in address and cleans up a late result after leaving', async (t) => {
+  withPlainDom(t);
+  let finishLogin;
+  let unsafe = true;
+  const calls = subscriptionFetch(t, {
+    login: () => unsafe ? { loginId: 'unsafe-flow', authUrl: 'https://unrelated.invalid/sign-in' } : new Promise(resolve => { finishLogin = resolve; }),
+  });
+  const { subscriptionPanel } = await import(fileUrl(UI, 'lib/subscription.js'));
+  const panel = subscriptionPanel({ onSave: async () => {} });
+  await settle();
+  findButton(panel.node, 'Sign in with ChatGPT').fire('click');
+  await settle();
+  assert.match(onScreen(panel.node), /valid sign-in page/);
+  assert.equal(plainWalk(panel.node).some(n => n.attributes.href?.includes('unrelated.invalid')), false);
+  assert.equal(calls.filter(c => c.path.endsWith('/cancel')).length, 1);
+  unsafe = false;
+  findButton(panel.node, 'Sign in with ChatGPT').fire('click');
+  await settle();
+  panel.dispose({ cancel: true });
+  finishLogin({ loginId: 'late-flow', authUrl: 'https://auth.openai.com/oauth/authorize?state=late' });
+  await settle();
+  assert.deepEqual(calls.filter(c => c.path.endsWith('/cancel')).map(c => c.body.loginId), ['unsafe-flow', 'late-flow']);
+  assert.equal(plainWalk(panel.node).some(n => n.textContent === 'Continue to OpenAI'), false);
+});
+
+test('ChatGPT connection failures can recover and an expired account cannot be saved', async (t) => {
+  withPlainDom(t);
+  let failRead = true;
+  let connected = true;
+  const calls = subscriptionFetch(t, {
+    read: () => { if (failRead) throw new Error('Connection interrupted'); return { ...chatgptConnected(), connected }; },
+  });
+  const { subscriptionPanel } = await import(fileUrl(UI, 'lib/subscription.js'));
+  let saved = 0;
+  const panel = subscriptionPanel({ onSave: async () => { saved++; } });
+  t.after(panel.dispose);
+  await settle();
+  assert.match(onScreen(panel.node), /Could not check ChatGPT/);
+  failRead = false;
+  findButton(panel.node, 'Check again').fire('click');
+  await settle();
+  connected = false;
+  findButton(panel.node, 'Use ChatGPT subscription').fire('click');
+  await settle();
+  assert.equal(saved, 0);
+  assert.match(onScreen(panel.node), /no longer connected/);
+  assert.ok(findButton(panel.node, 'Sign in with ChatGPT'));
+  assert.equal(calls.some(c => c.path.includes('/secrets') || c.path === '/api/model/test'), false);
+});
+
+test('ChatGPT sign-out only disconnects Zelos and keeps a clear recovery path', async (t) => {
+  withPlainDom(t);
+  const calls = subscriptionFetch(t, { read: chatgptConnected });
+  const { subscriptionPanel } = await import(fileUrl(UI, 'lib/subscription.js'));
+  const panel = subscriptionPanel({ onSave: async () => {} });
+  t.after(panel.dispose);
+  await settle();
+  findButton(panel.node, 'Sign out of Zelos').fire('click');
+  await settle();
+  assert.match(onScreen(panel.node), /automatic reviews pause until you sign in again/);
+  assert.ok(findButton(panel.node, 'Sign in with ChatGPT'));
+  assert.deepEqual(calls.filter(c => c.method !== 'GET').map(c => c.path), ['/api/model/subscription/logout']);
+});
+
+test('the AI panel surfaces ChatGPT without switching providers and restores it in compact onboarding', async (t) => {
+  withPlainDom(t);
+  const calls = [];
+  const base = plainFetch({ presets: await llmPresets(), calls });
+  globalThis.fetch = async (reqPath, init = {}) => {
+    if (reqPath === '/api/model/subscription') {
+      calls.push({ path: reqPath, method: init.method || 'GET' });
+      return { ok: true, status: 200, text: async () => JSON.stringify(chatgptConnected()) };
+    }
+    return base(reqPath, init);
+  };
+  t.after(() => { delete globalThis.fetch; });
+  const store = await import(fileUrl(UI, 'lib/store.js'));
+  const settings = await import(fileUrl(UI, 'views/settings.js'));
+  const { DEFAULTS } = await import(fileUrl(ROOT, 'core/config.mjs'));
+  store.state.config = { identity: {}, model: { ...DEFAULTS.model }, mail: [], calendars: [], sources: [] };
+  store.state.secretRefs = [];
+  store.state.health = { model: { configured: false } };
+  let advanced = 0;
+  const panel = settings.modelPanel({ compact: true, onDone: () => { advanced++; } });
+  await settle();
+  assert.equal(calls.some(c => c.path === '/api/model/subscription'), false, 'an unselected account must not launch its adapter');
+  assert.equal(store.state.config.model.protocol, 'anthropic');
+  assert.ok(plainWalk(panel).some(n => n.tag === 'a' && n.attributes.href === '#/settings/ai' && n.textContent === 'Use Zelos with Claude Desktop'));
+  assert.match(onScreen(panel), /separate pay-as-you-go account from OpenAI/);
+  findButtons(panel, /^Your ChatGPT subscription/)[0].fire('click');
+  await settle();
+  assert.equal(plainWalk(panel).some(n => n.tag === 'input' && n.attributes.type === 'password' && !plainHidden(n)), false);
+  assert.doesNotMatch(onScreen(panel), /Base URL|Response limit|Your key/);
+  findButton(panel, 'Use ChatGPT subscription').fire('click');
+  await settle();
+  assert.equal(advanced, 1);
+  assert.deepEqual(store.state.config.model, { protocol: 'chatgpt', label: 'ChatGPT subscription', baseUrl: 'https://chatgpt.com', model: 'auto', keyRef: null, maxTokens: 8192 });
+  assert.deepEqual(calls.filter(c => c.method !== 'GET' && c.path !== '/api/help').map(c => c.path), ['/api/config']);
+  const restored = settings.modelPanel({ compact: true });
+  await settle();
+  assert.match(onScreen(restored), /Connected as person@example.invalid/);
+  assert.equal(findInput(restored, n => n.tag === 'select').value, 'auto');
+  findButtons(restored, /^Claude, by Anthropic/)[0].fire('click');
+  assert.ok(findInput(restored, n => n.attributes.type === 'password'));
+  assert.match(onScreen(restored), /Pay-as-you-go/);
+  assert.equal(store.state.config.model.protocol, 'chatgpt', 'selecting a different card does not save it');
+});
+
+test('ChatGPT polling stops on completion and disposal without switching or saving the account', async (t) => {
+  withPlainDom(t);
+  const timers = new Map();
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  globalThis.setTimeout = (fn, ms) => { const id = { unref() {} }; timers.set(id, { fn, ms }); return id; };
+  globalThis.clearTimeout = id => { timers.delete(id); };
+  t.after(() => { globalThis.setTimeout = realSetTimeout; globalThis.clearTimeout = realClearTimeout; });
+  let pending = true;
+  const calls = subscriptionFetch(t, { read: () => pending
+    ? { installed: true, connected: false, login: { loginId: 'restored-flow', status: 'pending' } }
+    : chatgptConnected() });
+  const { subscriptionPanel } = await import(fileUrl(UI, 'lib/subscription.js'));
+  const panel = subscriptionPanel({ onSave: async () => assert.fail('completion must not save automatically') });
+  t.after(panel.dispose);
+  await settle();
+  assert.equal(timers.size, 1);
+  assert.equal([...timers.values()][0].ms, 2000);
+  assert.ok(findButton(panel.node, 'Cancel sign-in'));
+  assert.equal(plainWalk(panel.node).some(n => n.tag === 'a' && n.textContent === 'Continue to OpenAI'), false, 'a restored flow cannot invent its authorization link');
+  pending = false;
+  const [id, scheduled] = [...timers.entries()][0];
+  timers.delete(id);
+  scheduled.fn();
+  await settle();
+  assert.ok(findButton(panel.node, 'Use ChatGPT subscription'));
+  assert.equal(timers.size, 0);
+  assert.equal(calls.some(c => c.method !== 'GET'), false);
+  pending = true;
+  const other = subscriptionPanel({ onSave: async () => {} });
+  await settle();
+  assert.equal(timers.size, 1);
+  other.dispose();
+  assert.equal(timers.size, 0, 'leaving the panel must stop polling');
+});

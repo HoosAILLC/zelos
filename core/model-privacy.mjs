@@ -9,6 +9,7 @@ const PRIVATE_TOOLS = new Set(['read_health', 'read_money', 'read_progress', 'we
 const EXPLICIT_PRIVATE_REQUEST = /\b(?:read_health|read_money|read_progress|weekly_report|medications?|medicines?|prescriptions?|diagnosis|diagnoses|diagnosed|dosages?|medical\s+conditions?|diseases?|illness(?:es)?)\b/i;
 
 export function isPrivateRecordsModel(model) {
+  if (model?.protocol === 'chatgpt') return false;
   let url; try { url = new URL(model?.baseUrl); } catch { return false; }
   return ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password && !url.search && !url.hash && isLocalAddress(url.href);
 }

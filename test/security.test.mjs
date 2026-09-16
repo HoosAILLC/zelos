@@ -1025,13 +1025,14 @@ test('mail submission is isolated behind the reviewed workspace; content cannot 
     assert.ok(!/\bsendmail\b/.test(source), `${where} invokes a system mail sender`);
     // No evaluation of anything, ever.
     assert.ok(!/\beval\s*\(|new\s+Function\s*\(|node:vm\b/.test(source), `${where} can evaluate a string`);
-    // Native processes are confined to keychain helpers, browser launch, and
-    // bounded local document readers. None evaluates content as commands.
+    // Native processes are confined to keychain helpers, browser launch,
+    // bounded local document readers, and the isolated text-only subscription
+    // adapter. None evaluates message content as commands.
     if (/child_process/.test(source)) {
       // path.relative() answers in the platform's separators, and this list is
       // written the way the repository reads. Compare on one shape, not two.
       const posix = where.split(path.sep).join('/');
-      assert.ok(['core/secrets.mjs', 'core/documents.mjs', 'zelos.mjs'].includes(posix), `${posix} spawns processes`);
+      assert.ok(['core/secrets.mjs', 'core/documents.mjs', 'core/codex-subscription.mjs', 'zelos.mjs'].includes(posix), `${posix} spawns processes`);
       assert.ok(!/shell\s*:\s*true/.test(source), `${where} spawns through a shell`);
       // spawn and execFile do not use a shell by default. exec does. The
       // document reader additionally makes shell:false explicit.
@@ -1039,6 +1040,16 @@ test('mail submission is isolated behind the reviewed workspace; content cannot 
       assert.ok(imported, `${where} imports child_process in an unexpected shape`);
       assert.deepEqual(imported[1].split(',').map((s) => s.trim()).filter(Boolean), posix === 'core/documents.mjs' ? ['execFile'] : ['spawn'],
         `${where} imports an unexpected process primitive`);
+      if(posix === 'core/codex-subscription.mjs'){
+        // Behavioral protocol tests additionally prove API-key stripping,
+        // private scratch roots, tool refusal, cancellation and bounded output.
+        assert.equal([...source.matchAll(/\bspawnImpl\(/g)].length,2,'only schema discovery and the app-server may start processes');
+        assert.match(source,/shell: false, windowsHide: true/);
+        assert.match(source,/forced_login_method: 'chatgpt'/);
+        assert.match(source,/environments: \[\], dynamicTools: \[\], selectedCapabilityRoots: \[\]/);
+        assert.match(source,/cli_auth_credentials_store: 'file'/);
+        assert.doesNotMatch(source,/spawnImpl\([^\n]*(?:opts\.|message\.|content)/,'prompt content never chooses a process or process arguments');
+      }
       if(posix === 'core/documents.mjs'){
         assert.match(source,/const execute=promisify\(execFile\);/);
         assert.equal([...source.matchAll(/\bexecute\b/g)].length,2,'the native primitive is only declared and supplied to the bounded wrapper');

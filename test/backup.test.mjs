@@ -179,13 +179,15 @@ describe('portable backup and restore', () => {
     recordAccess(source.db, { tool: 'zelos_board', rows: 1, detail: 'fixture access history' });
     fs.mkdirSync(path.join(source.home, 'logs'), { recursive: true }); fs.writeFileSync(path.join(source.home, 'logs', 'private.log'), 'not portable');
     fs.mkdirSync(path.join(source.home, 'cache'), { recursive: true }); fs.writeFileSync(path.join(source.home, 'cache', 'temporary'), 'not portable');
+    fs.mkdirSync(path.join(source.home, 'chatgpt-subscription', 'codex'), { recursive: true });
+    fs.writeFileSync(path.join(source.home, 'chatgpt-subscription', 'codex', 'auth.json'), '{"token":"synthetic-subscription-credential"}');
     const before = source.db.prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name").all()
       .map(({ name }) => [name, source.db.prepare(`SELECT * FROM \"${name}\"`).all()]);
     const { file, manifest } = save(source);
     assert.equal(manifest.credentials, 'encrypted-file-included');
     assert.equal(manifest.counts.messages, 1); assert.equal(manifest.counts.drafts, 1);
     assert.equal(manifest.counts.item_history, 1);
-    assert.ok(!manifest.files.some((f) => /^(logs|cache)\//.test(f.path)));
+    assert.ok(!manifest.files.some((f) => /^(logs|cache|chatgpt-subscription)\//.test(f.path)));
     assert.ok(!JSON.stringify(manifest).includes('fixture-only-secret'));
     if (process.platform !== 'win32') assert.equal(fs.statSync(file).mode & 0o777, 0o600);
     const target = fixture('target', 'Current');

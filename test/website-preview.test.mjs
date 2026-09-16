@@ -52,6 +52,12 @@ test('external actions are blocked and demo transport has no network or persiste
  const source=fs.readFileSync(new URL('../website/try/lib/api.js',import.meta.url),'utf8');assert.doesNotMatch(source,/\bfetch\s*\(|new EventSource|new WebSocket|localStorage|sessionStorage/);
  const sample=fs.readFileSync(new URL('../website/try/lib/sample-data.js',import.meta.url),'utf8');assert.doesNotMatch(sample,/\/Users\/|\/private\/|ebe25ca50874/);
 });
+test('subscription preview is signed out and cannot start an account connection',async()=>{
+ const {request}=await fresh();const status=await request('/api/model/subscription');
+ assert.equal(status.connected,false);assert.equal(status.installed,false);assert.equal(status.account,null);assert.equal(status.login,null);
+ assert.match(status.error,/installed Zelos app/);
+ for(const action of ['login','cancel','logout'])await assert.rejects(request('/api/model/subscription/'+action,{method:'POST',body:{}}),/installed app/);
+});
 
 async function moneyHistory(request) {
  const current=await request('/api/finance');

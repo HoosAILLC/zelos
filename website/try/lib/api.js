@@ -81,6 +81,7 @@ export async function request(path,{method='GET',body,signal}={}){
  await delay(60);if(signal?.aborted)throw new DOMException('Aborted','AbortError');
  const url=new URL(path,'https://demo.invalid'),route=url.pathname,p=url.searchParams;
  if(method==='GET'){
+  if(route==='/api/model/subscription')return {installed:false,connected:false,account:null,login:null,rateLimits:null,error:'Subscription sign-in is available in the installed Zelos app. This browser demo never connects accounts.'};
   if(route==='/api/state')return clone(board());
   if(route==='/api/shopping')return shopping();
   if(route==='/api/shopping/week')return demoMeals.week(p.get('weekStart'));

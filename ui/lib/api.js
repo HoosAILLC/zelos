@@ -247,6 +247,10 @@ export const api = {
     if (keyRef) q.set('keyRef', keyRef);
     return request(`/api/model/list?${q.toString()}`);
   },
+  subscriptionStatus: () => request('/api/model/subscription'),
+  subscriptionLogin: () => request('/api/model/subscription/login', { method: 'POST', body: { type: 'chatgpt' } }),
+  subscriptionCancel: (loginId) => request('/api/model/subscription/cancel', { method: 'POST', body: { loginId } }),
+  subscriptionLogout: () => request('/api/model/subscription/logout', { method: 'POST', body: {} }),
   presets: () => request('/api/model/presets'),
   probeLocal: () => request('/api/local/probe'),
   // POST, so the address rides in the body: a query string is kept by the
