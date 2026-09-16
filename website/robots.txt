@@ -1,4 +1,4 @@
 User-agent: *
 Allow: /
 
-Sitemap: https://zelos-app.netlify.app/sitemap.xml
+Sitemap: https://zelos.life/sitemap.xml

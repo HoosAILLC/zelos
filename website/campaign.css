@@ -102,7 +102,7 @@ h2{font-size:clamp(42px,4.4vw,70px);line-height:1.03;letter-spacing:-.055em}
 .release-note{font-size:12px!important;line-height:1.8;margin-top:20px}
 .download-options{display:grid;grid-template-columns:1fr 1fr 1fr;gap:46px}
 .download-options article{border-top:1px solid var(--ink);padding-top:27px}
-.download-options h3{font-size:26px;letter-spacing:-.035em;margin-bottom:24px}
+.download-options h2{font-size:26px;line-height:inherit;letter-spacing:-.035em;margin-bottom:24px}
 .download-options .button{display:flex;max-width:330px}
 .secondary-download{display:block;margin-top:18px;font-size:12px}
 .download-help p{font-size:15px;color:var(--muted);max-width:300px}
@@ -222,20 +222,20 @@ dialog::backdrop{background:#151515dc}
 .vision-step{display:block;font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:#626954;margin-bottom:28px}
 .vision-glasses{display:grid;grid-template-columns:1fr 1.1fr;gap:55px;padding:38px;border:1px solid var(--line);border-radius:26px;background:#e9e8e1;margin-top:28px;scroll-margin-top:28px}
 .vision-glasses .eyebrow{margin-bottom:23px}
-.vision-glasses h3{font-size:clamp(34px,3.5vw,50px);line-height:1.05;letter-spacing:-.045em;margin-bottom:23px}
+.vision-glasses h2{font-size:clamp(34px,3.5vw,50px);line-height:1.05;letter-spacing:-.045em;margin-bottom:23px}
 .vision-glasses p{font-size:15px;color:var(--muted);line-height:1.65}
 .vision-glasses .glasses-availability{font-size:13px;margin-top:22px}
 .glasses-availability strong{color:var(--ink);font-weight:600}
 .glasses-examples{list-style:none;padding:0;margin:0;min-width:0}
 .glasses-examples li+li{border-top:1px solid #cccbc2;margin-top:19px;padding-top:19px}
-.glasses-examples h4{font-size:19px;font-weight:500;letter-spacing:-.02em;line-height:1.25;margin:0 0 7px}
+.glasses-examples h3{font-size:19px;font-weight:500;letter-spacing:-.02em;line-height:1.25;margin:0 0 7px}
 .glasses-examples p{font-size:14px}
 @media(max-width:900px){.vision-glasses{gap:30px;padding:30px}}
 
-.vision-journey h3,.vision-connections h3,.vision-foundation h3{font-size:29px;line-height:1.12;letter-spacing:-.04em;margin-bottom:18px}
+.vision-journey h2,.vision-connections h2,.vision-foundation h2{font-size:29px;line-height:1.12;letter-spacing:-.04em;margin-bottom:18px}
 .vision-journey p,.vision-connections p,.vision-foundation p:not(.eyebrow){font-size:15px;color:var(--muted);line-height:1.65}
 .vision-connections{display:grid;grid-template-columns:1fr 1fr;gap:45px;padding:34px 0 28px;margin-top:8px;border-bottom:1px solid var(--line)}
-.vision-connections h3{font-size:25px}
+.vision-connections h2{font-size:25px}
 .vision-controls{font-size:13px;color:var(--muted);margin-top:22px;max-width:1050px}
 .vision-foundation{display:flex;align-items:center;justify-content:space-between;gap:36px;padding:30px;border:1px solid var(--line);border-radius:24px;background:#e9e8e1;margin-top:28px}
 .vision-foundation>div{max-width:750px}
@@ -263,7 +263,7 @@ dialog::backdrop{background:#151515dc}
 .feature-library li::before{content:none}
 .feature-library a{gap:14px;font-size:13px;line-height:1.5}
 .preview-download{display:grid;grid-template-columns:1.3fr 1fr;gap:50px;margin-top:30px;border:1px solid var(--line);border-radius:24px;padding:32px;background:#e9e8e1}
-.preview-download h3{font-size:29px;letter-spacing:-.035em;margin:14px 0}
+.preview-download h2{font-size:29px;line-height:inherit;letter-spacing:-.035em;margin:14px 0}
 .preview-download p:not(.eyebrow){font-size:14px;color:var(--muted);max-width:650px}
 .preview-download-links{display:flex;flex-direction:column;align-items:flex-start;justify-content:center;gap:10px}
 .preview-download-links .text-link{margin:0;min-height:38px;padding:9px 0}
@@ -352,13 +352,13 @@ dialog::backdrop{background:#151515dc}
   .ownership-copy > p:not(.eyebrow) { font-size: 16px; line-height: 1.65; }
   .ownership-note { flex-wrap: wrap; gap: 10px 20px; margin-top: 20px; padding-top: 16px; }
   .ownership-note p { font-size: 14px; }
-  .download-options h3 { font-size: 26px; margin-bottom: 20px; }
+  .download-options h2 { font-size: 26px; margin-bottom: 20px; }
   .download-options .button { max-width: none; width: 100%; }
   .download-help { grid-column: auto; }
   .secondary-download { display: flex; align-items: center; min-height: 48px; margin-top: 12px; font-size: 15px; line-height: 1.5; }
   .release-note { font-size: 14px !important; line-height: 1.65; }
   .preview-download { grid-template-columns: 1fr; padding: 24px; gap: 20px; border-radius: 20px; }
-  .preview-download h3 { font-size: 26px; line-height: 1.2; }
+  .preview-download h2 { font-size: 26px; line-height: 1.2; }
   .preview-download p:not(.eyebrow) { font-size: 16px; line-height: 1.65; }
   .preview-download-links { align-items: stretch; gap: 8px; }
   .preview-download-links .text-link { min-height: 48px; font-size: 15px; }
@@ -371,12 +371,12 @@ dialog::backdrop{background:#151515dc}
   .vision-status p, .vision-journey p, .vision-connections p, .vision-foundation p:not(.eyebrow), .vision-glasses p, .glasses-examples p { font-size: 16px; line-height: 1.65; }
   .vision-journey { grid-template-columns: 1fr; gap: 16px; }
   .vision-step { font-size: 12px; margin-bottom: 16px; }
-  .vision-journey h3, .vision-connections h3, .vision-foundation h3 { font-size: 26px; line-height: 1.2; margin-bottom: 16px; }
+  .vision-journey h2, .vision-connections h2, .vision-foundation h2 { font-size: 26px; line-height: 1.2; margin-bottom: 16px; }
   .vision-glasses { grid-template-columns: 1fr; gap: 28px; margin-top: 20px; }
-  .vision-glasses h3 { font-size: 34px; }
+  .vision-glasses h2 { font-size: 34px; }
   .vision-glasses .eyebrow { font-size: 12px; margin-bottom: 16px; }
   .vision-glasses .glasses-availability, .vision-controls { font-size: 14px; line-height: 1.65; }
-  .glasses-examples h4 { font-size: 22px; }
+  .glasses-examples h3 { font-size: 22px; }
   .vision-connections { grid-template-columns: 1fr; gap: 26px; padding-top: 26px; }
   .vision-foundation { gap: 18px; margin-top: 22px; }
   .site-footer { padding: 32px var(--gutter) 24px; }

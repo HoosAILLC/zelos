@@ -12,6 +12,24 @@ process.on('exit',()=>fs.rmSync(output,{recursive:true,force:true}));
 import {detectRecurring,findDuplicateCandidates} from '../ui/lib/money-patterns.js';
 import {balancePresentation,scopedBankSnapshot} from '../ui/lib/money-accuracy.js';
 const fresh=()=>import(pathToFileURL(path.join(output,'try/lib/api.js')).href+`?test=${Math.random()}`);
+test('published pages consistently identify the branded domain in search metadata',()=>{
+ const origin='https://zelos.life';
+ const urls=['index','features','watch','vision','download','help','privacy'].map(name=>{
+  const url=origin+(name==='index'?'/':'/'+name);
+  const head=fs.readFileSync(path.join(output,name+'.html'),'utf8').split('</head>')[0];
+  assert.deepEqual([...head.matchAll(/<link\s+rel="canonical"\s+href="([^"]+)"/g)].map(match=>match[1]),[url],name);
+  const social=/<meta\s+property="og:url"\s+content="([^"]+)"/.exec(head);
+  if(social)assert.equal(social[1],url,name);
+  for(const match of head.matchAll(/<script\s+type="application\/ld\+json">([\s\S]*?)<\/script>/g)){
+   const data=JSON.parse(match[1]);if(data['@type']==='WebPage')assert.equal(data.url,url,name);
+  }
+  assert(!head.includes('zelos-app.netlify.app'),name+' retains the old domain in its metadata');
+  return url;
+ });
+ const sitemap=fs.readFileSync(path.join(output,'sitemap.xml'),'utf8');
+ assert.deepEqual([...sitemap.matchAll(/<loc>([^<]+)<\/loc>/g)].map(match=>match[1]),urls);
+ assert.match(fs.readFileSync(path.join(output,'robots.txt'),'utf8'),/^Sitemap: https:\/\/zelos\.life\/sitemap\.xml$/m);
+});
 // Use request directly so each test owns an independent browser-memory fixture.
 test('interactive preview supports completion, undo, history and new notes',async()=>{
  const {request}=await fresh();const before=await request('/api/state'),item=before.items.find(x=>x.state==='open');
