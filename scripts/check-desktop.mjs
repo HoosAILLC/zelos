@@ -7,9 +7,9 @@ import { pathToFileURL } from 'node:url';
 
 const dist = path.resolve('desktop/dist');
 const arm = process.arch === 'arm64';
-const app = process.platform === 'darwin'
+const app = process.env.ZELOS_PACKAGED_APP_DIR || (process.platform === 'darwin'
   ? path.join(dist, arm ? 'mac-arm64' : 'mac', 'Zelos.app/Contents')
-  : path.join(dist, arm ? 'win-arm64-unpacked' : 'win-unpacked');
+  : path.join(dist, arm ? 'win-arm64-unpacked' : 'win-unpacked'));
 const executable = path.join(app, process.platform === 'darwin' ? 'MacOS/Zelos' : 'Zelos.exe');
 const resources = path.join(app, process.platform === 'darwin' ? 'Resources' : 'resources');
 if (!fs.existsSync(executable)) throw new Error(`Missing native app: ${executable}`);
@@ -27,6 +27,8 @@ const program = `
   import { createBackup, stageBackup, applyRestore, recoveryDestination } from ${JSON.stringify(moduleURL('backup.mjs'))};
   import { acquireMaintenance } from ${JSON.stringify(moduleURL('data-lease.mjs'))};
   import { startCore } from ${JSON.stringify(pathToFileURL(path.join(resources, 'app', 'runtime.js')).href)};
+  assert.equal(process.arch, ${JSON.stringify(process.arch)}, 'Packaged runtime must match the native QA architecture');
+  assert.equal(process.platform, ${JSON.stringify(process.platform)}, 'Packaged runtime must match the native QA platform');
   const resources = fs.realpathSync(${JSON.stringify(resources)});
   const require = createRequire(path.join(resources, 'package.json'));
   const packaged = JSON.parse(fs.readFileSync(path.join(resources, 'package.json'), 'utf8'));

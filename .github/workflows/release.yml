@@ -1,0 +1,202 @@
+name: signed desktop releases
+
+# A manual run produces verified candidates. Only a matching v* tag publishes.
+# Account setup is documented in docs/SIGNING.md; missing credentials fail closed.
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  mac:
+    name: Signed macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    environment: release-signing
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+            arch: x64
+          - os: macos-15
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install pinned core dependencies
+        run: npm ci --omit=dev --ignore-scripts
+      - name: Install pinned packaging tools
+        working-directory: desktop
+        run: npm ci
+      - name: Run the suite
+        run: node --test --test-concurrency=4 --test-timeout=180000 test/*.test.mjs
+      - name: Sign and notarize the app
+        run: node scripts/build-signed-desktop.mjs ${{ matrix.arch }}
+        env:
+          CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+          MAC_SIGNING_IDENTITY: ${{ vars.MAC_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+      - name: Notarize the disk image and verify its installed payload
+        run: node scripts/verify-signed-desktop.mjs ${{ matrix.arch }}
+        env:
+          MAC_SIGNING_IDENTITY: ${{ vars.MAC_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zelos-signed-macos-${{ matrix.arch }}
+          path: |
+            desktop/dist/*-${{ matrix.arch }}.dmg
+            desktop/dist/*-${{ matrix.arch }}.dmg.signature.json
+          if-no-files-found: error
+
+  windows-build:
+    name: Sign Windows ${{ matrix.arch }} on x64
+    runs-on: windows-latest
+    environment: release-signing
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install pinned core dependencies
+        run: npm ci --omit=dev --ignore-scripts
+      - name: Install pinned packaging tools
+        working-directory: desktop
+        run: npm ci
+      # Microsoft's signer runs on x64. Both installers are subsequently
+      # installed and exercised on a clean runner of their own architecture.
+      - name: Install signing runtime
+        if: vars.WINDOWS_SIGNING_PROVIDER == 'azure'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Sign app, uninstaller, and installer
+        run: node scripts/build-signed-desktop.mjs ${{ matrix.arch }}
+        env:
+          WINDOWS_SIGNING_PROVIDER: ${{ vars.WINDOWS_SIGNING_PROVIDER }}
+          WINDOWS_PUBLISHER_NAME: ${{ vars.WINDOWS_PUBLISHER_NAME }}
+          AZURE_SIGNING_ENDPOINT: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          AZURE_SIGNING_ACCOUNT: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          AZURE_CERTIFICATE_PROFILE: ${{ vars.AZURE_CERTIFICATE_PROFILE }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: candidate-windows-${{ matrix.arch }}
+          path: desktop/dist/*-setup-${{ matrix.arch }}.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  windows-verify:
+    name: Verify installed Windows ${{ matrix.arch }}
+    needs: windows-build
+    runs-on: ${{ matrix.os }}
+    environment: release-signing
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            arch: x64
+          - os: windows-11-arm
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Verify native QA architecture
+        run: node -e "if(process.arch !== '${{ matrix.arch }}') throw Error('QA runner architecture mismatch')"
+      - name: Install pinned core dependencies
+        run: npm ci --omit=dev --ignore-scripts
+      - name: Run the suite
+        shell: bash
+        run: node --test --test-concurrency=4 --test-timeout=180000 test/*.test.mjs
+      - uses: actions/download-artifact@v4
+        with:
+          name: candidate-windows-${{ matrix.arch }}
+          path: desktop/dist
+      - name: Install into an isolated directory
+        shell: pwsh
+        env:
+          WINDOWS_PUBLISHER_NAME: ${{ vars.WINDOWS_PUBLISHER_NAME }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installDirectory = Join-Path $env:RUNNER_TEMP 'zelos-signed-install'
+          $installer = @(Get-ChildItem 'desktop/dist/*-setup-${{ matrix.arch }}.exe')
+          if ($installer.Count -ne 1) { throw 'Expected exactly one native installer' }
+          $signature = Get-AuthenticodeSignature -LiteralPath $installer[0].FullName
+          if ($signature.Status -ne 'Valid' -or $signature.SignatureType -ne 'Authenticode' -or $null -eq $signature.SignerCertificate -or $null -eq $signature.TimeStamperCertificate) { throw 'Installer must have a trusted timestamped signature before it can run' }
+          $publisher = $signature.SignerCertificate.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_PUBLISHER_NAME) -or $publisher -cne $env:WINDOWS_PUBLISHER_NAME) { throw 'Installer publisher does not match the release identity' }
+          # NSIS requires /D as the final argument, without quoting its value.
+          $process = Start-Process -FilePath $installer[0].FullName -ArgumentList "/S /D=$installDirectory" -PassThru
+          if (-not $process.WaitForExit(180000)) { $process.Kill(); throw 'Installation timed out' }
+          if ($process.ExitCode -ne 0) { throw "Installer failed: $($process.ExitCode)" }
+          "ZELOS_PACKAGED_APP_DIR=$installDirectory" >> $env:GITHUB_ENV
+      - name: Verify publisher, timestamps, installed uninstaller, and native startup
+        run: node scripts/verify-signed-desktop.mjs ${{ matrix.arch }}
+        env:
+          WINDOWS_PUBLISHER_NAME: ${{ vars.WINDOWS_PUBLISHER_NAME }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zelos-signed-windows-${{ matrix.arch }}
+          path: |
+            desktop/dist/*-setup-${{ matrix.arch }}.exe
+            desktop/dist/*-setup-${{ matrix.arch }}.exe.signature.json
+          if-no-files-found: error
+
+  publish:
+    name: Publish verified release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [mac, windows-verify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: zelos-signed-*
+          merge-multiple: true
+          path: release-assets
+      - name: Require signature evidence and prepare exact source and checksums
+        run: |
+          git archive --format=zip --prefix=zelos/ --output=release-assets/zelos-source.zip HEAD
+          node scripts/prepare-release.mjs
+          node scripts/build-website.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zelos-website
+          path: .site-dist
+          include-hidden-files: true
+          if-no-files-found: error
+      - name: Publish verified installers, source, and signing records
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/publish-release.mjs

@@ -151,6 +151,7 @@ rebinding, FTS injection, token forgery and MCP scope escapes.
 |---|---|
 | [docs/README.md](docs/README.md) | the long version |
 | [docs/INSTALL.md](docs/INSTALL.md) | installing, including the unsigned-app dance |
+| [docs/SIGNING.md](docs/SIGNING.md) | publisher signing and notarization setup for releases |
 | [docs/SECURITY.md](docs/SECURITY.md) | the threat model, stated honestly |
 | [docs/AI-SUBSCRIPTIONS.md](docs/AI-SUBSCRIPTIONS.md) | ChatGPT sign-in, Claude Desktop sharing, and local-model boundaries |
 | [docs/SPEC.md](docs/SPEC.md) · [docs/SPEC-v2.md](docs/SPEC-v2.md) | what it is meant to do |

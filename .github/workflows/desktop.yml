@@ -1,16 +1,14 @@
-name: desktop builds
+name: unsigned desktop previews
 
 # The Windows installer cannot be built on the machine Zelos is developed on:
 # NSIS needs Wine, which is not there. This runs the build on real Windows and
 # real macOS runners and attaches the results to the run, which is the whole
 # reason the project has CI at all.
 #
-# Deliberately manual (and tag-triggered): these are 100 MB+ artifacts and there
-# is no reason to build them on every push.
+# Explicitly manual development previews. Public/tagged releases must use
+# release.yml, which requires verified publisher signatures on every installer.
 on:
   workflow_dispatch:
-  push:
-    tags: ['v*']
 
 permissions:
   contents: read
@@ -115,41 +113,6 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: zelos-${{ matrix.platform }}-${{ matrix.arch }}
+          name: unsigned-preview-${{ matrix.platform }}-${{ matrix.arch }}
           path: ${{ matrix.out }}
           if-no-files-found: error
-
-  release:
-    name: publish release
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '24'
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: zelos-*
-          merge-multiple: true
-          path: release-assets
-      - name: Prepare exact source and checksums
-        run: |
-          git archive --format=zip --prefix=zelos/ --output=release-assets/zelos-source.zip HEAD
-          node scripts/prepare-release.mjs
-          node scripts/build-website.mjs
-      - name: Preserve matching website
-        uses: actions/upload-artifact@v4
-        with:
-          name: zelos-website
-          path: .site-dist
-          include-hidden-files: true
-          if-no-files-found: error
-      - name: Publish installers, source, and checksums
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: node scripts/publish-release.mjs

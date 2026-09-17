@@ -1,22 +1,26 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+import { assertReleaseIdentity, releaseChecksums, verifyReleaseAssets } from './release-signatures.mjs';
 
-const { version } = JSON.parse(fs.readFileSync('package.json', 'utf8'));
-const desktop = JSON.parse(fs.readFileSync('desktop/package.json', 'utf8'));
-const tag = process.env.GITHUB_REF_NAME;
-if (tag !== `v${version}` || desktop.version !== version) throw new Error('Release tag and app versions must match');
-const commit = process.env.GITHUB_SHA;
-if (!/^[a-f0-9]{40}$/.test(commit || '')) throw new Error('Release requires the full source commit');
-const dir = 'release-assets';
-const names = [`Zelos-${version}-arm64.dmg`, `Zelos-${version}-x64.dmg`,
-  `Zelos-${version}-setup-arm64.exe`, `Zelos-${version}-setup-x64.exe`, 'zelos-source.zip'];
-const assets = names.map((name) => {
-  const file = path.join(dir, name);
-  const bytes = fs.readFileSync(file);
-  if (bytes.length < 1000) throw new Error(`Empty or invalid release asset: ${name}`);
-  return { name, size: bytes.length, sha256: crypto.createHash('sha256').update(bytes).digest('hex') };
-});
-fs.writeFileSync(path.join(dir, 'SHA256SUMS.txt'), assets.map((a) => `${a.sha256}  ${a.name}\n`).join(''));
-fs.writeFileSync(path.join(dir, 'release.json'), `${JSON.stringify({ version, commit, assets }, null, 2)}\n`);
-console.log(`Verified ${assets.length} assets for ${tag}`);
+export function prepareRelease({ root = process.cwd(), env = process.env } = {}) {
+  const { version } = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+  const desktop = JSON.parse(fs.readFileSync(path.join(root, 'desktop/package.json'), 'utf8'));
+  const tag = env.GITHUB_REF_NAME;
+  if (tag !== `v${version}` || desktop.version !== version) throw new Error('Release tag and app versions must match');
+  const commit = env.GITHUB_SHA;
+  assertReleaseIdentity(version, commit);
+  const dir = path.join(root, 'release-assets');
+  // Native jobs produce a receipt only after verifying the finished installer.
+  // Every receipt must bind those checks to these exact bytes and this commit.
+  const assets = verifyReleaseAssets({ dir, version, commit });
+  const release = { version, commit, assets };
+  fs.writeFileSync(path.join(dir, 'SHA256SUMS.txt'), releaseChecksums(assets));
+  fs.writeFileSync(path.join(dir, 'release.json'), `${JSON.stringify(release, null, 2)}\n`);
+  return release;
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  const release = prepareRelease();
+  console.log(`Verified ${release.assets.length} assets and four signing receipts for v${release.version}`);
+}
