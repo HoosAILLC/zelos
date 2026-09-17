@@ -31,6 +31,13 @@ that all platform checks have passed.
 - **Recovery copies:** Daily encrypted backups retain seven verified copies.
   Recovery requires the separately stored key and produces a portable archive
   for reviewed restoration. See the backup scope below before upgrading.
+- **Signed desktop updates:** The release pipeline now requires Mac signing
+  and notarization and Windows publisher signatures. Eligible signed installs
+  can check for updates automatically, with separate **Download update** and
+  **Update and restart** actions. Before restarting, Zelos saves drafts and
+  creates a private recovery backup. Unsigned previews keep manual updates.
+  Signing accounts and credentials are still required before the first signed
+  release can be built and its upgrade path verified; see [SIGNING.md](SIGNING.md).
 
 ## Earlier changes included: 1.8.2
 
@@ -57,6 +64,11 @@ Before upgrading, quit Zelos and copy your data folder to a safe location. The d
 
 Desktop **Create backup** produces a `.zelos-backup` archive of the database, settings and portable credential files. It is not password protected. **Daily encrypted backups** and **Back up now** produce `.zelos-encrypted` copies that require the separate `.automatic-backup-key`. Recovery first creates a decrypted `.zelos-backup` for the reviewed restore workflow; it does not replace live data automatically. Keep a protected archive and separate key on another device. Neither format backs up installed models or the rest of the computer. Credentials kept in the operating system's keychain may need reconnecting on another computer. See [recovery steps](LOCAL-ASSISTANT.md#encrypted-recovery-copies).
 
-These builds are unsigned on Windows and ad-hoc signed, without Apple notarisation, on macOS. Only continue past an operating-system warning if you trust this release. Checksums verify that your downloaded file matches the release; they are not an independent security review. See INSTALL.md for first-launch instructions.
+The current public v1.8.1 downloads and development previews are unsigned on
+Windows and ad-hoc signed, without Apple notarization, on macOS. They cannot
+install updates automatically. Install the first verified signed release
+manually once it is available. Checksums verify downloaded bytes; operating
+system signatures establish publisher identity. See [INSTALL.md](INSTALL.md)
+for the current installation and update instructions.
 
 Google and Microsoft OAuth client registrations are not bundled. Gmail supports app-password setup when your account permits it; OAuth connections require the registration described in OAUTH.md. A model is needed for assessment and answers; sample data is available to explore the interface first. Zelos sends an email only after the user's review and explicit **Send reply** action. Background checks and draft generation do not send messages, and Zelos does not modify connected tasks. Reading Messages from an iPhone's synced texts is available only on a Mac with the required permission.

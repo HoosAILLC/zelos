@@ -15,9 +15,8 @@
  *     outright. Mail is attacker-controlled, and a link in it must never be
  *     able to load inside a window that holds the session token.
  *   - The renderer has no privileges: context isolation on, node integration
- *     off, sandbox on, `<webview>` off, and a preload that exposes four strings
- *     and one function — "show the Zelos folder", answered only for the
- *     board's own window and carrying nothing the page chose.
+ *     off, sandbox on, `<webview>` off, and a preload with fixed, bounded actions
+ *     for data management and updates, answered only for the board's own window.
  *   - The session cancels every outbound request that is not the board itself —
  *     on every scheme Chromium will put on the network, WebSockets included,
  *     and not only the http(s) a scheme wildcard would have shown it. WebRTC,
@@ -25,7 +24,8 @@
  *     stripped of UDP underneath that. The session also denies every
  *     permission but the one the Owed view's copy buttons use.
  *     Spellcheck is off because Chromium fetches its dictionaries from Google,
- *     and this app does not talk to anyone the user did not configure.
+ *     and the board does not load third-party content. Signed updates use a
+ *     separate session restricted to the official GitHub releases and CDN.
  *   - Nothing here assumes it succeeded. There may be no tray icon, so closing
  *     the window may have nowhere to hide to; the renderer may die repeatedly,
  *     so a reload is rationed rather than automatic; and another Zelos may
@@ -40,6 +40,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { createRequire } from 'node:module';
+import * as electron from 'electron';
 
 import {
   app, BrowserWindow, Menu, Tray, dialog, ipcMain, nativeImage, nativeTheme, screen, session, shell,
@@ -49,6 +51,11 @@ import { classifyTarget, guardWebContents, safeTarget } from './guard.js';
 import { buildAppMenuTemplate, buildTrayMenuTemplate, VIEWS } from './menus.js';
 import { startCore } from './runtime.js';
 import { clampToDisplays, WindowState } from './window-state.js';
+import { createDesktopUpdates, updateHandlers, UPDATE_CHANNELS, verifyCachedUpdate } from './updates.js';
+import { validateUpdateBuild, allowedUpdateRequest } from './update-policy.js';
+import { updatePreferences } from './update-preferences.js';
+import { verifyWindowsUpdate } from './update-signature.js';
+import { updateInstallation } from './update-install.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
@@ -119,6 +126,7 @@ let shuttingDown = null;
 let leaving = null;
 let leaveAction = null;
 let maintenanceActive = false;
+let desktopUpdates = null;
 let crashes = [];      // timestamps of recent render-process-gone events
 let crashTimer = null;
 
@@ -591,7 +599,7 @@ export const RESTORE_BACKUP_CHANNEL = 'zelos:restore-backup';
  * dependency boundary also lets tests exercise cancellation and failure without
  * opening an OS dialog or loading any real user data.
  */
-export function backupHandlers({ isBoard, getCore, getWindow, dialogs, flush, appVersion, restart, setBusy = () => {} }) {
+export function backupHandlers({ isBoard, getCore, getWindow, dialogs, flush, appVersion, restart, setBusy = () => {}, canStart = () => true }) {
   let busy = false;
   const safeError = (err) => {
     if (err?.code === 'ZELOS_DATA_BUSY' || err?.code === 'ZELOS_RESTORE_PENDING' || err?.message?.startsWith('Backup: ')) return err.message;
@@ -602,6 +610,7 @@ export function backupHandlers({ isBoard, getCore, getWindow, dialogs, flush, ap
     // a filesystem action merely because it lives in the same webContents.
     if (args.length || !isBoard(event)) return { ok: false, error: 'This action is only available in the Zelos desktop board.' };
     if (busy) return { ok: false, error: 'A backup or restore is already in progress.' };
+    if (!canStart()) return { ok: false, error: 'Finish the current backup, restore, or update before starting another operation.' };
     const core = getCore();
     const win = getWindow();
     if (!core || !win || win.isDestroyed()) return { ok: false, error: 'The Zelos board is not ready.' };
@@ -668,6 +677,7 @@ function installBackups() {
       && event?.sender === mainWindow.webContents && event.senderFrame === mainWindow.webContents.mainFrame
       && classifyTarget(event.senderFrame?.url, { port: zelos?.port ?? 0 }).action === 'internal',
     getCore: () => zelos, getWindow: () => mainWindow, dialogs: dialog,
+    canStart: () => !maintenanceActive && !leaving && !quitting,
     flush: flushDraftsInPage, appVersion: app.getVersion(), setBusy: (value) => { maintenanceActive = value; },
     restart: async () => {
       // Geometry is outside the portable data set. Preserve it once, then stop
@@ -680,6 +690,96 @@ function installBackups() {
   });
   ipcMain.handle(CREATE_BACKUP_CHANNEL, handlers.createBackup);
   ipcMain.handle(RESTORE_BACKUP_CHANNEL, handlers.restoreBackup);
+}
+
+function showUpdates() {
+  showWindow();
+  mainWindow?.webContents.executeJavaScript("window.location.hash = '#/settings/about';").catch(() => {});
+}
+
+async function installUpdates(flags) {
+  let updater, build, CancellationToken, reason;
+  const unavailable = message => { reason = message; throw new Error(message); };
+  try {
+    if (!app.isPackaged) unavailable('Development builds use manual updates. Install a signed release for in-app updates.');
+    if (flags.home || flags.port != null || process.env.ZELOS_HOME || process.env.ZELOS_PORT) unavailable('This custom startup configuration uses manual updates so its data-folder and connection options are preserved.');
+    if (process.platform === 'darwin' && !app.isInApplicationsFolder()) unavailable('Move Zelos to Applications, then reopen it to enable in-app updates.');
+    const manifest = JSON.parse(fs.readFileSync(path.join(HERE, 'package.json'), 'utf8'));
+    if (!manifest.zelosUpdates) unavailable('This preview uses manual updates. Install a signed release for in-app updates.');
+    const require = createRequire(import.meta.url);
+    const module = require('electron-updater');
+    updater = module.autoUpdater;
+    CancellationToken = module.CancellationToken;
+    updater.logger = null;
+    build = validateUpdateBuild({ manifest, feed: await updater.configOnDisk.value, packaged: true,
+      platform: process.platform, arch: process.arch });
+    // The updater has its own memory-only session. The board's existing local-
+    // only network rules stay intact, and update traffic carries no app tokens.
+    const network = session.fromPartition('electron-updater', { cache: false });
+    network.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
+    network.setPermissionCheckHandler(() => false);
+    network.webRequest.onBeforeRequest({ urls: ['<all_urls>'] }, (details, callback) => {
+      callback({ cancel: !allowedUpdateRequest(details.url, build) });
+    });
+    network.webRequest.onBeforeSendHeaders({ urls: ['<all_urls>'] }, (details, callback) => {
+      const requestHeaders = Object.fromEntries(Object.entries(details.requestHeaders).filter(([name]) =>
+        !['authorization', 'cookie', 'x-user-staging-id', 'proxy-authorization'].includes(name.toLowerCase())));
+      callback({ requestHeaders });
+    });
+    if (process.platform === 'win32') {
+      // Replace the library's compatibility fallbacks with a strict OS check.
+      updater.verifyUpdateCodeSignature = async (publishers, file) => {
+        if (publishers.length !== 1 || publishers[0] !== build.publisher) return 'Incorrect update publisher';
+        try { await verifyWindowsUpdate(file, build.publisher); return null; }
+        catch { return 'The publisher signature or timestamp could not be verified'; }
+      };
+    }
+  } catch {
+    reason ||= 'Signed in-app updates are unavailable for this installation. You can still check and download releases manually.';
+    build = null; updater = null;
+  }
+  const installation = updateInstallation({
+    getCore: () => zelos, getWindow: () => mainWindow, dialogs: dialog,
+    flush: flushDraftsInPage, appVersion: app.getVersion(),
+    canStart: () => !maintenanceActive && !leaving && !quitting,
+    setBusy: value => { maintenanceActive = value; }, capture: () => windowState?.capture(),
+    backupPath: async core => {
+      const { recoveryDestination } = await import(pathToFileURL(path.join(ROOT, 'core/backup.mjs')).href);
+      const file = recoveryDestination(core.paths.home);
+      return path.join(path.dirname(file), path.basename(file).replace(/^Before-restore-/, 'Before-update-'));
+    },
+    markStopped: () => { maintenanceActive = false; quitting = true; shuttingDown = Promise.resolve(); },
+    reopen: async () => { app.relaunch(); app.quit(); },
+  });
+  desktopUpdates = createDesktopUpdates({ updater, build, currentVersion: app.getVersion(), reason,
+    preferences: updatePreferences(path.join(zelos.paths.home, 'desktop-updates.json')),
+    prepareInstall: installation.prepare, recoverInstall: installation.recover,
+    createCancellationToken: () => new CancellationToken(),
+    verifyDownload: async (files, candidate) => {
+      await verifyCachedUpdate(files, candidate);
+      if (process.platform === 'win32') await verifyWindowsUpdate(files[0], build.publisher);
+    },
+    onState: state => {
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send?.(UPDATE_CHANNELS.changed, state);
+    },
+    notify: state => {
+      try {
+        if (!electron.Notification?.isSupported()) return false;
+        const notification = new electron.Notification({ title: 'Zelos update available',
+          body: `Version ${state.latestVersion} is ready to download. Open Updates to choose when to install it.`, silent: true });
+        notification.on('click', showUpdates);
+        notification.show();
+        return true;
+      } catch { return false; }
+    },
+  });
+  const handlers = updateHandlers({ controller: desktopUpdates,
+    isBoard: event => Boolean(zelos) && !zelos.closed && Boolean(mainWindow) && !mainWindow.isDestroyed()
+      && event?.sender === mainWindow.webContents && event.senderFrame === mainWindow.webContents.mainFrame
+      && classifyTarget(event.senderFrame?.url, { port: zelos.port }).action === 'internal',
+  });
+  for (const [channel, handler] of Object.entries(handlers)) ipcMain.handle(channel, handler);
+  desktopUpdates.start();
 }
 
 function installAppMenu() {
@@ -704,7 +804,7 @@ export function aboutText({ version, commit = '', url = null, home = '' }) {
       `Data    ${home}`,
       '',
       'Listening on 127.0.0.1 only. Reading and AI use the services you configure.',
-      'Update checks contact GitHub only when you request them.',
+      'Signed releases can check GitHub automatically for updates. Control this in Settings → About.',
     ].join('\n'),
     buttons: ['OK'],
   };
@@ -953,6 +1053,7 @@ async function bootstrap() {
   }
 
   app.setName(APP_NAME);
+  if (process.platform === 'win32') app.setAppUserModelId?.('app.zelos.desktop');
   app.on('second-instance', () => showWindow());
 
   // A page must never be able to raise an HTTP-auth or proxy prompt.
@@ -973,6 +1074,7 @@ async function bootstrap() {
     leaveBoard(() => { quitting = true; app.quit(); }, { quit: true });
   });
   app.on('will-quit', (event) => {
+    desktopUpdates?.dispose();
     if (shuttingDown) return; // second pass: everything is closed, let it go
     event.preventDefault();
     beginShutdown();
@@ -1060,7 +1162,7 @@ async function bootstrap() {
     app.setAboutPanelOptions({
       applicationName: APP_NAME,
       applicationVersion: versionLabel(app.getVersion(), BUILD_COMMIT),
-      copyright: 'MIT licensed. Local-first: reading and AI use the services you configure. Update checks contact GitHub only when you request them.',
+      copyright: 'MIT licensed. Local-first: reading and AI use the services you configure. Signed releases can check GitHub for updates; control this in Settings → About.',
     });
   }
   if (process.platform === 'darwin' && app.dock) {
@@ -1074,6 +1176,7 @@ async function bootstrap() {
   createWindow();
   installShowHome();
   installBackups();
+  await installUpdates(flags);
 
   // The badge is the only thing a swept-in-the-background Zelos says while its
   // window is shut. It is set when a sweep ends — from the clock or by hand,
@@ -1107,5 +1210,6 @@ export const ready = bootstrap();
 
 /** Exported for the same reason: a test has to be able to put it back down. */
 export function shutdown() {
+  desktopUpdates?.dispose();
   return beginShutdown();
 }

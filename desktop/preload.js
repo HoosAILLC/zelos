@@ -1,10 +1,12 @@
 /**
  * desktop/preload.js — the entire bridge between the shell and the page.
  *
- * It exposes app identity and three argument-free actions: reveal the data
- * folder, create a backup, and restore a backup. Native dialogs select every
- * backup path and confirm replacement; paths and secret bytes never cross
- * this bridge. The board is an ordinary web page that talks
+ * It exposes app identity, fixed data-folder and backup actions, and a bounded
+ * update API. Update actions carry no paths or URLs; only the automatic-check
+ * preference accepts a boolean. Its one subscription strips the Electron event
+ * and delivers public update state. Native dialogs select every backup path
+ * and confirm replacement; paths and secret bytes never cross this bridge.
+ * The board is an ordinary web page that talks
  * to 127.0.0.1 over fetch; it needs almost nothing from the main process, so
  * it is given almost nothing — no `require`, no open IPC channel, no file
  * access, no "just one more helper". The tray's Sweep now runs inside the
@@ -48,6 +50,19 @@ try {
       showHome: () => ipcRenderer.invoke(SHOW_HOME_CHANNEL).then((shown) => shown === true, () => false),
       createBackup: () => ipcRenderer.invoke('zelos:create-backup').catch(() => ({ ok: false, error: 'The backup could not finish. Please try again.' })),
       restoreBackup: () => ipcRenderer.invoke('zelos:restore-backup').catch(() => ({ ok: false, error: 'The restore could not finish. Please try again.' })),
+      updates: Object.freeze({
+        getState: () => ipcRenderer.invoke('zelos:updates-state'),
+        check: () => ipcRenderer.invoke('zelos:updates-check'),
+        download: () => ipcRenderer.invoke('zelos:updates-download'),
+        install: () => ipcRenderer.invoke('zelos:updates-install'),
+        setAutomatic: value => typeof value === 'boolean' ? ipcRenderer.invoke('zelos:updates-automatic', value) : Promise.reject(new TypeError('Expected a boolean update preference.')),
+        onState: callback => {
+          if (typeof callback !== 'function') return () => {};
+          const listener = (_event, state) => callback(state);
+          ipcRenderer.on('zelos:updates-changed', listener);
+          return () => ipcRenderer.removeListener('zelos:updates-changed', listener);
+        },
+      }),
     }),
   );
 } catch (err) {

@@ -59,6 +59,8 @@ jobs:
           path: |
             desktop/dist/*-${{ matrix.arch }}.dmg
             desktop/dist/*-${{ matrix.arch }}.dmg.signature.json
+            desktop/dist/*-${{ matrix.arch }}.zip
+            desktop/dist/*-${{ matrix.arch }}.zip.signature.json
           if-no-files-found: error
 
   windows-build:

@@ -26,6 +26,8 @@ export function releaseAssetSpecs(version) {
     { name: `Zelos-${version}-x64.dmg`, platform: 'darwin', arch: 'x64' },
     { name: `Zelos-${version}-setup-arm64.exe`, platform: 'win32', arch: 'arm64' },
     { name: `Zelos-${version}-setup-x64.exe`, platform: 'win32', arch: 'x64' },
+    { name: `Zelos-${version}-arm64.zip`, platform: 'darwin', arch: 'arm64' },
+    { name: `Zelos-${version}-x64.zip`, platform: 'darwin', arch: 'x64' },
     { name: 'zelos-source.zip' },
   ];
 }
@@ -77,7 +79,7 @@ export function verifyReleaseAssets({ dir, version, commit, manifestAssets } = {
   const specs = releaseAssetSpecs(version);
   if (manifestAssets !== undefined && (!Array.isArray(manifestAssets) || manifestAssets.length !== specs.length
       || specs.some(({ name }) => manifestAssets.filter((asset) => object(asset) && asset.name === name).length !== 1))) {
-    throw new Error('Release manifest must contain exactly the four installers and source archive');
+    throw new Error('Release manifest must contain exactly the four installers, two Mac update archives, and source archive');
   }
   return specs.map((spec) => {
     const bytes = regularFile(path.join(dir, spec.name), `release asset: ${spec.name}`);

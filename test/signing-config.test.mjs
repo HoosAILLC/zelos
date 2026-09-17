@@ -11,21 +11,21 @@ const azure = { GITHUB_SHA: commit, WINDOWS_SIGNING_PROVIDER: 'azure', WINDOWS_P
   AZURE_CERTIFICATE_PROFILE: 'release', AZURE_TENANT_ID: 'tenant', AZURE_CLIENT_ID: 'client', AZURE_CLIENT_SECRET: 'fixture-secret' };
 
 test('release configuration requires a source identity and refuses unsupported hosts', () => {
-  assert.throws(() => signingConfig({}, 'darwin'), /GITHUB_SHA/);
-  assert.throws(() => signingConfig({ ...mac, GITHUB_SHA: 'HEAD' }, 'darwin'), /full source commit/);
-  assert.throws(() => signingConfig({ GITHUB_SHA: commit }, 'linux'), /macOS or Windows/);
+  assert.throws(() => signingConfig({}, 'darwin', 'arm64'), /GITHUB_SHA/);
+  assert.throws(() => signingConfig({ ...mac, GITHUB_SHA: 'HEAD' }, 'darwin', 'arm64'), /full source commit/);
+  assert.throws(() => signingConfig({ GITHUB_SHA: commit }, 'linux', 'x64'), /macOS or Windows/);
 });
 
 test('Mac release cannot fall back to ad-hoc signing or silently skip notarization', () => {
   for (const key of Object.keys(mac)) {
     const env = { ...mac }; delete env[key];
-    assert.throws(() => signingConfig(env, 'darwin'), new RegExp(key));
+    assert.throws(() => signingConfig(env, 'darwin', 'arm64'), new RegExp(key));
   }
   for (const identity of ['-', 'Developer ID Application: Example Company (ABCDE12345)', 'Example Company (WRONG12345)']) {
-    assert.throws(() => signingConfig({ ...mac, MAC_SIGNING_IDENTITY: identity }, 'darwin'), /MAC_SIGNING_IDENTITY/);
+    assert.throws(() => signingConfig({ ...mac, MAC_SIGNING_IDENTITY: identity }, 'darwin', 'arm64'), /MAC_SIGNING_IDENTITY/);
   }
-  assert.throws(() => signingConfig({ ...mac, APPLE_TEAM_ID: 'invalid' }, 'darwin'), /APPLE_TEAM_ID/);
-  const config = signingConfig(mac, 'darwin');
+  assert.throws(() => signingConfig({ ...mac, APPLE_TEAM_ID: 'invalid' }, 'darwin', 'arm64'), /APPLE_TEAM_ID/);
+  const config = signingConfig(mac, 'darwin', 'arm64');
   assert.equal(config.forceCodeSigning, true);
   assert.equal(config.mac.type, 'distribution');
   assert.equal(config.mac.hardenedRuntime, true);
@@ -38,9 +38,9 @@ test('Mac release cannot fall back to ad-hoc signing or silently skip notarizati
 test('Azure releases require a complete signing account and public publisher name', () => {
   for (const key of Object.keys(azure)) {
     const env = { ...azure }; delete env[key];
-    assert.throws(() => signingConfig(env, 'win32'), new RegExp(key));
+    assert.throws(() => signingConfig(env, 'win32', 'x64'), new RegExp(key));
   }
-  const config = signingConfig(azure, 'win32');
+  const config = signingConfig(azure, 'win32', 'x64');
   assert.equal(config.forceCodeSigning, true);
   assert.equal(config.win.signtoolOptions, undefined);
   assert.equal(config.win.azureSignOptions.publisherName, 'Example Company');
@@ -52,7 +52,7 @@ test('Azure releases require a complete signing account and public publisher nam
 test('Azure credentials cannot be directed to an unrelated signing endpoint', () => {
   for (const endpoint of ['http://eus.codesigning.azure.net/', 'https://codesigning.azure.net.example.test/',
     'https://example.test/', 'https://user@eus.codesigning.azure.net/', 'https://eus.codesigning.azure.net/?secret=1']) {
-    assert.throws(() => signingConfig({ ...azure, AZURE_SIGNING_ENDPOINT: endpoint }, 'win32'), /Azure Artifact Signing endpoint/);
+    assert.throws(() => signingConfig({ ...azure, AZURE_SIGNING_ENDPOINT: endpoint }, 'win32', 'x64'), /Azure Artifact Signing endpoint/);
   }
 });
 
@@ -61,19 +61,32 @@ test('certificate signing is explicit, timestamped, and cannot use Azure by acci
     WIN_CSC_LINK: 'fixture-pfx', WIN_CSC_KEY_PASSWORD: 'fixture-password' };
   for (const key of ['WIN_CSC_LINK', 'WIN_CSC_KEY_PASSWORD']) {
     const missing = { ...env }; delete missing[key];
-    assert.throws(() => signingConfig(missing, 'win32'), new RegExp(key));
+    assert.throws(() => signingConfig(missing, 'win32', 'x64'), new RegExp(key));
   }
-  const config = signingConfig(env, 'win32');
+  const config = signingConfig(env, 'win32', 'x64');
   assert.equal(config.win.azureSignOptions, undefined);
   assert.deepEqual(config.win.signtoolOptions.signingHashAlgorithms, ['sha256']);
   assert.ok(config.win.signtoolOptions.rfc3161TimeStampServer);
-  assert.throws(() => signingConfig({ ...env, WINDOWS_SIGNING_PROVIDER: 'none' }, 'win32'), /azure or certificate/);
+  assert.throws(() => signingConfig({ ...env, WINDOWS_SIGNING_PROVIDER: 'none' }, 'win32', 'x64'), /azure or certificate/);
 });
 
 test('generated configuration never embeds certificate material or account passwords', () => {
   for (const [env, platform, privateKeys] of [[mac, 'darwin', ['CSC_LINK', 'CSC_KEY_PASSWORD', 'APPLE_APP_SPECIFIC_PASSWORD']],
     [azure, 'win32', ['AZURE_CLIENT_SECRET']]]) {
-    const serialized = JSON.stringify(signingConfig(env, platform));
+    const serialized = JSON.stringify(signingConfig(env, platform, 'x64'));
     for (const key of privateKeys) assert.ok(!serialized.includes(env[key]), `${key} must remain in the build environment`);
   }
+});
+
+test('each signed architecture embeds an official isolated channel and publisher', () => {
+  for (const platform of ['darwin', 'win32']) for (const arch of ['arm64', 'x64']) {
+    const env = platform === 'darwin' ? mac : azure;
+    const config = signingConfig(env, platform, arch);
+    const publisher = platform === 'darwin' ? `Developer ID Application: ${mac.MAC_SIGNING_IDENTITY}` : azure.WINDOWS_PUBLISHER_NAME;
+    assert.deepEqual(config.extraMetadata.zelosUpdates, { schemaVersion: 1, channel: `latest-${arch}`, platform, arch, publisher });
+    assert.deepEqual(config.publish, { provider: 'github', owner: 'HoosAILLC', repo: 'zelos', channel: `latest-${arch}`,
+      ...(platform === 'win32' ? { publisherName: [publisher] } : {}) });
+    assert.equal(config.generateUpdatesFilesForAllChannels, false);
+  }
+  for (const arch of [undefined, 'ia32', '../arm64']) assert.throws(() => signingConfig(mac, 'darwin', arch), /explicit arm64 or x64/);
 });

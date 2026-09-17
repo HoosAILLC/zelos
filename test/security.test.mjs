@@ -1430,11 +1430,17 @@ test('runtime dependencies are explicitly allowed, exactly pinned and integrity 
   assert.deepEqual(installedMail.dependencies || {}, {});
 });
 
-test('desktop packaging has no runtime dependencies or installation hooks', {
+test('desktop packaging pins its reviewed updater and has no installation hooks', {
   skip: !fs.existsSync(path.join(REPO, 'desktop/package.json')) && 'Desktop packaging is absent from this deployed npm layout; core dependency checks still run.',
 }, () => {
   const desktop = JSON.parse(fs.readFileSync(path.join(REPO, 'desktop/package.json'), 'utf8'));
-  assert.deepEqual(desktop.dependencies || {}, {});
+  assert.deepEqual(desktop.dependencies || {}, { 'electron-updater': '6.8.9' });
+  const lock = JSON.parse(fs.readFileSync(path.join(REPO, 'desktop/package-lock.json'), 'utf8'));
+  const updater = lock.packages['node_modules/electron-updater'];
+  assert.equal(updater.version, desktop.dependencies['electron-updater']);
+  assert.equal(updater.resolved, 'https://registry.npmjs.org/electron-updater/-/electron-updater-6.8.9.tgz');
+  assert.match(updater.integrity, /^sha512-[A-Za-z0-9+/]{86}==$/);
+  assert.equal(updater.dev, undefined, 'the updater must ship in the installed app');
   for (const hook of ['preinstall', 'install', 'postinstall']) assert.ok(!desktop.scripts?.[hook], `desktop runs ${hook}`);
 });
 

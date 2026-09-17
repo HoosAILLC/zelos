@@ -1,18 +1,26 @@
 // Release-only overrides. Local/preview builds keep their explicit ad-hoc defaults.
-export function signingConfig(env, platform) {
+export function signingConfig(env, platform, arch) {
   const requireValues = (names) => {
     const missing = names.filter(name => !env[name]?.trim());
     if (missing.length) throw new Error(`Signed ${platform} release requires: ${missing.join(', ')}`);
   };
   requireValues(['GITHUB_SHA']);
   if (!/^[a-f0-9]{40}$/.test(env.GITHUB_SHA)) throw new Error('Signing requires a full source commit');
-  const common = { forceCodeSigning: true, publish: null, extraMetadata: { commit: env.GITHUB_SHA } };
+  if (!['arm64', 'x64'].includes(arch)) throw new Error('Signed updates require an explicit arm64 or x64 architecture');
+  const channel = `latest-${arch}`;
+  const common = { forceCodeSigning: true,
+    publish: { provider: 'github', owner: 'HoosAILLC', repo: 'zelos', channel },
+    electronUpdaterCompatibility: '>=2.16',
+    generateUpdatesFilesForAllChannels: false,
+    extraMetadata: { commit: env.GITHUB_SHA },
+  };
   if (platform === 'darwin') {
     requireValues(['CSC_LINK', 'CSC_KEY_PASSWORD', 'MAC_SIGNING_IDENTITY', 'APPLE_ID', 'APPLE_APP_SPECIFIC_PASSWORD', 'APPLE_TEAM_ID']);
     if (!/^[A-Z0-9]{10}$/.test(env.APPLE_TEAM_ID)) throw new Error('APPLE_TEAM_ID must be a ten-character Apple team identifier');
     const identity = env.MAC_SIGNING_IDENTITY.trim();
     if (identity === '-' || identity.startsWith('Developer ID')) throw new Error('MAC_SIGNING_IDENTITY must be the certificate name without its Developer ID Application prefix');
     if (!identity.endsWith(`(${env.APPLE_TEAM_ID})`)) throw new Error('MAC_SIGNING_IDENTITY must end with the configured Apple team identifier in parentheses');
+    common.extraMetadata.zelosUpdates = { schemaVersion: 1, channel, platform, arch, publisher: `Developer ID Application: ${identity}` };
     return { ...common, mac: {
       identity, type: 'distribution', hardenedRuntime: true, notarize: true,
       // Assessment happens after notarization, including the actual mounted DMG.
@@ -23,6 +31,8 @@ export function signingConfig(env, platform) {
   }
   if (platform !== 'win32') throw new Error('Signed installers require macOS or Windows');
   requireValues(['WINDOWS_SIGNING_PROVIDER', 'WINDOWS_PUBLISHER_NAME']);
+  common.extraMetadata.zelosUpdates = { schemaVersion: 1, channel, platform, arch, publisher: env.WINDOWS_PUBLISHER_NAME };
+  common.publish.publisherName = [env.WINDOWS_PUBLISHER_NAME];
   const win = { signAndEditExecutable: true, signExecutable: true, signExts: ['.exe', '.dll', '.node'] };
   if (env.WINDOWS_SIGNING_PROVIDER === 'azure') {
     requireValues(['AZURE_SIGNING_ENDPOINT', 'AZURE_SIGNING_ACCOUNT', 'AZURE_CERTIFICATE_PROFILE', 'AZURE_TENANT_ID', 'AZURE_CLIENT_ID', 'AZURE_CLIENT_SECRET']);

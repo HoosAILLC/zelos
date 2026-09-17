@@ -332,13 +332,20 @@ those requested network operations offline.
    `core/connectors/http.mjs`, which refuses any other origin before a socket
    exists. Footnote 4 below has the list.
 
-Those are the configured reading and model destinations. A manual update check
-adds the official GitHub release API, as described below.
-Zelos adds no telemetry, no analytics, no crash reporting, no automatic update check, no
-CDN, no remote font, no remote image, no "anonymous usage statistics". The
-runtime dependencies are pinned Nodemailer 10.0.9 for reviewed SMTP sending and
+Those are the configured reading and model destinations. Manual browser/source
+update checks add the official GitHub release API. Eligible signed desktop
+releases check the official GitHub releases after startup and every six hours
+by default; Settings → About can turn those checks off. Download and installation
+require separate user actions. The updater uses a separate memory-only session
+restricted to the official repository and GitHub's release-asset CDN, with
+credentials and cookies stripped. No board content is sent. Existing unsigned
+v1.8.1 downloads still use manual updates; see [SIGNING.md](SIGNING.md).
+Zelos adds no telemetry, analytics, crash reporting, remote font, remote image,
+or "anonymous usage statistics". The core runtime dependencies are pinned
+Nodemailer 10.0.9 for reviewed SMTP sending and
 PDFKit 0.19.1 for local reports, with transitive integrity hashes in the package
-lock. Native document extraction also uses installed Poppler and Tesseract.
+lock. The desktop shell additionally pins electron-updater 6.8.9 for verified
+release downloads. Native document extraction also uses installed Poppler and Tesseract.
 An installed model client such as Codex has its own network and data-handling
 policies; these Zelos guarantees do not describe all behavior of that separate
 program. Their existence is part of the audit; a dependency list alone cannot prove an
@@ -411,14 +418,18 @@ Additional network boundaries:
    from `imap.gmail.com` or `outlook.office365.com` exactly as with a
    password, under item 1. [OAUTH.md](OAUTH.md) has the table of every step.
 
-7. **Manual update checks.** Pressing Settings → About → Check for updates calls
+7. **Manual update checks in the browser and unsigned builds.** Pressing
+   Settings → About → Check for updates calls
    `POST /api/updates/check` through the normal local session gate. The server
    fetches only `https://api.github.com/repos/HoosAILLC/zelos/releases/latest`,
    refuses redirects, caps the response at 1 MiB, and applies an eight-second
    deadline. It sends an Accept header and a fixed User-Agent, with no account
    content, credentials, request body or installation identifier. Successful
    results are cached for five minutes. Only exact official release destinations
-   are offered; the check downloads and installs nothing. No check runs at startup.
+   are offered; this check downloads and installs nothing and does not run at
+   startup. Eligible signed desktop installations use the separate native
+   updater described above: automatic checks are optional, and downloading and
+   installing are explicit actions with a backup before restart.
 
 8. **Reviewed email submission.** `core/mail-send.mjs` uses Nodemailer only for
    the fixed SMTP transport supported by the selected account. The authenticated

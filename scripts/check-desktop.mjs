@@ -14,6 +14,7 @@ const executable = path.join(app, process.platform === 'darwin' ? 'MacOS/Zelos' 
 const resources = path.join(app, process.platform === 'darwin' ? 'Resources' : 'resources');
 if (!fs.existsSync(executable)) throw new Error(`Missing native app: ${executable}`);
 const { version } = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+const shellDependencies = JSON.parse(fs.readFileSync('desktop/package.json', 'utf8')).dependencies;
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'zelos-packaged-smoke-'));
 const moduleURL = (name) => pathToFileURL(path.join(resources, 'core', name)).href;
 const program = `
@@ -37,6 +38,25 @@ const program = `
     assert.ok(resolved.startsWith(path.join(resources, 'node_modules') + path.sep), name + ' resolved outside the packaged runtime');
     assert.equal(require(name + '/package.json').version, expectedVersion, name + ' version differs from the pinned runtime');
   }
+  const shellRoot = path.join(resources, 'app');
+  const shellManifest = JSON.parse(fs.readFileSync(path.join(shellRoot, 'package.json'), 'utf8'));
+  const shellRequire = createRequire(path.join(shellRoot, 'package.json'));
+  assert.deepEqual(shellManifest.dependencies, ${JSON.stringify(shellDependencies)}, 'Packaged shell dependencies differ from this build');
+  assert.ok(shellManifest.dependencies['electron-updater'], 'The signed updater must be a production dependency');
+  for (const [name, expectedVersion] of Object.entries(shellManifest.dependencies)) {
+    const resolved = fs.realpathSync(shellRequire.resolve(name));
+    assert.ok(resolved.startsWith(path.join(shellRoot, 'node_modules') + path.sep), name + ' resolved outside the packaged shell');
+    assert.equal(shellRequire(name + '/package.json').version, expectedVersion, name + ' version differs from the pinned shell');
+  }
+  // Import the real updater's code without constructing an instance or making
+  // network requests. This exercises its production dependency tree, including
+  // its YAML parser, in the actual packaged native Electron runtime.
+  const updater = shellRequire('electron-updater');
+  assert.equal(typeof updater.MacUpdater, 'function');
+  assert.equal(typeof updater.NsisUpdater, 'function');
+  const { parseUpdateInfo } = shellRequire('electron-updater/out/providers/Provider.js');
+  const update = parseUpdateInfo(${JSON.stringify('version: 1.0.0\nfiles: []\n')}, 'fixture.yml', new URL('https://example.test/fixture.yml'));
+  assert.equal(update.version, '1.0.0');
   // Build a PDF and serialize a mail message entirely in memory. This catches
   // missing PDF fonts/transitive modules without sending anything or using accounts.
   const PDFDocument = require('pdfkit');
@@ -104,7 +124,7 @@ const program = `
   const workerRestored = open(databasePath);
   try { assert.equal(getKV(workerRestored, 'smoke.worker'), 'original'); }
   finally { close(workerRestored); }
-  console.log(JSON.stringify({ version: ${JSON.stringify(version)}, node: process.versions.node, electron: process.versions.electron, platform: process.platform, arch: process.arch, packagedDependencies: 'passed', pdfAndMailSerialization: 'passed', packagedCore: 'passed', backupRoundtrip: 'passed', nativeWorkerRoundtrip: 'passed' }));
+  console.log(JSON.stringify({ version: ${JSON.stringify(version)}, node: process.versions.node, electron: process.versions.electron, platform: process.platform, arch: process.arch, packagedDependencies: 'passed', packagedUpdater: 'passed', pdfAndMailSerialization: 'passed', packagedCore: 'passed', backupRoundtrip: 'passed', nativeWorkerRoundtrip: 'passed' }));
 `;
 try {
   const result = spawnSync(executable, ['--input-type=module', '-e', program], {

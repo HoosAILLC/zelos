@@ -3,6 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { assertReleaseIdentity, releaseChecksums, signatureReceiptNames, verifyReleaseAssets } from './release-signatures.mjs';
+import { verifyReleaseUpdateFeeds } from './release-updates.mjs';
 
 export function publishRelease({ root = process.cwd(), env = process.env, execute = execFileSync } = {}) {
   const dir = path.join(root, 'release-assets');
@@ -14,8 +15,10 @@ export function publishRelease({ root = process.cwd(), env = process.env, execut
   // Preparation is not a permanent permission to publish: recheck the complete
   // installer set, its signing metadata, and the receipts immediately before gh.
   const assets = verifyReleaseAssets({ dir, version: release.version, commit: release.commit, manifestAssets: release.assets });
-  if (fs.readFileSync(path.join(dir, 'SHA256SUMS.txt'), 'utf8') !== releaseChecksums(assets)) throw new Error('Release checksum file changed');
-  const files = [...assets.map((asset) => asset.name), ...signatureReceiptNames(assets)].map((name) => path.join(dir, name));
+  const updateFeeds = verifyReleaseUpdateFeeds({ dir, version: release.version, assets, manifestFeeds: release.updateFeeds });
+  if (fs.readFileSync(path.join(dir, 'SHA256SUMS.txt'), 'utf8') !== releaseChecksums([...assets, ...updateFeeds])) throw new Error('Release checksum file changed');
+  const files = [...assets.map((asset) => asset.name), ...signatureReceiptNames(assets), ...updateFeeds.map(feed => feed.name)]
+    .map((name) => path.join(dir, name));
   // Publish only the verified set. Receipts are public CI records; the embedded
   // OS signatures and Apple's notarization remain the signing trust source.
   const args = ['release', 'create', tag, ...files, path.join(dir, 'SHA256SUMS.txt'),

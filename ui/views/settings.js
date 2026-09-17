@@ -3181,7 +3181,7 @@ function privacyPanel() {
       hint: 'Switched off, email and text previews, sender names, subjects and basic calendar details can still be shared. Your questions, notes and existing board summaries can also contain private information. This reduces sharing; it does not make hosted AI local.',
     }),
     fold('Advanced', [
-      el('p', { class: 'quiet-note', text: 'There is no telemetry, analytics or remote font. Reading and AI use your configured services; Check for updates contacts GitHub only when you press it. These two numbers cap what each AI request carries.' }),
+      el('p', { class: 'quiet-note', text: 'There is no telemetry, analytics or remote font. Reading and AI use your configured services. Signed desktop releases can check GitHub for updates automatically; turn this off in About. Other installations check only when you ask. These two numbers cap what each AI request carries.' }),
       el('div', { class: 'grid-2' }, [
         field('Characters from each message or calendar description', charsInput),
         field('Most items per check', maxInput),
@@ -3415,7 +3415,7 @@ function aboutPanel() {
       section('Where Zelos stands', {}, [
         el('ul', { class: 'plain-list' }, [
           el('li', { text: 'The server binds 127.0.0.1 and nothing else. Every API call carries a session token minted at launch; no CORS header is ever sent, so a page in another tab cannot read one. The one exception is /api/mcp, the read-only channel an AI client uses: it is off until you switch it on under Share with another AI, and it carries the separate AI token you mint there rather than the session token — that one is meant to outlive a restart, and it lasts until you turn sharing off or revoke it.' }),
-          el('li', { text: 'Reading and AI checks contact the services you configured. Pressing Check for updates also contacts the official Zelos releases on GitHub; it sends no account content or credentials.' }),
+          el('li', { text: 'Reading and AI checks contact the services you configured. Signed desktop installations can check the official Zelos releases on GitHub automatically; you can turn this off in Updates. Browser and development versions check only when you press Check for updates. Update checks send no account content or credentials, and downloads and restarts need your approval.' }),
           el('li', { text: 'Mail is untrusted input, and so is anything the model writes after reading it. Zelos never executes, shells out to, or navigates to anything derived from either. It renders them, and you click.' }),
           el('li', { text: 'Drafts are drafts. Zelos has no send path at all — not a disabled button, no code.' }),
           el('li', { text: 'Prompt-injection defences here are mitigation, not proof. The guarantee is the one above: nothing acts on model output but you.' }),

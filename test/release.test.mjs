@@ -129,6 +129,20 @@ test('a prepared tag-release manifest overrides the published version and preser
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(out, 'release.json'), 'utf8')), release);
 });
 
+test('website release evidence accepts the complete pair of Mac update ZIPs', t => {
+  const { root, write } = websiteFixture(t);
+  const release = releaseManifest('1.8.4');
+  const zip = arch => ({ name: `Zelos-1.8.4-${arch}.zip`, size: 3000, sha256: 'e'.repeat(64) });
+  release.assets.push(zip('arm64'), zip('x64'));
+  write('release-assets/release.json', release);
+  assert.deepEqual(readWebsiteRelease(root, '1.8.4'), release);
+  for (const assets of [release.assets.slice(0, -1), [...release.assets.slice(0, -1), zip('arm64')],
+    [...release.assets.slice(0, -1), { ...zip('x64'), name: 'unverified-extra.zip' }]]) {
+    write('release-assets/release.json', { ...release, assets });
+    assert.throws(() => readWebsiteRelease(root, '1.8.4'), /complete release manifest/);
+  }
+});
+
 test('website builds reject missing, incomplete, or mismatched download evidence before writing output', (t) => {
   const { root, write } = websiteFixture(t);
   fs.rmSync(path.join(root, 'website/release.json'));

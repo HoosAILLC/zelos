@@ -19,7 +19,8 @@ function downloadNames(version) {
 }
 
 export function readWebsiteRelease(root, previewVersion) {
-  // Tag builds carry an exact manifest prepared from all five release assets.
+  // Tag builds include both Mac update archives; older published versions have
+  // only the four installers and source. Neither format allows unknown assets.
   // Website-only updates retain the separately verified, published release.
   const prepared = path.join(root, 'release-assets/release.json');
   const hasPrepared = fs.existsSync(prepared);
@@ -32,7 +33,9 @@ export function readWebsiteRelease(root, previewVersion) {
     throw new Error('Website downloads require a verified release version and source commit');
   }
   const names = Object.values(downloadNames(release.version)).filter((name) => name !== 'SHA256SUMS.txt');
-  if (!Array.isArray(release.assets) || release.assets.length !== names.length || names.some((name) => {
+  const updateArchives = [`Zelos-${release.version}-arm64.zip`, `Zelos-${release.version}-x64.zip`];
+  const expected = release.assets?.length === names.length + updateArchives.length ? [...names, ...updateArchives] : names;
+  if (!Array.isArray(release.assets) || release.assets.length !== expected.length || expected.some((name) => {
     const assets = release.assets.filter((asset) => asset.name === name);
     return assets.length !== 1 || !Number.isSafeInteger(assets[0].size) || assets[0].size < 1000 ||
       !/^[a-f0-9]{64}$/.test(assets[0].sha256 || '');

@@ -4,19 +4,27 @@ Zelos is available as a desktop app or a source download. Both run the same
 program. The desktop app includes its runtime and opens in its own window.
 
 **Not a programmer?** You want the desktop app. Download it for your Mac or
-Windows PC from [zelos-app.netlify.app](https://zelos-app.netlify.app/#download).
-These builds do not have a verified publisher signature, so your computer may
-show a warning. Continue only if you trust the download. The sections
+Windows PC from [the Zelos download page](https://zelos-app.netlify.app/#download).
+The currently published **1.8.1 installers are unsigned** and updates are manual.
+Your computer may show a warning; continue only if you trust that download. The sections
 [Installing on macOS](#installing-on-macos--and-what-you-will-actually-see) and
 [Installing on Windows](#installing-on-windows--and-what-you-will-actually-see)
-below say what to click. The rest of this page is for people who type commands.
+below explain installation on each platform. Command-line setup is optional.
 
 This checkout describes the **1.8.4 QA candidate**, which is not a published
 release. Candidate installers are temporary GitHub Actions artifacts; native
 build and acceptance checks must finish before release. The download links above
-continue to point to published builds.
+continue to point to published builds. Signing and in-app update support in this
+checkout are not evidence of a signed release: publisher accounts, credentials,
+and the first complete signed release still need to be configured and verified.
 
 ## Updating from an earlier version
+
+### Existing 1.8.1 installations and unsigned previews
+
+Updates remain manual for these builds. **Check for updates** can open the
+official release information; it cannot install a replacement inside Zelos.
+Download and install the first signed release once to enable its native updater.
 
 Quit Zelos, then copy the data folder shown in Settings to a safe location before
 installing the update. The usual folder is `~/.zelos`. Install the new app over
@@ -52,6 +60,40 @@ and do not include operating-system keychain credentials or installed AI models.
 
 **Settings → About → Check for updates** checks the official GitHub release when
 pressed. It sends no account content or credentials, and does not install anything.
+
+### Installed signed Mac and Windows releases
+
+Signed releases check for updates **45 seconds after startup, then every six
+hours** while Zelos is running. Turn this off with **Settings → About → Updates →
+Check for updates automatically**; **Check for updates** remains available.
+Checks read public release information from GitHub without sending your archived
+content or account credentials. They select the update for your platform and
+processor architecture.
+
+An available-update notification opens **About** when clicked. Choose **Download
+update** to download it. Zelos does not start downloads automatically, and it does
+not install a downloaded update just because you quit the app.
+
+When the download is ready, choose **Update and restart** and confirm in the
+desktop dialog. Zelos saves open drafts and creates a private local recovery
+backup before stopping its core, installing, and restarting. If saving or backup
+fails, the app stays open and the update is not installed. Keep that backup private;
+like a manual `.zelos-backup`, it can contain personal records and portable
+credentials. It is saved under the data folder's `backups/` directory as
+`Before-update-<id>.zelos-backup`. This recovery copy does not replace keeping a
+backup on another device.
+
+**Custom launches keep manual updates.** If you start Zelos with `--home`,
+`--port`, `ZELOS_HOME`, or `ZELOS_PORT`, in-app updating is disabled so an installer cannot
+restart it with different data-folder or connection settings. Download the new
+release manually, retain your backup, and reopen with the same custom settings.
+On a Mac, move Zelos from the disk image or another folder into **Applications**
+and reopen it before using in-app updates. Source, browser, and unsupported
+desktop installations continue to use manual downloads.
+
+The first signed release and an upgrade between signed versions still require
+real signing and installation verification. The existing 1.8.1 release and unsigned
+development previews do not gain these capabilities from a source-code update.
 
 ## Optional PDF and scan imports
 
@@ -217,9 +259,10 @@ Press `Ctrl-C` in the terminal to stop it.
 
 ### What it does not add
 
-- No Zelos account, no automatic update check, no telemetry. Pressing **Check
-  for updates** asks the official GitHub release API for public release details;
-  it sends no archived content or credentials. The shell blocks every
+- No Zelos account and no telemetry. Signed desktop releases check public GitHub
+  release information automatically unless you turn that setting off; older
+  unsigned builds check only when asked. Neither sends archived content or
+  account credentials. The shell blocks every
   outbound request from the window that is not the local board — **including
   WebSockets**, which is the class it silently missed until the guard's match
   pattern was widened from `*://*/*` to `<all_urls>` (`*` in a scheme position
@@ -264,10 +307,13 @@ Choose the release version and architecture that match your computer:
 On a Mac, Apple menu → About This Mac shows the chip. On Windows,
 Settings → System → About → System type shows the processor architecture.
 
-The desktop workflow builds and checks each architecture on a matching runner.
-Manual QA runs keep their installers as temporary GitHub Actions artifacts;
-a successful version-tagged release publishes installers, exact source and
-checksums to Releases. A QA artifact is not itself a published release.
+The signed release workflow builds Mac releases on matching native runners.
+Windows packages are signed on x64 and then installed and checked on matching
+x64 and ARM64 runners. Manual QA runs keep candidates as temporary GitHub Actions
+artifacts; a successful version-tagged release publishes verified installers,
+Mac update ZIPs, update feeds, exact source, and checksums to Releases. The separate
+preview workflow produces unsigned artifacts. A QA artifact is not itself a
+published release. Maintainer account setup is in [Signing releases](SIGNING.md).
 
 ### Building it yourself
 
@@ -294,146 +340,73 @@ and Windows ARM64, and runs packaged startup and backup checks on each.
 
 ## Installing on macOS — and what you will actually see
 
-**In plain English first.** Your Mac shows a warning the first time you open
-Zelos because its publisher has not been verified by Apple. Only continue if
-you trust this release. Here is what to click: press **Done** on the warning
-(not *Move to Trash*), then open **System Settings → Privacy & Security**,
-scroll to the bottom, and press **Open Anyway**. Everything below this paragraph
-is the technical explanation of why.
+For the published **1.8.1** build, your Mac may block the first opening. If you
+trust that download, press **Done**, not **Move to Trash**, then open **System
+Settings → Privacy & Security** and choose **Open Anyway**. These steps are for
+the existing download, whose publisher Apple cannot yet verify.
 
-**These builds are ad-hoc signed and not notarized**, and the difference between
-those two words is the whole of this section.
+**Published 1.8.1 and unsigned previews:** the app has an ad-hoc signature, which
+allows Apple Silicon to load it but does not verify the publisher. These builds
+are not notarized. The local packaging defaults in `desktop/package.json` produce
+these development builds; the separate signed workflow requires a Developer ID
+certificate, hardened runtime, and notarization.
 
-`desktop/package.json` sets `"identity": "-"`, which is an *ad-hoc* signature:
-it satisfies the loader on Apple Silicon, and it identifies **nobody**. It also
-sets `"notarize": false` and `"hardenedRuntime": false`. So there is a signature
-on the bundle, and it vouches for no one — nobody has paid Apple the **$99 a
-year** the Developer Program costs, and nothing has been through Apple's
-notary service. macOS therefore treats these builds the way it treats any
-unknown app. This is not a bug to work around quietly; it is the trade, and you
-should know exactly what you are agreeing to before you click past a security
-warning.
+Open the `.dmg`, drag **Zelos** to **Applications**, eject the disk image, and
+open the installed app. For a signed release, macOS should be able to verify the
+publisher and notarization, though it may still ask whether to open an app
+downloaded from the internet. The first signed release has not yet been published.
 
-1. Open the `.dmg`, drag **Zelos** to **Applications**, eject the disk image.
-2. Double-click Zelos in Applications. macOS refuses:
+For the existing unsigned build, macOS may say it cannot verify the developer
+or check the app for malware. If you deliberately trust that release:
 
-   > **Apple could not verify "Zelos" is free of malware that may harm your
-   > Mac or compromise your privacy.**
-   > `Move to Trash` `Done`
+1. Dismiss the warning with **Done**.
+2. Open **System Settings → Privacy & Security** and locate the blocked app
+   in the Security section.
+3. Choose **Open Anyway**, authenticate when asked, and confirm **Open**.
 
-   (On macOS 14 and earlier the wording is *""Zelos" cannot be opened because
-   the developer cannot be verified."*)
-
-   Click **Done**. Do not move it to the trash.
-3. Open **System Settings → Privacy & Security** and scroll down to the
-   **Security** section. There will be a line that just appeared:
-
-   > **"Zelos" was blocked to protect your Mac.**  `Open Anyway`
-
-4. Click **Open Anyway** and authenticate with Touch ID or your password.
-5. One more confirmation appears — *"macOS cannot verify the developer of
-   "Zelos". Are you sure you want to open it?"* — click **Open**.
-
-macOS remembers. You will not be asked again.
-
-**On macOS 14 and earlier** there is a shortcut: Control-click (right-click) the
-app in Finder → **Open** → **Open**. Apple removed that path in macOS 15, which
-is why the System Settings route above is the one that works everywhere.
-
-**From the Terminal**, if you prefer:
-
-```
-xattr -d com.apple.quarantine /Applications/Zelos.app
-```
-
-That deletes the "downloaded from the internet" flag macOS attaches to the file.
-It is a real safety mechanism — only strip it from something you built yourself
-or fetched deliberately, and never because a web page told you to.
+Do not use this unsigned-build exception to dismiss an unexpected signature
+warning on a release advertised as signed. Check the release notes and download
+the original artifact again instead.
 
 ### If it says "Zelos is damaged and can't be opened"
 
-On Apple Silicon, every executable needs at least an ad-hoc signature, and an
-unsigned build gets refused with that misleading message. Sign it locally:
-
-```
-codesign --force --deep --sign - /Applications/Zelos.app
-```
-
-`--sign -` is the same *ad-hoc* signature the build already applies
-(`mac.identity: "-"` in `desktop/package.json`): it identifies nobody, it just
-satisfies the loader. So a build you made yourself should not hit this — the fix
-is here for a bundle that was modified after it was signed, which invalidates
-the signature.
+A missing or invalid signature, a modified bundle, or a damaged download can
+cause this message. Download a fresh copy from the official release and verify
+its checksum. Re-signing a downloaded app yourself removes the publisher's
+signature and is not a repair for a signed release. For a local development
+build, rebuild from your reviewed source instead.
 
 ---
 
 ## Installing on Windows — and what you will actually see
 
-**In plain English first.** Windows shows a blue box that says **Windows
-protected your PC** the first time you run the installer. Click **More info**,
-then **Run anyway** only if you trust this release. Windows cannot verify the
-publisher of these installers. Everything below this paragraph explains why.
+For the published **1.8.1** build, Windows may show **Windows protected your PC**.
+Choose **More info**, then **Run anyway** only if you trust the download.
+Windows cannot verify the publisher of this existing installer.
 
-**These builds are not signed at all** — not even ad-hoc. There is no signing
-configuration in the `win` block of `desktop/package.json`, so nothing is
-applied. (The macOS builds do carry an ad-hoc signature; Windows carries none.
-The $99 figure in the macOS section is Apple's Developer Program and buys you
-nothing here — a Windows certificate is a separate purchase from a certificate
-authority at its own price.) A code-signing certificate is a bill that
-arrives every year, and this project does not pay it, so the installer reaches
-you with no publisher name attached and no reputation with Microsoft. Windows
-will say so, in a dialog designed to stop you, and it is right to. This is not a
-bug to work around quietly; it is the trade, and you should know exactly what
-you are agreeing to before you click past a security warning. The reason it is
-reasonable to click past *this* one is that you can read the source and build
-the installer yourself.
+**Published 1.8.1 and unsigned previews:** Windows cannot verify the installer
+publisher. A future signed release must pass the release checks for the
+installer, application, and uninstaller; that first signed release is still
+waiting for publisher account setup and verification.
 
-1. **Take the installer that matches your machine.**
-   Choose `Zelos-VERSION-setup-x64.exe` for an ordinary PC or
-   `Zelos-VERSION-setup-arm64.exe` for Windows on ARM, replacing `VERSION` with
-   the version you downloaded. Check Settings → System → About → System type
-   if unsure. Each architecture has its own installer; there is no combined
-   installer. The wrong one may run under emulation or fail to run.
-2. **Your browser may refuse to keep the file.** Edge says *"…setup.exe was
-   blocked because it could harm your device"*; Chrome says *"…isn't commonly
-   downloaded"*. Open the downloads list, click the **…** beside the file, and
-   choose **Keep** — then **Keep anyway** on the confirmation that follows.
-3. **Run it, and Windows stops it.** A blue full-window dialog:
+1. Choose `Zelos-VERSION-setup-x64.exe` for an ordinary PC or
+   `Zelos-VERSION-setup-arm64.exe` for Windows on ARM. Check **Settings → System →
+   About → System type** if unsure. Each architecture has its own installer.
+2. Download from the official release page and run the installer. If SmartScreen
+   shows **Windows protected your PC**, **More info** shows the publisher and any
+   available **Run anyway** option. Only continue if you trust the source.
+   Existing unsigned builds show **Unknown publisher**. On a signed release,
+   check that the verified publisher matches the release information; an unknown
+   or unexpected publisher is not the expected signed-release result.
+3. The installer normally installs per-user without an administrator password
+   into `C:\Users\<you>\AppData\Local\Programs\Zelos`. You can change the
+   location, and choose desktop and Start menu shortcuts. It launches Zelos when
+   setup finishes.
 
-   > **Windows protected your PC**
-   > Microsoft Defender SmartScreen prevented an unrecognized app from starting.
-   > Running this app might put your PC at risk.
-   > `Don't run`
-
-   **The button you need is not on screen yet.** The only other thing on that
-   dialog is a small **More info** link under the message text. Click it. It
-   expands to show the file name and *Publisher: Unknown publisher*, and a
-   **Run anyway** button appears next to **Don't run**. Click **Run anyway**.
-
-   That is SmartScreen's entire objection: it has not seen this file before and
-   nobody it recognises vouches for it. Signing would replace *Unknown
-   publisher* with a name. It would not make the app safer — it would make it
-   more expensive to hand out.
-4. **The installer does not need an administrator.** It installs per-user, so
-   Windows does not ask for an admin password, and it goes to
-   `C:\Users\<you>\AppData\Local\Programs\Zelos`. You can change that path
-   during setup. It offers a Start menu entry and a desktop shortcut, and
-   launches Zelos when it finishes.
-
-The warning is about the *downloaded file*, so it is the installer that trips
-it. Starting Zelos afterwards from the Start menu should not raise it again.
-
-**If you would rather deal with it before running anything**, Windows keeps a
-"this came from the internet" marker on the file, exactly as macOS does, and you
-can clear it first: right-click the `.exe` → **Properties** → tick **Unblock**
-at the bottom of the **General** tab → **OK**. In PowerShell that is:
-
-```
-Unblock-File .\Zelos-VERSION-setup-x64.exe
-```
-
-That marker is a real safety mechanism — clear it only from something you built
-yourself or fetched deliberately, and never because a web page told you to.
+Signing identifies the publisher and lets Windows detect changes to signed
+files. A new signed download can still trigger SmartScreen because reputation
+also matters. See [Microsoft's explanation](https://learn.microsoft.com/en-us/windows/apps/package-and-deploy/smartscreen-reputation).
+Your browser or organization may apply additional download restrictions.
 
 To uninstall: **Settings → Apps → Installed apps → Zelos → Uninstall**. It
 leaves `C:\Users\<you>\.zelos` alone, on purpose — see **Where your things
@@ -501,10 +474,9 @@ directly.
 
 ## Honest notes about these builds
 
-- **macOS: ad-hoc signed, not notarized. Windows: not signed at all.** Every
-  warning above is macOS and Windows doing their job. You are choosing to trust
-  a build; the reason that is a reasonable choice here is that you can read the
-  source and, if you want, produce the build yourself.
+- **Published 1.8.1 and development previews are unsigned.** Mac previews use
+  an ad-hoc signature without notarization; Windows previews have no verified
+  publisher signature. The signed release workflow does not change older files.
 - **Automated checks do not replace native acceptance testing.** The desktop
   workflow builds and checks each supported Mac and Windows architecture.
   A passing build does not establish that native dialogs, clipboard permissions,
@@ -518,9 +490,10 @@ directly.
   byte for byte the ones in this repository. An app whose entire claim is "you
   can check what it does" should not hide its own code. Diff them against a
   clone if you want to be sure.
-- **Updates are manual.** Settings → About → Check for updates contacts the
-  official GitHub release only when pressed. Zelos does not download or install
-  an update automatically.
+- **Signed releases can check automatically; downloads and restarts are your
+  choice.** Existing 1.8.1 and unsigned previews retain manual updates. See
+  [Updating from an earlier version](#updating-from-an-earlier-version) for the
+  first signed installation and the recovery backup made before later upgrades.
 - **One copy at a time, and it tells you rather than stopping you.** Launching
   the app while the app is already running brings the existing window forward.
   The other pairing — a `zelos` running in a terminal and the app in the tray,

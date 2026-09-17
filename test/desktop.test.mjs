@@ -897,7 +897,8 @@ describe('the shell, booted against a stub Electron', () => {
     assert.ok(channel, 'the preload no longer names its channel in one place');
     assert.equal(channel[1], main.SHOW_HOME_CHANNEL, 'the preload and the shell disagree about the channel name');
     assert.match(preload, /showHome: \(\) => ipcRenderer\.invoke\(SHOW_HOME_CHANNEL\)/, 'showHome must invoke the channel with no argument');
-    assert.ok(!/ipcRenderer\.(on|send|sendSync)\(/.test(preload), 'the preload must expose nothing but the one invoke');
+    assert.ok(!/ipcRenderer\.(send|sendSync)\(/.test(preload), 'the preload must not expose generic message sending');
+    assert.deepEqual([...preload.matchAll(/ipcRenderer\.on\('([^']+)'/g)].map(match => match[1]), ['zelos:updates-changed'], 'only the fixed public update-state subscription is allowed');
     assert.ok(!/require\('(fs|child_process|path)'\)/.test(preload), 'the preload must not reach into Node');
   });
 
@@ -922,6 +923,33 @@ describe('the shell, booted against a stub Electron', () => {
       assert.equal((await handler({ sender: board, senderFrame: frame })).ok, false);
       frame.url = booted.zelos.url;
     }
+  });
+
+  it('limits the update bridge to fixed actions, a boolean preference, and public state', async () => {
+    const calls = [], listeners = new Map();
+    let bridge;
+    vm.runInNewContext(fs.readFileSync(path.join(REPO, 'desktop', 'preload.js'), 'utf8'), {
+      require: () => ({ contextBridge: { exposeInMainWorld: (_name, value) => { bridge = value; } }, ipcRenderer: {
+        invoke: (...args) => { calls.push(args); return Promise.resolve({ supported: false }); },
+        on: (channel, listener) => { assert.equal(channel, 'zelos:updates-changed'); listeners.set(channel, listener); },
+        removeListener: (channel, listener) => { assert.equal(listeners.get(channel), listener); listeners.delete(channel); },
+      } }),
+      process: { platform: 'darwin', versions: {} }, console,
+    });
+    assert.equal(Object.isFrozen(bridge.updates), true);
+    for (const action of ['getState', 'check', 'download', 'install']) await bridge.updates[action]('https://untrusted.example/', '/renderer/path');
+    await bridge.updates.setAutomatic(false, 'ignored');
+    await assert.rejects(bridge.updates.setAutomatic('yes'), /boolean/);
+    assert.deepEqual(calls, [['zelos:updates-state'], ['zelos:updates-check'], ['zelos:updates-download'], ['zelos:updates-install'], ['zelos:updates-automatic', false]]);
+    const received = [];
+    const unsubscribe = bridge.updates.onState((...args) => received.push(args));
+    const state = { status: 'available', latestVersion: '1.8.5' };
+    listeners.get('zelos:updates-changed')({ sender: 'private Electron object' }, state);
+    assert.deepEqual(received, [[state]], 'the Electron event must never reach the page');
+    unsubscribe();
+    assert.equal(listeners.size, 0);
+    bridge.updates.onState(null)();
+    assert.equal(listeners.size, 0);
   });
 
   function backupHarness({ cancel = false, confirm = 1, failFlush = false, failRestore = false } = {}) {

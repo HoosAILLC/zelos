@@ -8,7 +8,7 @@ import { prepareRuntimeDependencies } from '../desktop/prepare-runtime.js';
 const root = fileURLToPath(new URL('../', import.meta.url));
 const arch = process.argv[2];
 if (!['arm64', 'x64'].includes(arch)) throw new Error('Choose exactly one installer architecture: arm64 or x64');
-const config = signingConfig(process.env, process.platform);
+const config = signingConfig(process.env, process.platform, arch);
 const manifest = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
 const desktop = JSON.parse(fs.readFileSync(path.join(root, 'desktop/package.json'), 'utf8'));
 if (manifest.version !== desktop.version) throw new Error('App and desktop versions must match');
@@ -23,6 +23,6 @@ if (process.argv.includes('--check')) {
   const { build, Platform, Arch } = require('electron-builder');
   await build({ projectDir: path.join(root, 'desktop'), config, publish: 'never',
     targets: (process.platform === 'darwin' ? Platform.MAC : Platform.WINDOWS)
-      .createTarget(process.platform === 'darwin' ? 'dmg' : 'nsis', Arch[arch]),
+      .createTarget(process.platform === 'darwin' ? ['dmg', 'zip'] : 'nsis', Arch[arch]),
   });
 }

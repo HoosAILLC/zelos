@@ -31,7 +31,7 @@
   "build": {
     "appId": "app.zelos.desktop",
     "productName": "Zelos",
-    "copyright": "MIT licensed. Local-first: reading and AI use the services you configure; update checks are manual.",
+    "copyright": "MIT licensed. Local-first: reading and AI use the services you configure. Signed releases offer optional automatic update checks.",
     "asar": false,
     "npmRebuild": false,
     "forceCodeSigning": false,
@@ -156,5 +156,8 @@
       "runAfterFinish": true,
       "deleteAppDataOnUninstall": false
     }
+  },
+  "dependencies": {
+    "electron-updater": "6.8.9"
   }
 }
