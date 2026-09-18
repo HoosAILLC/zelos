@@ -6,7 +6,7 @@ html,body{background:#f4f3ef;color:#191919}
 body::before,body::after,.band::before,.band::after,.glass::before,.glass::after,h2::after{display:none!important}
 .nav,.nav.scrolled{background:#f4f3eff5!important;border-color:#d5d4cd!important;backdrop-filter:none}
 .nav a,.nav-links a,.menu-toggle{color:#191919}
-.brand-wordmark{filter:none!important;mix-blend-mode:multiply!important}
+.brand-wordmark{filter:none!important;mix-blend-mode:normal!important}
 .nav-cta,.btn-primary{background:#191919!important;color:#fff!important;border-color:#191919!important;box-shadow:none!important}
 .menu-toggle{background:transparent;border-color:#a6a79e}
 .nav-links{background:transparent}
@@ -35,7 +35,13 @@ textarea,pre{border-radius:16px!important}
 .preview-guide p{line-height:1.65}
 #preview{scroll-margin-top:90px}
 .band-head>h1{font-size:clamp(38px,5vw,66px);line-height:1.05;letter-spacing:-.045em;margin:0 0 24px}
-.info-footer-pages{display:flex;flex-wrap:wrap;gap:16px 24px;font-size:13px;margin-top:28px}
+.foot{padding-bottom:max(80px,env(safe-area-inset-bottom))}
+.foot-inner{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(0,1fr);gap:20px 64px}
+.foot-mark{grid-column:1/-1;margin:0}
+.foot-mark .brand-wordmark{width:160px;max-width:100%}
+.foot-line,.foot-greek{margin:0;max-width:56ch;font-size:15px;line-height:1.65}
+.info-footer-pages{display:flex;flex-wrap:wrap;gap:8px 28px;font-size:14px;margin-top:30px;padding-top:18px;border-top:1px solid #cbcac3}
+.info-footer-pages a{display:inline-flex;align-items:center;min-height:44px}
 .nav-links a[aria-current="page"]{text-decoration:underline;text-underline-offset:5px}
 
 /* Help and Privacy use the same phone rhythm and navigation as the product pages. */
@@ -84,9 +90,9 @@ textarea,pre{border-radius:16px!important}
   .help-nav a { display: flex; align-items: center; min-height: 48px; padding: 12px 16px; font-size: 16px; }
   #preview, section[id], header[id] { scroll-margin-top: 20px; }
   .zero-deps, .fine { font-family: var(--ff-body); font-size: 14px; line-height: 1.6; }
-  .foot { padding: 28px var(--gut) 24px; margin-top: 24px; }
-  .foot-inner { padding-top: 0; }
-  .foot-mark { margin-bottom: 16px; }
+  .foot { padding: 28px var(--gut) max(80px,env(safe-area-inset-bottom)); margin-top: 24px; }
+  .foot-inner { grid-template-columns:minmax(0,1fr);gap:18px;padding-top:24px; }
+  .foot-mark { margin-bottom: 0; }
   .foot-mark .brand-wordmark { width: 132px; }
   .foot-line, .foot-greek { font-size: 14px; line-height: 1.65; }
   .info-footer-pages { display: grid; grid-template-columns: 1fr 1fr; gap: 0 24px; margin-top: 20px; font-size: 16px; }
