@@ -91,7 +91,7 @@ controls.forEach(control => {
     event.preventDefault();
     selectRoute(route);
     if (control.tagName === 'A') {
-      const motion = window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth';
+      const motion = window.matchMedia('(prefers-reduced-motion: reduce)').matches || document.documentElement.dataset?.motion === 'off' ? 'auto' : 'smooth';
       document.getElementById('see')?.scrollIntoView({behavior: motion, block: 'start'});
     }
   });

@@ -1,0 +1,13 @@
+{
+  "source": "a-clearer-day.mp4",
+  "creditsURL": "/video/credits.html",
+  "description": "Muted lakeside excerpt from the existing licensed, dramatized Zelos film.",
+  "sourceInSeconds": 20.25,
+  "sourceOutSeconds": 29.25,
+  "edit": "Cinematic crop excluding embedded captions; one-second dissolve across the loop seam.",
+  "durationSeconds": 8,
+  "audio": false,
+  "desktop": "hero-lakeside-desktop.mp4",
+  "mobile": "hero-lakeside-mobile.mp4",
+  "poster": "hero-lakeside-poster.jpg"
+}
