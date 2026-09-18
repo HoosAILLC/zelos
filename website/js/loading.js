@@ -147,10 +147,13 @@ export function initWebsiteLaunch({ document = globalThis.document, window = glo
     control.hidden = false;
     control.addEventListener('click', event => { event.preventDefault(); launch.play(); });
   });
-  let seen = false;
-  try { seen = window.sessionStorage.getItem('zelos.site-opening') === 'seen'; }
+  let seen = false, paused = false;
+  try {
+    seen = window.sessionStorage.getItem('zelos.site-opening') === 'seen';
+    paused = window.sessionStorage.getItem('zelos.site-motion') === 'paused';
+  }
   catch { /* A blocked storage API must not break the page. */ }
-  if (!seen && !window.location.hash && !window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+  if (!seen && !paused && !window.location.hash && !window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
     try { window.sessionStorage.setItem('zelos.site-opening', 'seen'); } catch {}
     launch.play();
   }

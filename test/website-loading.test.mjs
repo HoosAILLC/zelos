@@ -105,6 +105,16 @@ test('blocked storage and an animation setup failure cannot strand the page', t 
   launch.destroy();
 });
 
+test('pausing site motion on another page suppresses the automatic opening', t => {
+  const f = fixture(t);
+  f.window.sessionStorage.setItem('zelos.site-motion', 'paused');
+  const launch = initWebsiteLaunch(f);
+  assert.equal(launch.isOpen, false);
+  assert.equal(f.timers.size, 0);
+  assert.equal(f.replay.hidden, false);
+  launch.destroy();
+});
+
 test('wing motion uses paired frames, stops when hidden or reduced, and cleans up', t => {
   const calls = [], f = fixture(t, {animate(frames, timing) {
     const animation = {frames, timing, cancelled: false, cancel() {this.cancelled = true;}, finished: new Promise(() => {})};

@@ -17,4 +17,4 @@ window.addEventListener('hashchange',tellParent);tellParent();
 // Credential/file controls never accept real input. The adapter independently
 // rejects connections, uploads, sending, purchases and guest-access mutations.
 function blockRealInputs(){for(const input of document.querySelectorAll('input[type="password"],input[type="file"]')){input.disabled=true;input.title='Available in the installed app. Use the sample records in this demo.';}}
-blockRealInputs();new MutationObserver(blockRealInputs).observe(document.getElementById('app'),{childList:true,subtree:true});
+blockRealInputs();new MutationObserver(blockRealInputs).observe(document.body,{childList:true,subtree:true});

@@ -167,6 +167,14 @@ test('resizing mounts the pending route once and preserves the active route for 
   assert.equal(f.messages.at(-1).route, 'health');
 });
 
+test('a paused website opens demo links without smooth scrolling', () => {
+  const f = responsivePage({width: 1024});
+  f.document.documentElement.dataset.motion = 'off';
+  f.featureLink.click();
+  assert.deepEqual(f.scrolls, ['auto']);
+  assert.equal(f.messages.at(-1).route, 'health');
+});
+
 test('invalid route parameters and malformed or foreign messages cannot change the selected route', () => {
   for (const search of ['?demo=unknown', '?demo=%2Fhealth', '?demo=%3Cscript%3E']) {
     assert.deepEqual(responsivePage({width: 1024, search}).loads, ['/try/#/now']);
